@@ -1,0 +1,55 @@
+[package]
+name = "hanstat"
+version = "0.1.0"
+edition = "2024"
+description = "Accurate character/word statistics for Chinese EPUB and TXT files"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/caocaochan/hanstat"
+readme = "README.md"
+keywords = ["chinese", "epub", "word-segmentation", "text-analysis", "hanzi"]
+default-run = "hanstat"
+
+[[bin]]
+name = "hanstat"
+path = "src/main.rs"
+
+[[bin]]
+name = "hanstat-cli"
+path = "src/bin/hanstat-cli.rs"
+
+[dependencies]
+aho-corasick = "1.1.5"
+candle-core = "0.11.1"
+candle-nn = "0.11.1"
+candle-transformers = "0.11.1"
+chardetng = "1.0.0"
+eframe = "0.37.0"
+ego-tree = "0.11"
+egui_extras = "0.37.0"
+encoding_rs = "0.8.44"
+jieba-rs = "0.11.0"
+ltp = { version = "0.1.9", features = ["serialization", "near-char-type"] }
+percent-encoding = "2.3.2"
+rayon = "1.11"
+regex = "1.13.1"
+rfd = "0.18.0"
+roxmltree = "0.21.2"
+rustc-hash = "2.1.3"
+scraper = "0.29.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+unicode-general-category = "1.1.0"
+unicode-normalization = "0.1.26"
+unicode-script = "0.5.9"
+unicode-segmentation = "1.13.3"
+ureq = "3.5.2"
+zip = { version = "9.5.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+
+# The perceptron decoder is unusably slow unoptimised; keep deps fast in dev builds.
+[profile.dev.package."*"]
+opt-level = 3

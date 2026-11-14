@@ -1,0 +1,286 @@
+//! Word segmentation back-ends.
+//!
+//! * CKIP BERT (bert-tiny-chinese-ws, ASBC standard) — most accurate, slowest.
+//! * LTP legacy (HIT-SCIR averaged perceptron, PKU-style standard) — fast, default.
+//! * jieba (dictionary DAG + max-probability path, HMM off).
+//!
+//! Every back-end gets whitespace-free chunks of the *original* text and returns
+//! slices of it. Script folding needed by a model (T→S for LTP/jieba, S→T for
+//! CKIP) happens inside, character-for-character, so counts never see it.
+//! A user dictionary is applied to every back-end the same way: each match
+//! (leftmost-longest) on the original text becomes exactly one token.
+
+use crate::ckip::Ckip;
+use crate::models;
+use crate::script::{self, Variant};
+use serde::Serialize;
+use std::io::BufReader;
+use std::sync::OnceLock;
+
+// Only successful loads are memoised, so a failed download can be retried.
+static LTP_MODEL: OnceLock<ltp::CWSModel> = OnceLock::new();
+static CKIP_MODEL: OnceLock<Ckip> = OnceLock::new();
+
+/// Load (once) the LTP model, downloading it first if needed. Call from a background thread.
+pub fn ltp_model() -> Result<&'static ltp::CWSModel, String> {
+    if let Some(m) = LTP_MODEL.get() {
+        return Ok(m);
+    }
+    let dir = models::LTP.ensure(&|_, _| {})?;
+    let f =
+        std::fs::File::open(dir.join("cws_model.bin")).map_err(|e| format!("LTP model: {e}"))?;
+    let m: ltp::CWSModel =
+        ltp::ModelSerde::load(BufReader::new(f), ltp::Format::AVRO(ltp::Codec::Deflate))
+            .map_err(|e| format!("Failed to load LTP model: {e}"))?;
+    Ok(LTP_MODEL.get_or_init(|| m))
+}
+
+/// Load (once) the CKIP model, downloading it first if needed.
+pub fn ckip_model() -> Result<&'static Ckip, String> {
+    if let Some(m) = CKIP_MODEL.get() {
+        return Ok(m);
+    }
+    let dir = models::CKIP.ensure(&|_, _| {})?;
+    let m = Ckip::from_pth_dir(&dir)?;
+    Ok(CKIP_MODEL.get_or_init(|| m))
+}
+
+/// The downloadable model a segmenter needs, if any.
+pub fn model_for(kind: SegmenterKind) -> Option<&'static models::Model> {
+    match kind {
+        SegmenterKind::Ltp | SegmenterKind::Auto => Some(&models::LTP),
+        SegmenterKind::Ckip => Some(&models::CKIP),
+        SegmenterKind::Jieba => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize)]
+pub enum SegmenterKind {
+    /// Best-benchmarked model for the detected script: CKIP for Traditional, LTP otherwise.
+    #[default]
+    Auto,
+    Ckip,
+    Ltp,
+    Jieba,
+}
+
+impl SegmenterKind {
+    pub const ALL: [SegmenterKind; 4] = [Self::Auto, Self::Ckip, Self::Ltp, Self::Jieba];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto (by script)",
+            Self::Ckip => "CKIP BERT",
+            Self::Ltp => "LTP perceptron",
+            Self::Jieba => "jieba",
+        }
+    }
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Auto => {
+                "LTP for Simplified text, CKIP for Traditional text: the most accurate choice for each script on the SIGHAN 2005 benchmarks."
+            }
+            Self::Ckip => {
+                "Academia Sinica CKIP bert-tiny, a context-aware neural model (Taiwan AS standard). Best on Traditional text (SIGHAN F1 90–98) and the most consistent with character names; ~1–3 min per novel on CPU."
+            }
+            Self::Ltp => {
+                "HIT-SCIR LTP averaged perceptron, PKU-style granularity (三/个, 吃/掉). Best on Simplified text (SIGHAN F1 88–95); a few seconds per novel."
+            }
+            Self::Jieba => {
+                "jieba dictionary segmentation (HMM off). Fastest, least accurate (SIGHAN F1 81–84); merges many compounds."
+            }
+        }
+    }
+    /// The concrete model `Auto` stands for, given the detected script.
+    pub fn resolve(self, variant: Variant) -> SegmenterKind {
+        match self {
+            Self::Auto if variant == Variant::Traditional => Self::Ckip,
+            Self::Auto => Self::Ltp,
+            k => k,
+        }
+    }
+}
+
+enum Backend {
+    Ltp(&'static ltp::CWSModel),
+    Jieba(Box<jieba_rs::Jieba>),
+    Ckip(&'static Ckip),
+}
+
+pub struct Segmenter {
+    pub kind: SegmenterKind,
+    backend: Backend,
+    /// User dictionary, matched leftmost-longest on the original text.
+    forced: Option<aho_corasick::AhoCorasick>,
+    /// LTP/jieba: fold Traditional → Simplified for the model.
+    fold_t2s: bool,
+    /// CKIP: fold Simplified → Traditional for the model.
+    fold_s2t: bool,
+}
+
+impl Segmenter {
+    /// `user_words` must be NFC-normalised (same form as the analysed text).
+    pub fn new(
+        kind: SegmenterKind,
+        user_words: &[String],
+        variant: Variant,
+    ) -> Result<Self, String> {
+        let kind = kind.resolve(variant);
+        let trad_like = matches!(variant, Variant::Traditional | Variant::Mixed);
+        let (fold_t2s, fold_s2t) = match kind {
+            SegmenterKind::Ckip => (false, variant != Variant::Traditional),
+            _ => (trad_like, false),
+        };
+        let backend = match kind {
+            SegmenterKind::Ltp | SegmenterKind::Auto => Backend::Ltp(ltp_model()?),
+            SegmenterKind::Ckip => Backend::Ckip(ckip_model()?),
+            SegmenterKind::Jieba => Backend::Jieba(Box::new(jieba_rs::Jieba::new())),
+        };
+        let words: Vec<&str> = user_words
+            .iter()
+            .map(String::as_str)
+            .filter(|w| !w.is_empty())
+            .collect();
+        let forced = if words.is_empty() {
+            None
+        } else {
+            Some(
+                aho_corasick::AhoCorasick::builder()
+                    .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+                    .build(&words)
+                    .map_err(|e| format!("User dictionary: {e}"))?,
+            )
+        };
+        Ok(Segmenter {
+            kind,
+            backend,
+            forced,
+            fold_t2s,
+            fold_s2t,
+        })
+    }
+
+    /// Enforce user-dictionary words: each match becomes exactly one token
+    /// (boundaries forced at its edges, removed inside it).
+    fn force<'a>(&self, s: &'a str, toks: Vec<&'a str>) -> Vec<&'a str> {
+        let Some(ac) = &self.forced else { return toks };
+        let mut it = ac.find_iter(s).peekable();
+        if it.peek().is_none() {
+            return toks;
+        }
+        let base = s.as_ptr() as usize;
+        let mut cut = vec![false; s.len() + 1];
+        for t in &toks {
+            cut[t.as_ptr() as usize - base] = true;
+        }
+        cut[s.len()] = true;
+        for m in it {
+            cut[m.start() + 1..m.end()]
+                .iter_mut()
+                .for_each(|b| *b = false);
+            cut[m.start()] = true;
+            cut[m.end()] = true;
+        }
+        let mut out = Vec::with_capacity(toks.len());
+        let mut start = 0;
+        for i in 1..=s.len() {
+            if cut[i] {
+                out.push(&s[start..i]);
+                start = i;
+            }
+        }
+        out
+    }
+
+    /// Human-readable description of the script folding in effect, if any.
+    pub fn folding_note(&self) -> Option<&'static str> {
+        if self.fold_t2s {
+            Some(
+                "Text is Traditional/Mixed: it was folded character-by-character to Simplified for the segmenter only (LTP/jieba are trained on Simplified). Counts and word lists keep the original characters.",
+            )
+        } else if self.fold_s2t {
+            Some(
+                "Text was converted to Traditional (OpenCC phrases, length-preserving) for the CKIP segmenter only (CKIP is trained on Traditional). Counts and word lists keep the original characters.",
+            )
+        } else {
+            None
+        }
+    }
+
+    /// Segment many whitespace-free chunks; result `i` tiles `chunks[i]`.
+    pub fn cut_many<'a>(&self, chunks: &[&'a str]) -> Vec<Vec<&'a str>> {
+        match &self.backend {
+            Backend::Ckip(m) => m
+                .segment_many(chunks, self.fold_s2t)
+                .into_iter()
+                .zip(chunks)
+                .map(|(toks, c)| {
+                    let toks = if covers(c, &toks) {
+                        toks
+                    } else {
+                        c.split_inclusive(|_| true).collect()
+                    };
+                    self.force(c, toks)
+                })
+                .collect(),
+            _ => chunks
+                .iter()
+                .map(|c| self.force(c, self.cut_one(c)))
+                .collect(),
+        }
+    }
+
+    fn cut_one<'a>(&self, orig: &'a str) -> Vec<&'a str> {
+        if !self.fold_t2s {
+            return self.model_cut(orig);
+        }
+        let folded = script::fold_t2s(orig);
+        let toks = self.model_cut(&folded);
+        // byte offset in folded -> char index -> byte offset in orig (char counts are equal)
+        let offs: Vec<usize> = orig
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain([orig.len()])
+            .collect();
+        let mut out = Vec::with_capacity(toks.len());
+        let mut ci = 0usize;
+        for t in toks {
+            let n = t.chars().count();
+            let end = (ci + n).min(offs.len() - 1);
+            out.push(&orig[offs[ci]..offs[end]]);
+            ci = end;
+        }
+        out
+    }
+
+    /// Model output on text already in model script. Result tiles `s`.
+    fn model_cut<'a>(&self, s: &'a str) -> Vec<&'a str> {
+        let toks: Vec<&'a str> = match &self.backend {
+            Backend::Ltp(m) => m
+                .predict(s)
+                .unwrap_or_else(|_| s.split_inclusive(|_| true).collect()),
+            Backend::Jieba(j) => j.cut(s, false).into_iter().map(|t| t.word).collect(),
+            Backend::Ckip(m) => m
+                .segment_many(&[s], self.fold_s2t)
+                .pop()
+                .unwrap_or_default(),
+        };
+        if covers(s, &toks) {
+            toks
+        } else {
+            s.split_inclusive(|_| true).collect()
+        }
+    }
+}
+
+/// True if `toks` are consecutive slices that exactly tile `s`.
+fn covers(s: &str, toks: &[&str]) -> bool {
+    let base = s.as_ptr() as usize;
+    let mut pos = 0usize;
+    for t in toks {
+        if t.as_ptr() as usize != base + pos {
+            return false;
+        }
+        pos += t.len();
+    }
+    pos == s.len()
+}

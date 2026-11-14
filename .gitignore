@@ -1,0 +1,4 @@
+/target
+# Local model copies (the app downloads models to %LOCALAPPDATA%\hanstat\models)
+/models/
+*.part
