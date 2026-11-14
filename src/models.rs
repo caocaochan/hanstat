@@ -104,6 +104,12 @@ impl Model {
         if self.is_cached() {
             return Ok(dir);
         }
+        // One download at a time per process; re-check after waiting, since
+        // another thread may have just finished the same files.
+        let _guard = DOWNLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if self.is_cached() {
+            return Ok(dir);
+        }
         std::fs::create_dir_all(&dir)
             .map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
         let total = self.total_size();
@@ -127,12 +133,15 @@ impl Model {
     }
 }
 
+static DOWNLOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn download(f: &ModelFile, dest: &std::path::Path, progress: &dyn Fn(u64)) -> Result<(), String> {
     let mut resp = ureq::get(f.url)
         .header("User-Agent", concat!("hanstat/", env!("CARGO_PKG_VERSION")))
         .call()
         .map_err(|e| e.to_string())?;
-    let tmp = dest.with_extension("part");
+    // Per-process temp name so concurrent processes never share a partial file.
+    let tmp = dest.with_extension(format!("{}.part", std::process::id()));
     let mut out = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
     let mut reader = resp.body_mut().as_reader();
     let mut hasher = Sha256::new();
@@ -162,5 +171,13 @@ fn download(f: &ModelFile, dest: &std::path::Path, progress: &dyn Fn(u64)) -> Re
             f.sha256
         ));
     }
-    std::fs::rename(&tmp, dest).map_err(|e| e.to_string())
+    match std::fs::rename(&tmp, dest) {
+        Ok(()) => Ok(()),
+        // Another process finished the same verified file first: that's fine.
+        Err(_) if std::fs::metadata(dest).is_ok_and(|m| m.len() == f.size) => {
+            let _ = std::fs::remove_file(&tmp);
+            Ok(())
+        }
+        Err(e) => Err(e.to_string()),
+    }
 }
