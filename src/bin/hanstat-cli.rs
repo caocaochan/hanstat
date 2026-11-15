@@ -4,7 +4,7 @@
 //!             [--include-all] [--exclude N,M,..] [--chars-csv out.csv] [--words-csv out.csv] [--suggest N] [--auto-dict]
 
 use hanstat::analyze::{self, Report};
-use hanstat::anki::{self, BookCoverage, ByStatus, Knowledge, KnowledgeSummary, Status};
+use hanstat::anki::{self, BookCoverage, ByStatus, Knowledge, KnowledgeSummary};
 use hanstat::extract::{self, EncodingChoice};
 use hanstat::segment::SegmenterKind;
 use std::path::PathBuf;
@@ -157,27 +157,17 @@ fn print_anki_summary(k: &KnowledgeSummary) {
 
 fn print_coverage(c: &BookCoverage, top: usize) {
     print_anki_summary(&c.anki);
-    println!(
-        "{:<16} {:>8} {:>8} {:>9} {:>8} {:>8} {:>12}",
-        "Book vs Anki", "known", "mature", "young", "learning", "new", "not in Anki"
-    );
-    let pct = |b: &ByStatus, n: u64| format!("{:.1}%", n as f64 * 100.0 / b.total().max(1) as f64);
-    for (label, b, as_pct) in [
-        ("running words", &c.word_tokens, true),
-        ("unique words", &c.word_types, false),
-        ("running chars", &c.char_tokens, true),
-        ("unique chars", &c.char_types, false),
+    // Known = on a young or mature card.
+    for (label, k) in [
+        ("Unique characters", &c.unique_chars),
+        ("Unique words", &c.unique_words),
     ] {
-        let f = |n: u64| if as_pct { pct(b, n) } else { n.to_string() };
         println!(
-            "{:<16} {:>8} {:>8} {:>9} {:>8} {:>8} {:>12}",
-            label,
-            f(b.known()),
-            f(b.get(Status::Mature)),
-            f(b.get(Status::Young)),
-            f(b.get(Status::Learning)),
-            f(b.get(Status::New)),
-            f(b.get(Status::NotInAnki))
+            "{label:<18} known {:>7} of {:>7} ({:.1}%)   not known {:>7}",
+            k.known,
+            k.total,
+            k.percent(),
+            k.not_known()
         );
     }
     let tw: Vec<String> = c

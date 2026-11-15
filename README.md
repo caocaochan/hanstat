@@ -60,7 +60,7 @@ Click **🃏 Anki** and tick the decks and the fields that hold the word, for ex
 - **New:** in your selection but never studied.
 - **Not in Anki.**
 
-Results are given for running words, unique words, running characters and unique characters. The Words and Characters tabs get a status column and a filter (for example "Not young/mature"), and Export can save the book's unknown words in frequency order.
+The Overview shows how many of the book's unique characters and unique words you know, where known means young or mature. The Anki window breaks your selection down by every status. The Words and Characters tabs get a status column and a filter (for example "Not young/mature"), and Export can save the book's unknown words in frequency order.
 
 - A note takes the best status of its cards in the selected decks.
 - Every run of Chinese characters in a ticked field is one word. HTML, cloze markup, `[sound:…]` and `[readings]` are stripped.

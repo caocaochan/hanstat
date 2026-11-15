@@ -212,14 +212,22 @@ impl AnkiFilter {
     }
 }
 
+fn status_colour(s: Status) -> Color32 {
+    match s {
+        Status::Mature => Color32::from_rgb(80, 170, 100),
+        Status::Young => Color32::from_rgb(140, 200, 120),
+        Status::Learning => Color32::from_rgb(220, 170, 60),
+        Status::New => Color32::from_rgb(100, 150, 220),
+        Status::NotInAnki => Color32::GRAY,
+    }
+}
+
 fn status_text(s: Status) -> RichText {
     let t = RichText::new(s.label());
-    match s {
-        Status::Mature => t.color(Color32::from_rgb(80, 170, 100)),
-        Status::Young => t.color(Color32::from_rgb(140, 200, 120)),
-        Status::Learning => t.color(Color32::from_rgb(220, 170, 60)),
-        Status::New => t.color(Color32::from_rgb(100, 150, 220)),
-        Status::NotInAnki => t.weak(),
+    if s == Status::NotInAnki {
+        t.weak()
+    } else {
+        t.color(status_colour(s))
     }
 }
 
@@ -654,7 +662,7 @@ impl App {
                             String::new()
                         }
                     ));
-                    status_grid(ui, "anki-summary", &[("Cards", &s.cards, false), ("Words", &s.words, false), ("Characters", &s.chars, false)], false);
+                    status_grid(ui, "anki-summary", &[("Cards", &s.cards), ("Words", &s.words), ("Characters", &s.chars)]);
                 }
                 ui.add_space(6.0);
                 ui.label(
@@ -1030,17 +1038,9 @@ fn fmt_int(n: u64) -> String {
     out
 }
 
-/// Rows of counts by Anki status; `as_pct` shows a row as shares of its total.
-fn status_grid(
-    ui: &mut egui::Ui,
-    id: &str,
-    rows: &[(&str, &ByStatus, bool)],
-    with_not_in_anki: bool,
-) {
-    let mut cols = vec![Status::Mature, Status::Young, Status::Learning, Status::New];
-    if with_not_in_anki {
-        cols.push(Status::NotInAnki);
-    }
+/// Counts by Anki status (the Anki window's summary of the selection).
+fn status_grid(ui: &mut egui::Ui, id: &str, rows: &[(&str, &ByStatus)]) {
+    let cols = [Status::Mature, Status::Young, Status::Learning, Status::New];
     egui::Grid::new(id)
         .striped(true)
         .num_columns(cols.len() + 2)
@@ -1048,22 +1048,15 @@ fn status_grid(
         .show(ui, |ui| {
             ui.label("");
             ui.strong("Known").on_hover_text("Young + mature");
-            for s in &cols {
-                ui.label(status_text(*s).strong());
+            for s in cols {
+                ui.label(status_text(s).strong());
             }
             ui.end_row();
-            for (label, b, as_pct) in rows {
-                let f = |n: u64| {
-                    if *as_pct {
-                        format!("{:.1}%", n as f64 * 100.0 / b.total().max(1) as f64)
-                    } else {
-                        fmt_int(n)
-                    }
-                };
+            for (label, b) in rows {
                 ui.label(*label);
-                ui.strong(f(b.known()));
-                for s in &cols {
-                    ui.label(f(b.get(*s)));
+                ui.strong(fmt_int(b.known()));
+                for s in cols {
+                    ui.label(fmt_int(b.get(s)));
                 }
                 ui.end_row();
             }
@@ -1126,28 +1119,32 @@ impl App {
             ui.add_space(10.0);
 
             if let Some(c) = &r.anki {
-                ui.heading("Your Anki cards vs this book");
+                ui.heading("Known from Anki");
+                ui.horizontal_wrapped(|ui| {
+                    for (title, k) in [
+                        ("Unique characters you know", &c.unique_chars),
+                        ("Unique words you know", &c.unique_words),
+                    ] {
+                        big_stat(
+                            ui,
+                            title,
+                            k.known,
+                            &format!(
+                                "{:.1}% of {} · {} not known",
+                                k.percent(),
+                                fmt_int(k.total),
+                                fmt_int(k.not_known())
+                            ),
+                        );
+                    }
+                });
                 ui.label(
                     RichText::new(format!(
-                        "From {} notes: {} known words (mature {}, young {}), {} known characters. A character counts as known if it appears in a known word.",
-                        fmt_int(c.anki.notes),
+                        "Known = on a young or mature card in your selected decks ({} words, {} characters). A character is known if it appears in a known word.",
                         fmt_int(c.anki.words.known()),
-                        fmt_int(c.anki.words.mature),
-                        fmt_int(c.anki.words.young),
                         fmt_int(c.anki.chars.known()),
                     ))
                     .weak(),
-                );
-                status_grid(
-                    ui,
-                    "anki-book",
-                    &[
-                        ("Running words", &c.word_tokens, true),
-                        ("Unique words", &c.word_types, false),
-                        ("Running characters", &c.char_tokens, true),
-                        ("Unique characters", &c.char_types, false),
-                    ],
-                    true,
                 );
                 ui.add_space(10.0);
             }

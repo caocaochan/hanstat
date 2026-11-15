@@ -772,17 +772,30 @@ impl Knowledge {
     }
 }
 
+/// How many of a book's distinct items are known (young or mature).
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct KnownCount {
+    pub known: u64,
+    pub total: u64,
+}
+
+impl KnownCount {
+    pub fn not_known(&self) -> u64 {
+        self.total - self.known
+    }
+    pub fn percent(&self) -> f64 {
+        self.known as f64 * 100.0 / self.total.max(1) as f64
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct BookCoverage {
     pub anki: KnowledgeSummary,
-    /// Running words of the book by the status of the word.
-    pub word_tokens: ByStatus,
-    /// Distinct words of the book.
-    pub word_types: ByStatus,
-    /// Running Chinese characters by the status of the character.
-    pub char_tokens: ByStatus,
-    pub char_types: ByStatus,
-    /// Most frequent words that are neither young nor mature.
+    /// The book's distinct words that are known.
+    pub unique_words: KnownCount,
+    /// The book's distinct Chinese characters that are known.
+    pub unique_chars: KnownCount,
+    /// Most frequent words that are not known.
     pub top_unknown_words: Vec<(String, u32)>,
     /// Parallel to `Report::word_freq` / `char_freq`.
     #[serde(skip)]
@@ -795,20 +808,10 @@ impl BookCoverage {
     pub fn compute(k: &Knowledge, char_freq: &[(char, u32)], word_freq: &[(String, u32)]) -> Self {
         let word_status: Vec<Status> = word_freq.iter().map(|(w, _)| k.word(w)).collect();
         let char_status: Vec<Status> = char_freq.iter().map(|(c, _)| k.char(*c)).collect();
-        let (mut wt, mut wy, mut ct, mut cy) = (
-            ByStatus::default(),
-            ByStatus::default(),
-            ByStatus::default(),
-            ByStatus::default(),
-        );
-        for ((_, n), &s) in word_freq.iter().zip(&word_status) {
-            wt.add(s, *n as u64);
-            wy.add(s, 1);
-        }
-        for ((_, n), &s) in char_freq.iter().zip(&char_status) {
-            ct.add(s, *n as u64);
-            cy.add(s, 1);
-        }
+        let count = |v: &[Status]| KnownCount {
+            known: v.iter().filter(|s| s.is_known()).count() as u64,
+            total: v.len() as u64,
+        };
         let top_unknown_words = word_freq
             .iter()
             .zip(&word_status)
@@ -818,10 +821,8 @@ impl BookCoverage {
             .collect();
         BookCoverage {
             anki: k.summary.clone(),
-            word_tokens: wt,
-            word_types: wy,
-            char_tokens: ct,
-            char_types: cy,
+            unique_words: count(&word_status),
+            unique_chars: count(&char_status),
             top_unknown_words,
             word_status,
             char_status,
