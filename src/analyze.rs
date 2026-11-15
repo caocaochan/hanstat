@@ -336,6 +336,10 @@ pub struct Report {
     pub sections: Vec<SectionRow>,
     pub notes: Vec<String>,
 
+    /// Filled in by the caller when Anki data is in use.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anki: Option<crate::anki::BookCoverage>,
+
     #[serde(skip)]
     pub char_freq: Vec<(char, u32)>,
     #[serde(skip)]
@@ -490,6 +494,7 @@ pub fn build_report(book: &Book, prep: &Prepared, included: &[bool]) -> Report {
         norm: total.norm,
         sections: rows,
         notes,
+        anki: None,
         char_freq,
         word_freq,
         foreign_freq,

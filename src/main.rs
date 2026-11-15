@@ -3,6 +3,7 @@
 use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 use hanstat::analyze::{self, Prepared, Report};
+use hanstat::anki::{self, BookCoverage, ByStatus, Status};
 use hanstat::discover::{self, Candidate};
 use hanstat::extract::{self, Book, EncodingChoice, SectionKind};
 use hanstat::segment::SegmenterKind;
@@ -58,6 +59,7 @@ fn main() -> eframe::Result {
                     let _ = hanstat::segment::ckip_model();
                 }
             });
+            app.anki_init(&cc.egui_ctx);
             if let Some(p) = path {
                 app.start(p, cc.egui_ctx.clone());
             }
@@ -145,6 +147,80 @@ struct App {
     suggestions: Option<Vec<Candidate>>,
     suggest_rx: Option<Receiver<Vec<Candidate>>>,
     selected: HashSet<String>,
+
+    anki: AnkiState,
+    anki_filter: AnkiFilter,
+}
+
+enum AnkiMsg {
+    Opened(Result<anki::Collection, String>),
+    Built(Result<anki::Knowledge, String>),
+}
+
+#[derive(Default)]
+struct AnkiState {
+    settings: anki::Settings,
+    profiles: Vec<anki::Profile>,
+    col: Option<Arc<Mutex<anki::Collection>>>,
+    info: Option<Arc<anki::CollectionInfo>>,
+    knowledge: Option<Arc<anki::Knowledge>>,
+    /// One background job at a time (open or classify).
+    rx: Option<Receiver<AnkiMsg>>,
+    busy: &'static str,
+    /// The selection changed while a job was running: classify again afterwards.
+    dirty: bool,
+    error: Option<String>,
+    window: bool,
+    show_unused_types: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum AnkiFilter {
+    #[default]
+    All,
+    NotKnown,
+    Known,
+    Is(Status),
+}
+
+impl AnkiFilter {
+    const OPTIONS: [AnkiFilter; 8] = [
+        AnkiFilter::All,
+        AnkiFilter::NotKnown,
+        AnkiFilter::Known,
+        AnkiFilter::Is(Status::Mature),
+        AnkiFilter::Is(Status::Young),
+        AnkiFilter::Is(Status::Learning),
+        AnkiFilter::Is(Status::New),
+        AnkiFilter::Is(Status::NotInAnki),
+    ];
+    fn label(self) -> &'static str {
+        match self {
+            AnkiFilter::All => "All",
+            AnkiFilter::NotKnown => "Not young/mature",
+            AnkiFilter::Known => "Young or mature",
+            AnkiFilter::Is(s) => s.label(),
+        }
+    }
+    fn matches(self, s: Status) -> bool {
+        match self {
+            AnkiFilter::All => true,
+            AnkiFilter::NotKnown => !s.is_known(),
+            AnkiFilter::Known => s.is_known(),
+            AnkiFilter::Is(x) => s == x,
+        }
+    }
+}
+
+fn status_text(s: Status) -> RichText {
+    let t = RichText::new(s.label());
+    match s {
+        Status::Mature => t.color(Color32::from_rgb(80, 170, 100)),
+        Status::Young => t.color(Color32::from_rgb(140, 200, 120)),
+        Status::Learning => t.color(Color32::from_rgb(220, 170, 60)),
+        Status::New => t.color(Color32::from_rgb(100, 150, 220)),
+        Status::NotInAnki => t.weak(),
+    }
 }
 
 impl Default for App {
@@ -171,6 +247,8 @@ impl Default for App {
             suggestions: None,
             suggest_rx: None,
             selected: HashSet::new(),
+            anki: AnkiState::default(),
+            anki_filter: AnkiFilter::All,
         }
     }
 }
@@ -287,6 +365,318 @@ impl App {
             });
             self.suggest_rx = Some(rx);
             self.report = Some(r);
+            self.refresh_anki_coverage();
+        }
+    }
+
+    // ----- Anki -----
+
+    fn anki_init(&mut self, ctx: &egui::Context) {
+        let (s, warn) = anki::Settings::load();
+        self.anki.settings = s;
+        self.anki.error = warn;
+        self.anki.profiles = anki::find_profiles();
+        if self.anki.settings.enabled && self.anki.settings.collection.is_some() {
+            self.anki_open(ctx);
+        }
+    }
+
+    fn anki_open(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.anki.settings.collection.clone() else {
+            return;
+        };
+        self.anki.error = None;
+        self.anki.col = None;
+        self.anki.info = None;
+        self.anki.knowledge = None;
+        self.anki.dirty = false;
+        self.anki.busy = "Reading Anki collection…";
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(AnkiMsg::Opened(anki::Collection::open(&path)));
+            ctx.request_repaint();
+        });
+        // Replacing the receiver discards any job still running for the old collection.
+        self.anki.rx = Some(rx);
+        self.refresh_anki_coverage();
+    }
+
+    fn anki_rebuild(&mut self, ctx: &egui::Context) {
+        if self.anki.rx.is_some() {
+            self.anki.dirty = true;
+            return;
+        }
+        let Some(col) = self.anki.col.clone() else {
+            return;
+        };
+        if !self.anki.settings.has_selection() {
+            self.anki.knowledge = None;
+            self.refresh_anki_coverage();
+            return;
+        }
+        self.anki.busy = "Classifying Anki notes…";
+        let s = self.anki.settings.clone();
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let col = col.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = tx.send(AnkiMsg::Built(col.knowledge(&s)));
+            ctx.request_repaint();
+        });
+        self.anki.rx = Some(rx);
+    }
+
+    /// The user changed the selection or an option: persist it, then re-classify.
+    fn anki_changed(&mut self, ctx: &egui::Context) {
+        if let Err(e) = self.anki.settings.save() {
+            self.anki.error = Some(e);
+        }
+        self.anki_rebuild(ctx);
+        self.refresh_anki_coverage();
+    }
+
+    fn poll_anki(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.anki.rx else { return };
+        let msg = match rx.try_recv() {
+            Ok(m) => m,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                return;
+            }
+            Err(_) => {
+                self.anki.rx = None;
+                return;
+            }
+        };
+        self.anki.rx = None;
+        self.anki.busy = "";
+        match msg {
+            AnkiMsg::Opened(Ok(c)) => {
+                let before = self.anki.settings.clone();
+                self.anki.settings.rebind(&c.info);
+                if self.anki.settings != before
+                    && let Err(e) = self.anki.settings.save()
+                {
+                    self.anki.error = Some(e);
+                }
+                self.anki.info = Some(c.info.clone());
+                self.anki.col = Some(Arc::new(Mutex::new(c)));
+                self.anki_rebuild(ctx);
+            }
+            AnkiMsg::Built(Ok(k)) => {
+                self.anki.knowledge = Some(Arc::new(k));
+                self.refresh_anki_coverage();
+                if std::mem::take(&mut self.anki.dirty) {
+                    self.anki_rebuild(ctx);
+                }
+            }
+            AnkiMsg::Opened(Err(e)) | AnkiMsg::Built(Err(e)) => self.anki.error = Some(e),
+        }
+    }
+
+    fn refresh_anki_coverage(&mut self) {
+        let Some(r) = &mut self.report else { return };
+        r.anki = match &self.anki.knowledge {
+            Some(k) if self.anki.settings.enabled => {
+                Some(BookCoverage::compute(k, &r.char_freq, &r.word_freq))
+            }
+            _ => None,
+        };
+        if r.anki.is_none() {
+            self.anki_filter = AnkiFilter::All;
+        }
+    }
+
+    fn anki_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.anki.window;
+        let mut changed = false;
+        let mut reopen = false;
+        egui::Window::new("Anki")
+            .open(&mut open)
+            .default_size([720.0, 560.0])
+            .vscroll(true)
+            .show(ctx, |ui| {
+                let a = &mut self.anki;
+                changed |= ui
+                    .checkbox(&mut a.settings.enabled, "Show known-vocabulary statistics from Anki")
+                    .changed();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Collection:");
+                    let current = a.settings.collection.clone();
+                    let shown = current
+                        .as_ref()
+                        .map(|p| {
+                            a.profiles
+                                .iter()
+                                .find(|pr| &pr.collection == p)
+                                .map(|pr| format!("Profile: {}", pr.name))
+                                .unwrap_or_else(|| p.display().to_string())
+                        })
+                        .unwrap_or_else(|| "(none)".into());
+                    egui::ComboBox::from_id_salt("anki-profile")
+                        .selected_text(shown)
+                        .width(260.0)
+                        .show_ui(ui, |ui| {
+                            for p in &a.profiles {
+                                if ui
+                                    .selectable_label(current.as_ref() == Some(&p.collection), &p.name)
+                                    .on_hover_text(p.collection.display().to_string())
+                                    .clicked()
+                                    && current.as_ref() != Some(&p.collection)
+                                {
+                                    a.settings.collection = Some(p.collection.clone());
+                                    reopen = true;
+                                }
+                            }
+                        });
+                    if ui.button("Browse…").clicked()
+                        && let Some(p) = rfd::FileDialog::new()
+                            .add_filter("Anki collection", &["anki2", "anki21"])
+                            .pick_file()
+                    {
+                        a.settings.collection = Some(p);
+                        reopen = true;
+                    }
+                    if ui
+                        .add_enabled(a.settings.collection.is_some(), egui::Button::new("⟳ Reload"))
+                        .on_hover_text("Re-read the collection, e.g. after reviewing in Anki")
+                        .clicked()
+                    {
+                        reopen = true;
+                    }
+                    if !a.busy.is_empty() {
+                        ui.spinner();
+                        ui.label(a.busy);
+                    }
+                });
+                if let Some(e) = &a.error {
+                    ui.colored_label(Color32::from_rgb(220, 80, 80), format!("⚠ {e}"));
+                }
+                if a.profiles.is_empty() && a.settings.collection.is_none() {
+                    ui.label("No Anki profiles found in %APPDATA%\\Anki2. Use Browse… to pick a collection.anki2.");
+                }
+                let Some(info) = a.info.clone() else { return };
+                ui.separator();
+                ui.columns(2, |cols| {
+                    let ui = &mut cols[0];
+                    ui.strong("Decks");
+                    ui.label(RichText::new("A deck includes its subdecks.").weak());
+                    egui::ScrollArea::vertical()
+                        .id_salt("anki-decks")
+                        .max_height(300.0)
+                        .show(ui, |ui| {
+                            for d in &info.decks {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(d.depth() as f32 * 18.0);
+                                    let mut v = a.settings.deck_selected(d);
+                                    if ui
+                                        .checkbox(&mut v, format!("{}  ({} cards)", d.leaf(), d.cards))
+                                        .on_hover_text(&d.name)
+                                        .changed()
+                                    {
+                                        a.settings.set_deck(d, v);
+                                        a.settings.enabled = true;
+                                        changed = true;
+                                    }
+                                });
+                            }
+                        });
+
+                    let ui = &mut cols[1];
+                    ui.horizontal(|ui| {
+                        ui.strong("Note types → fields");
+                        ui.checkbox(&mut a.show_unused_types, "show unused");
+                    });
+                    ui.label(RichText::new("Tick the fields that hold the word (not sentences).").weak());
+                    egui::ScrollArea::vertical()
+                        .id_salt("anki-types")
+                        .max_height(300.0)
+                        .show(ui, |ui| {
+                            for nt in info
+                                .note_types
+                                .iter()
+                                .filter(|n| n.notes > 0 || a.show_unused_types)
+                            {
+                                let n_sel = nt
+                                    .fields
+                                    .iter()
+                                    .filter(|f| a.settings.field_selected(nt, f))
+                                    .count();
+                                let title = if n_sel > 0 {
+                                    RichText::new(format!("{}  ({} notes, {n_sel} field(s))", nt.name, nt.notes)).strong()
+                                } else {
+                                    RichText::new(format!("{}  ({} notes)", nt.name, nt.notes))
+                                };
+                                egui::CollapsingHeader::new(title)
+                                    .id_salt(("anki-nt", nt.id))
+                                    .default_open(n_sel > 0)
+                                    .show(ui, |ui| {
+                                        for f in &nt.fields {
+                                            let mut v = a.settings.field_selected(nt, f);
+                                            if ui.checkbox(&mut v, f).changed() {
+                                                a.settings.set_field(nt, f, v);
+                                                a.settings.enabled = true;
+                                                changed = true;
+                                            }
+                                        }
+                                    });
+                            }
+                        });
+                });
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    changed |= ui
+                        .checkbox(&mut a.settings.include_suspended, "Count suspended cards")
+                        .on_hover_text("On: a suspended card counts by its interval. Off: suspended cards are ignored.")
+                        .changed();
+                    changed |= ui
+                        .checkbox(&mut a.settings.match_across_scripts, "Match Traditional ↔ Simplified")
+                        .on_hover_text("Fold both your cards and the book to Simplified (character level) before matching.")
+                        .changed();
+                });
+                if !a.settings.has_selection() {
+                    ui.label(RichText::new("Select at least one deck and one field.").color(Color32::from_rgb(220, 170, 60)));
+                } else if let Some(k) = &a.knowledge {
+                    let s = &k.summary;
+                    ui.add_space(4.0);
+                    ui.label(format!(
+                        "{} notes{}{}",
+                        fmt_int(s.notes),
+                        if s.notes_without_chinese > 0 {
+                            format!(" ({} have no Chinese in the ticked fields)", fmt_int(s.notes_without_chinese))
+                        } else {
+                            String::new()
+                        },
+                        if s.suspended_excluded > 0 {
+                            format!(", {} suspended cards ignored", fmt_int(s.suspended_excluded))
+                        } else {
+                            String::new()
+                        }
+                    ));
+                    status_grid(ui, "anki-summary", &[("Cards", &s.cards, false), ("Words", &s.words, false), ("Characters", &s.chars, false)], false);
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!(
+                        "Young = review interval under {0} days, mature = {0}+ days (Anki's definitions). Learning and relearning cards are not counted as known. \
+                         Each run of Chinese characters in a ticked field is one word; HTML, sound tags and [readings] are ignored. \
+                         The collection is read from a temporary copy and never modified. Choices are saved to {1}.",
+                        anki::MATURE_IVL,
+                        anki::Settings::path().display()
+                    ))
+                    .weak()
+                    .small(),
+                );
+            });
+        self.anki.window = open;
+        if reopen {
+            if let Err(e) = self.anki.settings.save() {
+                self.anki.error = Some(e);
+            }
+            self.anki_open(ctx);
+        } else if changed {
+            self.anki_changed(ctx);
         }
     }
 
@@ -355,6 +745,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.poll_job();
         self.poll_suggestions(&ctx);
+        self.poll_anki(&ctx);
 
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
@@ -417,6 +808,30 @@ impl eframe::App for App {
                     self.rerun(&ctx, false);
                 }
 
+                ui.separator();
+                let anki_label = match &self.anki.knowledge {
+                    Some(k) if self.anki.settings.enabled => format!(
+                        "🃏 Anki: {} known words",
+                        fmt_int(k.summary.words.known())
+                    ),
+                    _ => "🃏 Anki…".to_owned(),
+                };
+                if ui
+                    .selectable_label(self.anki.window, anki_label)
+                    .on_hover_text("Compare the book with your Anki cards (young and mature)")
+                    .clicked()
+                {
+                    self.anki.window = !self.anki.window;
+                    if self.anki.window && self.anki.col.is_none() && self.anki.rx.is_none() {
+                        if self.anki.settings.collection.is_none() {
+                            self.anki.profiles = anki::find_profiles();
+                            self.anki.settings.collection =
+                                self.anki.profiles.first().map(|p| p.collection.clone());
+                        }
+                        self.anki_open(&ctx);
+                    }
+                }
+
                 let is_txt = self.book.as_ref().is_some_and(|b| b.format == "TXT");
                 if is_txt {
                     ui.separator();
@@ -446,6 +861,18 @@ impl eframe::App for App {
                         }
                         if ui.button("Full report (JSON)…").clicked() {
                             msg = save(&format!("{stem}-report.json"), "json", serde_json::to_string_pretty(r).unwrap());
+                        }
+                        if let Some(c) = &r.anki
+                            && ui.button("Words not young/mature in Anki, by frequency (TXT)…").clicked()
+                        {
+                            let list: Vec<&str> = r
+                                .word_freq
+                                .iter()
+                                .zip(&c.word_status)
+                                .filter(|(_, s)| !s.is_known())
+                                .map(|((w, _), _)| w.as_str())
+                                .collect();
+                            msg = save(&format!("{stem}-unknown-words.txt"), "txt", list.join("\n") + "\n");
                         }
                         if !self.user_words.is_empty() && ui.button("Forced words as user dictionary (TXT)…").clicked() {
                             msg = save(&format!("{stem}-dictionary.txt"), "txt", self.user_words.join("\n") + "\n");
@@ -548,7 +975,25 @@ impl eframe::App for App {
                 Tab::Notes => self.notes(ui),
             }
         });
+
+        if self.anki.window {
+            self.anki_window(&ctx);
+        }
     }
+}
+
+fn anki_filter_combo(ui: &mut egui::Ui, f: &mut AnkiFilter, available: bool) {
+    if !available {
+        return;
+    }
+    ui.label("Anki:");
+    egui::ComboBox::from_id_salt("anki-filter")
+        .selected_text(f.label())
+        .show_ui(ui, |ui| {
+            for o in AnkiFilter::OPTIONS {
+                ui.selectable_value(f, o, o.label());
+            }
+        });
 }
 
 fn file_name(p: &Path) -> String {
@@ -583,6 +1028,41 @@ fn fmt_int(n: u64) -> String {
         out.push(c);
     }
     out
+}
+
+/// Rows of counts by Anki status; `as_pct` shows a row as shares of its total.
+fn status_grid(ui: &mut egui::Ui, id: &str, rows: &[(&str, &ByStatus, bool)], with_not_in_anki: bool) {
+    let mut cols = vec![Status::Mature, Status::Young, Status::Learning, Status::New];
+    if with_not_in_anki {
+        cols.push(Status::NotInAnki);
+    }
+    egui::Grid::new(id)
+        .striped(true)
+        .num_columns(cols.len() + 2)
+        .spacing([24.0, 4.0])
+        .show(ui, |ui| {
+            ui.label("");
+            ui.strong("Known").on_hover_text("Young + mature");
+            for s in &cols {
+                ui.label(status_text(*s).strong());
+            }
+            ui.end_row();
+            for (label, b, as_pct) in rows {
+                let f = |n: u64| {
+                    if *as_pct {
+                        format!("{:.1}%", n as f64 * 100.0 / b.total().max(1) as f64)
+                    } else {
+                        fmt_int(n)
+                    }
+                };
+                ui.label(*label);
+                ui.strong(f(b.known()));
+                for s in &cols {
+                    ui.label(f(b.get(*s)));
+                }
+                ui.end_row();
+            }
+        });
 }
 
 fn big_stat(ui: &mut egui::Ui, title: &str, value: u64, sub: &str) {
@@ -639,6 +1119,33 @@ impl App {
                 big_stat(ui, "Unique words", r.words_unique as u64, &format!("{} occur only once", fmt_int(r.words_hapax as u64)));
             });
             ui.add_space(10.0);
+
+            if let Some(c) = &r.anki {
+                ui.heading("Your Anki cards vs this book");
+                ui.label(
+                    RichText::new(format!(
+                        "From {} notes: {} known words (mature {}, young {}), {} known characters. A character counts as known if it appears in a known word.",
+                        fmt_int(c.anki.notes),
+                        fmt_int(c.anki.words.known()),
+                        fmt_int(c.anki.words.mature),
+                        fmt_int(c.anki.words.young),
+                        fmt_int(c.anki.chars.known()),
+                    ))
+                    .weak(),
+                );
+                status_grid(
+                    ui,
+                    "anki-book",
+                    &[
+                        ("Running words", &c.word_tokens, true),
+                        ("Unique words", &c.word_types, false),
+                        ("Running characters", &c.char_tokens, true),
+                        ("Unique characters", &c.char_types, false),
+                    ],
+                    true,
+                );
+                ui.add_space(10.0);
+            }
 
             ui.columns(2, |cols| {
                 let ui = &mut cols[0];
@@ -730,23 +1237,23 @@ impl App {
                     .hint_text("characters to find")
                     .desired_width(200.0),
             );
+            anki_filter_combo(ui, &mut self.anki_filter, r.anki.is_some());
             ui.label(format!(
                 "{} unique characters",
                 fmt_int(r.char_freq.len() as u64)
             ));
         });
-        let rows: Vec<usize> = if self.char_filter.trim().is_empty() {
-            (0..r.char_freq.len()).collect()
-        } else {
-            let f: Vec<char> = self
-                .char_filter
-                .chars()
-                .filter(|c| !c.is_whitespace())
-                .collect();
-            (0..r.char_freq.len())
-                .filter(|&i| f.contains(&r.char_freq[i].0))
-                .collect()
-        };
+        let status = r.anki.as_ref().map(|c| &c.char_status);
+        let af = self.anki_filter;
+        let f: Vec<char> = self
+            .char_filter
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let rows: Vec<usize> = (0..r.char_freq.len())
+            .filter(|&i| f.is_empty() || f.contains(&r.char_freq[i].0))
+            .filter(|&i| status.is_none_or(|s| af.matches(s[i])))
+            .collect();
         let total = r.han_total.max(1) as f64;
         TableBuilder::new(ui)
             .striped(true)
@@ -755,9 +1262,11 @@ impl App {
             .column(Column::exact(100.0))
             .column(Column::exact(90.0))
             .column(Column::exact(110.0))
+            .column(Column::exact(if status.is_some() { 100.0 } else { 0.0 }))
             .column(Column::remainder())
             .header(24.0, |mut h| {
-                for t in ["Rank", "Char", "Count", "%", "Cumulative %", "Code point"] {
+                let anki_h = if status.is_some() { "Anki" } else { "" };
+                for t in ["Rank", "Char", "Count", "%", "Cumulative %", anki_h, "Code point"] {
                     h.col(|ui| {
                         ui.strong(t);
                     });
@@ -783,6 +1292,11 @@ impl App {
                         ui.label(format!("{:.2}", self.char_cum[i]));
                     });
                     row.col(|ui| {
+                        if let Some(s) = status {
+                            ui.label(status_text(s[i]));
+                        }
+                    });
+                    row.col(|ui| {
                         ui.monospace(format!("U+{:04X}", c as u32));
                     });
                 });
@@ -798,19 +1312,19 @@ impl App {
                     .hint_text("substring")
                     .desired_width(200.0),
             );
+            anki_filter_combo(ui, &mut self.anki_filter, r.anki.is_some());
             ui.label(format!(
                 "{} unique words",
                 fmt_int(r.word_freq.len() as u64)
             ));
         });
+        let status = r.anki.as_ref().map(|c| &c.word_status);
+        let af = self.anki_filter;
         let f = self.word_filter.trim();
-        let rows: Vec<usize> = if f.is_empty() {
-            (0..r.word_freq.len()).collect()
-        } else {
-            (0..r.word_freq.len())
-                .filter(|&i| r.word_freq[i].0.contains(f))
-                .collect()
-        };
+        let rows: Vec<usize> = (0..r.word_freq.len())
+            .filter(|&i| f.is_empty() || r.word_freq[i].0.contains(f))
+            .filter(|&i| status.is_none_or(|s| af.matches(s[i])))
+            .collect();
         let total = r.words_total.max(1) as f64;
         TableBuilder::new(ui)
             .striped(true)
@@ -819,9 +1333,11 @@ impl App {
             .column(Column::exact(100.0))
             .column(Column::exact(90.0))
             .column(Column::exact(110.0))
+            .column(Column::exact(if status.is_some() { 100.0 } else { 0.0 }))
             .column(Column::remainder())
             .header(24.0, |mut h| {
-                for t in ["Rank", "Word", "Count", "%", "Cumulative %", "Length"] {
+                let anki_h = if status.is_some() { "Anki" } else { "" };
+                for t in ["Rank", "Word", "Count", "%", "Cumulative %", anki_h, "Length"] {
                     h.col(|ui| {
                         ui.strong(t);
                     });
@@ -845,6 +1361,11 @@ impl App {
                     });
                     row.col(|ui| {
                         ui.label(format!("{:.2}", self.word_cum[i]));
+                    });
+                    row.col(|ui| {
+                        if let Some(s) = status {
+                            ui.label(status_text(s[i]));
+                        }
                     });
                     row.col(|ui| {
                         ui.label(w.chars().count().to_string());
@@ -1143,4 +1664,5 @@ const METHOD: &[&str] = &[
     "Script folding for the segmenter only: Traditional text is folded to Simplified for LTP/jieba (character-level), and Simplified text to Traditional for CKIP (OpenCC phrase-level, e.g. 以后→以後), matching each model's training script. The conversion is length-preserving and all counts and lists keep the original characters.",
     "Sentences end at 。！？!?… (runs count once) or the end of a paragraph; a sentence must contain a letter or digit.",
     "Coverage = the number of most-frequent distinct characters/words whose occurrences add up to X% of all occurrences.",
+    "Anki: the collection is copied (with its write-ahead log) to a temporary folder and read from there, so it works while Anki is open and is never modified. A review card is mature at an interval of 21+ days and young below that; learning and relearning cards are 'learning'. A note takes its best card's status in the selected decks, a word its best note's, and a character the best status of any known word containing it. Each run of Chinese characters in a ticked field is one word, and book words must match it exactly (after optional Traditional→Simplified folding), so the segmenter's word boundaries matter.",
 ];

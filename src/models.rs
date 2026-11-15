@@ -68,17 +68,22 @@ pub const CKIP: Model = Model {
     ],
 };
 
-/// Root cache directory for all models.
-pub fn cache_root() -> PathBuf {
-    if let Some(d) = std::env::var_os("HANSTAT_MODEL_DIR") {
-        return PathBuf::from(d);
-    }
+/// hanstat's per-user data folder (`%LOCALAPPDATA%\hanstat`): models and saved settings.
+pub fn app_dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
         .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
         .unwrap_or_else(std::env::temp_dir);
-    base.join("hanstat").join("models")
+    base.join("hanstat")
+}
+
+/// Root cache directory for all models.
+pub fn cache_root() -> PathBuf {
+    if let Some(d) = std::env::var_os("HANSTAT_MODEL_DIR") {
+        return PathBuf::from(d);
+    }
+    app_dir().join("models")
 }
 
 impl Model {

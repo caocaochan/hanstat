@@ -22,6 +22,7 @@ CJK glyphs come from Windows system fonts (YaHei, JhengHei, SimSun-ExtB/ExtG).
 ```
 hanstat.exe [file] [--tab overview|characters|words|sections|suggestions|notes]
 hanstat-cli.exe file.epub [--ckip|--ltp|--jieba] [--dict names.txt] [--auto-dict] [--suggest N] [--json] [--top N] [--include-all] [--exclude i,j] [--chars-csv f] [--words-csv f]
+                [--anki] [--anki-list] [--anki-collection f] [--anki-deck NAME]... [--anki-field "Note type:Field"]... [--anki-save]
 ```
 
 ### Building from source
@@ -45,6 +46,27 @@ cargo test --release      # downloads the models on first run
 - Traditional vs Simplified detection, based on OpenCC's script-exclusive characters.
 - Reading-time estimate at an adjustable speed.
 - Exports: character and word frequency CSV (UTF-8 BOM, so Excel opens it correctly), the full report as JSON, and copying the unique lists to the clipboard.
+- Known vocabulary from Anki (optional). See below.
+
+## Anki: what you already know
+
+Click **🃏 Anki** and tick the decks and the fields that hold the word, for example `Lapis Chinese → Expression`. You can tick several decks, note types and fields, and a deck includes its subdecks. hanstat then shows how much of the book your cards cover, by Anki's own categories:
+
+- **Mature:** review interval of 21 days or more.
+- **Young:** review interval under 21 days.
+- **Learning:** learning or relearning (lapsed) cards. These don't count as known.
+- **New:** in your selection but never studied.
+- **Not in Anki.**
+
+Results are given for running words, unique words, running characters and unique characters. The Words and Characters tabs get a status column and a filter (for example "Not young/mature"), and Export can save the book's unknown words in frequency order.
+
+- A note takes the best status of its cards in the selected decks.
+- Every run of Chinese characters in a ticked field is one word. HTML, cloze markup, `[sound:…]` and `[readings]` are stripped.
+- A character is known if it appears in a known word.
+- Traditional and Simplified are folded to Simplified on both sides before matching (you can turn this off).
+- Book words must match a card exactly, so the segmenter's word boundaries affect word coverage. Character coverage doesn't depend on them.
+
+Anki locks its collection while running, so hanstat copies `collection.anki2` and its `-wal` to a temporary folder and reads that copy. Your collection is never modified. Click **Reload** after reviewing to pick up new intervals. Your choices are saved to `%LOCALAPPDATA%\hanstat\anki.json`, next to the `models` folder. The CLI uses the same saved choices with `--anki`. `--anki-deck`/`--anki-field` override them for one run, and `--anki-save` keeps the override.
 
 ## Counting rules (why the numbers are right)
 
