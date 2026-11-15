@@ -258,6 +258,9 @@ fn main() {
                     k.set_band(b, true);
                 }
                 k.lists.extend(s.lists);
+                for w in &s.marked {
+                    k.set_marked(w, true);
+                }
             }
             "--hsk" => {
                 let n: u8 = match args.next().and_then(|s| s.parse().ok()) {

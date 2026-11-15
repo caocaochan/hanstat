@@ -1587,6 +1587,45 @@ impl App {
                     .weak()
                     .small(),
                 );
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.strong(format!("Marked in the Words tab ({})", fmt_int(k.settings.marked.len() as u64)));
+                    if !k.settings.marked.is_empty()
+                        && ui
+                            .small_button("Clear all")
+                            .on_hover_text("Unmark every word you marked with +")
+                            .clicked()
+                    {
+                        k.settings.marked.clear();
+                        changed = true;
+                    }
+                });
+                if k.settings.marked.is_empty() {
+                    ui.label(RichText::new("Click + next to a word in the Words tab to mark it known.").weak());
+                } else {
+                    let mut unmark = None;
+                    egui::ScrollArea::vertical()
+                        .id_salt("known-marked")
+                        .max_height(140.0)
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                // Newest first.
+                                for w in k.settings.marked.iter().rev() {
+                                    if ui
+                                        .small_button(format!("{w} ✖"))
+                                        .on_hover_text("Unmark")
+                                        .clicked()
+                                    {
+                                        unmark = Some(w.clone());
+                                    }
+                                }
+                            });
+                        });
+                    if let Some(w) = unmark {
+                        changed |= k.settings.set_marked(&w, false);
+                    }
+                }
                 if let Some(e) = &k.error {
                     ui.colored_label(Color32::from_rgb(220, 80, 80), format!("⚠ {e}"));
                 }
@@ -1628,11 +1667,16 @@ impl App {
             });
         self.known.window = open;
         if changed {
-            if let Err(e) = self.known.settings.save() {
-                self.known.error = Some(e);
-            }
-            self.refresh_anki_coverage();
+            self.known_changed();
         }
+    }
+
+    /// HSK bands, lists or marked words changed: save them and recompute coverage.
+    fn known_changed(&mut self) {
+        if let Err(e) = self.known.settings.save() {
+            self.known.error = Some(e);
+        }
+        self.refresh_anki_coverage();
     }
 }
 
@@ -2141,9 +2185,13 @@ impl App {
             .filter(|&i| status.is_none_or(|s| af.matches(s[i])))
             .collect();
         let total = r.words_total.max(1) as f64;
+        let known = &self.known.settings;
+        // (word, mark) from a +/− click, applied after the table.
+        let mut toggle: Option<(String, bool)> = None;
         TableBuilder::new(ui)
             .striped(true)
             .column(Column::exact(70.0))
+            .column(Column::exact(30.0))
             .column(Column::exact(200.0))
             .column(Column::exact(100.0))
             .column(Column::exact(90.0))
@@ -2154,6 +2202,7 @@ impl App {
                 let anki_h = if status.is_some() { "Status" } else { "" };
                 for t in [
                     "Rank",
+                    "",
                     "Word",
                     "Count",
                     "%",
@@ -2172,6 +2221,27 @@ impl App {
                     let (w, n) = &r.word_freq[i];
                     row.col(|ui| {
                         ui.label((i + 1).to_string());
+                    });
+                    row.col(|ui| {
+                        let is_known = status.is_some_and(|s| s[i].is_known());
+                        if known.is_marked(w) {
+                            if ui
+                                .small_button("−")
+                                .on_hover_text("You marked this word known. Click to unmark it.")
+                                .clicked()
+                            {
+                                toggle = Some((w.clone(), false));
+                            }
+                        } else if !is_known
+                            && ui
+                                .small_button("+")
+                                .on_hover_text(
+                                    "Mark as known (added to your known words, kept between runs)",
+                                )
+                                .clicked()
+                        {
+                            toggle = Some((w.clone(), true));
+                        }
                     });
                     row.col(|ui| {
                         ui.label(RichText::new(w).size(18.0));
@@ -2195,6 +2265,17 @@ impl App {
                     });
                 });
             });
+        if let Some((w, on)) = toggle
+            && self.known.settings.set_marked(&w, on)
+        {
+            let msg = if on {
+                format!("Marked {w} as known")
+            } else {
+                format!("Unmarked {w}")
+            };
+            self.toast = Some((msg, ui.input(|i| i.time) + 3.0));
+            self.known_changed();
+        }
     }
 
     fn sections(&mut self, ui: &mut egui::Ui) {

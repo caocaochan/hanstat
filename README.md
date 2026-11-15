@@ -25,7 +25,7 @@ Click **🃏 Anki**, tick your decks and the fields that hold the word (sentence
 
 ## HSK levels and word lists
 
-Click **📚 HSK & word lists** to mark words as known without Anki cards. You can tick HSK 3.0 levels, or import `.txt` word lists with one word per line (exports with pinyin or definitions after a tab or comma work too). These words count as known alongside your Anki cards, or on their own if Anki is off. The HSK vocabulary is the 2025 《HSK 考试大纲》 (11,000 entries, 10,896 distinct words), bundled with the app. Your choices and imported lists are saved to `%LOCALAPPDATA%\hanstat\known.json` and kept between runs.
+Click **📚 HSK & word lists** to mark words as known without Anki cards. You can tick HSK 3.0 levels, or import `.txt` word lists with one word per line (exports with pinyin or definitions after a tab or comma work too). You can also click **+** next to any unknown word in the **Words** tab to mark that word known. These words count as known alongside your Anki cards, or on their own if Anki is off. The HSK vocabulary is the 2025 《HSK 考试大纲》 (11,000 entries, 10,896 distinct words), bundled with the app. Your choices, imported lists and marked words are saved to `%LOCALAPPDATA%\hanstat\known.json` and kept between runs.
 
 ## Command line
 

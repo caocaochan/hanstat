@@ -102,6 +102,8 @@ pub struct Settings {
     /// Ticked HSK bands (see [`BANDS`]).
     pub hsk: Vec<u8>,
     pub lists: Vec<WordList>,
+    /// Words marked known one by one with + in the Words tab, as the book wrote them.
+    pub marked: Vec<String>,
 }
 
 impl Settings {
@@ -146,7 +148,24 @@ impl Settings {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.hsk.is_empty() && self.lists.iter().all(|l| l.words.is_empty())
+        self.hsk.is_empty()
+            && self.lists.iter().all(|l| l.words.is_empty())
+            && self.marked.is_empty()
+    }
+
+    pub fn is_marked(&self, w: &str) -> bool {
+        self.marked.iter().any(|m| m == w)
+    }
+
+    /// Mark or unmark one word; false if nothing changed.
+    pub fn set_marked(&mut self, w: &str, on: bool) -> bool {
+        let had = self.is_marked(w);
+        if on && !had {
+            self.marked.push(w.to_owned());
+        } else if !on && had {
+            self.marked.retain(|m| m != w);
+        }
+        on != had
     }
 
     pub fn band_on(&self, band: u8) -> bool {
@@ -180,22 +199,25 @@ impl Settings {
                 .iter()
                 .flat_map(|l| l.words.iter().map(String::as_str)),
         )
+        .chain(self.marked.iter().map(String::as_str))
     }
 
-    /// "HSK 1–3 + 2 word lists".
+    /// "HSK 1–3 + 2 word lists + 15 marked".
     pub fn label(&self) -> String {
         let n = self.lists.iter().filter(|l| !l.words.is_empty()).count();
-        let lists = match n {
-            0 => None,
-            1 => Some("1 word list".to_owned()),
-            n => Some(format!("{n} word lists")),
-        };
-        match (self.hsk.is_empty(), lists) {
-            (false, Some(l)) => format!("{} + {l}", bands_label(&self.hsk)),
-            (false, None) => bands_label(&self.hsk),
-            (true, Some(l)) => l,
-            (true, None) => String::new(),
+        let mut parts = Vec::new();
+        if !self.hsk.is_empty() {
+            parts.push(bands_label(&self.hsk));
         }
+        match n {
+            0 => {}
+            1 => parts.push("1 word list".to_owned()),
+            n => parts.push(format!("{n} word lists")),
+        }
+        if !self.marked.is_empty() {
+            parts.push(format!("{} marked", self.marked.len()));
+        }
+        parts.join(" + ")
     }
 
     /// `base` (Anki, if on) plus these words; `None` if there is neither.
@@ -288,6 +310,7 @@ mod tests {
         let mut s = Settings::default();
         s.set_band(3, true);
         s.set_band(1, true);
+        s.set_marked("顾九思", true);
         s.add_list(WordList {
             name: "a.txt".into(),
             path: r"C:\lists\a.txt".into(),
@@ -337,6 +360,7 @@ mod tests {
         base.chars.insert('看', Status::Learning);
         let s = Settings {
             hsk: vec![],
+            marked: vec!["跑步".into(), "我".into()],
             lists: vec![WordList {
                 name: "a.txt".into(),
                 path: "a.txt".into(),
@@ -350,9 +374,17 @@ mod tests {
         assert_eq!(k.word("学习"), Status::Listed);
         assert_eq!(k.char('习'), Status::Listed);
         assert!(k.word("看").is_known());
-        assert_eq!(k.listed.words, 3);
-        assert_eq!(k.listed.new_words, 2);
-        assert_eq!(k.listed.new_chars, 3);
+        assert_eq!(k.word("跑步"), Status::Listed);
+        // 我 is in the list and marked: counted once.
+        assert_eq!(k.listed.words, 4);
+        assert_eq!(k.listed.new_words, 3);
+        assert_eq!(k.listed.new_chars, 5);
+        assert_eq!(s.label(), "1 word list + 2 marked");
+        // Marking alone is enough to have known words.
+        let mut m = Settings::default();
+        assert!(m.set_marked("跑步", true) && !m.set_marked("跑步", true));
+        assert_eq!(m.apply(None, true).unwrap().word("跑步"), Status::Listed);
+        assert!(m.set_marked("跑步", false) && m.is_empty());
         assert!(Settings::default().apply(None, true).is_none());
     }
 }

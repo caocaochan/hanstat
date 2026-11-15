@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **Mark single words as known from the Words tab.** Each word that isn't known has a **+** button next to it. Click it to add the word to your known words. Words you marked show **−** instead, which unmarks them. Marked words are saved to `known.json` with your HSK levels and word lists, so they're kept between runs. They count like a word list: they appear with the status "Word list", feed the Overview and difficulty, and make their characters known. The **📚 Known** window lists them, newest first, with ✖ to unmark one and **Clear all**. `hanstat-cli --known` includes them too.
+
 ## [0.6.0] - 2026-11-15
 
 ### Added
