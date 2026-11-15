@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.7.1] - 2026-11-15
 
 ### Fixed
 - EPUB chapters with an empty `<title/>` in their head (common in Readmoo/Pubu books made with Sigil) were read as empty: the whole chapter ended up inside the title. XML-style self-closing tags such as `<title/>` and `<a id="x"/>` are now read as empty elements.

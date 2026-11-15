@@ -2149,7 +2149,7 @@ dependencies = [
 
 [[package]]
 name = "hanstat"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "aho-corasick",
  "candle-core",
