@@ -21,7 +21,7 @@ Character counts are exact; word counts depend on the segmentation model. The de
 
 ## Anki
 
-Click **🃏 Anki**, tick your decks and the fields that hold the word (sentence fields work too), and hanstat shows which of the book's characters and words you already know. Young and mature cards count as known. Your collection is only read from a copy, never modified.
+Click **🃏 Anki**, tick your decks and the fields that hold the word (sentence fields work too), and hanstat shows which of the book's characters and words you already know, what share of the running text that covers, and a difficulty rating from it. Young and mature cards count as known. Your collection is only read from a copy, never modified.
 
 ## Command line
 

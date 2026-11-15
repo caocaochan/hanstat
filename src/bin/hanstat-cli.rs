@@ -189,6 +189,24 @@ fn print_coverage(c: &BookCoverage, top: usize) {
             k.not_known()
         );
     }
+    for (label, k) in [
+        ("Running chars", &c.running_chars),
+        ("Running words", &c.running_words),
+    ] {
+        println!(
+            "{label:<18} known {:>7} of {:>7} ({:.1}%)   not known {:>7}",
+            k.known,
+            k.total,
+            k.percent(),
+            k.not_known()
+        );
+    }
+    println!(
+        "Difficulty: {} ({}); running words exclude {} occurrences of names",
+        c.difficulty.label(),
+        c.difficulty.description(),
+        c.name_tokens
+    );
     let tw: Vec<String> = c
         .top_unknown_words
         .iter()
@@ -356,7 +374,28 @@ fn main() {
             loaded,
             &anki::SegConfig::new(kind, Some(book_segmenter), &words),
         );
-        r.anki = Some(BookCoverage::compute(&k, &r.char_freq, &r.word_freq));
+        // Names are left out of the difficulty: the user dictionary plus the
+        // recommended discovered words, as the GUI does.
+        let known: std::collections::HashSet<String> = words.iter().cloned().collect();
+        let mut names = known.clone();
+        names.extend(
+            hanstat::discover::discover(
+                &book,
+                &included,
+                &r.word_freq,
+                &known,
+                &hanstat::discover::Options::for_size(r.han_total),
+            )
+            .into_iter()
+            .filter(|c| c.recommended)
+            .map(|c| c.word),
+        );
+        r.anki = Some(BookCoverage::compute(
+            &k,
+            &r.char_freq,
+            &r.word_freq,
+            &names,
+        ));
     }
     eprintln!("load {:?}, total {:?}", t_load, t0.elapsed());
 

@@ -914,6 +914,60 @@ impl KnownCount {
     }
 }
 
+/// How hard the book should be to read with the known words, from the share
+/// of running words (every occurrence) that are known. The thresholds follow
+/// L2 reading research on lexical coverage: 98% for comfortable unassisted
+/// reading of fiction (Hu & Nation 2000), 95% as the minimum for adequate
+/// comprehension (Laufer 1989), and comprehension falling off steeply below
+/// 90% and failing at 80%.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Difficulty {
+    Easy,
+    Moderate,
+    Challenging,
+    Hard,
+    VeryHard,
+}
+
+impl Difficulty {
+    /// Lower bounds (percent of running words known) of each band but the last.
+    pub const BANDS: [(f64, Difficulty); 4] = [
+        (98.0, Difficulty::Easy),
+        (95.0, Difficulty::Moderate),
+        (90.0, Difficulty::Challenging),
+        (80.0, Difficulty::Hard),
+    ];
+
+    pub fn from_percent(p: f64) -> Self {
+        Self::BANDS
+            .iter()
+            .find(|(min, _)| p >= *min)
+            .map(|(_, d)| *d)
+            .unwrap_or(Difficulty::VeryHard)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Difficulty::Easy => "Easy",
+            Difficulty::Moderate => "Moderate",
+            Difficulty::Challenging => "Challenging",
+            Difficulty::Hard => "Hard",
+            Difficulty::VeryHard => "Very hard",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Difficulty::Easy => "read without a dictionary",
+            Difficulty::Moderate => "occasional look-ups",
+            Difficulty::Challenging => "frequent look-ups",
+            Difficulty::Hard => "look-ups in most sentences",
+            Difficulty::VeryHard => "several unknowns per sentence",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct BookCoverage {
     pub anki: KnowledgeSummary,
@@ -921,6 +975,15 @@ pub struct BookCoverage {
     pub unique_words: KnownCount,
     /// The book's distinct Chinese characters that are known.
     pub unique_chars: KnownCount,
+    /// Word occurrences in the running text whose word is known, leaving out
+    /// names (words that contain one of the `names` passed to `compute`).
+    pub running_words: KnownCount,
+    /// Word occurrences left out of `running_words` as names.
+    pub name_tokens: u64,
+    /// Chinese character occurrences in the running text that are known.
+    pub running_chars: KnownCount,
+    /// From `running_words`.
+    pub difficulty: Difficulty,
     /// Most frequent words that are not known.
     pub top_unknown_words: Vec<(String, u32)>,
     /// Parallel to `Report::word_freq` / `char_freq`.
@@ -931,7 +994,16 @@ pub struct BookCoverage {
 }
 
 impl BookCoverage {
-    pub fn compute(k: &Knowledge, char_freq: &[(char, u32)], word_freq: &[(String, u32)]) -> Self {
+    /// `names`: names and terms (the user dictionary and the recommended
+    /// Suggested words). Readers don't need to know a name to follow a text,
+    /// so any word containing one is left out of the running-word coverage
+    /// that sets the difficulty (as coverage studies treat proper nouns).
+    pub fn compute(
+        k: &Knowledge,
+        char_freq: &[(char, u32)],
+        word_freq: &[(String, u32)],
+        names: &HashSet<String>,
+    ) -> Self {
         let word_status: Vec<Status> = word_freq.iter().map(|(w, _)| k.word(w)).collect();
         let char_status: Vec<Status> = char_freq.iter().map(|(c, _)| k.char(*c)).collect();
         let count = |v: &[Status]| KnownCount {
@@ -945,10 +1017,42 @@ impl BookCoverage {
             .take(100)
             .map(|(w, _)| w.clone())
             .collect();
+        // Single characters would match far too much.
+        let names: Vec<&str> = names
+            .iter()
+            .filter(|n| n.chars().count() >= 2)
+            .map(String::as_str)
+            .collect();
+        let mut name_tokens = 0;
+        let mut running_words = KnownCount::default();
+        for ((w, n), s) in word_freq.iter().zip(&word_status) {
+            let n = *n as u64;
+            if !s.is_known() && names.iter().any(|name| w.contains(name)) {
+                name_tokens += n;
+                continue;
+            }
+            running_words.total += n;
+            if s.is_known() {
+                running_words.known += n;
+            }
+        }
         BookCoverage {
             anki: k.summary.clone(),
             unique_words: count(&word_status),
             unique_chars: count(&char_status),
+            running_words,
+            name_tokens,
+            running_chars: char_freq.iter().zip(&char_status).fold(
+                KnownCount::default(),
+                |mut c, ((_, n), s)| {
+                    c.total += *n as u64;
+                    if s.is_known() {
+                        c.known += *n as u64;
+                    }
+                    c
+                },
+            ),
+            difficulty: Difficulty::from_percent(running_words.percent()),
             top_unknown_words,
             word_status,
             char_status,
@@ -990,6 +1094,50 @@ mod tests {
         assert!(!s("<b>一路順風</b>", &mut n));
         assert!(!s("你好、再見", &mut n));
         assert!(!s("你好[nǐ hǎo]", &mut n));
+    }
+
+    #[test]
+    fn difficulty_bands() {
+        let d = Difficulty::from_percent;
+        assert_eq!(d(100.0), Difficulty::Easy);
+        assert_eq!(d(98.0), Difficulty::Easy);
+        assert_eq!(d(97.9), Difficulty::Moderate);
+        assert_eq!(d(95.0), Difficulty::Moderate);
+        assert_eq!(d(90.0), Difficulty::Challenging);
+        assert_eq!(d(85.0), Difficulty::Hard);
+        assert_eq!(d(79.9), Difficulty::VeryHard);
+        assert_eq!(d(0.0), Difficulty::VeryHard);
+    }
+
+    #[test]
+    fn running_coverage_leaves_out_names() {
+        let k = Knowledge {
+            words: [
+                ("我".to_string(), Status::Mature),
+                ("看".to_string(), Status::Young),
+            ]
+            .into(),
+            chars: [('我', Status::Mature), ('看', Status::Young)].into(),
+            fold: false,
+            summary: KnowledgeSummary::default(),
+        };
+        let word_freq = vec![
+            ("我".to_string(), 50),
+            ("看".to_string(), 30),
+            ("顾飞".to_string(), 10),
+            ("顾飞说".to_string(), 5),
+            ("滑板".to_string(), 5),
+        ];
+        let char_freq = vec![('我', 50), ('看', 30), ('顾', 15), ('飞', 15)];
+        let names: HashSet<String> = ["顾飞".to_string(), "飞".to_string()].into();
+        let c = BookCoverage::compute(&k, &char_freq, &word_freq, &names);
+        // 顾飞 and 顾飞说 are names; the one-character "name" 飞 is ignored.
+        assert_eq!(c.name_tokens, 15);
+        assert_eq!((c.running_words.known, c.running_words.total), (80, 85));
+        // 80 / 85 = 94.1%
+        assert_eq!(c.difficulty, Difficulty::Challenging);
+        assert_eq!((c.running_chars.known, c.running_chars.total), (80, 110));
+        assert_eq!((c.unique_words.known, c.unique_words.total), (2, 5));
     }
 
     #[test]

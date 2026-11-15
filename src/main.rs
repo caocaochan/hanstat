@@ -3,7 +3,7 @@
 use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 use hanstat::analyze::{self, Prepared, Report};
-use hanstat::anki::{self, BookCoverage, ByStatus, Status};
+use hanstat::anki::{self, BookCoverage, ByStatus, Difficulty, Status};
 use hanstat::discover::{self, Candidate};
 use hanstat::extract::{self, Book, EncodingChoice, SectionKind};
 use hanstat::segment::SegmenterKind;
@@ -54,6 +54,8 @@ fn main() -> eframe::Result {
             },
             ..Default::default()
         },
+        // Centre on the primary monitor at startup.
+        centered: true,
         ..Default::default()
     };
     eframe::run_native(
@@ -717,11 +719,21 @@ impl App {
     }
 
     fn refresh_anki_coverage(&mut self) {
+        // Names don't count against the difficulty: the user dictionary plus
+        // the recommended Suggested words (once discovery has finished).
+        let mut names: HashSet<String> = self.user_words.iter().cloned().collect();
+        names.extend(
+            self.suggestions
+                .iter()
+                .flatten()
+                .filter(|c| c.recommended)
+                .map(|c| c.word.clone()),
+        );
         let Some(r) = &mut self.report else { return };
         let had = r.anki.is_some();
         r.anki = match &self.anki.knowledge {
             Some(k) if self.anki.settings.enabled => {
-                Some(BookCoverage::compute(k, &r.char_freq, &r.word_freq))
+                Some(BookCoverage::compute(k, &r.char_freq, &r.word_freq, &names))
             }
             _ => None,
         };
@@ -868,6 +880,7 @@ impl App {
                     ui.label(RichText::new("A deck includes its subdecks.").weak());
                     egui::ScrollArea::vertical()
                         .id_salt("anki-decks")
+                        .auto_shrink([false, true])
                         .show(ui, |ui| {
                             for d in &info.decks {
                                 ui.horizontal(|ui| {
@@ -894,6 +907,7 @@ impl App {
                     ui.label(RichText::new("Tick the fields that hold the word (not sentences).").weak());
                     egui::ScrollArea::vertical()
                         .id_salt("anki-types")
+                        .auto_shrink([false, true])
                         .show(ui, |ui| {
                             for nt in info
                                 .note_types
@@ -954,6 +968,8 @@ impl App {
                 }
                 self.suggestions = Some(v);
                 self.suggest_rx = None;
+                // The recommended ones are left out of the difficulty.
+                self.refresh_anki_coverage();
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100))
@@ -1528,16 +1544,31 @@ fn status_grid(ui: &mut egui::Ui, id: &str, rows: &[(&str, &ByStatus)]) {
 }
 
 fn big_stat(ui: &mut egui::Ui, title: &str, value: u64, sub: &str) {
+    stat_tile(ui, title, RichText::new(fmt_int(value)), sub);
+}
+
+fn stat_tile(ui: &mut egui::Ui, title: &str, value: RichText, sub: &str) -> egui::Response {
     egui::Frame::group(ui.style())
         .inner_margin(12.0)
         .show(ui, |ui| {
             ui.set_min_width(230.0);
             ui.vertical(|ui| {
                 ui.label(RichText::new(title).weak());
-                ui.label(RichText::new(fmt_int(value)).size(30.0).strong());
+                ui.label(value.size(30.0).strong());
                 ui.label(sub);
             });
-        });
+        })
+        .response
+}
+
+fn difficulty_color(d: Difficulty) -> Color32 {
+    match d {
+        Difficulty::Easy => Color32::from_rgb(90, 190, 110),
+        Difficulty::Moderate => Color32::from_rgb(170, 200, 80),
+        Difficulty::Challenging => Color32::from_rgb(220, 170, 60),
+        Difficulty::Hard => Color32::from_rgb(230, 120, 60),
+        Difficulty::VeryHard => Color32::from_rgb(220, 80, 80),
+    }
 }
 
 impl App {
@@ -1601,10 +1632,66 @@ impl App {
                             ),
                         );
                     }
+                    let rw = &c.running_words;
+                    let unknown = rw.not_known();
+                    stat_tile(
+                        ui,
+                        "Running words you know",
+                        RichText::new(format!("{:.1}%", rw.percent())),
+                        &if unknown > 0 {
+                            format!("1 unknown every {:.1} words", rw.total as f64 / unknown as f64)
+                        } else {
+                            "no unknown words".to_owned()
+                        },
+                    )
+                    .on_hover_text(format!(
+                        "Every occurrence counts, so frequent words weigh more. {} of {} word occurrences are known; {} occurrences of names (your user dictionary and the recommended Suggested words) are left out. \
+                         Of the running characters, {:.1}% are known.",
+                        fmt_int(rw.known),
+                        fmt_int(rw.total),
+                        fmt_int(c.name_tokens),
+                        c.running_chars.percent()
+                    ));
+                    let d = c.difficulty;
+                    stat_tile(
+                        ui,
+                        "Difficulty for you",
+                        RichText::new(d.label()).color(difficulty_color(d)),
+                        d.description(),
+                    )
+                    .on_hover_ui(|ui| {
+                        ui.label("From the share of running words you know:");
+                        egui::Grid::new("difficulty-bands").spacing([16.0, 2.0]).show(ui, |ui| {
+                            let mut upper = None;
+                            for (min, band) in Difficulty::BANDS
+                                .iter()
+                                .copied()
+                                .chain([(0.0, Difficulty::VeryHard)])
+                            {
+                                let text = RichText::new(band.label()).color(difficulty_color(band));
+                                ui.label(if band == d { text.strong() } else { text });
+                                ui.label(match upper {
+                                    None => format!("{min:.0}% or more"),
+                                    Some(u) if min == 0.0 => format!("under {u:.0}%"),
+                                    Some(u) => format!("{min:.0} – {u:.0}%"),
+                                });
+                                ui.end_row();
+                                upper = Some(min);
+                            }
+                        });
+                        ui.label(
+                            RichText::new(
+                                "Thresholds from L2 reading research: 98% coverage for comfortable reading of fiction (Hu & Nation 2000), 95% as the minimum for adequate comprehension (Laufer 1989). \
+                                 Words you know but have no Anki card for count as unknown, so the book may be easier than this.",
+                            )
+                            .weak()
+                            .small(),
+                        );
+                    });
                 });
                 ui.label(
                     RichText::new(format!(
-                        "Known = on a young or mature card in your selected decks ({} words, {} characters). A character is known if it appears in a known word.",
+                        "Known = on a young or mature card in your selected decks ({} words, {} characters). A character is known if it appears in a known word. Hover the last two tiles for details.",
                         fmt_int(c.anki.words.known()),
                         fmt_int(c.anki.chars.known()),
                     ))
