@@ -3,7 +3,7 @@
 ## [0.4.1] - 2026-11-15
 
 ### Changed
-- `hanstat.exe` and `hanstat-cli.exe` now carry the app's icon, so Explorer, shortcuts and pinned taskbar entries show the same icon as the window instead of the generic program icon.
+- hanstat has its own icon, replacing egui's default window icon. `hanstat.exe` and `hanstat-cli.exe` carry it too, so Explorer, shortcuts and pinned taskbar entries show it instead of the generic program icon.
 
 ## [0.4.0] - 2026-11-15
 
