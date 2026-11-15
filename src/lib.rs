@@ -7,6 +7,7 @@ pub mod extract;
 pub mod models;
 pub mod script;
 pub mod segment;
+pub mod update;
 
 /// Read a user dictionary: one word per line; anything after the first
 /// whitespace (jieba-style frequency/tag) is ignored; `#` starts a comment.

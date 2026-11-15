@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.0] - 2026-11-15
+
+### Added
+- **Automatic updates.** At startup the app checks GitHub for a newer release. It downloads it in the background, verifies its SHA-256, and replaces `hanstat.exe`, `hanstat-cli.exe` and the docs in place. Then the status bar offers a restart, which reopens the current file and tab. If any step fails, every file is put back. Click the version number in the status bar to check now or to turn automatic updates off. Releases before this one can't update themselves, so download this one by hand.
+
+### Changed
+- The folder inside the release zip is now just `hanstat`, not `hanstat-vX.Y.Z-x86_64-pc-windows-msvc`. To update by hand, replace your `hanstat` folder with the new one. The zip's own name still carries the version.
+
 ## [0.3.1] - 2026-11-15
 
 ### Fixed

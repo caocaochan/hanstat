@@ -88,10 +88,13 @@ jobs:
         shell: pwsh
         run: |
           $name = "hanstat-${{ steps.rel.outputs.tag }}-x86_64-pc-windows-msvc"
-          New-Item -ItemType Directory $name | Out-Null
-          Copy-Item target/release/hanstat.exe, target/release/hanstat-cli.exe, README.md, CHANGELOG.md, LICENSE-MIT, LICENSE-APACHE $name
-          Copy-Item data/OpenCC-LICENSE.txt "$name/LICENSE-OpenCC-data.txt"
-          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          # The folder inside the zip is plain `hanstat`, so a manual update
+          # is "replace the folder". The zip name carries the version.
+          $dir = "hanstat"
+          New-Item -ItemType Directory $dir | Out-Null
+          Copy-Item target/release/hanstat.exe, target/release/hanstat-cli.exe, README.md, CHANGELOG.md, LICENSE-MIT, LICENSE-APACHE $dir
+          Copy-Item data/OpenCC-LICENSE.txt "$dir/LICENSE-OpenCC-data.txt"
+          Compress-Archive -Path $dir -DestinationPath "$name.zip"
           $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
           "$hash  $name.zip" | Out-File -Encoding ascii "$name.zip.sha256"
           "name=$name" >> $env:GITHUB_OUTPUT

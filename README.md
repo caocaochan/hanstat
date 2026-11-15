@@ -7,15 +7,21 @@ Character and word statistics for Chinese `.epub` and `.txt` files, with countin
 
 ## Install
 
-Download `hanstat-vX.Y.Z-x86_64-pc-windows-msvc.zip` from [Releases](https://github.com/caocaochan/hanstat/releases/latest), unzip, and run `hanstat.exe`. Open a file, or drag it onto the window. The exe isn't code-signed, so Windows SmartScreen may ask you to confirm the first run. You can check the zip against its `.sha256` file.
+Download `hanstat-vX.Y.Z-x86_64-pc-windows-msvc.zip` from [Releases](https://github.com/caocaochan/hanstat/releases/latest), unzip, and run `hanstat.exe` from the `hanstat` folder inside. The app updates itself (see [Updates](#updates)). To update by hand, replace that folder with the one from a newer zip. Open a file, or drag it onto the window. The exe isn't code-signed, so Windows SmartScreen may ask you to confirm the first run. You can check the zip against its `.sha256` file.
 
 The segmentation models are **not bundled**, because their licences differ from this project's. On first start, and whenever a model is missing from the cache folder, the app downloads it in the background from its official Hugging Face repository, so it's ready before you need it. The status bar shows progress. The CLI downloads only the model a run needs. The models are:
 - LTP: 32 MB.
 - CKIP: 46 MB.
 
-Each download is pinned to an exact commit and verified by SHA-256, then cached in `%LOCALAPPDATA%\hanstat\models` (override with `HANSTAT_MODEL_DIR`). Nothing else is ever sent or fetched. jieba works fully offline.
+Each download is pinned to an exact commit and verified by SHA-256, then cached in `%LOCALAPPDATA%\hanstat\models` (override with `HANSTAT_MODEL_DIR`). The only other network access is the update check below. jieba works fully offline.
 
 CJK glyphs come from Windows system fonts (YaHei, JhengHei, SimSun-ExtB/ExtG).
+
+### Updates
+
+At startup the app asks the GitHub API for the latest release. If it's newer, the app downloads the release zip in the background, checks it against the release's `.sha256` file, and replaces the files next to `hanstat.exe` (including `hanstat-cli.exe`). The status bar then shows **Restart to use vX.Y.Z**. Restarting reopens the current file and tab. If you don't restart, the new version runs next time. Windows can't overwrite a running exe, so the old one is renamed to `*.hanstat-old` and deleted at the next start. If any step fails, every file is put back.
+
+Click the version number at the right of the status bar to check now or to turn off **Install updates automatically**. With it off, nothing is fetched at startup, and a manual check offers an **Update** button instead. The choice is saved in `%LOCALAPPDATA%\hanstat\update.json`. Debug builds, builds run from Cargo's `target` folder, and runs with `HANSTAT_NO_UPDATE` set never update. The folder must be writable, so if you unzipped into `Program Files`, update by hand.
 
 ### Command line
 

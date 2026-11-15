@@ -7,6 +7,7 @@ use hanstat::anki::{self, BookCoverage, ByStatus, Status};
 use hanstat::discover::{self, Candidate};
 use hanstat::extract::{self, Book, EncodingChoice, SectionKind};
 use hanstat::segment::SegmenterKind;
+use hanstat::update::{self, Release};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -60,6 +61,7 @@ fn main() -> eframe::Result {
                 ..App::default()
             };
             app.models = fetch_models(&cc.egui_ctx);
+            app.updater.start(&cc.egui_ctx);
             app.anki_init(&cc.egui_ctx);
             if let Some(p) = path {
                 app.start(p, cc.egui_ctx.clone());
@@ -105,6 +107,20 @@ enum Tab {
     Sections,
     Suggestions,
     Notes,
+}
+
+impl Tab {
+    /// The `--tab` value that reopens this tab.
+    fn arg(self) -> &'static str {
+        match self {
+            Tab::Overview => "overview",
+            Tab::Characters => "characters",
+            Tab::Words => "words",
+            Tab::Sections => "sections",
+            Tab::Suggestions => "suggestions",
+            Tab::Notes => "notes",
+        }
+    }
 }
 
 struct Loaded {
@@ -168,6 +184,137 @@ fn fetch_models(ctx: &egui::Context) -> Option<Arc<ModelFetch>> {
     (state.total.load(Ordering::Relaxed) != 0).then_some(state)
 }
 
+#[derive(Clone, Default)]
+enum UpdatePhase {
+    #[default]
+    Idle,
+    Checking,
+    UpToDate,
+    /// Found by a manual check with automatic updates off.
+    Available(Release),
+    Downloading {
+        tag: String,
+        done: u64,
+        total: u64,
+    },
+    /// On disk; the running copy is still the old version until a restart.
+    Installed(Release),
+    Failed(String),
+}
+
+/// Self-update from GitHub releases: checked at startup and, unless turned
+/// off, installed in the background; the new version runs after a restart.
+struct Updater {
+    settings: update::Settings,
+    /// Set for dev builds, `HANSTAT_NO_UPDATE`, or an unlocatable exe.
+    disabled: Option<String>,
+    phase: Arc<Mutex<UpdatePhase>>,
+}
+
+impl Default for Updater {
+    fn default() -> Self {
+        Self {
+            settings: update::Settings::load(),
+            disabled: update::disabled_reason(),
+            phase: Arc::default(),
+        }
+    }
+}
+
+impl Updater {
+    fn phase(&self) -> UpdatePhase {
+        self.phase.lock().unwrap().clone()
+    }
+
+    fn busy(&self) -> bool {
+        matches!(
+            self.phase(),
+            UpdatePhase::Checking | UpdatePhase::Downloading { .. }
+        )
+    }
+
+    /// At launch: delete what the previous update left, then check.
+    fn start(&self, ctx: &egui::Context) {
+        if self.disabled.is_some() {
+            return;
+        }
+        if let Some(dir) = update::exe_path().ok().and_then(Path::parent) {
+            let dir = dir.to_owned();
+            std::thread::spawn(move || update::clean_up(&dir));
+        }
+        if self.settings.auto_update {
+            self.check(ctx, true);
+        }
+    }
+
+    /// Look for a newer release; with `install`, download and install it too.
+    fn check(&self, ctx: &egui::Context, install: bool) {
+        if self.disabled.is_some() || self.busy() {
+            return;
+        }
+        *self.phase.lock().unwrap() = UpdatePhase::Checking;
+        let (phase, ctx) = (self.phase.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let next = match update::check() {
+                Ok(None) => UpdatePhase::UpToDate,
+                Ok(Some(rel)) if install => return Self::install_now(&phase, &ctx, rel),
+                Ok(Some(rel)) => UpdatePhase::Available(rel),
+                Err(e) => UpdatePhase::Failed(format!("Checking for updates failed: {e}")),
+            };
+            *phase.lock().unwrap() = next;
+            ctx.request_repaint();
+        });
+    }
+
+    fn install(&self, ctx: &egui::Context, rel: Release) {
+        if self.disabled.is_some() || self.busy() {
+            return;
+        }
+        let (phase, ctx) = (self.phase.clone(), ctx.clone());
+        std::thread::spawn(move || Self::install_now(&phase, &ctx, rel));
+    }
+
+    fn install_now(phase: &Mutex<UpdatePhase>, ctx: &egui::Context, rel: Release) {
+        let set = |p: UpdatePhase| {
+            *phase.lock().unwrap() = p;
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        };
+        set(UpdatePhase::Downloading {
+            tag: rel.tag.clone(),
+            done: 0,
+            total: rel.size,
+        });
+        let result = update::download(&rel, &|done, total| {
+            set(UpdatePhase::Downloading {
+                tag: rel.tag.clone(),
+                done,
+                total,
+            })
+        })
+        .and_then(|zip| {
+            let exe = update::exe_path()?;
+            let (Some(dir), Some(name)) = (exe.parent(), exe.file_name()) else {
+                return Err(format!("Unexpected exe path {}", exe.display()));
+            };
+            update::install(&zip, dir, &name.to_string_lossy())
+        });
+        set(match result {
+            Ok(()) => UpdatePhase::Installed(rel),
+            Err(e) => UpdatePhase::Failed(format!("Updating to {} failed: {e}", rel.tag)),
+        });
+        ctx.request_repaint();
+    }
+}
+
+/// Release notes for a tooltip, cut short if long.
+fn notes_preview(rel: &Release) -> String {
+    let mut s: String = rel.notes.chars().take(1500).collect();
+    if s.len() < rel.notes.len() {
+        s.push_str("\n…");
+    }
+    s
+}
+
 struct Job {
     rx: Receiver<JobMsg>,
     done: Arc<AtomicUsize>,
@@ -212,6 +359,7 @@ struct App {
     fit_until: f64,
     /// Inner height last asked for, so a resize still in flight isn't requested again.
     fit_requested: f32,
+    updater: Updater,
 }
 
 enum AnkiMsg {
@@ -325,6 +473,7 @@ impl Default for App {
             models: None,
             fit_until: 0.0,
             fit_requested: 0.0,
+            updater: Updater::default(),
         }
     }
 }
@@ -818,6 +967,132 @@ impl App {
         self.rerun(ctx, false);
     }
 
+    /// Status-bar part of the updater: download progress, then a restart button.
+    fn update_status(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        match self.updater.phase() {
+            UpdatePhase::Downloading { tag, done, total } => {
+                ui.separator();
+                ui.spinner();
+                ui.label(format!(
+                    "Downloading hanstat {tag} ({:.0} of {:.0} MB)",
+                    done as f64 / 1e6,
+                    total as f64 / 1e6
+                ));
+                ui.add(
+                    egui::ProgressBar::new(done as f32 / total.max(1) as f32)
+                        .desired_width(160.0)
+                        .show_percentage(),
+                );
+            }
+            UpdatePhase::Available(rel) => {
+                ui.separator();
+                if ui
+                    .button(format!("⬆ Update to {}", rel.tag))
+                    .on_hover_text(notes_preview(&rel))
+                    .clicked()
+                {
+                    self.updater.install(ctx, rel);
+                }
+            }
+            UpdatePhase::Installed(rel) => {
+                ui.separator();
+                let label = RichText::new(format!("⟳ Restart to use {}", rel.tag))
+                    .color(Color32::from_rgb(80, 170, 100));
+                let hover = format!(
+                    "hanstat {} is installed and starts next time. Restart now to use it; the open file is reopened.\n\n{}",
+                    rel.tag,
+                    notes_preview(&rel)
+                );
+                if ui.button(label).on_hover_text(hover).clicked() {
+                    self.restart(ctx);
+                }
+            }
+            UpdatePhase::Failed(e) => {
+                ui.separator();
+                ui.colored_label(Color32::from_rgb(220, 170, 60), "⚠ Update failed")
+                    .on_hover_text(e);
+            }
+            UpdatePhase::Idle | UpdatePhase::Checking | UpdatePhase::UpToDate => {}
+        }
+    }
+
+    /// The version label at the right of the status bar, with update settings.
+    fn version_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.menu_button(
+            RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).weak(),
+            |ui| {
+                if let Some(reason) = &self.updater.disabled {
+                    ui.label(RichText::new(reason).weak());
+                } else {
+                    if ui
+                        .checkbox(
+                            &mut self.updater.settings.auto_update,
+                            "Install updates automatically",
+                        )
+                        .on_hover_text("Check GitHub for a new release at startup and install it in the background. It runs after a restart.")
+                        .changed()
+                        && let Err(e) = self.updater.settings.save()
+                    {
+                        self.error = Some(e);
+                    }
+                    let busy = self.updater.busy();
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("Check for updates now"))
+                        .clicked()
+                    {
+                        self.updater.check(ctx, self.updater.settings.auto_update);
+                    }
+                    match self.updater.phase() {
+                        UpdatePhase::Idle => {}
+                        UpdatePhase::Checking => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Checking…");
+                            });
+                        }
+                        UpdatePhase::UpToDate => {
+                            ui.label("hanstat is up to date.");
+                        }
+                        UpdatePhase::Available(rel) => {
+                            ui.label(format!("{} is available.", rel.tag));
+                        }
+                        UpdatePhase::Downloading { tag, .. } => {
+                            ui.label(format!("Downloading {tag}…"));
+                        }
+                        UpdatePhase::Installed(rel) => {
+                            ui.label(format!("{} is installed; restart to use it.", rel.tag));
+                        }
+                        UpdatePhase::Failed(e) => {
+                            ui.colored_label(Color32::from_rgb(220, 170, 60), e);
+                        }
+                    }
+                }
+                ui.separator();
+                ui.hyperlink_to("Releases on GitHub", update::RELEASES_PAGE);
+            },
+        );
+    }
+
+    /// Start the (now updated) exe on the same file and tab, then close.
+    fn restart(&mut self, ctx: &egui::Context) {
+        let exe = match update::exe_path() {
+            Ok(p) => p,
+            Err(e) => {
+                self.error = Some(e);
+                return;
+            }
+        };
+        let mut cmd = std::process::Command::new(exe);
+        if let Some(p) = &self.path {
+            cmd.arg(p);
+        }
+        cmd.args(["--tab", self.tab.arg()]);
+        match cmd.spawn() {
+            Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Err(e) => self.error = Some(format!("Cannot start {}: {e}", exe.display())),
+        }
+    }
+
     fn poll_job(&mut self, ctx: &egui::Context) {
         let Some(job) = &self.job else { return };
         if let Ok(JobMsg::Done(res)) = job.rx.try_recv() {
@@ -1061,17 +1336,19 @@ impl eframe::App for App {
                         }
                     }
                 }
+                self.update_status(ui, &ctx);
                 let now = ui.input(|i| i.time);
-                if let Some((m, until)) = &self.toast {
-                    if now < *until {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(RichText::new(m).strong())
-                        });
-                        ctx.request_repaint_after(std::time::Duration::from_millis(250));
-                    } else {
-                        self.toast = None;
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.version_menu(ui, &ctx);
+                    if let Some((m, until)) = &self.toast {
+                        if now < *until {
+                            ui.label(RichText::new(m).strong());
+                            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+                        } else {
+                            self.toast = None;
+                        }
                     }
-                }
+                });
             });
         });
 
