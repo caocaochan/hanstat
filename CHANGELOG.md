@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.4.2] - 2026-11-15
+
+### Changed
+- The Anki window opens larger (780×680 instead of 720×560). The suspended/Traditional↔Simplified options and the Cards/Words/Characters table are pinned to the bottom of the window, so they stay visible when a note type's fields are expanded. Only the deck and field lists scroll, and they use whatever height the window has.
+
 ## [0.4.1] - 2026-11-15
 
 ### Changed
