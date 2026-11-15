@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.0] - 2026-11-15
+
+### Added
+- **Difficulty rating.** The Overview's Anki section has two new tiles. **Running words you know** is the share of the book's word occurrences that are on a young or mature card, so frequent words weigh more, along with how often an unknown word comes up. **Difficulty for you** rates the book from that share: Easy at 98% or more, Moderate from 95%, Challenging from 90%, Hard from 80%, and Very hard below 80%. These cut-offs follow L2 reading research (Hu & Nation 2000, Laufer 1989). Hover either tile for the counts and the band table. Names don't count as unknown words: any word containing a name from your user dictionary or the recommended Suggested words is left out, as coverage studies do with proper nouns. The CLI prints the same figures with `--anki`, and the JSON report adds `running_words`, `running_chars`, `name_tokens` and `difficulty`.
+
+### Changed
+- The main window opens centred on the primary monitor.
+- In the Anki window, the deck and field lists fill the width of their column, so the field list's scrollbar is at the window edge instead of next to the longest field name.
+
 ## [0.4.2] - 2026-11-15
 
 ### Changed
