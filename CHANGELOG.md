@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.1] - 2026-11-15
+
+### Fixed
+- Dragging the window is smooth again. egui redraws on every move event, and with vsync on, each redraw held up Windows' move loop until the next refresh, so the window lagged behind the cursor. The window now presents without waiting for vsync. egui still only redraws when something changes, so the app doesn't use more GPU while idle.
+
 ## [0.3.0] - 2026-11-15
 
 ### Added

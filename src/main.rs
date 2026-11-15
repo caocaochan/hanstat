@@ -38,6 +38,16 @@ fn main() -> eframe::Result {
             .with_inner_size([1180.0, 800.0])
             .with_min_inner_size([760.0, 520.0])
             .with_drag_and_drop(true),
+        // egui repaints on every WM_MOVE; with vsync each of those blocks the
+        // OS move loop until vblank, so dragging the window stutters. egui
+        // only repaints on demand, so dropping vsync costs nothing at idle.
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            surface: eframe::egui_wgpu::SurfaceConfig {
+                present_mode: eframe::wgpu::PresentMode::AutoNoVsync,
+                ..eframe::egui_wgpu::SurfaceConfig::HIGH_THROUGHPUT
+            },
+            ..Default::default()
+        },
         ..Default::default()
     };
     eframe::run_native(
