@@ -33,6 +33,8 @@ Rust stable (edition 2024) with the MSVC toolchain:
 cargo build --release
 cargo test --release      # downloads the models on first run
 ```
+
+Releases are automatic: when a push to `main` passes CI and the `Cargo.toml` version has no `v<version>` tag yet, CI tags that commit and publishes the zip, using that version's `CHANGELOG.md` section as release notes. To ship, bump the version and add its changelog section in the same push.
 ## What it reports
 
 - Chinese characters: total, unique, and once-only (hapax).

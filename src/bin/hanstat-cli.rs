@@ -32,7 +32,12 @@ fn load_anki(a: &AnkiArgs) -> Result<Option<Knowledge>, String> {
     if s.collection.is_none() {
         let p = anki::find_profiles();
         match p.len() {
-            0 => return Err("No Anki collection found; pass --anki-collection path\\to\\collection.anki2".into()),
+            0 => {
+                return Err(
+                    "No Anki collection found; pass --anki-collection path\\to\\collection.anki2"
+                        .into(),
+                );
+            }
             1 => s.collection = Some(p[0].collection.clone()),
             _ => {
                 return Err(format!(
@@ -120,7 +125,10 @@ fn load_anki(a: &AnkiArgs) -> Result<Option<Knowledge>, String> {
     s.enabled = true;
     if a.save {
         s.save()?;
-        eprintln!("Saved Anki selection to {}", anki::Settings::path().display());
+        eprintln!(
+            "Saved Anki selection to {}",
+            anki::Settings::path().display()
+        );
     }
     col.knowledge(&s).map(Some)
 }

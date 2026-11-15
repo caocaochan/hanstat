@@ -209,7 +209,8 @@ impl Settings {
     pub fn save(&self) -> Result<(), String> {
         let p = Self::path();
         let dir = p.parent().unwrap();
-        std::fs::create_dir_all(dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
         let tmp = p.with_extension(format!("json.{}.tmp", std::process::id()));
         std::fs::write(&tmp, serde_json::to_string_pretty(self).unwrap())
             .map_err(|e| format!("Cannot write {}: {e}", tmp.display()))?;
@@ -404,7 +405,9 @@ impl Collection {
             }
         }
         let mut raw: Vec<(i64, String)> = {
-            let mut st = conn.prepare("SELECT id, name FROM decks").map_err(sql_err)?;
+            let mut st = conn
+                .prepare("SELECT id, name FROM decks")
+                .map_err(sql_err)?;
             st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
                 .map_err(sql_err)?
                 .collect::<Result<_, _>>()
@@ -458,7 +461,9 @@ impl Collection {
             }
         }
         let mut note_types: Vec<NoteType> = {
-            let mut st = conn.prepare("SELECT id, name FROM notetypes").map_err(sql_err)?;
+            let mut st = conn
+                .prepare("SELECT id, name FROM notetypes")
+                .map_err(sql_err)?;
             st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
                 .map_err(sql_err)?
                 .collect::<Result<Vec<_>, _>>()
@@ -629,9 +634,14 @@ impl Collection {
 }
 
 fn all_deck_ids(conn: &Connection) -> Result<Vec<(i64, String)>, String> {
-    let mut st = conn.prepare("SELECT id, name FROM decks").map_err(sql_err)?;
+    let mut st = conn
+        .prepare("SELECT id, name FROM decks")
+        .map_err(sql_err)?;
     st.query_map([], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?.replace('\x1f', "::")))
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?.replace('\x1f', "::"),
+        ))
     })
     .map_err(sql_err)?
     .collect::<Result<_, _>>()
@@ -640,7 +650,9 @@ fn all_deck_ids(conn: &Connection) -> Result<Vec<(i64, String)>, String> {
 
 /// Copies left behind by a crashed run, older than a day.
 fn remove_stale_copies(tmp: &Path) {
-    let Ok(rd) = std::fs::read_dir(tmp) else { return };
+    let Ok(rd) = std::fs::read_dir(tmp) else {
+        return;
+    };
     let day = std::time::Duration::from_secs(86_400);
     for e in rd.flatten() {
         if e.file_name().to_string_lossy().starts_with("hanstat-anki-")
@@ -692,7 +704,9 @@ pub fn field_words(field: &str, norm: &mut chars::NormStats) -> Vec<String> {
             (_, Some(d)) => d.as_str().parse().ok(),
             _ => None,
         };
-        n.and_then(char::from_u32).map(String::from).unwrap_or_default()
+        n.and_then(char::from_u32)
+            .map(String::from)
+            .unwrap_or_default()
     });
     let s = chars::normalize(&s, norm);
     s.split(|c: char| !chars::is_han(c))
@@ -828,7 +842,10 @@ mod tests {
             ["跫音", "喀"]
         );
         assert_eq!(field_words("你好[nǐ hǎo]、再見", &mut n), ["你好", "再見"]);
-        assert_eq!(field_words("{{c1::電腦::computer}}壞了", &mut n), ["電腦壞了"]);
+        assert_eq!(
+            field_words("{{c1::電腦::computer}}壞了", &mut n),
+            ["電腦壞了"]
+        );
         assert_eq!(
             field_words("<style>.x{content:'字'}</style>&#20320;好&nbsp;OK", &mut n),
             ["你好"]
@@ -849,7 +866,9 @@ mod tests {
     fn folding_matches_across_scripts() {
         let k = Knowledge {
             words: [(fold("響徹", true), Status::Mature)].into_iter().collect(),
-            chars: [(fold_char('響', true), Status::Mature)].into_iter().collect(),
+            chars: [(fold_char('響', true), Status::Mature)]
+                .into_iter()
+                .collect(),
             fold: true,
             summary: Default::default(),
         };

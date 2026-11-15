@@ -1031,7 +1031,12 @@ fn fmt_int(n: u64) -> String {
 }
 
 /// Rows of counts by Anki status; `as_pct` shows a row as shares of its total.
-fn status_grid(ui: &mut egui::Ui, id: &str, rows: &[(&str, &ByStatus, bool)], with_not_in_anki: bool) {
+fn status_grid(
+    ui: &mut egui::Ui,
+    id: &str,
+    rows: &[(&str, &ByStatus, bool)],
+    with_not_in_anki: bool,
+) {
     let mut cols = vec![Status::Mature, Status::Young, Status::Learning, Status::New];
     if with_not_in_anki {
         cols.push(Status::NotInAnki);
@@ -1266,7 +1271,15 @@ impl App {
             .column(Column::remainder())
             .header(24.0, |mut h| {
                 let anki_h = if status.is_some() { "Anki" } else { "" };
-                for t in ["Rank", "Char", "Count", "%", "Cumulative %", anki_h, "Code point"] {
+                for t in [
+                    "Rank",
+                    "Char",
+                    "Count",
+                    "%",
+                    "Cumulative %",
+                    anki_h,
+                    "Code point",
+                ] {
                     h.col(|ui| {
                         ui.strong(t);
                     });
@@ -1337,7 +1350,15 @@ impl App {
             .column(Column::remainder())
             .header(24.0, |mut h| {
                 let anki_h = if status.is_some() { "Anki" } else { "" };
-                for t in ["Rank", "Word", "Count", "%", "Cumulative %", anki_h, "Length"] {
+                for t in [
+                    "Rank",
+                    "Word",
+                    "Count",
+                    "%",
+                    "Cumulative %",
+                    anki_h,
+                    "Length",
+                ] {
                     h.col(|ui| {
                         ui.strong(t);
                     });
