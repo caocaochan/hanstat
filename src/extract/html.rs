@@ -73,7 +73,7 @@ pub struct Extracted {
 }
 
 pub fn extract(src: &str) -> Extracted {
-    let doc = Html::parse_document(src);
+    let doc = Html::parse_document(&expand_self_closing(src));
     let mut out = Extracted {
         paragraphs: Vec::new(),
         first_heading: None,
@@ -108,6 +108,76 @@ pub fn extract(src: &str) -> Extracted {
     flush(&mut buf, &mut out.paragraphs);
     out.first_heading = heading;
     out
+}
+
+/// HTML void elements: `<x/>` and `<x>` mean the same thing for these.
+const VOID: &[&str] = &[
+    "area", "base", "basefont", "bgsound", "br", "col", "embed", "frame", "hr", "img", "input",
+    "keygen", "link", "meta", "param", "source", "track", "wbr",
+];
+
+/// Rewrite XML self-closing tags of non-void elements (`<title/>`, `<a id="x"/>`)
+/// as an explicit start/end pair. EPUB content documents are XHTML, but the HTML
+/// parser ignores the `/` on non-void elements, so `<title/>` would open an RCDATA
+/// element that swallows the whole rest of the document.
+fn expand_self_closing(src: &str) -> std::borrow::Cow<'_, str> {
+    if !src.contains("/>") {
+        return src.into();
+    }
+    let b = src.as_bytes();
+    let mut out = String::with_capacity(src.len() + 64);
+    let mut copied = 0; // src[..copied] is already in `out`
+    let mut i = 0;
+    while let Some(off) = src[i..].find('<') {
+        let lt = i + off;
+        let rest = &src[lt..];
+        // Comments and CDATA may contain anything; skip them whole.
+        let skip_to = if rest.starts_with("<!--") {
+            Some(rest.find("-->").map_or(src.len(), |e| lt + e + 3))
+        } else if rest.starts_with("<![CDATA[") {
+            Some(rest.find("]]>").map_or(src.len(), |e| lt + e + 3))
+        } else if !b.get(lt + 1).is_some_and(u8::is_ascii_alphabetic) {
+            Some(lt + 1)
+        } else {
+            None
+        };
+        if let Some(j) = skip_to {
+            i = j;
+            continue;
+        }
+        let name_end = rest[1..]
+            .find(|c: char| c.is_ascii_whitespace() || c == '/' || c == '>')
+            .map_or(src.len(), |e| lt + 1 + e);
+        let name = &src[lt + 1..name_end];
+        // Find the closing '>' outside quoted attribute values.
+        let mut j = name_end;
+        let mut quote = None;
+        while j < b.len() {
+            match (quote, b[j]) {
+                (Some(q), c) if c == q => quote = None,
+                (None, b'"' | b'\'') => quote = Some(b[j]),
+                (None, b'>') => break,
+                _ => {}
+            }
+            j += 1;
+        }
+        if j >= b.len() {
+            break;
+        }
+        if b[j - 1] == b'/' && j > name_end && !VOID.contains(&name.to_ascii_lowercase().as_str()) {
+            out.push_str(&src[copied..j - 1]);
+            out.push_str("></");
+            out.push_str(name);
+            out.push('>');
+            copied = j + 1;
+        }
+        i = j + 1;
+    }
+    if copied == 0 {
+        return src.into();
+    }
+    out.push_str(&src[copied..]);
+    out.into()
 }
 
 fn walk(
@@ -234,6 +304,24 @@ mod tests {
         );
         assert_eq!(e.first_heading.as_deref(), Some("第一章"));
         assert_eq!(e.title.as_deref(), Some("T"));
+    }
+
+    #[test]
+    fn xhtml_self_closing() {
+        // Readmoo/Pubu (Sigil) chapters have <title/>; HTML parsing would make the
+        // whole body title text.
+        let html = r#"<?xml version='1.0' encoding='utf-8'?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title/><link href="a.css" rel="stylesheet"/></head>
+<body><h1>壹、黑與白</h1><a id="x"/><p class="a">濕熱的氣息</p><div/><p title="a/>b">第二段<br/>行</p><!-- <script/> --></body></html>"#;
+        let e = extract(html);
+        assert_eq!(e.paragraphs, ["壹、黑與白", "濕熱的氣息", "第二段", "行"]);
+        assert_eq!(e.first_heading.as_deref(), Some("壹、黑與白"));
+        assert_eq!(e.title, None);
+        assert_eq!(
+            expand_self_closing(r#"<title/><a  id="q/>"/><br/><svg:rect x="1"/><!--<b/>-->"#),
+            r#"<title></title><a  id="q/>"></a><br/><svg:rect x="1"></svg:rect><!--<b/>-->"#
+        );
     }
 
     #[test]
