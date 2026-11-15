@@ -7,7 +7,7 @@ Character and word statistics for Chinese `.epub` and `.txt` files, with countin
 
 ## Install
 
-Download `hanstat-vX.Y.Z-x86_64-pc-windows-msvc.zip` from [Releases](https://github.com/caocaochan/hanstat/releases/latest), unzip, and run `hanstat.exe` from the `hanstat` folder inside. The app updates itself (see [Updates](#updates)). To update by hand, replace that folder with the one from a newer zip. Open a file, or drag it onto the window. The exe isn't code-signed, so Windows SmartScreen may ask you to confirm the first run. You can check the zip against its `.sha256` file.
+Download [`hanstat-x86_64-pc-windows-msvc.zip`](https://github.com/caocaochan/hanstat/releases/latest/download/hanstat-x86_64-pc-windows-msvc.zip) (always the latest release; older versions are on [Releases](https://github.com/caocaochan/hanstat/releases)), unzip, and run `hanstat.exe` from the `hanstat` folder inside. The app updates itself (see [Updates](#updates)). To update by hand, replace that folder with the one from a newer zip. Open a file, or drag it onto the window. The exe isn't code-signed, so Windows SmartScreen may ask you to confirm the first run. You can check the zip against its `.sha256` file.
 
 The segmentation models are **not bundled**, because their licences differ from this project's. On first start, and whenever a model is missing from the cache folder, the app downloads it in the background from its official Hugging Face repository, so it's ready before you need it. The status bar shows progress. The CLI downloads only the model a run needs. The models are:
 - LTP: 32 MB.

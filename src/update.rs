@@ -16,7 +16,6 @@ use std::sync::OnceLock;
 
 pub const REPO: &str = "caocaochan/hanstat";
 pub const RELEASES_PAGE: &str = "https://github.com/caocaochan/hanstat/releases/latest";
-const TARGET: &str = "x86_64-pc-windows-msvc";
 const OLD_SUFFIX: &str = "hanstat-old";
 const NEW_SUFFIX: &str = "hanstat-new";
 const USER_AGENT: &str = concat!("hanstat/", env!("CARGO_PKG_VERSION"));
@@ -69,9 +68,9 @@ struct ApiAsset {
     browser_download_url: String,
 }
 
-fn asset_name(tag: &str) -> String {
-    format!("hanstat-{tag}-{TARGET}.zip")
-}
+/// The release zip's asset name. It has no version in it, so
+/// `.../releases/latest/download/<this>` is a permanent link.
+const ZIP_NAME: &str = "hanstat-x86_64-pc-windows-msvc.zip";
 
 /// Parse the `releases/latest` API response. Asset URLs must point at this
 /// repository's own release downloads.
@@ -83,7 +82,7 @@ fn parse_release(json: &str) -> Result<Release, String> {
     }
     let version = parse_version(&r.tag_name)
         .ok_or_else(|| format!("Unrecognised release tag {:?}", r.tag_name))?;
-    let zip_name = asset_name(&r.tag_name);
+    let zip_name = ZIP_NAME;
     let sha_name = format!("{zip_name}.sha256");
     let prefix = format!(
         "https://github.com/{REPO}/releases/download/{}/",
@@ -95,7 +94,7 @@ fn parse_release(json: &str) -> Result<Release, String> {
             .find(|a| a.name == name && a.browser_download_url == format!("{prefix}{name}"))
             .ok_or_else(|| format!("Release {} has no {name}", r.tag_name))
     };
-    let zip = find(&zip_name)?;
+    let zip = find(zip_name)?;
     let sha = find(&sha_name)?;
     Ok(Release {
         version,
@@ -152,12 +151,12 @@ fn hex(bytes: &[u8]) -> String {
 /// Download the release zip and verify it against the release's `.sha256`.
 /// `progress(done_bytes, total_bytes)`.
 pub fn download(rel: &Release, progress: &dyn Fn(u64, u64)) -> Result<Vec<u8>, String> {
-    let zip_name = asset_name(&rel.tag);
+    let zip_name = ZIP_NAME;
     let sha_text = get(&rel.sha256_url)?
         .body_mut()
         .read_to_string()
         .map_err(|e| e.to_string())?;
-    let want = parse_sha256_file(&sha_text, &zip_name)?;
+    let want = parse_sha256_file(&sha_text, zip_name)?;
 
     let mut resp = get(&rel.zip_url)?;
     let mut reader = resp.body_mut().as_reader();
@@ -428,7 +427,7 @@ mod tests {
     }
 
     fn api_json(tag: &str, repo: &str) -> String {
-        let zip = asset_name(tag);
+        let zip = ZIP_NAME;
         serde_json::json!({
             "tag_name": tag,
             "body": "### Fixed\n- Things.\n",
@@ -452,7 +451,7 @@ mod tests {
         assert_eq!(r.notes, "### Fixed\n- Things.");
         assert!(
             r.zip_url
-                .ends_with("/v9.8.7/hanstat-v9.8.7-x86_64-pc-windows-msvc.zip")
+                .ends_with("/releases/download/v9.8.7/hanstat-x86_64-pc-windows-msvc.zip")
         );
         // Assets hosted anywhere else are refused.
         assert!(parse_release(&api_json("v9.8.7", "someone/else")).is_err());

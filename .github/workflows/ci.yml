@@ -87,9 +87,10 @@ jobs:
         if: steps.rel.outputs.release == 'true'
         shell: pwsh
         run: |
-          $name = "hanstat-${{ steps.rel.outputs.tag }}-x86_64-pc-windows-msvc"
-          # The folder inside the zip is plain `hanstat`, so a manual update
-          # is "replace the folder". The zip name carries the version.
+          # Fixed names, no version: .../releases/latest/download/<name>.zip is
+          # a permanent link, and a manual update is "replace the hanstat
+          # folder". The in-app updater looks for exactly this asset name.
+          $name = "hanstat-x86_64-pc-windows-msvc"
           $dir = "hanstat"
           New-Item -ItemType Directory $dir | Out-Null
           Copy-Item target/release/hanstat.exe, target/release/hanstat-cli.exe, README.md, CHANGELOG.md, LICENSE-MIT, LICENSE-APACHE $dir
