@@ -1,9 +1,16 @@
 # Changelog
 
-## [0.8.0] - 2026-11-15
+## [2026.11.15.0] - 2026-11-15
 
 ### Added
 - **Mature by FSRS stability.** The Anki window has a **Mature by FSRS stability** option with a slider (1–365 days). When it's on, a review card is mature once its FSRS stability reaches that many days, instead of at Anki's interval of 21+ days. The interval depends on desired retention: at 90% it is about the stability, above 90% it is shorter and below 90% longer. Stability doesn't change with desired retention, so the same memory strength counts as mature in every preset. Cards with no FSRS data keep the interval rule, and the window says how many of them there are. The setting is saved per language with the rest of the Anki selection. CLI: `--anki-mature-stability DAYS`, where 0 means the interval rule. The JSON report's `anki` object gains `mature_stability_days` and `no_stability`.
+
+### Changed
+- **New version numbers.** Releases are now numbered by date, `yyyy.mm.dd.n`, where n counts releases on the same day from 0 (2026.11.15.0, 2026.11.15.1, 2026.11.16.0). This release follows 0.7.1. Version 0.7.1 and earlier can't read the new numbers, so their automatic update reports an unrecognised release tag. Update them once by hand: download the zip and replace the hanstat folder. Updates work automatically from this release on.
+
+### Fixed
+- **Suggested words** no longer lists common words such as 什麼, 關係, 朋友 and 廁所. A word inside a longer word that the segmenter kept whole (什麼 in 為什麼, 關係 in 沒關係, 朋友 in 男朋友) was counted as split. Such occurrences now count as kept whole, so **Split** only counts occurrences that a word boundary actually cuts through.
+- Suggested words in Traditional Chinese books: the particles that rule out a candidate (麼, 著, 過, 這, 還, 沒, 來…) were only recognised in Simplified. So strings ending in one (什麼, 怎麼) were listed, and phrases containing one (捺著性子) could be pre-ticked on statistical evidence alone.
 
 ## [0.7.1] - 2026-11-15
 

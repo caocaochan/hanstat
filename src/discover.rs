@@ -15,7 +15,7 @@ use crate::extract::Book;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 const MAX_N: usize = 6;
 const EDGE: u32 = 0;
@@ -25,7 +25,8 @@ pub struct Candidate {
     pub word: String,
     /// Occurrences of the string in the text.
     pub occurrences: u32,
-    /// How many of those the segmenter produced as exactly this one token.
+    /// How many of those the segmenter didn't split: no token boundary falls
+    /// inside (the token is this string, or a longer word containing it).
     pub kept_whole: u32,
     pub cohesion: f64,
     /// Min over split points of f(w) / min(f(left), f(right)): the share of the rarer
@@ -62,14 +63,44 @@ fn unkey(mut k: u128) -> String {
     s
 }
 
+/// `c` or its Simplified form is in `set` (the stop lists are written in
+/// Simplified; the n-grams keep the book's own characters).
+fn in_set(set: &str, c: char) -> bool {
+    set.contains(c)
+        || crate::script::TABLES
+            .t2s
+            .get(&c)
+            .is_some_and(|&s| set.contains(s))
+}
+
 /// Particles/function characters that essentially never start or end a name.
+/// 著 is listed itself: it is also Simplified, so OpenCC has no 著→着 char mapping.
 fn is_edge_stop(c: char) -> bool {
-    "的了着地得过吗呢吧啊呀么嘛哦是在和与就都也又还很被把将从向对给让跟这那些个".contains(c)
+    in_set(
+        "的了着著地得过吗呢吧啊呀么嘛哦是在和与就都也又还很被把将从向对给让跟这那些个",
+        c,
+    )
 }
 
 /// Grammatical characters that mark a phrase when they occur anywhere inside.
 fn is_inner_stop(c: char) -> bool {
-    is_edge_stop(c) || "一不没上下来去起".contains(c)
+    is_edge_stop(c) || in_set("一不没上下来去起", c)
+}
+
+/// How many occurrences of each 2..=MAX_N-char string lie inside a single
+/// segmenter token, either as the whole token or within a longer one (什麼 in
+/// 為什麼, 朋友 in 男朋友). Those weren't split: no token boundary falls inside.
+fn within_token_counts(word_freq: &[(String, u32)]) -> FxHashMap<u128, u32> {
+    let mut m = FxHashMap::<u128, u32>::default();
+    for (w, n) in word_freq {
+        let cs: Vec<char> = w.chars().collect();
+        for len in 2..=MAX_N.min(cs.len()) {
+            for i in 0..=cs.len() - len {
+                *m.entry(key(&cs[i..i + len])).or_default() += n;
+            }
+        }
+    }
+    m
 }
 
 fn entropy(m: &FxHashMap<u32, u32>) -> f64 {
@@ -226,7 +257,7 @@ pub fn discover(
         }
     }
 
-    let tokens: HashMap<&str, u32> = word_freq.iter().map(|(w, n)| (w.as_str(), *n)).collect();
+    let tokens = within_token_counts(word_freq);
     let jieba = jieba_rs::Jieba::new();
     let mut out: Vec<Candidate> = cand
         .into_iter()
@@ -240,11 +271,7 @@ pub fn discover(
                 return None;
             }
             let occurrences = freq[word.chars().count()][&k];
-            let kept_whole = tokens
-                .get(word.as_str())
-                .copied()
-                .unwrap_or(0)
-                .min(occurrences);
+            let kept_whole = tokens.get(&k).copied().unwrap_or(0).min(occurrences);
             let split = occurrences - kept_whole;
             // Only worth suggesting if the segmenter splits it a meaningful share of the time.
             if split < min || (split as f64) < 0.05 * occurrences as f64 {
@@ -311,5 +338,28 @@ mod tests {
     fn key_roundtrip() {
         let s: Vec<char> = "温简言𠮷野家".chars().collect();
         assert_eq!(unkey(key(&s)), "温简言𠮷野家");
+    }
+
+    #[test]
+    fn words_inside_longer_tokens_are_not_split() {
+        let freq = [
+            ("為什麼".to_owned(), 3),
+            ("什麼".to_owned(), 5),
+            ("什".to_owned(), 1),
+        ];
+        let m = within_token_counts(&freq);
+        let get = |s: &str| m.get(&key(&s.chars().collect::<Vec<_>>())).copied();
+        assert_eq!(get("什麼"), Some(8));
+        assert_eq!(get("為什"), Some(3));
+        assert_eq!(get("為什麼"), Some(3));
+    }
+
+    #[test]
+    fn stop_chars_match_traditional() {
+        for c in ['麼', '么', '著', '過', '這', '還'] {
+            assert!(is_edge_stop(c), "{c}");
+        }
+        assert!(is_inner_stop('沒') && is_inner_stop('來'));
+        assert!(!is_edge_stop('阿'));
     }
 }

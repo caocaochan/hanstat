@@ -1250,7 +1250,7 @@ impl App {
     /// The version label at the right of the status bar, with update settings.
     fn version_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.menu_button(
-            RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).weak(),
+            RichText::new(update::version_string()).weak(),
             |ui| {
                 if let Some(reason) = &self.updater.disabled {
                     ui.label(RichText::new(reason).weak());

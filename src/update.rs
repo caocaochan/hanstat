@@ -20,21 +20,55 @@ const OLD_SUFFIX: &str = "hanstat-old";
 const NEW_SUFFIX: &str = "hanstat-new";
 const USER_AGENT: &str = concat!("hanstat/", env!("CARGO_PKG_VERSION"));
 
-pub type Version = (u64, u64, u64);
+/// Releases are versioned `yyyy.mm.dd.n` (n counts releases on that day from
+/// 0), tagged without a `v`. Older releases (up to v0.7.1) were `v0.x.y`, read as `(0, x, y, 0)`,
+/// so they sort before every dated one.
+pub type Version = (u64, u64, u64, u64);
 
-/// `1.2.3` or `v1.2.3`; anything else (pre-release suffixes included) is `None`.
+/// `2026.11.15.0`, or a legacy `0.8.0` / `v0.8.0`; anything else
+/// (pre-release suffixes included) is `None`.
 pub fn parse_version(s: &str) -> Option<Version> {
-    let mut it = s.strip_prefix('v').unwrap_or(s).split('.');
-    let v = (
-        it.next()?.parse().ok()?,
-        it.next()?.parse().ok()?,
-        it.next()?.parse().ok()?,
-    );
-    it.next().is_none().then_some(v)
+    let parts: Vec<u64> = s
+        .strip_prefix('v')
+        .unwrap_or(s)
+        .split('.')
+        .map(|p| p.parse().ok())
+        .collect::<Option<_>>()?;
+    match parts[..] {
+        [y, m, d, n] if (1..=12).contains(&m) && (1..=31).contains(&d) => Some((y, m, d, n)),
+        [a, b, c] => Some((a, b, c, 0)),
+        _ => None,
+    }
+}
+
+/// Cargo needs a SemVer version without leading zeros, so Cargo.toml holds
+/// `yyyy.Mdd.n` (2026.1115.0 for 2026.11.15.0, 2027.105.2 for 2027.01.05.2).
+fn from_cargo(s: &str) -> Option<Version> {
+    let mut it = s.split('.').map(|p| p.parse::<u64>().ok());
+    let (y, md, n) = (it.next()??, it.next()??, it.next()??);
+    if it.next().is_some() {
+        return None;
+    }
+    let (m, d) = (md / 100, md % 100);
+    ((1..=12).contains(&m) && (1..=31).contains(&d)).then_some((y, m, d, n))
 }
 
 pub fn current_version() -> Version {
-    parse_version(env!("CARGO_PKG_VERSION")).expect("Cargo.toml version is x.y.z")
+    from_cargo(env!("CARGO_PKG_VERSION")).expect("Cargo.toml version is yyyy.Mdd.n")
+}
+
+/// `2026.11.15.0` (legacy versions as `0.8.0`).
+pub fn format_version((a, b, c, n): Version) -> String {
+    if a == 0 {
+        format!("{a}.{b}.{c}")
+    } else {
+        format!("{a}.{b:02}.{c:02}.{n}")
+    }
+}
+
+/// This build's version as released, e.g. `2026.11.15.0`.
+pub fn version_string() -> String {
+    format_version(current_version())
 }
 
 #[derive(Clone, Debug)]
@@ -414,16 +448,27 @@ mod tests {
 
     #[test]
     fn versions() {
-        assert_eq!(parse_version("v0.3.1"), Some((0, 3, 1)));
-        assert_eq!(parse_version("10.20.30"), Some((10, 20, 30)));
+        assert_eq!(parse_version("v0.3.1"), Some((0, 3, 1, 0)));
+        assert_eq!(parse_version("10.20.30"), Some((10, 20, 30, 0)));
+        assert_eq!(parse_version("2026.11.15.0"), Some((2026, 11, 15, 0)));
+        assert_eq!(parse_version("2027.01.05.12"), Some((2027, 1, 5, 12)));
         assert_eq!(parse_version("v1.2"), None);
-        assert_eq!(parse_version("v1.2.3.4"), None);
+        assert_eq!(parse_version("2026.13.01.0"), None);
         assert_eq!(parse_version("v1.2.3-rc1"), None);
+        assert_eq!(parse_version("1.2.3.4.5"), None);
         assert!(parse_version("v0.10.0") > parse_version("v0.9.9"));
-        assert_eq!(
-            current_version(),
-            parse_version(env!("CARGO_PKG_VERSION")).unwrap()
-        );
+        assert!(parse_version("2026.11.15.0") > parse_version("v0.8.0"));
+        assert!(parse_version("2026.11.15.1") > parse_version("2026.11.15.0"));
+        assert!(parse_version("2026.11.16.0") > parse_version("2026.11.15.9"));
+        assert!(parse_version("2027.01.01.0") > parse_version("2026.12.31.3"));
+
+        assert_eq!(from_cargo("2026.1115.0"), Some((2026, 11, 15, 0)));
+        assert_eq!(from_cargo("2027.105.2"), Some((2027, 1, 5, 2)));
+        assert_eq!(from_cargo("0.8.0"), None);
+        assert_eq!(format_version((2027, 1, 5, 2)), "2027.01.05.2");
+        assert_eq!(format_version((0, 8, 0, 0)), "0.8.0");
+        // The release tag (made by CI from Cargo.toml) round-trips.
+        assert_eq!(parse_version(&version_string()), Some(current_version()));
     }
 
     fn api_json(tag: &str, repo: &str) -> String {
@@ -446,7 +491,10 @@ mod tests {
     #[test]
     fn release_parsing() {
         let r = parse_release(&api_json("v9.8.7", REPO)).unwrap();
-        assert_eq!(r.version, (9, 8, 7));
+        assert_eq!(r.version, (9, 8, 7, 0));
+        let r = parse_release(&api_json("2026.11.15.1", REPO)).unwrap();
+        assert_eq!(r.version, (2026, 11, 15, 1));
+        let r = parse_release(&api_json("v9.8.7", REPO)).unwrap();
         assert_eq!(r.size, 123);
         assert_eq!(r.notes, "### Fixed\n- Things.");
         assert!(
