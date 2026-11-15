@@ -12,10 +12,12 @@
 //! status of the notes it appears in, and a character the best status of the
 //! words containing it.
 //!
-//! The user's choice of collection, decks, note types and fields is saved to
-//! `%LOCALAPPDATA%\hanstat\anki.json`, next to the `models` folder.
+//! The user's choice of collection, decks, note types and fields is saved per
+//! language: `%LOCALAPPDATA%\hanstat\anki.json` for Chinese and `anki-ko.json`
+//! for Korean, next to the `models` folder.
 
 use crate::chars;
+use crate::lang::Language;
 use crate::script::{self, Variant};
 use crate::segment::{Segmenter, SegmenterKind};
 use regex::Regex;
@@ -182,6 +184,9 @@ pub struct Settings {
     pub include_suspended: bool,
     /// Fold Traditional to Simplified on both sides before matching.
     pub match_across_scripts: bool,
+    /// Which language's file these settings belong to (not stored in it).
+    #[serde(skip)]
+    pub language: Language,
 }
 
 impl Default for Settings {
@@ -193,19 +198,31 @@ impl Default for Settings {
             note_types: Vec::new(),
             include_suspended: true,
             match_across_scripts: true,
+            language: Language::Chinese,
         }
     }
 }
 
 impl Settings {
+    /// The Chinese settings file (`anki.json`).
     pub fn path() -> PathBuf {
-        crate::models::app_dir().join("anki.json")
+        Self::path_for(Language::Chinese)
+    }
+
+    /// `anki.json` (Chinese) or `anki-ko.json` (Korean).
+    pub fn path_for(lang: Language) -> PathBuf {
+        lang.settings_path("anki")
+    }
+
+    /// The Chinese settings.
+    pub fn load() -> (Settings, Option<String>) {
+        Self::load_for(Language::Chinese)
     }
 
     /// Missing file → defaults. A corrupt file is reported, and defaults are used.
-    pub fn load() -> (Settings, Option<String>) {
-        let p = Self::path();
-        match std::fs::read(&p) {
+    pub fn load_for(lang: Language) -> (Settings, Option<String>) {
+        let p = Self::path_for(lang);
+        let (mut s, warn) = match std::fs::read(&p) {
             Err(_) => (Settings::default(), None),
             Ok(b) => match serde_json::from_slice(&b) {
                 Ok(s) => (s, None),
@@ -214,11 +231,14 @@ impl Settings {
                     Some(format!("Ignoring unreadable {}: {e}", p.display())),
                 ),
             },
-        }
+        };
+        s.language = lang;
+        (s, warn)
     }
 
+    /// Saved to this language's file.
     pub fn save(&self) -> Result<(), String> {
-        let p = Self::path();
+        let p = Self::path_for(self.language);
         let dir = p.parent().unwrap();
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
@@ -358,6 +378,23 @@ impl SegConfig {
                 k => k,
             }),
             user_words: user_words.to_vec(),
+        }
+    }
+
+    /// As [`SegConfig::new`] for Chinese; Kiwi for Korean, where every field
+    /// value is analysed into dictionary forms like the book.
+    pub fn for_language(
+        lang: Language,
+        chosen: SegmenterKind,
+        book: Option<SegmenterKind>,
+        user_words: &[String],
+    ) -> Self {
+        match lang {
+            Language::Chinese => Self::new(chosen, book, user_words),
+            Language::Korean => SegConfig {
+                kind: SegmenterKind::Kiwi,
+                user_words: user_words.to_vec(),
+            },
         }
     }
 }
@@ -619,7 +656,9 @@ impl Collection {
             let e = words.entry(fold(w, s.match_across_scripts)).or_default();
             *e = (*e).max(st);
         };
-        // Sentences and long phrases, segmented together afterwards.
+        // Sentences and long phrases, segmented together afterwards. In Korean,
+        // every field value: Kiwi turns it into dictionary forms like the book.
+        let korean = seg.kind == SegmenterKind::Kiwi;
         let mut to_segment: Vec<(String, Status)> = Vec::new();
         if !note_status.is_empty() {
             let mids: Vec<String> = ords.keys().map(|m| m.to_string()).collect();
@@ -645,6 +684,17 @@ impl Collection {
                 for &o in &ords[&mid] {
                     let Some(f) = parts.get(o) else { continue };
                     let text = clean_field(f, &mut norm);
+                    if korean {
+                        if !text.chars().any(chars::is_hangul) {
+                            continue;
+                        }
+                        any = true;
+                        if text.split_whitespace().nth(1).is_some() || looks_like_sentence(&text) {
+                            summary.sentences += 1;
+                        }
+                        to_segment.push((text, ns));
+                        continue;
+                    }
                     if han_runs(&text).next().is_none() {
                         continue;
                     }
@@ -669,7 +719,23 @@ impl Collection {
                 }
             }
         }
-        if !to_segment.is_empty() {
+        if korean && !to_segment.is_empty() {
+            let mut nd = chars::NormStats::default();
+            let forced: Vec<String> = seg
+                .user_words
+                .iter()
+                .map(|w| chars::normalize(w.trim(), &mut nd))
+                .filter(|w| !w.is_empty())
+                .collect();
+            let segmenter = Segmenter::new(SegmenterKind::Kiwi, &forced, Variant::Unknown)?;
+            let texts: Vec<&str> = to_segment.iter().map(|(t, _)| t.as_str()).collect();
+            for (ls, (_, st)) in segmenter.lemmas_many(&texts)?.into_iter().zip(&to_segment) {
+                for w in ls.iter().filter(|w| w.chars().any(chars::is_hangul)) {
+                    add(w, *st);
+                }
+            }
+            summary.segmenter = Some(SegmenterKind::Kiwi);
+        } else if !to_segment.is_empty() {
             let t = &*script::TABLES;
             let (mut tr, mut si) = (0u64, 0u64);
             for c in to_segment.iter().flat_map(|(x, _)| x.chars()) {
@@ -707,7 +773,8 @@ impl Collection {
         let mut char_status: HashMap<char, Status> = HashMap::new();
         for (w, &st) in &words {
             summary.words.add(st, 1);
-            for c in w.chars() {
+            // Korean has word statistics only: no per-syllable status.
+            for c in w.chars().filter(|c| !chars::is_hangul(*c)) {
                 let e = char_status.entry(c).or_default();
                 *e = (*e).max(st);
             }
@@ -873,7 +940,8 @@ fn fold_char(c: char, on: bool) -> char {
 pub struct KnowledgeSummary {
     /// Selected notes with at least one card in the selected decks.
     pub notes: u64,
-    /// Of those, notes whose selected fields contain no Chinese characters.
+    /// Of those, notes whose selected fields contain no Chinese characters
+    /// (for Korean settings: no Hangul).
     pub notes_without_chinese: u64,
     /// Field values that looked like sentences and were split into words.
     pub sentences: u64,
@@ -935,7 +1003,8 @@ impl Knowledge {
             if key.is_empty() || !seen.insert(key.clone()) {
                 continue;
             }
-            for c in key.chars() {
+            // Korean has word statistics only: no per-syllable status.
+            for c in key.chars().filter(|c| !chars::is_hangul(*c)) {
                 let e = self.chars.entry(c).or_default();
                 if !e.is_known() {
                     self.listed.new_chars += 1;

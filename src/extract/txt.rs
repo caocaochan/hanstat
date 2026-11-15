@@ -1,14 +1,14 @@
 //! Plain-text loading: encoding detection, paragraphs, chapter detection.
 
 use super::{Book, EncodingChoice, Section, SectionKind};
-use crate::chars::{is_han, is_sentence_end};
+use crate::chars::{is_han, is_hangul, is_sentence_end};
 use encoding_rs::Encoding;
 use regex::Regex;
 use std::sync::LazyLock;
 
 static CHAPTER_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"^\s*(?:第\s*[0-9０-９零〇一二三四五六七八九十百千万萬两兩]+\s*[章回节節卷集部篇幕话話]|(?:序章|序幕|楔子|引子|序言|前言|尾声|尾聲|终章|終章|后记|後記|番外)|(?i:chapter)\s*\d+)",
+        r"^\s*(?:第\s*[0-9０-９零〇一二三四五六七八九十百千万萬两兩]+\s*[章回节節卷集部篇幕话話]|(?:序章|序幕|楔子|引子|序言|前言|尾声|尾聲|终章|終章|后记|後記|番外)|(?i:chapter)\s*\d+|제\s*[0-9０-９]+\s*[장화권부편막]|[0-9]+\s*화(?:\s|$|[.:)\]])|(?:프롤로그|에필로그|외전|서장|종장|작가의 말|작가 후기))",
     )
     .unwrap()
 });
@@ -120,6 +120,16 @@ pub fn load(bytes: &[u8], choice: EncodingChoice) -> Book {
 
     let lines: Vec<&str> = text.lines().collect();
 
+    // Korean text wraps between Hangul syllables, and its lines rejoin with a
+    // space (Korean separates words with spaces); Chinese rejoins without one.
+    let korean = {
+        let (hangul, han) = text.chars().fold((0usize, 0usize), |(a, b), c| {
+            (a + is_hangul(c) as usize, b + is_han(c) as usize)
+        });
+        hangul > han
+    };
+    let is_main = |c: char| if korean { is_hangul(c) } else { is_han(c) };
+
     // Hard-wrap detection: in paragraph-per-line files almost every non-empty line ends
     // in punctuation; in hard-wrapped files many end mid-sentence on a Han character.
     let nonempty: Vec<&str> = lines
@@ -129,13 +139,14 @@ pub fn load(bytes: &[u8], choice: EncodingChoice) -> Book {
         .collect();
     let ends_han = nonempty
         .iter()
-        .filter(|l| l.chars().last().is_some_and(is_han))
+        .filter(|l| l.chars().last().is_some_and(is_main))
         .count();
     let hard_wrapped = nonempty.len() >= 20 && ends_han * 10 > nonempty.len() * 4;
     if hard_wrapped {
         notes.push(format!(
-            "Hard-wrapped text detected ({}% of lines end mid-sentence): lines are joined when one ends and the next starts with a Chinese character without indentation.",
-            ends_han * 100 / nonempty.len().max(1)
+            "Hard-wrapped text detected ({}% of lines end mid-sentence): lines are joined when one ends and the next starts with a {} without indentation.",
+            ends_han * 100 / nonempty.len().max(1),
+            if korean { "Hangul letter (with a space between them)" } else { "Chinese character" }
         ));
     }
 
@@ -184,10 +195,12 @@ pub fn load(bytes: &[u8], choice: EncodingChoice) -> Book {
             && para
                 .chars()
                 .last()
-                .is_some_and(|c| is_han(c) && !is_sentence_end(c))
-            && trimmed.chars().next().is_some_and(is_han);
+                .is_some_and(|c| is_main(c) && !is_sentence_end(c))
+            && trimmed.chars().next().is_some_and(is_main);
         if !joinable {
             flush(&mut para, &mut cur);
+        } else if korean {
+            para.push(' ');
         }
         para.push_str(trimmed);
     }
@@ -249,5 +262,39 @@ mod tests {
         );
         let labels: Vec<_> = b.sections.iter().map(|s| s.label.as_str()).collect();
         assert_eq!(labels, ["Front matter", "第一章 起", "第2章 承"]);
+    }
+
+    #[test]
+    fn korean_chapters_and_euc_kr() {
+        let text = "제목\n\n프롤로그\n그는 문을 열었다.\n제1장 시작\n본문입니다.\n12화. 다음\n본문입니다.\n1화의 내용을 다시 읽었다.\n";
+        let (bytes, _, _) = encoding_rs::EUC_KR.encode(text);
+        let (s, enc, _, err) = decode(&bytes, EncodingChoice::Auto);
+        assert!(!err);
+        assert_eq!(enc, encoding_rs::EUC_KR);
+        let b = load(s.as_bytes(), EncodingChoice::Auto);
+        let labels: Vec<_> = b.sections.iter().map(|s| s.label.as_str()).collect();
+        // "1화의 …" is prose, not a heading.
+        assert_eq!(
+            labels,
+            ["Front matter", "프롤로그", "제1장 시작", "12화. 다음"]
+        );
+    }
+
+    #[test]
+    fn korean_hard_wrap_joins_with_a_space() {
+        let mut text = String::from("제1장\n");
+        for _ in 0..12 {
+            text.push_str("그는 오래된 문을 천천히\n열고 안으로 들어갔다.\n");
+        }
+        let b = load(text.as_bytes(), EncodingChoice::Auto);
+        assert!(
+            b.notes.iter().any(|n| n.contains("Hard-wrapped")),
+            "{:?}",
+            b.notes
+        );
+        assert_eq!(
+            b.sections[0].paragraphs[1],
+            "그는 오래된 문을 천천히 열고 안으로 들어갔다."
+        );
     }
 }

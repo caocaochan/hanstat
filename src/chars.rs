@@ -4,6 +4,7 @@
 //! [`normalize`], so that visually identical text produces identical counts no
 //! matter how the producer of the file encoded it.
 
+use crate::lang::Language;
 use serde::Serialize;
 use unicode_general_category::{GeneralCategory as Gc, get_general_category};
 use unicode_normalization::UnicodeNormalization;
@@ -118,8 +119,36 @@ pub fn is_han(c: char) -> bool {
         )
 }
 
+/// A precomposed Hangul syllable (가–힣). Conjoining jamo are composed into
+/// these by the NFC step of [`normalize`]; lone jamo (ㅋㅋ) are letters.
+#[inline]
+pub fn is_hangul(c: char) -> bool {
+    ('\u{AC00}'..='\u{D7A3}').contains(&c)
+}
+
+/// A character of the book's main script: Han for Chinese, Hangul syllables for Korean.
+#[inline]
+pub fn is_main(c: char, lang: Language) -> bool {
+    match lang {
+        Language::Chinese => is_han(c),
+        Language::Korean => is_hangul(c),
+    }
+}
+
+/// [`classify`] for a book in `lang`. A Korean book has no character
+/// statistics (only words), so Hanja there are letters like Hangul.
+#[inline]
+pub fn classify_in(c: char, lang: Language) -> Class {
+    match lang {
+        Language::Chinese => classify(c),
+        Language::Korean if is_han(c) => Class::Letter,
+        Language::Korean => classify(c),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Class {
+    /// A Chinese character in a Chinese book (never used for Korean, see [`classify_in`]).
     Han,
     /// Letters of any other script (Latin, kana, hangul, ...), plus combining marks.
     Letter,
@@ -212,6 +241,19 @@ mod tests {
         for c in ['，', '。', 'A', '1', '⼀', '⺀', 'あ', '　', '・', '㇀'] {
             assert!(!is_han(c), "{c:?} U+{:04X}", c as u32);
         }
+    }
+
+    #[test]
+    fn korean_classes() {
+        let k = Language::Korean;
+        assert_eq!(classify_in('한', k), Class::Letter);
+        assert_eq!(classify_in('漢', k), Class::Letter);
+        assert_eq!(classify_in('ㅋ', k), Class::Letter);
+        assert_eq!(classify_in('한', Language::Chinese), Class::Letter);
+        assert_eq!(classify_in('漢', Language::Chinese), Class::Han);
+        // Conjoining jamo compose into a syllable.
+        let mut s = NormStats::default();
+        assert_eq!(normalize("\u{1112}\u{1161}\u{11AB}", &mut s), "한");
     }
 
     #[test]

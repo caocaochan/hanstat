@@ -53,16 +53,19 @@ pub enum EncodingChoice {
     Utf8,
     Gb18030,
     Big5,
+    /// EUC-KR as browsers read it (the CP949 / Unified Hangul Code superset).
+    EucKr,
     Utf16Le,
     Utf16Be,
 }
 
 impl EncodingChoice {
-    pub const ALL: [EncodingChoice; 6] = [
+    pub const ALL: [EncodingChoice; 7] = [
         Self::Auto,
         Self::Utf8,
         Self::Gb18030,
         Self::Big5,
+        Self::EucKr,
         Self::Utf16Le,
         Self::Utf16Be,
     ];
@@ -72,6 +75,7 @@ impl EncodingChoice {
             Self::Utf8 => "UTF-8",
             Self::Gb18030 => "GB18030 / GBK",
             Self::Big5 => "Big5",
+            Self::EucKr => "EUC-KR / CP949",
             Self::Utf16Le => "UTF-16 LE",
             Self::Utf16Be => "UTF-16 BE",
         }
@@ -82,6 +86,7 @@ impl EncodingChoice {
             Self::Utf8 => encoding_rs::UTF_8,
             Self::Gb18030 => encoding_rs::GB18030,
             Self::Big5 => encoding_rs::BIG5,
+            Self::EucKr => encoding_rs::EUC_KR,
             Self::Utf16Le => encoding_rs::UTF_16LE,
             Self::Utf16Be => encoding_rs::UTF_16BE,
         })

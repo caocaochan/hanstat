@@ -106,6 +106,7 @@ impl Options {
 
 /// `word_freq`: the segmenter's token counts over the same sections.
 /// `known`: words already forced (user dictionary) — never suggested.
+/// Chinese only: a Korean book has no suggestions.
 pub fn discover(
     book: &Book,
     included: &[bool],
@@ -113,6 +114,9 @@ pub fn discover(
     known: &HashSet<String>,
     opts: &Options,
 ) -> Vec<Candidate> {
+    if crate::analyze::detect_language(book) == crate::lang::Language::Korean {
+        return Vec::new();
+    }
     // Han-only runs of the normalised text.
     let runs: Vec<Vec<char>> = book
         .sections

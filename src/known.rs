@@ -3,10 +3,12 @@
 //! The HSK vocabulary is the 2025 《HSK 考试大纲》 (中外语言交流合作中心,
 //! in force from July 2026), bundled in `data/HSK30-2025.tsv`. The choice of
 //! bands and the imported lists (copied in, so the source files may move) are
-//! saved to `%LOCALAPPDATA%\hanstat\known.json`.
+//! saved per language: `%LOCALAPPDATA%\hanstat\known.json` for Chinese and
+//! `known-ko.json` for Korean (word lists and marked words only).
 
 use crate::anki::{self, Knowledge};
 use crate::chars;
+use crate::lang::Language;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -104,20 +106,36 @@ pub struct Settings {
     pub lists: Vec<WordList>,
     /// Words marked known one by one with + in the Words tab, as the book wrote them.
     pub marked: Vec<String>,
+    /// Which language's file these settings belong to (not stored in it).
+    #[serde(skip)]
+    pub language: Language,
 }
 
 impl Settings {
+    /// The Chinese file (`known.json`).
     pub fn path() -> PathBuf {
-        crate::models::app_dir().join("known.json")
+        Self::path_for(Language::Chinese)
     }
 
-    /// Missing file → nothing known. A corrupt file is reported and ignored.
+    /// `known.json` (Chinese) or `known-ko.json` (Korean).
+    pub fn path_for(lang: Language) -> PathBuf {
+        lang.settings_path("known")
+    }
+
+    /// The Chinese settings. Missing file → nothing known. A corrupt file is reported and ignored.
     pub fn load() -> (Settings, Option<String>) {
-        Self::load_from(&Self::path())
+        Self::load_for(Language::Chinese)
     }
 
+    pub fn load_for(lang: Language) -> (Settings, Option<String>) {
+        let (mut s, warn) = Self::load_from(&Self::path_for(lang));
+        s.language = lang;
+        (s, warn)
+    }
+
+    /// Saved to this language's file.
     pub fn save(&self) -> Result<(), String> {
-        self.save_to(&Self::path())
+        self.save_to(&Self::path_for(self.language))
     }
 
     fn load_from(p: &Path) -> (Settings, Option<String>) {
@@ -235,17 +253,24 @@ impl Settings {
     }
 }
 
-/// Read a word list: one word per line. On each line the first item (split at
-/// tabs, commas, semicolons and spaces) that contains Chinese is taken, so
-/// exports with pinyin or definitions after the word work; HTML and
-/// `[readings]` are dropped as in Anki fields. `#` starts a comment line.
+/// Read a Chinese word list (see [`read_word_list_in`]).
 pub fn read_word_list(path: &Path) -> Result<WordList, String> {
+    read_word_list_in(path, Language::Chinese)
+}
+
+/// Read a word list: one word per line. On each line the first item (split at
+/// tabs, commas, semicolons and spaces) that contains Chinese (Korean: Hangul)
+/// is taken, so exports with pinyin or definitions after the word work; HTML
+/// and `[readings]` are dropped as in Anki fields. `#` starts a comment line.
+/// Korean words should be dictionary forms (먹다, 공부하다), as the book's words are.
+pub fn read_word_list_in(path: &Path, lang: Language) -> Result<WordList, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
     let (text, _, _, _) = crate::extract::txt::decode(&bytes, crate::extract::EncodingChoice::Auto);
-    let words = parse_word_list(&text);
+    let words = parse_word_list_in(&text, lang);
     if words.is_empty() {
         return Err(format!(
-            "No Chinese words found in {}. Expected one word per line.",
+            "No {} words found in {}. Expected one word per line.",
+            lang.name(),
             path.display()
         ));
     }
@@ -259,8 +284,14 @@ pub fn read_word_list(path: &Path) -> Result<WordList, String> {
     })
 }
 
-/// Distinct words, in file order.
+/// Distinct Chinese words, in file order.
 pub fn parse_word_list(text: &str) -> Vec<String> {
+    parse_word_list_in(text, Language::Chinese)
+}
+
+/// Distinct words in `lang` (runs of Han characters, or of Hangul syllables), in file order.
+pub fn parse_word_list_in(text: &str, lang: Language) -> Vec<String> {
+    let is_main = |c: char| chars::is_main(c, lang);
     let mut norm = chars::NormStats::default();
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -271,11 +302,15 @@ pub fn parse_word_list(text: &str) -> Vec<String> {
         }
         let Some(item) = l
             .split(|c: char| matches!(c, '\t' | ',' | ';') || c.is_whitespace())
-            .find(|t| t.chars().any(chars::is_han))
+            .find(|t| t.chars().any(is_main))
         else {
             continue;
         };
-        for w in anki::han_runs(&anki::clean_field(item, &mut norm)) {
+        let cleaned = anki::clean_field(item, &mut norm);
+        for w in cleaned
+            .split(|c: char| !is_main(c))
+            .filter(|w| !w.is_empty())
+        {
             if seen.insert(w.to_owned()) {
                 out.push(w.to_owned());
             }
@@ -352,6 +387,27 @@ mod tests {
     }
 
     #[test]
+    fn korean_word_list_lines() {
+        let text =
+            "# 단어장\n먹다\tto eat\n1. 공부하다 [study]\n\"사과\",apple\n漢字\nhello\n먹다\n";
+        assert_eq!(
+            parse_word_list_in(text, Language::Korean),
+            ["먹다", "공부하다", "사과"]
+        );
+        // The Chinese parser ignores Korean, and the other way round.
+        assert_eq!(parse_word_list_in(text, Language::Chinese), ["漢字"]);
+    }
+
+    #[test]
+    fn settings_files_per_language() {
+        let (zh, _) = Settings::load_for(Language::Chinese);
+        assert_eq!(zh.language, Language::Chinese);
+        assert!(Settings::path_for(Language::Korean).ends_with("known-ko.json"));
+        assert!(anki::Settings::path_for(Language::Korean).ends_with("anki-ko.json"));
+        assert_eq!(Settings::path(), Settings::path_for(Language::Chinese));
+    }
+
+    #[test]
     fn lists_add_to_anki_without_downgrading() {
         let mut base = Knowledge::empty(true);
         base.words.insert("我".into(), Status::Mature);
@@ -366,6 +422,7 @@ mod tests {
                 path: "a.txt".into(),
                 words: vec!["我".into(), "看".into(), "學習".into()],
             }],
+            ..Default::default()
         };
         let k = s.apply(Some(&base), true).unwrap();
         assert_eq!(k.word("我"), Status::Mature);

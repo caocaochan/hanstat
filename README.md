@@ -3,7 +3,7 @@
 [![CI](https://github.com/caocaochan/hanstat/actions/workflows/ci.yml/badge.svg)](https://github.com/caocaochan/hanstat/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/caocaochan/hanstat)](https://github.com/caocaochan/hanstat/releases/latest)
 
-Character and word statistics for Chinese `.epub` and `.txt` files: totals, unique and once-only characters and words, coverage, per-section breakdowns, reading time, and how much of the book your Anki cards already cover.
+Character and word statistics for Chinese `.epub` and `.txt` files, and word statistics for Korean ones: totals, unique and once-only characters and words, coverage, per-section breakdowns, reading time, and how much of the book your Anki cards already cover.
 
 ## Install
 
@@ -13,7 +13,13 @@ Character and word statistics for Chinese `.epub` and `.txt` files: totals, uniq
 
 The exe isn't code-signed, so SmartScreen may ask you to confirm the first run. The app updates itself; click the version number in the status bar to check now or turn automatic updates off.
 
-On first start the app downloads the word-segmentation models (LTP 32 MB, CKIP 46 MB) from Hugging Face into `%LOCALAPPDATA%\hanstat\models`. They aren't bundled because their licences differ (see below).
+On first start the app downloads the word-segmentation models (LTP 32 MB, CKIP 46 MB) from Hugging Face into `%LOCALAPPDATA%\hanstat\models`. They aren't bundled because their licences differ (see below). The Korean analyser (Kiwi, 126 MB from its GitHub release) is downloaded the first time you open a Korean book.
+
+## Korean
+
+hanstat detects the book's language: a book with more Hangul than Chinese characters is Korean. The badge at the right of the toolbar shows the mode (简体中文, 繁體中文 or 한국어). Korean books are analysed with [Kiwi](https://github.com/bab2min/Kiwi) and measured in words only. Words are counted in dictionary form: 먹었어요 counts as 먹다, 걸어서 as 걷다, and 공부했다 as 공부하다. Particles and endings aren't words. If Kiwi splits a character's name, add it to a user dictionary.
+
+Anki decks and fields, word lists, marked words and the user dictionary are kept separately for Chinese and Korean. Korean settings are saved to `anki-ko.json` and `known-ko.json`. Every ticked Anki field is analysed with Kiwi, so a card for 먹다 or 먹어요 matches the book's 먹다. Korean word lists should hold dictionary forms. With no book open, click the badge to choose which language's settings the Anki and word-list windows show.
 
 ## Word segmentation
 
@@ -31,11 +37,11 @@ Click **📚 HSK & word lists** to mark words as known without Anki cards. You c
 
 ```
 hanstat.exe [file] [--tab overview|characters|words|sections|suggestions|notes]
-hanstat-cli.exe file.epub [--ltp|--ckip|--jieba] [--dict names.txt] [--auto-dict] [--json] [--chars-csv f] [--words-csv f] [--anki] [--known] [--hsk N] [--known-list words.txt]
+hanstat-cli.exe file.epub [--ltp|--ckip|--jieba] [--dict names.txt] [--auto-dict] [--json] [--chars-csv f] [--words-csv f] [--anki] [--known] [--hsk N] [--known-list words.txt] [--lang zh|ko]
 ```
 
 Run `hanstat-cli.exe --help` for all options.
 
 ## Licence
 
-MIT or Apache-2.0, at your option. Bundled OpenCC data is Apache-2.0; the jieba dictionary is MIT. The HSK word list comes from the official syllabus via [ofou/hsk](https://github.com/ofou/hsk) (MIT). The downloaded models have their own licences: [LTP](https://huggingface.co/LTP/legacy) is free for research and individual use (commercial use needs a licence from HIT-SCIR), [CKIP bert-tiny](https://huggingface.co/ckiplab/bert-tiny-chinese-ws) is GPL-3.0.
+MIT or Apache-2.0, at your option. Bundled OpenCC data is Apache-2.0; the jieba dictionary is MIT. The HSK word list comes from the official syllabus via [ofou/hsk](https://github.com/ofou/hsk) (MIT). The downloaded models have their own licences: [LTP](https://huggingface.co/LTP/legacy) is free for research and individual use (commercial use needs a licence from HIT-SCIR), [CKIP bert-tiny](https://huggingface.co/ckiplab/bert-tiny-chinese-ws) is GPL-3.0, and [Kiwi](https://github.com/bab2min/Kiwi) is Apache-2.0.

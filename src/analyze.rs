@@ -4,6 +4,7 @@
 
 use crate::chars::{self, Class, NormStats};
 use crate::extract::{Book, SectionKind};
+use crate::lang::{self, Language};
 use crate::script::{self, Variant};
 use crate::segment::{Segmenter, SegmenterKind};
 use rayon::prelude::*;
@@ -112,7 +113,23 @@ pub fn detect_variant(book: &Book) -> (u64, u64) {
         .reduce(|| (0, 0), |x, y| (x.0 + y.0, x.1 + y.1))
 }
 
+/// The book's language from its text: Korean if Hangul syllables outnumber Han characters.
+pub fn detect_language(book: &Book) -> Language {
+    let (hangul, han) = book
+        .sections
+        .par_iter()
+        .flat_map_iter(|s| s.paragraphs.iter())
+        .map(|p| {
+            p.chars().fold((0u64, 0u64), |(a, b), c| {
+                (a + chars::is_hangul(c) as u64, b + chars::is_han(c) as u64)
+            })
+        })
+        .reduce(|| (0, 0), |x, y| (x.0 + y.0, x.1 + y.1));
+    lang::classify(hangul, han)
+}
+
 pub struct Prepared {
+    pub language: Language,
     pub segmenter_kind: SegmenterKind,
     pub variant: Variant,
     pub folding_note: Option<&'static str>,
@@ -123,7 +140,9 @@ pub struct Prepared {
 /// Paragraphs per work unit: CKIP batches the chunks of one group together.
 const GROUP: usize = 128;
 
-/// Full analysis of every section of the book (included or not).
+/// Full analysis of every section of the book (included or not). The
+/// language is detected from the text; a Korean book always uses Kiwi, and
+/// `kind` is the Chinese segmenter otherwise.
 /// `progress(done, total)` is called in paragraphs.
 pub fn analyze_book(
     book: &Book,
@@ -131,15 +150,20 @@ pub fn analyze_book(
     user_words: &[String],
     progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Result<Prepared, String> {
+    let language = detect_language(book);
     let (tr, si) = detect_variant(book);
-    let variant = script::classify(tr, si);
+    let variant = match language {
+        Language::Chinese => script::classify(tr, si),
+        // Hanja in a Korean book say nothing about Chinese script variants.
+        Language::Korean => Variant::Unknown,
+    };
     let mut norm_dummy = NormStats::default();
     let words: Vec<String> = user_words
         .iter()
         .map(|w| chars::normalize(w.trim(), &mut norm_dummy))
         .filter(|w| !w.is_empty())
         .collect();
-    let seg = Segmenter::new(kind, &words, variant)?;
+    let seg = Segmenter::new(kind.resolve_in(language, variant), &words, variant)?;
     let total: usize = book.sections.iter().map(|s| s.paragraphs.len()).sum();
     let done = std::sync::atomic::AtomicUsize::new(0);
     let stats = book
@@ -149,7 +173,10 @@ pub fn analyze_book(
             s.paragraphs
                 .par_chunks(GROUP)
                 .fold(SectionStats::default, |mut acc, group| {
-                    analyze_group(&mut acc, group, &seg);
+                    match language {
+                        Language::Chinese => analyze_group(&mut acc, group, &seg),
+                        Language::Korean => analyze_group_korean(&mut acc, group, &seg),
+                    }
                     let d = done.fetch_add(group.len(), std::sync::atomic::Ordering::Relaxed)
                         + group.len();
                     progress(d, total);
@@ -159,6 +186,7 @@ pub fn analyze_book(
         })
         .collect();
     Ok(Prepared {
+        language,
         segmenter_kind: seg.kind,
         variant,
         folding_note: seg.folding_note(),
@@ -173,7 +201,7 @@ fn analyze_group(acc: &mut SectionStats, raw: &[String], seg: &Segmenter) {
         .map(|p| chars::normalize(p, &mut acc.norm))
         .collect();
     for p in &paras {
-        count_paragraph(acc, p);
+        count_paragraph(acc, p, Language::Chinese);
     }
     // Chinese words: segment whitespace-free chunks that contain Han, all at once.
     let chunks: Vec<&str> = paras
@@ -211,8 +239,33 @@ fn analyze_group(acc: &mut SectionStats, raw: &[String], seg: &Segmenter) {
     }
 }
 
-/// Character classes, sentences and non-Chinese words of one normalised paragraph.
-fn count_paragraph(acc: &mut SectionStats, p: &str) {
+/// Korean: words are Kiwi's dictionary forms of whole paragraphs (spacing
+/// matters to the analysis, so paragraphs are not split at spaces).
+fn analyze_group_korean(acc: &mut SectionStats, raw: &[String], seg: &Segmenter) {
+    let paras: Vec<String> = raw
+        .iter()
+        .map(|p| chars::normalize(p, &mut acc.norm))
+        .collect();
+    for p in &paras {
+        count_paragraph(acc, p, Language::Korean);
+    }
+    let texts: Vec<&str> = paras
+        .iter()
+        .map(String::as_str)
+        .filter(|p| p.chars().any(chars::is_hangul))
+        .collect();
+    let lemmas = seg
+        .lemmas_many(&texts)
+        .unwrap_or_else(|_| vec![Vec::new(); texts.len()]);
+    for w in lemmas.into_iter().flatten() {
+        if w.chars().any(chars::is_hangul) {
+            *acc.words.entry(w).or_default() += 1;
+        }
+    }
+}
+
+/// Character classes, sentences and non-Chinese (non-Korean) words of one normalised paragraph.
+fn count_paragraph(acc: &mut SectionStats, p: &str, lang: Language) {
     let tables = &*script::TABLES;
 
     // Characters and sentences.
@@ -220,7 +273,7 @@ fn count_paragraph(acc: &mut SectionStats, p: &str) {
     let mut para_has_content = false;
     let cs: Vec<char> = p.chars().collect();
     for (i, &c) in cs.iter().enumerate() {
-        let cl = chars::classify(c);
+        let cl = chars::classify_in(c, lang);
         acc.class_counts[class_index(cl)] += 1;
         match cl {
             Class::Han => {
@@ -255,9 +308,12 @@ fn count_paragraph(acc: &mut SectionStats, p: &str) {
         acc.paragraphs += 1;
     }
 
-    // Non-Chinese words (UAX #29), excluding anything containing Han.
+    // Non-Chinese/non-Korean words (UAX #29), excluding anything containing Han
+    // (or, in Korean, Hangul).
     for w in p.unicode_words() {
-        if w.chars().any(chars::is_han) {
+        if w.chars()
+            .any(|c| chars::is_han(c) || chars::is_main(c, lang))
+        {
             continue;
         }
         if w.chars().any(char::is_alphabetic) {
@@ -293,6 +349,10 @@ pub struct Coverage {
 pub struct Report {
     pub title: Option<String>,
     pub format: &'static str,
+    /// Chinese or Korean. A Korean book has word statistics only (words are
+    /// dictionary forms): its `han_*` counts, character coverage, word
+    /// lengths and character averages are zero or empty.
+    pub language: Language,
     pub segmenter: SegmenterKind,
     pub variant: Variant,
     pub folded_for_segmentation: bool,
@@ -325,6 +385,11 @@ pub struct Report {
     pub sentences: u64,
     pub avg_sentence_han: f64,
     pub avg_paragraph_han: f64,
+    /// Korean: words per sentence and per paragraph.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_sentence_words: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_paragraph_words: Option<f64>,
 
     pub trad_marks: u64,
     pub simp_marks: u64,
@@ -412,13 +477,25 @@ pub fn build_report(book: &Book, prep: &Prepared, included: &[bool]) -> Report {
     let c = &total.class_counts;
     let han_total = c[0];
     let words_total: u64 = word_freq.iter().map(|(_, n)| *n as u64).sum();
+    let lang = prep.language;
     let mut wl = [0u64; 5];
     let mut han_in_words = 0u64;
-    for (w, n) in &word_freq {
-        let l = w.chars().count();
-        wl[l.clamp(1, 5) - 1] += *n as u64;
-        han_in_words += (w.chars().filter(|c| chars::is_han(*c)).count() as u64) * *n as u64;
+    // Lengths are in Chinese characters; Korean words have none.
+    if lang == Language::Chinese {
+        for (w, n) in &word_freq {
+            let l = w.chars().count();
+            wl[l.clamp(1, 5) - 1] += *n as u64;
+            han_in_words += (w.chars().filter(|c| chars::is_han(*c)).count() as u64) * *n as u64;
+        }
     }
+    let per = |n: u64, d: u64| (d > 0).then(|| n as f64 / d as f64);
+    let (avg_sentence_words, avg_paragraph_words) = match lang {
+        Language::Chinese => (None, None),
+        Language::Korean => (
+            Some(per(words_total, total.sentences).unwrap_or(0.0)),
+            Some(per(words_total, total.paragraphs).unwrap_or(0.0)),
+        ),
+    };
 
     let mut notes = book.notes.clone();
     if total.class_counts[6] > 0 {
@@ -444,9 +521,26 @@ pub fn build_report(book: &Book, prep: &Prepared, included: &[bool]) -> Report {
         ));
     }
 
+    if lang == Language::Korean && c[1] > 0 {
+        let hanja: u64 = book
+            .sections
+            .iter()
+            .zip(included)
+            .filter(|(_, inc)| **inc)
+            .flat_map(|(s, _)| s.paragraphs.iter())
+            .map(|p| p.chars().filter(|c| chars::is_han(*c)).count() as u64)
+            .sum();
+        if hanja > 0 {
+            notes.push(format!(
+                "{hanja} Hanja (Chinese characters) found; in a Korean book they count as other letters, not as syllables or words."
+            ));
+        }
+    }
+
     Report {
         title: book.title.clone(),
         format: book.format,
+        language: lang,
         segmenter: prep.segmenter_kind,
         variant: prep.variant,
         folded_for_segmentation: prep.folding_note.is_some(),
@@ -487,6 +581,8 @@ pub fn build_report(book: &Book, prep: &Prepared, included: &[bool]) -> Report {
         } else {
             0.0
         },
+        avg_sentence_words,
+        avg_paragraph_words,
         trad_marks: total.trad_marks,
         simp_marks: total.simp_marks,
         char_coverage: coverage(&char_freq, han_total),

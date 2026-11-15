@@ -1,17 +1,51 @@
 //! Segmentation models are not bundled (their licences differ from this
 //! project's). They are downloaded on first use from their official Hugging
-//! Face repositories, pinned to an exact commit and verified by SHA-256, then
-//! cached in `%LOCALAPPDATA%\hanstat\models` (override: `HANSTAT_MODEL_DIR`).
+//! Face repositories or GitHub releases, pinned to an exact commit or release
+//! and verified by SHA-256, then cached in `%LOCALAPPDATA%\hanstat\models`
+//! (override: `HANSTAT_MODEL_DIR`).
 
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub struct ModelFile {
     pub name: &'static str,
     pub url: &'static str,
     pub sha256: &'static str,
     pub size: u64,
+    /// What to keep of the download.
+    pub unpack: Unpack,
+}
+
+/// One file taken out of a downloaded archive.
+pub struct Member {
+    /// Path inside the archive (`/`-separated).
+    pub path: &'static str,
+    /// File name it is saved as in the model folder.
+    pub name: &'static str,
+    pub size: u64,
+}
+
+pub enum Unpack {
+    /// Keep the download as is, named [`ModelFile::name`].
+    Keep,
+    /// Extract these members of a ZIP archive, then delete the archive.
+    Zip(&'static [Member]),
+    /// Extract these members of a gzip-compressed tar archive, then delete the archive.
+    TarGz(&'static [Member]),
+}
+
+impl ModelFile {
+    /// Everything this file provides is in `dir` with the expected size.
+    fn is_present(&self, dir: &Path) -> bool {
+        let ok = |name: &str, size: u64| {
+            std::fs::metadata(dir.join(name)).is_ok_and(|m| m.len() == size)
+        };
+        match self.unpack {
+            Unpack::Keep => ok(self.name, self.size),
+            Unpack::Zip(ms) | Unpack::TarGz(ms) => ms.iter().all(|m| ok(m.name, m.size)),
+        }
+    }
 }
 
 pub struct Model {
@@ -32,6 +66,7 @@ pub const LTP: Model = Model {
         url: "https://huggingface.co/LTP/legacy/resolve/aca6c995c6ca7ab2e4cba4af34964bcc37742fe9/cws_model.bin",
         sha256: "28fc2db628b27d4f69162d697d2294671784c7a61e0b4ce414e31060cfd20592",
         size: 31_977_765,
+        unpack: Unpack::Keep,
     }],
 };
 
@@ -52,18 +87,75 @@ pub const CKIP: Model = Model {
             url: ckip_url!("config.json"),
             sha256: "ce3c02e59fd3456a2d1cda726c3fbf86dfaa4bc544590aceaa0c29d5ac60d463",
             size: 861,
+            unpack: Unpack::Keep,
         },
         ModelFile {
             name: "vocab.txt",
             url: ckip_url!("vocab.txt"),
             sha256: "45bbac6b341c319adc98a532532882e91a9cefc0329aa57bac9ae761c27b291c",
             size: 109_540,
+            unpack: Unpack::Keep,
         },
         ModelFile {
             name: "pytorch_model.bin",
             url: ckip_url!("pytorch_model.bin"),
             sha256: "29d3ccfe939242b1691e8293d0cd30b5fd6b80333bf11967f22a6a7d5a213189",
             size: 45_802_231,
+            unpack: Unpack::Keep,
+        },
+    ],
+};
+
+macro_rules! kiwi_url {
+    ($f:literal) => {
+        concat!(
+            "https://github.com/bab2min/Kiwi/releases/download/v0.24.1/",
+            $f
+        )
+    };
+}
+
+macro_rules! kiwi_model_files {
+    ($($f:literal = $size:literal),* $(,)?) => {
+        &[$(Member { path: concat!("models/cong/base/", $f), name: $f, size: $size }),*]
+    };
+}
+
+/// Kiwi Korean morphological analyser (library + CoNg base model). The DLL is
+/// loaded at run time (see `crate::kiwi`), so a build never needs it.
+pub const KIWI: Model = Model {
+    id: "kiwi-v0.24.1",
+    title: "Kiwi v0.24.1 Korean morphological analyser (bab2min)",
+    licence: "Apache-2.0",
+    homepage: "https://github.com/bab2min/Kiwi",
+    files: &[
+        ModelFile {
+            name: "kiwi_win_x64_v0.24.1.zip",
+            url: kiwi_url!("kiwi_win_x64_v0.24.1.zip"),
+            sha256: "857576c5e8492ec66f8327e35572b20f286b092a8e760fe780ace1a99afc3b30",
+            size: 38_261_195,
+            unpack: Unpack::Zip(&[Member {
+                path: "lib/kiwi.dll",
+                name: "kiwi.dll",
+                size: 23_307_264,
+            }]),
+        },
+        ModelFile {
+            name: "kiwi_model_v0.24.1_base.tgz",
+            url: kiwi_url!("kiwi_model_v0.24.1_base.tgz"),
+            sha256: "50d163e1af817444ef21f7ec5ea07ef69fb347282d57a6b49260f2039d4dc346",
+            size: 87_967_233,
+            unpack: Unpack::TarGz(kiwi_model_files![
+                "combiningRule.txt" = 3_611,
+                "cong.mdl" = 75_854_705,
+                "default.dict" = 3_090_954,
+                "dialect.dict" = 644,
+                "extract.mdl" = 17_370,
+                "multi.dict" = 12_064_440,
+                "nounchr.mdl" = 9_734_234,
+                "sj.morph" = 8_462_892,
+                "typo.dict" = 395,
+            ]),
         },
     ],
 };
@@ -98,9 +190,7 @@ impl Model {
     /// True if every file is present with the expected size (hash checked on download).
     pub fn is_cached(&self) -> bool {
         let d = self.dir();
-        self.files
-            .iter()
-            .all(|f| std::fs::metadata(d.join(f.name)).is_ok_and(|m| m.len() == f.size))
+        self.files.iter().all(|f| f.is_present(&d))
     }
 
     /// Download any missing files. `progress(done_bytes, total_bytes)`.
@@ -120,21 +210,89 @@ impl Model {
         let total = self.total_size();
         let mut done_before = 0u64;
         for f in self.files {
-            let dest = dir.join(f.name);
-            if std::fs::metadata(&dest).is_ok_and(|m| m.len() == f.size) {
+            if f.is_present(&dir) {
                 done_before += f.size;
                 continue;
             }
-            download(f, &dest, &|d| progress(done_before + d, total)).map_err(|e| {
-                format!(
-                    "Downloading {} for {} failed: {e}\nURL: {}",
-                    f.name, self.title, f.url
-                )
-            })?;
+            let dest = dir.join(f.name);
+            // An archive left by an interrupted unpack was verified before it was renamed.
+            if !std::fs::metadata(&dest).is_ok_and(|m| m.len() == f.size) {
+                download(f, &dest, &|d| progress(done_before + d, total)).map_err(|e| {
+                    format!(
+                        "Downloading {} for {} failed: {e}\nURL: {}",
+                        f.name, self.title, f.url
+                    )
+                })?;
+            }
+            match f.unpack {
+                Unpack::Keep => {}
+                Unpack::Zip(ms) => {
+                    unpack_zip(&dest, &dir, ms)
+                        .map_err(|e| format!("Unpacking {} failed: {e}", f.name))?;
+                    let _ = std::fs::remove_file(&dest);
+                }
+                Unpack::TarGz(ms) => {
+                    unpack_tar_gz(&dest, &dir, ms)
+                        .map_err(|e| format!("Unpacking {} failed: {e}", f.name))?;
+                    let _ = std::fs::remove_file(&dest);
+                }
+            }
             done_before += f.size;
         }
         progress(total, total);
         Ok(dir)
+    }
+}
+
+/// Write one archive member to `dir/m.name` (via a temporary name), checking its size.
+fn save_member(mut r: impl Read, dir: &Path, m: &Member) -> Result<(), String> {
+    let dest = dir.join(m.name);
+    let tmp = dest.with_extension(format!("{}.part", std::process::id()));
+    let mut out = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+    let n = std::io::copy(&mut r, &mut out).map_err(|e| e.to_string())?;
+    drop(out);
+    if n != m.size {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("{}: expected {} bytes, got {n}", m.path, m.size));
+    }
+    std::fs::rename(&tmp, &dest).or_else(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        // Another process unpacked the same file first.
+        if std::fs::metadata(&dest).is_ok_and(|x| x.len() == m.size) {
+            Ok(())
+        } else {
+            Err(e.to_string())
+        }
+    })
+}
+
+fn unpack_zip(archive: &Path, dir: &Path, members: &[Member]) -> Result<(), String> {
+    let f = std::fs::File::open(archive).map_err(|e| e.to_string())?;
+    let mut z = zip::ZipArchive::new(f).map_err(|e| e.to_string())?;
+    for m in members {
+        let entry = z.by_name(m.path).map_err(|e| format!("{}: {e}", m.path))?;
+        save_member(entry, dir, m)?;
+    }
+    Ok(())
+}
+
+fn unpack_tar_gz(archive: &Path, dir: &Path, members: &[Member]) -> Result<(), String> {
+    let f = std::fs::File::open(archive).map_err(|e| e.to_string())?;
+    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(std::io::BufReader::new(f)));
+    let mut found = vec![false; members.len()];
+    for entry in tar.entries().map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path().map_err(|e| e.to_string())?;
+        let path = path.to_string_lossy().replace('\\', "/");
+        let path = path.trim_start_matches("./");
+        if let Some(i) = members.iter().position(|m| m.path == path) {
+            save_member(entry, dir, &members[i])?;
+            found[i] = true;
+        }
+    }
+    match members.iter().zip(&found).find(|(_, f)| !**f) {
+        Some((m, _)) => Err(format!("{} is missing from the archive", m.path)),
+        None => Ok(()),
     }
 }
 

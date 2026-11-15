@@ -222,6 +222,47 @@ fn discovers_invented_name() {
 }
 
 #[test]
+fn korean_book_counts_dictionary_forms_only() {
+    use hanstat::lang::Language;
+    let text = "제1장 시작\n그는 매일 공원까지 걸어서 갔다. 친구를 도와줬어요.\n하남이 열심히 공부했다. 하남의 방은 깨끗했다.\n음악을 들어요. 길을 물어봤다.\n";
+    let book = extract::txt::load(text.as_bytes(), EncodingChoice::Auto);
+    assert_eq!(hanstat::analyze::detect_language(&book), Language::Korean);
+    // The Chinese segmenter choice is ignored: Korean always uses Kiwi.
+    let prep = analyze_book(&book, SegmenterKind::Jieba, &["하남".into()], &|_, _| {}).unwrap();
+    assert_eq!(prep.language, Language::Korean);
+    assert_eq!(prep.segmenter_kind, SegmenterKind::Kiwi);
+    let r = build_report(&book, &prep, &vec![true; book.sections.len()]);
+    let words: Vec<&str> = r.word_freq.iter().map(|(w, _)| w.as_str()).collect();
+    for w in [
+        "걷다",
+        "가다",
+        "돕다",
+        "공부하다",
+        "깨끗하다",
+        "듣다",
+        "묻다",
+        "공원",
+        "음악",
+    ] {
+        assert!(words.contains(&w), "missing {w}: {words:?}");
+    }
+    // The user dictionary keeps the name whole; particles and endings are not words.
+    assert_eq!(
+        r.word_freq.iter().find(|(w, _)| w == "하남").map(|x| x.1),
+        Some(2)
+    );
+    assert!(
+        !words.iter().any(|w| ["이", "는", "었", "다"].contains(w)),
+        "{words:?}"
+    );
+    // Words only: no character (syllable) statistics.
+    assert_eq!((r.han_total, r.han_unique), (0, 0));
+    assert!(r.char_freq.is_empty() && r.char_coverage.is_empty());
+    assert_eq!(r.word_length_tokens, [0; 5]);
+    assert!(r.avg_sentence_words.unwrap() > 0.0);
+}
+
+#[test]
 fn user_dictionary_merges_names() {
     let text = "温简言看向不远处的黑方小队。温简言笑了。\n";
     let book = extract::txt::load(text.as_bytes(), EncodingChoice::Auto);

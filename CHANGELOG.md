@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **Korean books.** hanstat now detects the book's language. A book with more Hangul than Chinese characters is analysed as Korean with [Kiwi](https://github.com/bab2min/Kiwi), a Korean morphological analyser (Apache-2.0). Kiwi is downloaded from its GitHub release the first time you open a Korean book: 126 MB, pinned and checked by SHA-256. Korean books are measured in words only, with no character or syllable counts. Words are counted in dictionary form: irregular stems are restored (걸어서 → 걷다), predicates get 다 (먹었어요 → 먹다), and a noun plus 하 is one word (공부했다 → 공부하다). Particles and endings aren't counted. The Overview shows word totals, unique words, word coverage, sentence and paragraph length in words, and reading time in words per minute. The Characters and Suggested words tabs are hidden for Korean books. The user dictionary works for Korean too: Kiwi keeps its words whole as proper nouns.
+- **Language badge.** A coloured badge at the right of the toolbar shows the mode: 简体中文, 繁體中文, 简繁混合, 中文 or 한국어. With no book open, click it to choose which language's settings the Anki and word-list windows show.
+- **Settings per language.** Anki collection, decks and fields, word lists, marked words and the user dictionary are kept separately for Chinese and Korean. Chinese settings stay in `anki.json` and `known.json`; Korean ones go to `anki-ko.json` and `known-ko.json`. For Korean, every ticked Anki field is analysed with Kiwi, so a card for 먹다 or 먹어요 matches the book's 먹다. Korean word lists are read as Hangul words, one per line.
+- TXT files: EUC-KR/CP949 in the encoding menu, Korean chapter headings (제1장, 12화, 프롤로그, 외전…) and hard-wrapped Korean text, whose lines are rejoined with a space.
+- CLI: Korean books work the same way. `--known`, `--known-list` and `--anki` use the book's language, and `--lang zh|ko` picks the language for `--anki` without a file.
+
+### Changed
+- The JSON report has a new `language` field. Chinese results are otherwise unchanged.
+
 ## [0.6.1] - 2026-11-15
 
 ### Added

@@ -3,6 +3,8 @@
 //! * CKIP BERT (bert-tiny-chinese-ws, ASBC standard) — most accurate, slowest.
 //! * LTP legacy (HIT-SCIR averaged perceptron, PKU-style standard) — fast, default.
 //! * jieba (dictionary DAG + max-probability path, HMM off).
+//! * Kiwi, for Korean books only: returns dictionary forms instead of slices
+//!   (see [`Segmenter::lemmas_many`] and [`crate::kiwi`]).
 //!
 //! Every back-end gets whitespace-free chunks of the *original* text and returns
 //! slices of it. Script folding needed by a model (T→S for LTP/jieba, S→T for
@@ -11,11 +13,14 @@
 //! (leftmost-longest) on the original text becomes exactly one token.
 
 use crate::ckip::Ckip;
+use crate::kiwi;
+use crate::lang::Language;
 use crate::models;
 use crate::script::{self, Variant};
+use rayon::prelude::*;
 use serde::Serialize;
 use std::io::BufReader;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 // Only successful loads are memoised, so a failed download can be retried.
 static LTP_MODEL: OnceLock<ltp::CWSModel> = OnceLock::new();
@@ -51,6 +56,7 @@ pub fn model_for(kind: SegmenterKind) -> Option<&'static models::Model> {
         SegmenterKind::Ltp | SegmenterKind::Auto => Some(&models::LTP),
         SegmenterKind::Ckip => Some(&models::CKIP),
         SegmenterKind::Jieba => None,
+        SegmenterKind::Kiwi => Some(&models::KIWI),
     }
 }
 
@@ -62,9 +68,12 @@ pub enum SegmenterKind {
     Ckip,
     Ltp,
     Jieba,
+    /// Korean morphological analysis; used for every Korean book.
+    Kiwi,
 }
 
 impl SegmenterKind {
+    /// The Chinese segmenters the user can choose from.
     pub const ALL: [SegmenterKind; 4] = [Self::Auto, Self::Ckip, Self::Ltp, Self::Jieba];
     pub fn label(self) -> &'static str {
         match self {
@@ -72,6 +81,7 @@ impl SegmenterKind {
             Self::Ckip => "CKIP BERT",
             Self::Ltp => "LTP perceptron",
             Self::Jieba => "jieba",
+            Self::Kiwi => "Kiwi",
         }
     }
     pub fn description(self) -> &'static str {
@@ -88,6 +98,9 @@ impl SegmenterKind {
             Self::Jieba => {
                 "jieba dictionary segmentation (HMM off). Fastest, least accurate (SIGHAN F1 81–84); merges many compounds."
             }
+            Self::Kiwi => {
+                "Kiwi Korean morphological analyser (CoNg model). Counts words as dictionary forms (먹었어요 → 먹다); used for every Korean book."
+            }
         }
     }
     /// The concrete model `Auto` stands for, given the detected script.
@@ -98,12 +111,22 @@ impl SegmenterKind {
             k => k,
         }
     }
+
+    /// The segmenter for a book in `lang`: Kiwi for Korean, otherwise the
+    /// chosen Chinese one with `Auto` resolved by script.
+    pub fn resolve_in(self, lang: Language, variant: Variant) -> SegmenterKind {
+        match lang {
+            Language::Korean => Self::Kiwi,
+            Language::Chinese => self.resolve(variant),
+        }
+    }
 }
 
 enum Backend {
     Ltp(&'static ltp::CWSModel),
     Jieba(Box<jieba_rs::Jieba>),
     Ckip(&'static Ckip),
+    Kiwi(Arc<kiwi::Kiwi>),
 }
 
 pub struct Segmenter {
@@ -134,6 +157,16 @@ impl Segmenter {
             SegmenterKind::Ltp | SegmenterKind::Auto => Backend::Ltp(ltp_model()?),
             SegmenterKind::Ckip => Backend::Ckip(ckip_model()?),
             SegmenterKind::Jieba => Backend::Jieba(Box::new(jieba_rs::Jieba::new())),
+            // Kiwi takes the user dictionary itself (as proper nouns).
+            SegmenterKind::Kiwi => {
+                return Ok(Segmenter {
+                    kind,
+                    backend: Backend::Kiwi(kiwi::shared(user_words)?),
+                    forced: None,
+                    fold_t2s: false,
+                    fold_s2t: false,
+                });
+            }
         };
         let words: Vec<&str> = user_words
             .iter()
@@ -206,6 +239,19 @@ impl Segmenter {
         }
     }
 
+    /// Korean (Kiwi): the dictionary-form words of each text, analysed in
+    /// parallel. Other segmenters return their tokens.
+    pub fn lemmas_many(&self, texts: &[&str]) -> Result<Vec<Vec<String>>, String> {
+        match &self.backend {
+            Backend::Kiwi(k) => texts.par_iter().map(|t| k.lemmas(t)).collect(),
+            _ => Ok(self
+                .cut_many(texts)
+                .into_iter()
+                .map(|v| v.into_iter().map(str::to_owned).collect())
+                .collect()),
+        }
+    }
+
     /// Segment many whitespace-free chunks; result `i` tiles `chunks[i]`.
     pub fn cut_many<'a>(&self, chunks: &[&'a str]) -> Vec<Vec<&'a str>> {
         match &self.backend {
@@ -263,6 +309,8 @@ impl Segmenter {
                 .segment_many(&[s], self.fold_s2t)
                 .pop()
                 .unwrap_or_default(),
+            // Kiwi output is lemmas, not slices (see `lemmas_many`).
+            Backend::Kiwi(_) => s.split_inclusive(|_| true).collect(),
         };
         if covers(s, &toks) {
             toks
