@@ -7,7 +7,11 @@
 //!
 //! Classification follows Anki's own Card Counts definitions: a review card is
 //! *mature* when its interval is ≥ 21 days and *young* otherwise; learning and
-//! relearning (lapsed) cards are *learning*; unstudied cards are *new*. A note
+//! relearning (lapsed) cards are *learning*; unstudied cards are *new*.
+//! Optionally, a review card is mature when its FSRS stability (`s` in the
+//! `cards.data` JSON) reaches a chosen number of days instead, which doesn't
+//! shift with desired retention the way the interval does; cards without FSRS
+//! data keep the interval rule. A note
 //! takes the best status of its cards in the selected decks, a word the best
 //! status of the notes it appears in, and a character the best status of the
 //! words containing it.
@@ -184,6 +188,10 @@ pub struct Settings {
     pub include_suspended: bool,
     /// Fold Traditional to Simplified on both sides before matching.
     pub match_across_scripts: bool,
+    /// Judge maturity by FSRS stability instead of the interval.
+    pub mature_by_stability: bool,
+    /// The stability, in days, at which a review card is mature.
+    pub mature_stability_days: u32,
     /// Which language's file these settings belong to (not stored in it).
     #[serde(skip)]
     pub language: Language,
@@ -198,6 +206,8 @@ impl Default for Settings {
             note_types: Vec::new(),
             include_suspended: true,
             match_across_scripts: true,
+            mature_by_stability: false,
+            mature_stability_days: MATURE_IVL as u32,
             language: Language::Chinese,
         }
     }
@@ -249,6 +259,12 @@ impl Settings {
             let _ = std::fs::remove_file(&tmp);
             format!("Cannot write {}: {e}", p.display())
         })
+    }
+
+    /// The stability threshold in days, if maturity is judged by stability.
+    pub fn stability_threshold(&self) -> Option<u32> {
+        self.mature_by_stability
+            .then_some(self.mature_stability_days.max(1))
     }
 
     pub fn has_selection(&self) -> bool {
@@ -613,13 +629,20 @@ impl Collection {
             }
         }
 
-        let mut summary = KnowledgeSummary::default();
+        let threshold = s.stability_threshold();
+        let mut summary = KnowledgeSummary {
+            mature_stability_days: threshold,
+            ..Default::default()
+        };
         let mut note_status: HashMap<i64, Status> = HashMap::new();
         if !deck_ids.is_empty() && !ords.is_empty() {
+            // FSRS stability is `s` in the card's data JSON (Anki 23.10+), present
+            // only on cards with an FSRS memory state; `data` is often empty.
             let mut st = self
                 .conn
                 .prepare(
-                    "SELECT c.nid, n.mid, CASE WHEN c.odid != 0 THEN c.odid ELSE c.did END, c.type, c.queue, c.ivl \
+                    "SELECT c.nid, n.mid, CASE WHEN c.odid != 0 THEN c.odid ELSE c.did END, c.type, c.queue, c.ivl, \
+                     CASE WHEN json_valid(c.data) THEN json_extract(c.data, '$.s') END \
                      FROM cards c JOIN notes n ON n.id = c.nid",
                 )
                 .map_err(sql_err)?;
@@ -632,11 +655,12 @@ impl Collection {
                         r.get::<_, i64>(3)?,
                         r.get::<_, i64>(4)?,
                         r.get::<_, i64>(5)?,
+                        r.get::<_, Option<f64>>(6).unwrap_or(None),
                     ))
                 })
                 .map_err(sql_err)?;
             for r in rows {
-                let (nid, mid, did, ctype, queue, ivl) = r.map_err(sql_err)?;
+                let (nid, mid, did, ctype, queue, ivl, stability) = r.map_err(sql_err)?;
                 if !deck_ids.contains(&did) || !ords.contains_key(&mid) {
                     continue;
                 }
@@ -644,7 +668,11 @@ impl Collection {
                     summary.suspended_excluded += 1;
                     continue;
                 }
-                let cs = card_status(ctype, ivl);
+                let (mature, by_interval) = is_mature(ivl, stability, threshold);
+                if by_interval && ctype == 2 {
+                    summary.no_stability += 1;
+                }
+                let cs = card_status(ctype, mature);
                 summary.cards.add(cs, 1);
                 let e = note_status.entry(nid).or_insert(Status::New);
                 *e = (*e).max(cs);
@@ -825,10 +853,22 @@ fn remove_stale_copies(tmp: &Path) {
     }
 }
 
-/// Anki card `type`: 0 new, 1 learning, 2 review, 3 relearning.
-fn card_status(ctype: i64, ivl: i64) -> Status {
+/// Whether a review card counts as mature: by FSRS stability when `threshold`
+/// is set and the card has one, otherwise by Anki's interval rule. The second
+/// value is true when a stability threshold was set but the card had none.
+fn is_mature(ivl: i64, stability: Option<f64>, threshold: Option<u32>) -> (bool, bool) {
+    match (threshold, stability) {
+        (Some(t), Some(s)) => (s >= t as f64, false),
+        (Some(_), None) => (ivl >= MATURE_IVL, true),
+        (None, _) => (ivl >= MATURE_IVL, false),
+    }
+}
+
+/// Anki card `type`: 0 new, 1 learning, 2 review, 3 relearning. `mature`
+/// only matters for review cards.
+fn card_status(ctype: i64, mature: bool) -> Status {
     match ctype {
-        2 if ivl >= MATURE_IVL => Status::Mature,
+        2 if mature => Status::Mature,
         2 => Status::Young,
         1 | 3 => Status::Learning,
         _ => Status::New,
@@ -949,6 +989,11 @@ pub struct KnowledgeSummary {
     pub segmenter: Option<SegmenterKind>,
     pub cards: ByStatus,
     pub suspended_excluded: u64,
+    /// Mature at this FSRS stability (days); `None`: at an interval of 21+ days.
+    pub mature_stability_days: Option<u32>,
+    /// Review cards judged by interval because they have no FSRS stability
+    /// (only counted with a stability threshold).
+    pub no_stability: u64,
     /// Distinct words (Han runs) by status.
     pub words: ByStatus,
     /// Distinct characters by status.
@@ -1287,12 +1332,59 @@ mod tests {
 
     #[test]
     fn statuses() {
-        assert_eq!(card_status(2, 21), Status::Mature);
-        assert_eq!(card_status(2, 20), Status::Young);
-        assert_eq!(card_status(3, 30), Status::Learning);
-        assert_eq!(card_status(1, 0), Status::Learning);
-        assert_eq!(card_status(0, 0), Status::New);
+        let by_ivl = |t, ivl| card_status(t, is_mature(ivl, None, None).0);
+        assert_eq!(by_ivl(2, 21), Status::Mature);
+        assert_eq!(by_ivl(2, 20), Status::Young);
+        assert_eq!(by_ivl(3, 30), Status::Learning);
+        assert_eq!(by_ivl(1, 0), Status::Learning);
+        assert_eq!(by_ivl(0, 0), Status::New);
         assert!(Status::Young.is_known() && !Status::Learning.is_known());
+    }
+
+    #[test]
+    fn maturity_by_stability() {
+        // Interval rule: stability is ignored.
+        assert_eq!(is_mature(21, Some(5.0), None), (true, false));
+        // Stability rule: a long interval at low desired retention isn't enough…
+        assert_eq!(is_mature(40, Some(17.0), Some(21)), (false, false));
+        // …and a short one at high retention can be.
+        assert_eq!(is_mature(10, Some(21.0), Some(21)), (true, false));
+        // No FSRS data: the interval decides, and the fallback is reported.
+        assert_eq!(is_mature(30, None, Some(21)), (true, true));
+        assert_eq!(is_mature(5, None, Some(21)), (false, true));
+    }
+
+    #[test]
+    fn stability_settings_default_and_old_files() {
+        // Files saved before the option existed load with the interval rule.
+        let s: Settings = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+        assert!(!s.mature_by_stability);
+        assert_eq!(s.mature_stability_days, 21);
+        assert_eq!(s.stability_threshold(), None);
+        let s = Settings {
+            mature_by_stability: true,
+            mature_stability_days: 0,
+            ..Default::default()
+        };
+        assert_eq!(s.stability_threshold(), Some(1));
+    }
+
+    /// `json_extract` on Anki's `cards.data`: empty for non-FSRS cards.
+    #[test]
+    fn stability_sql() {
+        let c = Connection::open_in_memory().unwrap();
+        let q = |data: &str| -> Option<f64> {
+            c.query_row(
+                "SELECT CASE WHEN json_valid(?1) THEN json_extract(?1, '$.s') END",
+                [data],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(q(r#"{"s":23.5,"d":5.1,"dr":0.9}"#), Some(23.5));
+        assert_eq!(q(r#"{"pos":12}"#), None);
+        assert_eq!(q(""), None);
+        assert_eq!(q(r#"{"s":30}"#), Some(30.0));
     }
 
     #[test]

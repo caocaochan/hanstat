@@ -975,7 +975,7 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                     changed |= ui
                         .checkbox(&mut a.settings.include_suspended, "Count suspended cards")
-                        .on_hover_text("On: a suspended card counts by its interval. Off: suspended cards are ignored.")
+                        .on_hover_text("On: a suspended card counts like any other card. Off: suspended cards are ignored.")
                         .changed();
                     if lang == Language::Chinese {
                         changed |= ui
@@ -984,13 +984,34 @@ impl App {
                             .changed();
                     }
                 });
+                ui.horizontal_wrapped(|ui| {
+                    changed |= ui
+                        .checkbox(&mut a.settings.mature_by_stability, "Mature by FSRS stability")
+                        .on_hover_text(format!(
+                            "Off: a review card is mature at an interval of {} days or more (Anki's definition). The interval depends on desired retention: \
+                             at 90% it is about the stability, above 90% shorter, below 90% longer.\n\
+                             On: a review card is mature once its FSRS stability (the days until recall falls to 90%) reaches the value on the slider, \
+                             whatever the desired retention. Cards without FSRS data keep the interval rule.",
+                            anki::MATURE_IVL
+                        ))
+                        .changed();
+                    let r = ui.add_enabled(
+                        a.settings.mature_by_stability,
+                        egui::Slider::new(&mut a.settings.mature_stability_days, 1..=365)
+                            .logarithmic(true)
+                            .prefix("≥ ")
+                            .suffix(" days"),
+                    );
+                    // Reclassify once the drag ends, not on every frame of it.
+                    changed |= r.drag_stopped() || (r.changed() && !r.dragged());
+                });
                 if !a.settings.has_selection() {
                     ui.label(RichText::new("Select at least one deck and one field.").color(Color32::from_rgb(220, 170, 60)));
                 } else if let Some(k) = &a.knowledge {
                     let s = &k.summary;
                     ui.add_space(4.0);
                     ui.label(format!(
-                        "{} notes{}{}{}",
+                        "{} notes{}{}{}{}",
                         fmt_int(s.notes),
                         if s.notes_without_chinese > 0 {
                             format!(
@@ -1003,6 +1024,15 @@ impl App {
                         },
                         if s.suspended_excluded > 0 {
                             format!(", {} suspended cards ignored", fmt_int(s.suspended_excluded))
+                        } else {
+                            String::new()
+                        },
+                        if s.no_stability > 0 {
+                            format!(
+                                ", {} review cards have no FSRS stability and use the {}-day interval",
+                                fmt_int(s.no_stability),
+                                anki::MATURE_IVL
+                            )
                         } else {
                             String::new()
                         },
@@ -1023,10 +1053,19 @@ impl App {
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new(format!(
-                        "Young = review interval under {0} days, mature = {0}+ days (Anki's definitions). Learning and relearning cards are not counted as known. \
+                        "{0} Learning and relearning cards are not counted as known. \
                          {2} HTML, sound tags and [readings] are ignored. \
                          The collection is read from a temporary copy and never modified. Choices are saved to {1}, separately for each language.",
-                        anki::MATURE_IVL,
+                        match a.settings.stability_threshold() {
+                            None => format!(
+                                "Young = review interval under {0} days, mature = {0}+ days (Anki's definitions).",
+                                anki::MATURE_IVL
+                            ),
+                            Some(t) => format!(
+                                "Mature = review card with FSRS stability of {t}+ days, young = below that (cards without FSRS data: interval of {}+ days).",
+                                anki::MATURE_IVL
+                            ),
+                        },
                         anki::Settings::path_for(lang).display(),
                         match lang {
                             Language::Chinese => "A ticked field holding a word counts as that word; one holding a sentence is split into words with the book's segmenter.",
@@ -2935,7 +2974,7 @@ const KOREAN_METHOD: &[&str] = &[
     "TXT: encoding from BOM, strict UTF-8 validation, UTF-16 statistics, then chardetng (EUC-KR is read as CP949). Hard-wrapped lines are joined with a space. Chapter headings like 제1장, 12화, 프롤로그 and 외전 start sections.",
     "Sentences end at . ? ! … (a full stop counts when a space, quote or the paragraph end follows) or the end of a paragraph.",
     "Coverage = the number of most-frequent distinct words whose occurrences add up to X% of all word occurrences.",
-    "Anki: the collection is copied (with its write-ahead log) to a temporary folder and read from there, so it works while Anki is open and is never modified. A review card is mature at an interval of 21+ days and young below that. Every ticked field is analysed with Kiwi and the user dictionary, so a card for 먹다 or 먹어요 matches the book's 먹다.",
+    "Anki: the collection is copied (with its write-ahead log) to a temporary folder and read from there, so it works while Anki is open and is never modified. A review card is mature at an interval of 21+ days and young below that, or, with \"Mature by FSRS stability\" on, at the chosen stability (cards without FSRS data keep the interval rule). Every ticked field is analysed with Kiwi and the user dictionary, so a card for 먹다 or 먹어요 matches the book's 먹다.",
 ];
 
 const METHOD: &[&str] = &[
@@ -2949,5 +2988,5 @@ const METHOD: &[&str] = &[
     "Script folding for the segmenter only: Traditional text is folded to Simplified for LTP/jieba (character-level), and Simplified text to Traditional for CKIP (OpenCC phrase-level, e.g. 以后→以後), matching each model's training script. The conversion is length-preserving and all counts and lists keep the original characters.",
     "Sentences end at 。！？!?… (runs count once) or the end of a paragraph; a sentence must contain a letter or digit.",
     "Coverage = the number of most-frequent distinct characters/words whose occurrences add up to X% of all occurrences.",
-    "Anki: the collection is copied (with its write-ahead log) to a temporary folder and read from there, so it works while Anki is open and is never modified. A review card is mature at an interval of 21+ days and young below that; learning and relearning cards are 'learning'. A note takes its best card's status in the selected decks, a word its best note's, and a character the best status of any known word containing it. A ticked field value with sentence punctuation is split into words with the book's segmenter and forced words, so its boundaries agree with the book's. Otherwise each run of Chinese characters is a word; runs longer than 4 characters (idioms, sayings) also count their segmented parts. Book words must match exactly (after optional Traditional→Simplified folding), so the segmenter's word boundaries matter.",
+    "Anki: the collection is copied (with its write-ahead log) to a temporary folder and read from there, so it works while Anki is open and is never modified. A review card is mature at an interval of 21+ days and young below that, or, with \"Mature by FSRS stability\" on, at the chosen stability (cards without FSRS data keep the interval rule); learning and relearning cards are 'learning'. A note takes its best card's status in the selected decks, a word its best note's, and a character the best status of any known word containing it. A ticked field value with sentence punctuation is split into words with the book's segmenter and forced words, so its boundaries agree with the book's. Otherwise each run of Chinese characters is a word; runs longer than 4 characters (idioms, sayings) also count their segmented parts. Book words must match exactly (after optional Traditional→Simplified folding), so the segmenter's word boundaries matter.",
 ];

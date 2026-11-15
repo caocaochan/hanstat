@@ -63,6 +63,8 @@ struct AnkiArgs {
     decks: Vec<String>,
     /// "Note type:Field"
     fields: Vec<String>,
+    /// Mature at this FSRS stability in days; 0 = Anki's interval rule.
+    mature_stability: Option<u32>,
 }
 
 /// Open the collection with `lang`'s saved settings plus command-line overrides.
@@ -135,6 +137,12 @@ fn load_anki(
             s.set_field(nt, field, true);
         }
     }
+    if let Some(d) = a.mature_stability {
+        s.mature_by_stability = d > 0;
+        if d > 0 {
+            s.mature_stability_days = d;
+        }
+    }
     if a.list {
         println!("Collection: {}", path.display());
         println!("Decks (cards incl. subdecks; * = selected):");
@@ -198,7 +206,7 @@ fn print_anki_summary(k: &KnowledgeSummary, lang: Language) {
         )
     };
     println!(
-        "Anki: {} notes ({} with no {} in the chosen fields){}{}",
+        "Anki: {} notes ({} with no {} in the chosen fields){}{}{}",
         k.notes,
         k.notes_without_chinese,
         lang.name(),
@@ -206,6 +214,15 @@ fn print_anki_summary(k: &KnowledgeSummary, lang: Language) {
             format!(", {} suspended cards ignored", k.suspended_excluded)
         } else {
             String::new()
+        },
+        match k.mature_stability_days {
+            None => format!(", mature = interval {}+ days", anki::MATURE_IVL),
+            Some(t) if k.no_stability > 0 => format!(
+                ", mature = FSRS stability {t}+ days ({} review cards without FSRS data use interval {}+ days)",
+                k.no_stability,
+                anki::MATURE_IVL
+            ),
+            Some(t) => format!(", mature = FSRS stability {t}+ days"),
         },
         match k.segmenter {
             Some(s) if k.sentences > 0 => {
@@ -351,6 +368,14 @@ fn main() {
                 ak.on = true;
                 ak.fields.extend(args.next());
             }
+            "--anki-mature-stability" => {
+                ak.on = true;
+                let v = args.next().unwrap_or_default();
+                ak.mature_stability = Some(v.parse().unwrap_or_else(|_| {
+                    eprintln!("--anki-mature-stability expects a number of days (0 = interval rule), got {v:?}");
+                    std::process::exit(2)
+                }));
+            }
             "--jieba" => kind = SegmenterKind::Jieba,
             "--ltp" => kind = SegmenterKind::Ltp,
             "--ckip" => kind = SegmenterKind::Ckip,
@@ -373,7 +398,7 @@ fn main() {
             "-h" | "--help" => {
                 eprintln!(
                     "usage: hanstat-cli <file.epub|file.txt> [--ckip|--ltp|--jieba] [--dict words.txt] [--json] [--top N] [--include-all] [--exclude i,j] [--chars-csv f] [--words-csv f] [--suggest N] [--auto-dict]\n\
-                     \x20      [--anki] [--anki-list] [--anki-collection collection.anki2] [--anki-deck NAME]... [--anki-field \"NOTE TYPE:FIELD\"]... [--anki-save]\n\
+                     \x20      [--anki] [--anki-list] [--anki-collection collection.anki2] [--anki-deck NAME]... [--anki-field \"NOTE TYPE:FIELD\"]... [--anki-mature-stability DAYS] [--anki-save]\n\
                      \x20      [--known] [--hsk N] [--known-list words.txt]... [--lang zh|ko]\n\
                      \n\
                      The book's language is detected: Korean books are analysed with Kiwi (downloaded on first use) and have word statistics only.\n\
@@ -382,6 +407,7 @@ fn main() {
                      These count as known together with young/mature Anki cards, or on their own without --anki.\n\
                      --anki uses the decks/note types/fields chosen in the hanstat window for the book's language (saved in {} / {}).\n\
                      --anki-deck/--anki-field replace that choice for this run (repeatable; a deck includes its subdecks); --anki-save keeps it.\n\
+                     --anki-mature-stability DAYS counts a review card as mature once its FSRS stability reaches DAYS instead of at an interval of 21+ days (0: interval rule).\n\
                      Without a file, --anki prints the collection summary only, for --lang (default zh).",
                     hanstat::known::Settings::path_for(Language::Chinese).display(),
                     hanstat::known::Settings::path_for(Language::Korean).display(),

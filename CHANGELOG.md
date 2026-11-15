@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **Mature by FSRS stability.** The Anki window has a **Mature by FSRS stability** option with a slider (1–365 days). When it's on, a review card is mature once its FSRS stability reaches that many days, instead of at Anki's interval of 21+ days. The interval depends on desired retention: at 90% it is about the stability, above 90% it is shorter and below 90% longer. Stability doesn't change with desired retention, so the same memory strength counts as mature in every preset. Cards with no FSRS data keep the interval rule, and the window says how many of them there are. The setting is saved per language with the rest of the Anki selection. CLI: `--anki-mature-stability DAYS`, where 0 means the interval rule. The JSON report's `anki` object gains `mature_stability_days` and `no_stability`.
+
 ## [0.7.1] - 2026-11-15
 
 ### Fixed

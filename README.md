@@ -27,7 +27,7 @@ Character counts are exact; word counts depend on the segmentation model. The de
 
 ## Anki
 
-Click **🃏 Anki**, tick your decks and the fields that hold the word (sentence fields work too), and hanstat shows which of the book's characters and words you already know, what share of the running text that covers, and a difficulty rating from it. Young and mature cards count as known. Your collection is only read from a copy, never modified.
+Click **🃏 Anki**, tick your decks and the fields that hold the word (sentence fields work too), and hanstat shows which of the book's characters and words you already know, what share of the running text that covers, and a difficulty rating from it. Young and mature cards count as known. Mature means an interval of 21+ days, as in Anki, or, if you use FSRS and tick **Mature by FSRS stability**, a stability of at least the days you set on the slider, which doesn't shift with desired retention. Your collection is only read from a copy, never modified.
 
 ## HSK levels and word lists
 
