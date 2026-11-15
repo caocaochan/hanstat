@@ -38,7 +38,12 @@ fn main() -> eframe::Result {
             .with_title("hanstat")
             .with_inner_size([1180.0, 800.0])
             .with_min_inner_size([760.0, 520.0])
-            .with_drag_and_drop(true),
+            .with_drag_and_drop(true)
+            // Same image as the exe's icon resource (build.rs, assets/icon.ico).
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+                    .expect("bundled icon is a valid PNG"),
+            ),
         // egui repaints on every WM_MOVE; with vsync each of those blocks the
         // OS move loop until vblank, so dragging the window stutters. egui
         // only repaints on demand, so dropping vsync costs nothing at idle.
