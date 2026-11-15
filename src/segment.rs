@@ -11,6 +11,9 @@
 //! CKIP) happens inside, character-for-character, so counts never see it.
 //! A user dictionary is applied to every back-end the same way: each match
 //! (leftmost-longest) on the original text becomes exactly one token.
+//! Known words (word lists, marked words) are applied more gently: a match
+//! only joins tokens the model split, and never cuts through a model token
+//! (see [`Segmenter::with_known`]).
 
 use crate::ckip::Ckip;
 use crate::kiwi;
@@ -134,6 +137,8 @@ pub struct Segmenter {
     backend: Backend,
     /// User dictionary, matched leftmost-longest on the original text.
     forced: Option<aho_corasick::AhoCorasick>,
+    /// Known words, matched overlapping; see [`Segmenter::with_known`].
+    known: Option<aho_corasick::AhoCorasick>,
     /// LTP/jieba: fold Traditional → Simplified for the model.
     fold_t2s: bool,
     /// CKIP: fold Simplified → Traditional for the model.
@@ -163,6 +168,7 @@ impl Segmenter {
                     kind,
                     backend: Backend::Kiwi(kiwi::shared(user_words)?),
                     forced: None,
+                    known: None,
                     fold_t2s: false,
                     fold_s2t: false,
                 });
@@ -187,9 +193,96 @@ impl Segmenter {
             kind,
             backend,
             forced,
+            known: None,
             fold_t2s,
             fold_s2t,
         })
+    }
+
+    /// Words the reader knows (NFC-normalised). Where the model split one into
+    /// several tokens, they are joined back into one, but only if the word
+    /// starts and ends on the model's own boundaries: 想/到 becomes 想到, while
+    /// 研究/生命 stays as it is although 研究生 is known. Each word is also
+    /// matched in its other script (T↔S), as known words are elsewhere.
+    /// Kiwi (Korean) returns dictionary forms, not slices, so it ignores them.
+    pub fn with_known(mut self, words: &[String]) -> Result<Self, String> {
+        if matches!(self.backend, Backend::Kiwi(_)) {
+            return Ok(self);
+        }
+        let mut pats: Vec<String> = words
+            .iter()
+            .filter(|w| w.chars().count() > 1)
+            .flat_map(|w| [w.clone(), script::fold_t2s(w), script::fold_s2t(w)])
+            .collect();
+        pats.sort_unstable();
+        pats.dedup();
+        self.known = if pats.is_empty() {
+            None
+        } else {
+            Some(aho_corasick::AhoCorasick::new(&pats).map_err(|e| format!("Known words: {e}"))?)
+        };
+        Ok(self)
+    }
+
+    /// Join model tokens that together spell a known word (see [`Self::with_known`]).
+    /// A word inside a longer one gives way to it (一口气 over 口气). Two that
+    /// partly overlap are both left alone, as the split there is ambiguous:
+    /// 地/点/头 with 地点 and 点头 known stays as the model cut it.
+    fn merge_known<'a>(&self, s: &'a str, toks: Vec<&'a str>) -> Vec<&'a str> {
+        let Some(ac) = &self.known else { return toks };
+        if toks.len() < 2 {
+            return toks;
+        }
+        let base = s.as_ptr() as usize;
+        let mut cut = vec![false; s.len() + 1];
+        for t in &toks {
+            cut[t.as_ptr() as usize - base] = true;
+        }
+        cut[s.len()] = true;
+        // Known words on model boundaries that span more than one token.
+        let mut cands: Vec<(usize, usize)> = ac
+            .find_overlapping_iter(s)
+            .map(|m| (m.start(), m.end()))
+            .filter(|&(a, b)| cut[a] && cut[b] && cut[a + 1..b].iter().any(|&c| c))
+            .collect();
+        if cands.is_empty() {
+            return toks;
+        }
+        // Keep the maximal ones (not inside another): sorted by start, then
+        // longest first, a candidate is maximal iff it ends past all before it.
+        cands.sort_unstable_by(|x, y| x.0.cmp(&y.0).then(y.1.cmp(&x.1)));
+        let mut maximal: Vec<(usize, usize)> = Vec::new();
+        for c in cands {
+            if maximal.last().is_none_or(|m| c.1 > m.1) {
+                maximal.push(c);
+            }
+        }
+        // Maximal ones have increasing starts and ends: only neighbours can overlap.
+        let mut best = vec![0usize; s.len() + 1];
+        let mut any = false;
+        for (i, &(a, b)) in maximal.iter().enumerate() {
+            let clash_prev = i > 0 && maximal[i - 1].1 > a;
+            let clash_next = maximal.get(i + 1).is_some_and(|n| n.0 < b);
+            if !clash_prev && !clash_next {
+                best[a] = b;
+                any = true;
+            }
+        }
+        if !any {
+            return toks;
+        }
+        let mut out = Vec::with_capacity(toks.len());
+        let mut start = 0;
+        for t in toks {
+            let a = t.as_ptr() as usize - base;
+            if a < start {
+                continue; // inside a merged word
+            }
+            let b = if best[a] > 0 { best[a] } else { a + t.len() };
+            out.push(&s[a..b]);
+            start = b;
+        }
+        out
     }
 
     /// Enforce user-dictionary words: each match becomes exactly one token
@@ -265,12 +358,12 @@ impl Segmenter {
                     } else {
                         c.split_inclusive(|_| true).collect()
                     };
-                    self.force(c, toks)
+                    self.force(c, self.merge_known(c, toks))
                 })
                 .collect(),
             _ => chunks
                 .iter()
-                .map(|c| self.force(c, self.cut_one(c)))
+                .map(|c| self.force(c, self.merge_known(c, self.cut_one(c))))
                 .collect(),
         }
     }
@@ -331,4 +424,90 @@ fn covers(s: &str, toks: &[&str]) -> bool {
         pos += t.len();
     }
     pos == s.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Byte offsets where `toks` (slices of `s`) start, plus the end.
+    fn cuts(s: &str, toks: &[&str]) -> Vec<usize> {
+        let base = s.as_ptr() as usize;
+        let mut v: Vec<usize> = toks.iter().map(|t| t.as_ptr() as usize - base).collect();
+        v.push(s.len());
+        v
+    }
+
+    #[test]
+    fn known_words_only_join_model_tokens() {
+        let s = "我们今天下午一起去图书馆看书，然后研究生命的起源问题。";
+        let plain = Segmenter::new(SegmenterKind::Jieba, &[], Variant::Simplified).unwrap();
+        let base = plain.cut_many(&[s]).pop().unwrap();
+        let i = base.iter().position(|t| t.chars().count() > 1).unwrap();
+        // Two adjacent model tokens spell a known word: joined.
+        let joined = format!("{}{}", base[i], base[i + 1]);
+        // A word that crosses a model boundary in the middle of a token: ignored.
+        let crossing = format!(
+            "{}{}",
+            base[i].chars().last().unwrap(),
+            base[i + 1].chars().next().unwrap()
+        );
+        let seg = Segmenter::new(SegmenterKind::Jieba, &[], Variant::Simplified)
+            .unwrap()
+            .with_known(&[joined.clone(), crossing.clone()])
+            .unwrap();
+        let out = seg.cut_many(&[s]).pop().unwrap();
+        assert!(covers(s, &out));
+        assert!(out.contains(&joined.as_str()), "{out:?}");
+        let (b, o) = (cuts(s, &base), cuts(s, &out));
+        assert!(
+            o.iter().all(|c| b.contains(c)),
+            "new boundary: {base:?} -> {out:?}"
+        );
+        assert_eq!(out.len(), base.len() - 1);
+    }
+
+    #[test]
+    fn overlapping_known_words_keep_model_split() {
+        let s = "我们今天下午一起去图书馆看书";
+        let plain = Segmenter::new(SegmenterKind::Jieba, &[], Variant::Simplified).unwrap();
+        let base = plain.cut_many(&[s]).pop().unwrap();
+        assert!(base.len() >= 4, "{base:?}");
+        let (x, y, z) = (base[1], base[2], base[3]);
+        let seg = Segmenter::new(SegmenterKind::Jieba, &[], Variant::Simplified)
+            .unwrap()
+            .with_known(&[
+                format!("{x}{y}"),
+                format!("{y}{z}"),
+                format!("{}{}", base[0], x),
+            ])
+            .unwrap();
+        // 0+1 and 1+2 clash, 1+2 and 2+3 clash: nothing joins.
+        assert_eq!(seg.cut_many(&[s]).pop().unwrap(), base);
+        // A word containing both wins over them.
+        let seg = Segmenter::new(SegmenterKind::Jieba, &[], Variant::Simplified)
+            .unwrap()
+            .with_known(&[format!("{x}{y}"), format!("{y}{z}"), format!("{x}{y}{z}")])
+            .unwrap();
+        let out = seg.cut_many(&[s]).pop().unwrap();
+        assert!(out.contains(&format!("{x}{y}{z}").as_str()), "{out:?}");
+    }
+
+    #[test]
+    fn known_words_match_other_script() {
+        let s = "她只看了一瞬间就走了";
+        let plain = Segmenter::new(SegmenterKind::Jieba, &[], Variant::Simplified).unwrap();
+        let base = plain.cut_many(&[s]).pop().unwrap();
+        let seg = Segmenter::new(SegmenterKind::Jieba, &[], Variant::Simplified)
+            .unwrap()
+            .with_known(&["一瞬間".to_owned()])
+            .unwrap();
+        let out = seg.cut_many(&[s]).pop().unwrap();
+        // Joined when jieba split it along its own boundaries.
+        let starts = cuts(s, &base);
+        let a = s.find("一瞬间").unwrap();
+        if starts.contains(&a) && starts.contains(&(a + "一瞬间".len())) {
+            assert!(out.contains(&"一瞬间"), "{base:?} -> {out:?}");
+        }
+    }
 }

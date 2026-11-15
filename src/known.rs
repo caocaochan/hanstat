@@ -220,6 +220,21 @@ impl Settings {
         .chain(self.marked.iter().map(String::as_str))
     }
 
+    /// The words given to the segmenter (imported lists and marked words, not
+    /// HSK), sorted and deduplicated so two sets compare equal.
+    pub fn segmenter_words(&self) -> Vec<String> {
+        let mut w: Vec<String> = self
+            .lists
+            .iter()
+            .flat_map(|l| l.words.iter())
+            .chain(&self.marked)
+            .cloned()
+            .collect();
+        w.sort_unstable();
+        w.dedup();
+        w
+    }
+
     /// "HSK 1–3 + 2 word lists + 15 marked".
     pub fn label(&self) -> String {
         let n = self.lists.iter().filter(|l| !l.words.is_empty()).count();

@@ -337,7 +337,6 @@ struct Job {
 /// lives in `App`'s own fields; the other one waits here.
 #[derive(Default)]
 struct LangData {
-    dict_path: Option<PathBuf>,
     user_words: Vec<String>,
     anki: AnkiState,
     known: KnownState,
@@ -353,7 +352,6 @@ struct App {
     /// The Chinese segmenter choice (a Korean book always uses Kiwi).
     segmenter: SegmenterKind,
     encoding: EncodingChoice,
-    dict_path: Option<PathBuf>,
     user_words: Vec<String>,
 
     book: Option<Arc<Book>>,
@@ -516,7 +514,6 @@ impl Default for App {
             stash: HashMap::new(),
             segmenter: SegmenterKind::Auto,
             encoding: EncodingChoice::Auto,
-            dict_path: None,
             user_words: Vec::new(),
             book: None,
             prep: None,
@@ -574,6 +571,14 @@ impl App {
             .map(|(l, d)| (*l, d.user_words.clone()))
             .collect();
         words_by_lang.insert(self.language, self.user_words.clone());
+        // Word lists and marked words join words the segmenter split; a
+        // language whose settings aren't loaded yet is read from disk.
+        let mut known_by_lang: HashMap<Language, Vec<String>> = self
+            .stash
+            .iter()
+            .map(|(l, d)| (*l, d.known.settings.segmenter_words()))
+            .collect();
+        known_by_lang.insert(self.language, self.known.settings.segmenter_words());
         // Reuse the already-extracted book if only segmentation options changed.
         let cached = self
             .book
@@ -588,6 +593,9 @@ impl App {
                 // First use of a model: download it (pinned + checksummed) with visible progress.
                 let lang = analyze::detect_language(&book);
                 let words = words_by_lang.remove(&lang).unwrap_or_default();
+                let known_words = known_by_lang
+                    .remove(&lang)
+                    .unwrap_or_else(|| known::Settings::load_for(lang).0.segmenter_words());
                 let (tr, si) = analyze::detect_variant(&book);
                 let resolved = kind.resolve_in(lang, hanstat::script::classify(tr, si));
                 if let Some(m) = hanstat::segment::model_for(resolved)
@@ -612,7 +620,7 @@ impl App {
                     Ordering::Relaxed,
                 );
                 let c2 = ctx.clone();
-                let prep = analyze::analyze_book(&book, kind, &words, &|d, _| {
+                let prep = analyze::analyze_book(&book, kind, &words, &known_words, &|d, _| {
                     d2.fetch_max(d, Ordering::Relaxed);
                     c2.request_repaint_after(std::time::Duration::from_millis(100));
                 })?;
@@ -697,7 +705,6 @@ impl App {
         }
         let (anki_window, known_window) = (self.anki.window, self.known.window);
         let current = LangData {
-            dict_path: self.dict_path.take(),
             user_words: std::mem::take(&mut self.user_words),
             anki: std::mem::take(&mut self.anki),
             known: std::mem::take(&mut self.known),
@@ -706,7 +713,6 @@ impl App {
         self.language = lang;
         match self.stash.remove(&lang) {
             Some(d) => {
-                self.dict_path = d.dict_path;
                 self.user_words = d.user_words;
                 self.anki = d.anki;
                 self.known = d.known;
@@ -1406,34 +1412,16 @@ impl eframe::App for App {
                     }
                 }
 
-                let dict_label = match (&self.dict_path, self.user_words.len()) {
-                    (Some(p), n) => format!("📖 {} ({n} words)", file_name(p)),
-                    (None, 0) => "📖 User dictionary…".to_owned(),
-                    (None, n) => format!("📖 {n} forced words"),
-                };
-                let dict_hover = match self.language {
-                    Language::Chinese => "Plain text, one word per line (names, terms). Forces these to be segmented as single words.",
-                    Language::Korean => "Plain text, one word per line (names, terms). Kiwi keeps these whole, as proper nouns. Kept separately from the Chinese dictionary.",
-                };
-                if ui
-                    .button(dict_label)
-                    .on_hover_text(dict_hover)
-                    .clicked()
-                    && let Some(p) = rfd::FileDialog::new().add_filter("Text", &["txt", "dict"]).pick_file()
-                {
-                    match hanstat::read_user_dict(&p) {
-                        Ok(w) => {
-                            self.user_words = w;
-                            self.dict_path = Some(p);
-                            self.rerun(&ctx, false);
-                        }
-                        Err(e) => self.error = Some(e),
+                if !self.user_words.is_empty() {
+                    let hover = match self.language {
+                        Language::Chinese => "Always segmented as single words. Added from the Suggested words tab.",
+                        Language::Korean => "Kiwi keeps these whole, as proper nouns. Added from the Suggested words tab; kept separately from the Chinese ones.",
+                    };
+                    ui.label(format!("📖 {} forced words", self.user_words.len())).on_hover_text(hover);
+                    if ui.small_button("✖").on_hover_text("Remove all forced words").clicked() {
+                        self.user_words.clear();
+                        self.rerun(&ctx, false);
                     }
-                }
-                if !self.user_words.is_empty() && ui.small_button("✖").on_hover_text("Remove all forced words").clicked() {
-                    self.dict_path = None;
-                    self.user_words.clear();
-                    self.rerun(&ctx, false);
                 }
 
                 ui.separator();
@@ -1640,6 +1628,7 @@ impl eframe::App for App {
             if korean && matches!(self.tab, Tab::Characters | Tab::Suggestions) {
                 self.tab = Tab::Overview;
             }
+            let tab_before = self.tab;
             ui.horizontal(|ui| {
                 for (t, name) in [
                     (Tab::Overview, "Overview"),
@@ -1655,6 +1644,14 @@ impl eframe::App for App {
                     ui.selectable_value(&mut self.tab, t, RichText::new(name).size(15.0));
                 }
             });
+            // Marking words or importing lists changes how the book is
+            // segmented; it's redone on returning to the Overview, not per click.
+            if self.tab == Tab::Overview
+                && tab_before != Tab::Overview
+                && self.known_resegment_due()
+            {
+                self.rerun(&ctx, false);
+            }
             ui.separator();
             match self.tab {
                 Tab::Overview => self.overview(ui),
@@ -1957,6 +1954,17 @@ impl App {
             self.known.error = Some(e);
         }
         self.refresh_anki_coverage();
+    }
+
+    /// True if the open Chinese book was segmented with other word lists or
+    /// marked words than the current ones.
+    fn known_resegment_due(&self) -> bool {
+        self.job.is_none()
+            && self.prep.as_ref().is_some_and(|p| {
+                p.language == Language::Chinese
+                    && p.language == self.language
+                    && p.known_words != self.known.settings.segmenter_words()
+            })
     }
 }
 
@@ -2923,6 +2931,12 @@ impl App {
                         r.user_words
                     ));
                 }
+                if r.known_words > 0 {
+                    ui.label(format!(
+                        "• Known words (word lists and marked words): {} used to join words the segmenter split, never cutting through one of its words. Changes apply on returning to the Overview.",
+                        fmt_int(r.known_words as u64)
+                    ));
+                }
                 ui.add_space(12.0);
                 ui.heading("Models");
                 for m in [
@@ -2984,7 +2998,7 @@ const METHOD: &[&str] = &[
     "TXT: encoding from BOM, strict UTF-8 validation, UTF-16 statistics, then chardetng (GBK is read as GB18030). Each line is a paragraph unless the file is detected as hard-wrapped.",
     "Words: there is no single correct segmentation of Chinese; different standards (PKU, CTB, MSR, AS) disagree on 5–15% of boundaries, and unique-word counts can differ by 20–40% between segmenters. Only tokens containing Chinese characters are counted as Chinese words. Character counts, by contrast, are exact.",
     "Segmenters (SIGHAN 2005 F1): LTP perceptron is best on Simplified text (MSR 87.7, PKU 95.2) and takes seconds; CKIP BERT is best on Traditional text (CityU 90.1, AS 97.9) and keeps character names together more consistently, but takes minutes per novel; jieba is fastest and least accurate (81–84). Auto picks LTP for Simplified and CKIP for Traditional.",
-    "Proper names are the main source of segmentation errors. Load a user dictionary (one word per line) to fix them; it applies to every segmenter.",
+    "Proper names are the main source of segmentation errors. Apply them from the Suggested words tab to force them as single words; forced words apply to every segmenter.",
     "Script folding for the segmenter only: Traditional text is folded to Simplified for LTP/jieba (character-level), and Simplified text to Traditional for CKIP (OpenCC phrase-level, e.g. 以后→以後), matching each model's training script. The conversion is length-preserving and all counts and lists keep the original characters.",
     "Sentences end at 。！？!?… (runs count once) or the end of a paragraph; a sentence must contain a letter or digit.",
     "Coverage = the number of most-frequent distinct characters/words whose occurrences add up to X% of all occurrences.",

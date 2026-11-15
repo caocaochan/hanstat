@@ -462,6 +462,11 @@ fn main() {
     let lang = analyze::detect_language(&book);
     let anki_col = open_anki(lang);
     let known_lists = ka.resolve(lang);
+    // Word lists and marked words also join words the segmenter split.
+    let seg_known: Vec<String> = known_lists
+        .as_ref()
+        .map(|k| k.segmenter_words())
+        .unwrap_or_default();
     let (tr, si) = analyze::detect_variant(&book);
     if let Some(m) =
         hanstat::segment::model_for(kind.resolve_in(lang, hanstat::script::classify(tr, si)))
@@ -478,10 +483,11 @@ fn main() {
             std::process::exit(1);
         }
     }
-    let prep = analyze::analyze_book(&book, kind, &words, &|_, _| {}).unwrap_or_else(|e| {
-        eprintln!("{e}");
-        std::process::exit(1)
-    });
+    let prep =
+        analyze::analyze_book(&book, kind, &words, &seg_known, &|_, _| {}).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1)
+        });
     let included: Vec<bool> = book
         .sections
         .iter()
@@ -511,10 +517,11 @@ fn main() {
             rec.join(" ")
         );
         words.extend(rec);
-        let prep = analyze::analyze_book(&book, kind, &words, &|_, _| {}).unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(1)
-        });
+        let prep = analyze::analyze_book(&book, kind, &words, &seg_known, &|_, _| {})
+            .unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(1)
+            });
         r = analyze::build_report(&book, &prep, &included);
     }
     let anki_k = anki_col.as_ref().map(|loaded| {

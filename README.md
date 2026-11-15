@@ -17,13 +17,15 @@ On first start the app downloads the word-segmentation models (LTP 32 MB, CKIP 4
 
 ## Korean
 
-hanstat detects the book's language: a book with more Hangul than Chinese characters is Korean. The badge at the right of the toolbar shows the mode (简体中文, 繁體中文 or 한국어). Korean books are analysed with [Kiwi](https://github.com/bab2min/Kiwi) and measured in words only. Words are counted in dictionary form: 먹었어요 counts as 먹다, 걸어서 as 걷다, and 공부했다 as 공부하다. Particles and endings aren't words. If Kiwi splits a character's name, add it to a user dictionary.
+hanstat detects the book's language: a book with more Hangul than Chinese characters is Korean. The badge at the right of the toolbar shows the mode (简体中文, 繁體中文 or 한국어). Korean books are analysed with [Kiwi](https://github.com/bab2min/Kiwi) and measured in words only. Words are counted in dictionary form: 먹었어요 counts as 먹다, 걸어서 as 걷다, and 공부했다 as 공부하다. Particles and endings aren't words. If Kiwi splits a character's name, apply it from the **Suggested words** tab.
 
 Anki decks and fields, word lists, marked words and the user dictionary are kept separately for Chinese and Korean. Korean settings are saved to `anki-ko.json` and `known-ko.json`. Every ticked Anki field is analysed with Kiwi, so a card for 먹다 or 먹어요 matches the book's 먹다. Korean word lists should hold dictionary forms. With no book open, click the badge to choose which language's settings the Anki and word-list windows show.
 
 ## Word segmentation
 
-Character counts are exact; word counts depend on the segmentation model. The default, **Auto**, uses LTP for Simplified and CKIP for Traditional text; jieba is available as a fast offline option. If names get split, add them to a user dictionary (one word per line), or apply the ones the **Suggested words** tab finds for you.
+Character counts are exact; word counts depend on the segmentation model. The default, **Auto**, uses LTP for Simplified and CKIP for Traditional text; jieba is available as a fast offline option. If names get split, apply the ones the **Suggested words** tab finds for you; they're then always segmented as single words.
+
+Words from your imported word lists and words you marked known (not the HSK levels) also guide segmentation in Chinese books. Where the segmenter split such a word into pieces, the pieces are joined back into one word (一/口/气 → 一口气). This applies everywhere the word appears, so a known word that is also a common phrase can be joined where the phrase was meant: with 个人 known, 一个人 reads as 一/个人. This only happens when the word starts and ends on the segmenter's own boundaries. It never cuts through a word the segmenter kept whole: 研究/生命 stays as it is even if 研究生 is on your list. If two known words overlap (地/点/头 with 地点 and 点头), neither is joined. After you mark words or import a list, the book is re-segmented when you return to the **Overview** tab.
 
 ## Anki
 

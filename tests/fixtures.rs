@@ -114,7 +114,7 @@ fn epub_adversarial() {
         ]
     );
 
-    let prep = analyze_book(&book, SegmenterKind::Jieba, &[], &|_, _| {}).unwrap();
+    let prep = analyze_book(&book, SegmenterKind::Jieba, &[], &[], &|_, _| {}).unwrap();
     let inc: Vec<bool> = book.sections.iter().map(|s| s.default_included()).collect();
     let r = build_report(&book, &prep, &inc);
     assert_eq!(r.han_total, 20);
@@ -150,7 +150,7 @@ fn traditional_segmentation_keeps_original_chars() {
     let text = format!("第一章 測試\n{}", para.repeat(10));
     let book = extract::txt::load(text.as_bytes(), EncodingChoice::Auto);
     for kind in SegmenterKind::ALL {
-        let prep = analyze_book(&book, kind, &[], &|_, _| {}).unwrap();
+        let prep = analyze_book(&book, kind, &[], &[], &|_, _| {}).unwrap();
         let r = build_report(&book, &prep, &vec![true; book.sections.len()]);
         assert_eq!(r.variant, hanstat::script::Variant::Traditional);
         let words: Vec<&str> = r.word_freq.iter().map(|(w, _)| w.as_str()).collect();
@@ -194,7 +194,7 @@ fn discovers_invented_name() {
         }
     }
     let book = extract::txt::load(text.as_bytes(), EncodingChoice::Auto);
-    let prep = analyze_book(&book, SegmenterKind::Ltp, &[], &|_, _| {}).unwrap();
+    let prep = analyze_book(&book, SegmenterKind::Ltp, &[], &[], &|_, _| {}).unwrap();
     let inc = vec![true; book.sections.len()];
     let r = build_report(&book, &prep, &inc);
     let found = hanstat::discover::discover(
@@ -228,7 +228,14 @@ fn korean_book_counts_dictionary_forms_only() {
     let book = extract::txt::load(text.as_bytes(), EncodingChoice::Auto);
     assert_eq!(hanstat::analyze::detect_language(&book), Language::Korean);
     // The Chinese segmenter choice is ignored: Korean always uses Kiwi.
-    let prep = analyze_book(&book, SegmenterKind::Jieba, &["하남".into()], &|_, _| {}).unwrap();
+    let prep = analyze_book(
+        &book,
+        SegmenterKind::Jieba,
+        &["하남".into()],
+        &[],
+        &|_, _| {},
+    )
+    .unwrap();
     assert_eq!(prep.language, Language::Korean);
     assert_eq!(prep.segmenter_kind, SegmenterKind::Kiwi);
     let r = build_report(&book, &prep, &vec![true; book.sections.len()]);
@@ -267,7 +274,7 @@ fn user_dictionary_merges_names() {
     let text = "温简言看向不远处的黑方小队。温简言笑了。\n";
     let book = extract::txt::load(text.as_bytes(), EncodingChoice::Auto);
     for kind in SegmenterKind::ALL {
-        let prep = analyze_book(&book, kind, &["温简言".into()], &|_, _| {}).unwrap();
+        let prep = analyze_book(&book, kind, &["温简言".into()], &[], &|_, _| {}).unwrap();
         let r = build_report(&book, &prep, &[true]);
         let n = r.word_freq.iter().find(|(w, _)| w == "温简言").map(|x| x.1);
         assert_eq!(n, Some(2), "{kind:?}: {:?}", r.word_freq);

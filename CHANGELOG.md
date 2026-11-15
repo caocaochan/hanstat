@@ -1,5 +1,13 @@
 # Changelog
 
+## [2026.11.15.1] - 2026-11-15
+
+### Added
+- **Known words guide segmentation.** In Chinese books, words from imported word lists and words marked known with **+** now join pieces the segmenter split (就/是 → 就是, 一/口/气 → 一口气), so they count as one known word. A word is joined only where it starts and ends on the segmenter's own boundaries, so it never cuts through a word the model kept whole. Where two known words overlap, neither is joined. HSK levels are not used. With HSK 1–6 as a word list, SIGHAN F1 changed by −0.2 (PKU, LTP), +0.04 (MSR, LTP) and −0.5 (AS, CKIP). Forcing the same words like a user dictionary scored 65–70. After you mark words or import a list, the book is re-segmented when you return to the **Overview** tab. The CLI applies `--known` and `--known-list` words the same way. `examples/known_eval.rs` reproduces the measurement.
+
+### Removed
+- The **User dictionary…** button. Forced words come from the **Suggested words** tab; the toolbar shows how many there are, with ✖ to clear them. The CLI's `--dict` is unchanged.
+
 ## [2026.11.15.0] - 2026-11-15
 
 ### Added

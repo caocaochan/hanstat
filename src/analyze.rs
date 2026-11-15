@@ -135,6 +135,9 @@ pub struct Prepared {
     pub folding_note: Option<&'static str>,
     pub stats: Vec<SectionStats>,
     pub user_words: usize,
+    /// The known words given to the segmenter, as passed in (Chinese only;
+    /// empty for Korean). Compared to see if the book needs re-segmenting.
+    pub known_words: Vec<String>,
 }
 
 /// Paragraphs per work unit: CKIP batches the chunks of one group together.
@@ -143,11 +146,14 @@ const GROUP: usize = 128;
 /// Full analysis of every section of the book (included or not). The
 /// language is detected from the text; a Korean book always uses Kiwi, and
 /// `kind` is the Chinese segmenter otherwise.
+/// `known_words` (word lists, marked words) join tokens the model split
+/// (see [`Segmenter::with_known`]); Korean books ignore them.
 /// `progress(done, total)` is called in paragraphs.
 pub fn analyze_book(
     book: &Book,
     kind: SegmenterKind,
     user_words: &[String],
+    known_words: &[String],
     progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Result<Prepared, String> {
     let language = detect_language(book);
@@ -163,7 +169,16 @@ pub fn analyze_book(
         .map(|w| chars::normalize(w.trim(), &mut norm_dummy))
         .filter(|w| !w.is_empty())
         .collect();
-    let seg = Segmenter::new(kind.resolve_in(language, variant), &words, variant)?;
+    let known: Vec<String> = match language {
+        Language::Chinese => known_words
+            .iter()
+            .map(|w| chars::normalize(w.trim(), &mut norm_dummy))
+            .filter(|w| !w.is_empty())
+            .collect(),
+        Language::Korean => Vec::new(),
+    };
+    let seg =
+        Segmenter::new(kind.resolve_in(language, variant), &words, variant)?.with_known(&known)?;
     let total: usize = book.sections.iter().map(|s| s.paragraphs.len()).sum();
     let done = std::sync::atomic::AtomicUsize::new(0);
     let stats = book
@@ -192,6 +207,10 @@ pub fn analyze_book(
         folding_note: seg.folding_note(),
         stats,
         user_words: words.len(),
+        known_words: match language {
+            Language::Chinese => known_words.to_vec(),
+            Language::Korean => Vec::new(),
+        },
     })
 }
 
@@ -357,6 +376,8 @@ pub struct Report {
     pub variant: Variant,
     pub folded_for_segmentation: bool,
     pub user_words: usize,
+    /// Known words given to the segmenter to join split words.
+    pub known_words: usize,
 
     pub han_total: u64,
     pub han_unique: usize,
@@ -545,6 +566,7 @@ pub fn build_report(book: &Book, prep: &Prepared, included: &[bool]) -> Report {
         variant: prep.variant,
         folded_for_segmentation: prep.folding_note.is_some(),
         user_words: prep.user_words,
+        known_words: prep.known_words.len(),
         han_total,
         han_unique: char_freq.len(),
         han_hapax: char_freq.iter().filter(|(_, n)| *n == 1).count(),
