@@ -4,6 +4,7 @@ pub mod chars;
 pub mod ckip;
 pub mod discover;
 pub mod extract;
+pub mod known;
 pub mod models;
 pub mod script;
 pub mod segment;

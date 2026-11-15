@@ -175,8 +175,22 @@ fn print_anki_summary(k: &KnowledgeSummary) {
 }
 
 fn print_coverage(c: &BookCoverage, top: usize) {
-    print_anki_summary(&c.anki);
-    // Known = on a young or mature card.
+    if c.from_anki {
+        print_anki_summary(&c.anki);
+    }
+    if !c.listed.source.is_empty() {
+        println!(
+            "Known from {}: {} words{}",
+            c.listed.source,
+            c.listed.words,
+            if c.from_anki {
+                format!(" ({} not young/mature in Anki)", c.listed.new_words)
+            } else {
+                String::new()
+            }
+        );
+    }
+    // Known = on a young or mature card, or in a known word list.
     for (label, k) in [
         ("Unique characters", &c.unique_chars),
         ("Unique words", &c.unique_words),
@@ -213,7 +227,7 @@ fn print_coverage(c: &BookCoverage, top: usize) {
         .take(top)
         .map(|(w, n)| format!("{w}:{n}"))
         .collect();
-    println!("Top words not young/mature: {}", tw.join(" "));
+    println!("Top words not known: {}", tw.join(" "));
 }
 
 fn main() {
@@ -230,8 +244,42 @@ fn main() {
     let mut suggest: Option<usize> = None;
     let mut auto_dict = false;
     let mut ak = AnkiArgs::default();
+    // HSK levels and word lists marked known (None: not used).
+    let mut known_lists: Option<hanstat::known::Settings> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--known" => {
+                let (s, warn) = hanstat::known::Settings::load();
+                if let Some(w) = warn {
+                    eprintln!("warning: {w}");
+                }
+                let k = known_lists.get_or_insert_with(Default::default);
+                for b in s.hsk {
+                    k.set_band(b, true);
+                }
+                k.lists.extend(s.lists);
+            }
+            "--hsk" => {
+                let n: u8 = match args.next().and_then(|s| s.parse().ok()) {
+                    Some(n @ 1..=9) => n.min(7),
+                    _ => {
+                        eprintln!("--hsk expects a level from 1 to 9 (7, 8 and 9 share one list)");
+                        std::process::exit(2)
+                    }
+                };
+                let k = known_lists.get_or_insert_with(Default::default);
+                for b in 1..=n {
+                    k.set_band(b, true);
+                }
+            }
+            "--known-list" => {
+                let p = PathBuf::from(args.next().unwrap_or_default());
+                let l = hanstat::known::read_word_list(&p).unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1)
+                });
+                known_lists.get_or_insert_with(Default::default).add_list(l);
+            }
             "--anki" => ak.on = true,
             "--anki-list" => ak.list = true,
             "--anki-save" => (ak.on, ak.save) = (true, true),
@@ -270,10 +318,15 @@ fn main() {
                 eprintln!(
                     "usage: hanstat-cli <file.epub|file.txt> [--ckip|--ltp|--jieba] [--dict words.txt] [--json] [--top N] [--include-all] [--exclude i,j] [--chars-csv f] [--words-csv f] [--suggest N] [--auto-dict]\n\
                      \x20      [--anki] [--anki-list] [--anki-collection collection.anki2] [--anki-deck NAME]... [--anki-field \"NOTE TYPE:FIELD\"]... [--anki-save]\n\
+                     \x20      [--known] [--hsk N] [--known-list words.txt]...\n\
                      \n\
+                     --known adds the HSK levels and word lists marked known in the hanstat window (saved in {}).\n\
+                     --hsk N marks HSK 3.0 (2025 syllabus) levels 1 to N known (7, 8, 9: all); --known-list adds a word list (one word per line).\n\
+                     These count as known together with young/mature Anki cards, or on their own without --anki.\n\
                      --anki uses the decks/note types/fields chosen in the hanstat window (saved in {}).\n\
                      --anki-deck/--anki-field replace that choice for this run (repeatable; a deck includes its subdecks); --anki-save keeps it.\n\
                      Without a file, --anki prints the collection summary only.",
+                    hanstat::known::Settings::path().display(),
                     hanstat::anki::Settings::path().display()
                 );
                 return;
@@ -369,11 +422,21 @@ fn main() {
         });
         r = analyze::build_report(&book, &prep, &included);
     }
-    if let Some(loaded) = &anki_col {
-        let k = anki_knowledge(
+    let anki_k = anki_col.as_ref().map(|loaded| {
+        anki_knowledge(
             loaded,
             &anki::SegConfig::new(kind, Some(book_segmenter), &words),
-        );
+        )
+    });
+    let fold = match &anki_col {
+        Some((_, s)) => s.match_across_scripts,
+        None => anki::Settings::load().0.match_across_scripts,
+    };
+    let known_k = match &known_lists {
+        Some(l) => l.apply(anki_k.as_ref(), fold),
+        None => anki_k,
+    };
+    if let Some(k) = known_k {
         // Names are left out of the difficulty: the user dictionary plus the
         // recommended discovered words, as the GUI does.
         let known: std::collections::HashSet<String> = words.iter().cloned().collect();

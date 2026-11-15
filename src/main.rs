@@ -6,6 +6,7 @@ use hanstat::analyze::{self, Prepared, Report};
 use hanstat::anki::{self, BookCoverage, ByStatus, Difficulty, Status};
 use hanstat::discover::{self, Candidate};
 use hanstat::extract::{self, Book, EncodingChoice, SectionKind};
+use hanstat::known;
 use hanstat::segment::SegmenterKind;
 use hanstat::update::{self, Release};
 use std::collections::HashSet;
@@ -357,6 +358,7 @@ struct App {
 
     anki: AnkiState,
     anki_filter: AnkiFilter,
+    known: KnownState,
     /// Grow the window to fit the Overview next time it is drawn.
     fit_pending: bool,
     /// Startup download of missing models.
@@ -371,7 +373,7 @@ struct App {
 
 enum AnkiMsg {
     Opened(Result<anki::Collection, String>),
-    Built(Result<anki::Knowledge, String>),
+    Built(Box<Result<anki::Knowledge, String>>),
 }
 
 #[derive(Default)]
@@ -393,6 +395,16 @@ struct AnkiState {
     built_with: Option<anki::SegConfig>,
 }
 
+/// HSK bands and word lists marked known (saved in known.json).
+#[derive(Default)]
+struct KnownState {
+    settings: known::Settings,
+    error: Option<String>,
+    window: bool,
+    /// Anki (if on) plus these lists: what the book is compared with.
+    merged: Option<Arc<anki::Knowledge>>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum AnkiFilter {
     #[default]
@@ -403,12 +415,13 @@ enum AnkiFilter {
 }
 
 impl AnkiFilter {
-    const OPTIONS: [AnkiFilter; 8] = [
+    const OPTIONS: [AnkiFilter; 9] = [
         AnkiFilter::All,
         AnkiFilter::NotKnown,
         AnkiFilter::Known,
         AnkiFilter::Is(Status::Mature),
         AnkiFilter::Is(Status::Young),
+        AnkiFilter::Is(Status::Listed),
         AnkiFilter::Is(Status::Learning),
         AnkiFilter::Is(Status::New),
         AnkiFilter::Is(Status::NotInAnki),
@@ -416,8 +429,8 @@ impl AnkiFilter {
     fn label(self) -> &'static str {
         match self {
             AnkiFilter::All => "All",
-            AnkiFilter::NotKnown => "Not young/mature",
-            AnkiFilter::Known => "Young or mature",
+            AnkiFilter::NotKnown => "Not known",
+            AnkiFilter::Known => "Known",
             AnkiFilter::Is(s) => s.label(),
         }
     }
@@ -435,6 +448,7 @@ fn status_colour(s: Status) -> Color32 {
     match s {
         Status::Mature => Color32::from_rgb(80, 170, 100),
         Status::Young => Color32::from_rgb(140, 200, 120),
+        Status::Listed => Color32::from_rgb(90, 180, 190),
         Status::Learning => Color32::from_rgb(220, 170, 60),
         Status::New => Color32::from_rgb(100, 150, 220),
         Status::NotInAnki => Color32::GRAY,
@@ -476,6 +490,7 @@ impl Default for App {
             selected: HashSet::new(),
             anki: AnkiState::default(),
             anki_filter: AnkiFilter::All,
+            known: KnownState::default(),
             fit_pending: false,
             models: None,
             fit_until: 0.0,
@@ -607,6 +622,10 @@ impl App {
         let (s, warn) = anki::Settings::load();
         self.anki.settings = s;
         self.anki.error = warn;
+        let (k, warn) = known::Settings::load();
+        self.known.settings = k;
+        self.known.error = warn;
+        self.refresh_anki_coverage();
         self.anki.profiles = anki::find_profiles();
         if self.anki.settings.enabled && self.anki.settings.collection.is_some() {
             self.anki_open(ctx);
@@ -664,7 +683,7 @@ impl App {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let col = col.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = tx.send(AnkiMsg::Built(col.knowledge(&s, &seg)));
+            let _ = tx.send(AnkiMsg::Built(Box::new(col.knowledge(&s, &seg))));
             ctx.request_repaint();
         });
         self.anki.rx = Some(rx);
@@ -707,18 +726,38 @@ impl App {
                 self.anki.col = Some(Arc::new(Mutex::new(c)));
                 self.anki_rebuild(ctx);
             }
-            AnkiMsg::Built(Ok(k)) => {
-                self.anki.knowledge = Some(Arc::new(k));
-                self.refresh_anki_coverage();
-                if std::mem::take(&mut self.anki.dirty) {
-                    self.anki_rebuild(ctx);
+            AnkiMsg::Built(b) => match *b {
+                Ok(k) => {
+                    self.anki.knowledge = Some(Arc::new(k));
+                    self.refresh_anki_coverage();
+                    if std::mem::take(&mut self.anki.dirty) {
+                        self.anki_rebuild(ctx);
+                    }
                 }
-            }
-            AnkiMsg::Opened(Err(e)) | AnkiMsg::Built(Err(e)) => self.anki.error = Some(e),
+                Err(e) => self.anki.error = Some(e),
+            },
+            AnkiMsg::Opened(Err(e)) => self.anki.error = Some(e),
         }
     }
 
     fn refresh_anki_coverage(&mut self) {
+        // Anki (if on) plus the HSK bands and word lists marked known.
+        let base = self
+            .anki
+            .knowledge
+            .as_deref()
+            .filter(|_| self.anki.settings.enabled);
+        self.known.merged = if self.known.settings.is_empty() {
+            self.anki
+                .knowledge
+                .clone()
+                .filter(|_| self.anki.settings.enabled)
+        } else {
+            self.known
+                .settings
+                .apply(base, self.anki.settings.match_across_scripts)
+                .map(Arc::new)
+        };
         // Names don't count against the difficulty: the user dictionary plus
         // the recommended Suggested words (once discovery has finished).
         let mut names: HashSet<String> = self.user_words.iter().cloned().collect();
@@ -731,12 +770,11 @@ impl App {
         );
         let Some(r) = &mut self.report else { return };
         let had = r.anki.is_some();
-        r.anki = match &self.anki.knowledge {
-            Some(k) if self.anki.settings.enabled => {
-                Some(BookCoverage::compute(k, &r.char_freq, &r.word_freq, &names))
-            }
-            _ => None,
-        };
+        r.anki = self
+            .known
+            .merged
+            .as_ref()
+            .map(|k| BookCoverage::compute(k, &r.char_freq, &r.word_freq, &names));
         if r.anki.is_none() {
             self.anki_filter = AnkiFilter::All;
         } else if !had {
@@ -1275,7 +1313,7 @@ impl eframe::App for App {
                             msg = save(&format!("{stem}-report.json"), "json", serde_json::to_string_pretty(r).unwrap());
                         }
                         if let Some(c) = &r.anki
-                            && ui.button("Words not young/mature in Anki, by frequency (TXT)…").clicked()
+                            && ui.button("Words not known, by frequency (TXT)…").clicked()
                         {
                             let list: Vec<&str> = r
                                 .word_freq
@@ -1303,6 +1341,20 @@ impl eframe::App for App {
                             ui.close();
                         }
                     });
+                }
+
+                ui.separator();
+                let label = if self.known.settings.is_empty() {
+                    "📚 HSK & word lists…".to_owned()
+                } else {
+                    format!("📚 Known: {}", self.known.settings.label())
+                };
+                if ui
+                    .selectable_label(self.known.window, label)
+                    .on_hover_text("Mark HSK 3.0 levels and imported word lists as known, in addition to your Anki cards")
+                    .clicked()
+                {
+                    self.known.window = !self.known.window;
                 }
             });
             ui.add_space(4.0);
@@ -1424,6 +1476,163 @@ impl eframe::App for App {
         if self.anki.window {
             self.anki_window(&ctx);
         }
+        if self.known.window {
+            self.known_window(&ctx);
+        }
+    }
+}
+
+impl App {
+    fn known_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.known.window;
+        let mut changed = false;
+        egui::Window::new("Known words: HSK & word lists")
+            .open(&mut open)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                let k = &mut self.known;
+                ui.strong("HSK 3.0 vocabulary");
+                ui.label(
+                    RichText::new(
+                        "《HSK 考试大纲》, released November 2025 (exams from July 2026). Tick each level whose new words you know; levels 7–9 share one list.",
+                    )
+                    .weak(),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    let mut cum = 0;
+                    for b in known::BANDS {
+                        let n = known::hsk_count(b);
+                        cum += n;
+                        let mut v = k.settings.band_on(b);
+                        if ui
+                            .checkbox(&mut v, format!("{} ({})", known::band_label(b), fmt_int(n as u64)))
+                            .on_hover_text(format!(
+                                "{} words introduced at this level; {} up to and including it",
+                                fmt_int(n as u64),
+                                fmt_int(cum as u64)
+                            ))
+                            .changed()
+                        {
+                            k.settings.set_band(b, v);
+                            changed = true;
+                        }
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("All up to:").weak());
+                    for b in known::BANDS {
+                        let short = known::band_label(b).trim_start_matches("HSK ");
+                        if ui.small_button(short).on_hover_text(format!("Tick HSK 1 to {short} only")).clicked() {
+                            k.settings.hsk = known::BANDS.iter().copied().filter(|x| *x <= b).collect();
+                            changed = true;
+                        }
+                    }
+                    if ui.small_button("None").clicked() && !k.settings.hsk.is_empty() {
+                        k.settings.hsk.clear();
+                        changed = true;
+                    }
+                });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.strong("Word lists");
+                    if ui.button("📂 Import TXT…").clicked()
+                        && let Some(paths) = rfd::FileDialog::new()
+                            .add_filter("Word lists", &["txt", "csv", "tsv"])
+                            .add_filter("All files", &["*"])
+                            .pick_files()
+                    {
+                        let mut errors = Vec::new();
+                        for p in paths {
+                            match known::read_word_list(&p) {
+                                Ok(l) => {
+                                    k.settings.add_list(l);
+                                    changed = true;
+                                }
+                                Err(e) => errors.push(e),
+                            }
+                        }
+                        k.error = (!errors.is_empty()).then(|| errors.join("\n"));
+                    }
+                });
+                let mut remove = None;
+                if k.settings.lists.is_empty() {
+                    ui.label(RichText::new("No lists imported.").weak());
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("known-lists")
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            egui::Grid::new("known-lists-grid").striped(true).spacing([16.0, 4.0]).show(ui, |ui| {
+                                for (i, l) in k.settings.lists.iter().enumerate() {
+                                    ui.label(&l.name).on_hover_text(l.path.display().to_string());
+                                    ui.label(format!("{} words", fmt_int(l.words.len() as u64)));
+                                    if ui.small_button("✖").on_hover_text("Remove this list").clicked() {
+                                        remove = Some(i);
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                        });
+                }
+                if let Some(i) = remove {
+                    k.settings.lists.remove(i);
+                    changed = true;
+                }
+                ui.label(
+                    RichText::new(
+                        "One word per line. The first item on a line that contains Chinese is used, so exports with pinyin or definitions after a tab, comma or space work; # starts a comment. \
+                         Lists are copied in: import a file again to update it.",
+                    )
+                    .weak()
+                    .small(),
+                );
+                if let Some(e) = &k.error {
+                    ui.colored_label(Color32::from_rgb(220, 80, 80), format!("⚠ {e}"));
+                }
+
+                ui.separator();
+                let anki_on = self.anki.settings.enabled && self.anki.knowledge.is_some();
+                match k.merged.as_ref().filter(|_| !k.settings.is_empty()) {
+                    Some(m) => {
+                        let l = &m.listed;
+                        ui.label(if anki_on {
+                            format!(
+                                "{} distinct words marked known; {} of them are not young/mature in Anki, adding {} characters.",
+                                fmt_int(l.words),
+                                fmt_int(l.new_words),
+                                fmt_int(l.new_chars)
+                            )
+                        } else {
+                            format!(
+                                "{} distinct words marked known ({} characters). Anki is off, so only these count.",
+                                fmt_int(l.words),
+                                fmt_int(l.new_chars)
+                            )
+                        });
+                    }
+                    None => {
+                        ui.label("Nothing marked known yet.");
+                    }
+                }
+                ui.label(
+                    RichText::new(format!(
+                        "These words count as known (\"Word list\" in the Characters and Words tabs) alongside young and mature Anki cards, and a character is known if it is in a known word. \
+                         Traditional ↔ Simplified matching follows the Anki window's option (now {}). Saved to {}.",
+                        if self.anki.settings.match_across_scripts { "on" } else { "off" },
+                        known::Settings::path().display()
+                    ))
+                    .weak()
+                    .small(),
+                );
+            });
+        self.known.window = open;
+        if changed {
+            if let Err(e) = self.known.settings.save() {
+                self.known.error = Some(e);
+            }
+            self.refresh_anki_coverage();
+        }
     }
 }
 
@@ -1474,7 +1683,7 @@ fn anki_filter_combo(ui: &mut egui::Ui, f: &mut AnkiFilter, available: bool) {
     if !available {
         return;
     }
-    ui.label("Anki:");
+    ui.label("Known:");
     egui::ComboBox::from_id_salt("anki-filter")
         .selected_text(f.label())
         .show_ui(ui, |ui| {
@@ -1614,7 +1823,12 @@ impl App {
             ui.add_space(10.0);
 
             if let Some(c) = &r.anki {
-                ui.heading("Known from Anki");
+                let lists = &c.listed.source;
+                ui.heading(match (c.from_anki, lists.is_empty()) {
+                    (true, true) => "Known from Anki".to_owned(),
+                    (true, false) => format!("Known from Anki + {lists}"),
+                    (false, _) => format!("Known from {lists}"),
+                });
                 ui.horizontal_wrapped(|ui| {
                     for (title, k) in [
                         ("Unique characters you know", &c.unique_chars),
@@ -1682,18 +1896,36 @@ impl App {
                         ui.label(
                             RichText::new(
                                 "Thresholds from L2 reading research: 98% coverage for comfortable reading of fiction (Hu & Nation 2000), 95% as the minimum for adequate comprehension (Laufer 1989). \
-                                 Words you know but have no Anki card for count as unknown, so the book may be easier than this.",
+                                 Words you know but have no Anki card for (and aren't in a ticked HSK level or word list) count as unknown, so the book may be easier than this.",
                             )
                             .weak()
                             .small(),
                         );
                     });
                 });
+                let anki_part = format!(
+                    "on a young or mature card in your selected decks ({} words, {} characters)",
+                    fmt_int(c.anki.words.known()),
+                    fmt_int(c.anki.chars.known()),
+                );
+                let list_part = format!(
+                    "in {} ({} words{})",
+                    lists,
+                    fmt_int(c.listed.words),
+                    if c.from_anki {
+                        format!(", {} not already known from Anki", fmt_int(c.listed.new_words))
+                    } else {
+                        String::new()
+                    }
+                );
+                let known_def = match (c.from_anki, lists.is_empty()) {
+                    (true, true) => anki_part,
+                    (true, false) => format!("{anki_part}, or {list_part}"),
+                    (false, _) => list_part,
+                };
                 ui.label(
                     RichText::new(format!(
-                        "Known = on a young or mature card in your selected decks ({} words, {} characters). A character is known if it appears in a known word. Hover the last two tiles for details.",
-                        fmt_int(c.anki.words.known()),
-                        fmt_int(c.anki.chars.known()),
+                        "Known = {known_def}. A character is known if it appears in a known word. Hover the last two tiles for details."
                     ))
                     .weak(),
                 );
@@ -1840,7 +2072,7 @@ impl App {
             .column(Column::exact(if status.is_some() { 100.0 } else { 0.0 }))
             .column(Column::remainder())
             .header(24.0, |mut h| {
-                let anki_h = if status.is_some() { "Anki" } else { "" };
+                let anki_h = if status.is_some() { "Status" } else { "" };
                 for t in [
                     "Rank",
                     "Char",
@@ -1919,7 +2151,7 @@ impl App {
             .column(Column::exact(if status.is_some() { 100.0 } else { 0.0 }))
             .column(Column::remainder())
             .header(24.0, |mut h| {
-                let anki_h = if status.is_some() { "Anki" } else { "" };
+                let anki_h = if status.is_some() { "Status" } else { "" };
                 for t in [
                     "Rank",
                     "Word",

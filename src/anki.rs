@@ -35,14 +35,18 @@ pub enum Status {
     NotInAnki,
     New,
     Learning,
+    /// Not young/mature in Anki, but in a ticked HSK band or an imported word
+    /// list (see `crate::known`). Counts as known.
+    Listed,
     Young,
     Mature,
 }
 
 impl Status {
-    pub const ALL: [Status; 5] = [
+    pub const ALL: [Status; 6] = [
         Status::Mature,
         Status::Young,
+        Status::Listed,
         Status::Learning,
         Status::New,
         Status::NotInAnki,
@@ -53,14 +57,16 @@ impl Status {
             Status::NotInAnki => "Not in Anki",
             Status::New => "New",
             Status::Learning => "Learning",
+            Status::Listed => "Word list",
             Status::Young => "Young",
             Status::Mature => "Mature",
         }
     }
 
-    /// Young or mature: what Anki considers successfully reviewed.
+    /// Young or mature (what Anki considers successfully reviewed), or in a
+    /// word list marked known.
     pub fn is_known(self) -> bool {
-        self >= Status::Young
+        self >= Status::Listed
     }
 }
 
@@ -72,6 +78,8 @@ pub struct ByStatus {
     pub learning: u64,
     pub new: u64,
     pub not_in_anki: u64,
+    /// Always 0 in an Anki summary.
+    pub listed: u64,
 }
 
 impl ByStatus {
@@ -80,6 +88,7 @@ impl ByStatus {
             Status::NotInAnki => &mut self.not_in_anki,
             Status::New => &mut self.new,
             Status::Learning => &mut self.learning,
+            Status::Listed => &mut self.listed,
             Status::Young => &mut self.young,
             Status::Mature => &mut self.mature,
         } += n;
@@ -90,18 +99,19 @@ impl ByStatus {
             Status::NotInAnki => self.not_in_anki,
             Status::New => self.new,
             Status::Learning => self.learning,
+            Status::Listed => self.listed,
             Status::Young => self.young,
             Status::Mature => self.mature,
         }
     }
 
     pub fn total(&self) -> u64 {
-        self.mature + self.young + self.learning + self.new + self.not_in_anki
+        self.mature + self.young + self.listed + self.learning + self.new + self.not_in_anki
     }
 
-    /// Mature + young.
+    /// Mature + young (+ listed).
     pub fn known(&self) -> u64 {
-        self.mature + self.young
+        self.mature + self.young + self.listed
     }
 }
 
@@ -710,6 +720,8 @@ impl Collection {
             chars: char_status,
             fold: s.match_across_scripts,
             summary,
+            from_anki: true,
+            listed: ListedSummary::default(),
         })
     }
 }
@@ -875,15 +887,71 @@ pub struct KnowledgeSummary {
     pub chars: ByStatus,
 }
 
+/// Words marked known from HSK bands and word lists (`crate::known`).
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ListedSummary {
+    /// What was marked known, e.g. "HSK 1–3 + 2 word lists"; empty if nothing.
+    pub source: String,
+    /// Distinct words in those lists (after Traditional → Simplified folding, if on).
+    pub words: u64,
+    /// Of those, words that were not young/mature in Anki.
+    pub new_words: u64,
+    /// Characters known only through those words.
+    pub new_chars: u64,
+}
+
+#[derive(Clone)]
 pub struct Knowledge {
     /// Keyed by the (optionally T→S folded) word.
     pub words: HashMap<String, Status>,
     pub chars: HashMap<char, Status>,
     pub fold: bool,
+    /// Anki's own counts (empty if Anki is off).
     pub summary: KnowledgeSummary,
+    /// Built from an Anki collection, not from word lists alone.
+    pub from_anki: bool,
+    pub listed: ListedSummary,
 }
 
 impl Knowledge {
+    /// Nothing known (for word lists without Anki).
+    pub fn empty(fold: bool) -> Self {
+        Knowledge {
+            words: HashMap::new(),
+            chars: HashMap::new(),
+            fold,
+            summary: KnowledgeSummary::default(),
+            from_anki: false,
+            listed: ListedSummary::default(),
+        }
+    }
+
+    /// Mark `words` known as [`Status::Listed`], keeping a better (young or
+    /// mature) Anki status. Their characters become known too.
+    pub fn add_listed<'a>(&mut self, words: impl IntoIterator<Item = &'a str>, source: String) {
+        let mut seen: HashSet<String> = HashSet::new();
+        for w in words {
+            let key = fold(w, self.fold);
+            if key.is_empty() || !seen.insert(key.clone()) {
+                continue;
+            }
+            for c in key.chars() {
+                let e = self.chars.entry(c).or_default();
+                if !e.is_known() {
+                    self.listed.new_chars += 1;
+                    *e = Status::Listed;
+                }
+            }
+            let e = self.words.entry(key).or_default();
+            if !e.is_known() {
+                self.listed.new_words += 1;
+                *e = Status::Listed;
+            }
+        }
+        self.listed.words += seen.len() as u64;
+        self.listed.source = source;
+    }
+
     pub fn word(&self, w: &str) -> Status {
         self.words
             .get(&fold(w, self.fold))
@@ -971,6 +1039,10 @@ impl Difficulty {
 #[derive(Clone, Debug, Serialize)]
 pub struct BookCoverage {
     pub anki: KnowledgeSummary,
+    /// Anki was on (otherwise only word lists count).
+    pub from_anki: bool,
+    /// Words marked known from HSK bands and word lists.
+    pub listed: ListedSummary,
     /// The book's distinct words that are known.
     pub unique_words: KnownCount,
     /// The book's distinct Chinese characters that are known.
@@ -1038,6 +1110,8 @@ impl BookCoverage {
         }
         BookCoverage {
             anki: k.summary.clone(),
+            from_anki: k.from_anki,
+            listed: k.listed.clone(),
             unique_words: count(&word_status),
             unique_chars: count(&char_status),
             running_words,
@@ -1120,6 +1194,8 @@ mod tests {
             chars: [('我', Status::Mature), ('看', Status::Young)].into(),
             fold: false,
             summary: KnowledgeSummary::default(),
+            from_anki: true,
+            listed: ListedSummary::default(),
         };
         let word_freq = vec![
             ("我".to_string(), 50),
@@ -1159,6 +1235,8 @@ mod tests {
                 .collect(),
             fold: true,
             summary: Default::default(),
+            from_anki: true,
+            listed: Default::default(),
         };
         assert_eq!(k.word("响彻"), Status::Mature);
         assert_eq!(k.word("響徹"), Status::Mature);
