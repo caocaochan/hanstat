@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.7.0] - 2026-11-15
 
 ### Added
 - **Korean books.** hanstat now detects the book's language. A book with more Hangul than Chinese characters is analysed as Korean with [Kiwi](https://github.com/bab2min/Kiwi), a Korean morphological analyser (Apache-2.0). Kiwi is downloaded from its GitHub release the first time you open a Korean book: 126 MB, pinned and checked by SHA-256. Korean books are measured in words only, with no character or syllable counts. Words are counted in dictionary form: irregular stems are restored (걸어서 → 걷다), predicates get 다 (먹었어요 → 먹다), and a noun plus 하 is one word (공부했다 → 공부하다). Particles and endings aren't counted. The Overview shows word totals, unique words, word coverage, sentence and paragraph length in words, and reading time in words per minute. The Characters and Suggested words tabs are hidden for Korean books. The user dictionary works for Korean too: Kiwi keeps its words whole as proper nouns.
