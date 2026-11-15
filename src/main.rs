@@ -739,8 +739,9 @@ impl App {
         let mut reopen = false;
         egui::Window::new("Anki")
             .open(&mut open)
-            .default_size([720.0, 560.0])
-            .vscroll(true)
+            .default_size([780.0, 680.0])
+            .min_height(420.0)
+            .vscroll(false)
             .show(ctx, |ui| {
                 let a = &mut self.anki;
                 changed |= ui
@@ -802,74 +803,11 @@ impl App {
                     ui.label("No Anki profiles found in %APPDATA%\\Anki2. Use Browse… to pick a collection.anki2.");
                 }
                 let Some(info) = a.info.clone() else { return };
-                ui.separator();
-                ui.columns(2, |cols| {
-                    let ui = &mut cols[0];
-                    ui.strong("Decks");
-                    ui.label(RichText::new("A deck includes its subdecks.").weak());
-                    egui::ScrollArea::vertical()
-                        .id_salt("anki-decks")
-                        .max_height(300.0)
-                        .show(ui, |ui| {
-                            for d in &info.decks {
-                                ui.horizontal(|ui| {
-                                    ui.add_space(d.depth() as f32 * 18.0);
-                                    let mut v = a.settings.deck_selected(d);
-                                    if ui
-                                        .checkbox(&mut v, format!("{}  ({} cards)", d.leaf(), d.cards))
-                                        .on_hover_text(&d.name)
-                                        .changed()
-                                    {
-                                        a.settings.set_deck(d, v);
-                                        a.settings.enabled = true;
-                                        changed = true;
-                                    }
-                                });
-                            }
-                        });
-
-                    let ui = &mut cols[1];
-                    ui.horizontal(|ui| {
-                        ui.strong("Note types → fields");
-                        ui.checkbox(&mut a.show_unused_types, "show unused");
-                    });
-                    ui.label(RichText::new("Tick the fields that hold the word (not sentences).").weak());
-                    egui::ScrollArea::vertical()
-                        .id_salt("anki-types")
-                        .max_height(300.0)
-                        .show(ui, |ui| {
-                            for nt in info
-                                .note_types
-                                .iter()
-                                .filter(|n| n.notes > 0 || a.show_unused_types)
-                            {
-                                let n_sel = nt
-                                    .fields
-                                    .iter()
-                                    .filter(|f| a.settings.field_selected(nt, f))
-                                    .count();
-                                let title = if n_sel > 0 {
-                                    RichText::new(format!("{}  ({} notes, {n_sel} field(s))", nt.name, nt.notes)).strong()
-                                } else {
-                                    RichText::new(format!("{}  ({} notes)", nt.name, nt.notes))
-                                };
-                                egui::CollapsingHeader::new(title)
-                                    .id_salt(("anki-nt", nt.id))
-                                    .default_open(n_sel > 0)
-                                    .show(ui, |ui| {
-                                        for f in &nt.fields {
-                                            let mut v = a.settings.field_selected(nt, f);
-                                            if ui.checkbox(&mut v, f).changed() {
-                                                a.settings.set_field(nt, f, v);
-                                                a.settings.enabled = true;
-                                                changed = true;
-                                            }
-                                        }
-                                    });
-                            }
-                        });
-                });
-                ui.separator();
+                // Options and results are pinned to the bottom; the deck and
+                // field lists get whatever height is left and scroll inside it.
+                egui::Panel::bottom("anki-bottom")
+                    .frame(egui::Frame::NONE.inner_margin(egui::Margin { top: 6, ..Default::default() }))
+                    .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     changed |= ui
                         .checkbox(&mut a.settings.include_suspended, "Count suspended cards")
@@ -921,6 +859,74 @@ impl App {
                     .weak()
                     .small(),
                 );
+                    });
+                egui::CentralPanel::no_frame().show(ui, |ui| {
+                ui.separator();
+                ui.columns(2, |cols| {
+                    let ui = &mut cols[0];
+                    ui.strong("Decks");
+                    ui.label(RichText::new("A deck includes its subdecks.").weak());
+                    egui::ScrollArea::vertical()
+                        .id_salt("anki-decks")
+                        .show(ui, |ui| {
+                            for d in &info.decks {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(d.depth() as f32 * 18.0);
+                                    let mut v = a.settings.deck_selected(d);
+                                    if ui
+                                        .checkbox(&mut v, format!("{}  ({} cards)", d.leaf(), d.cards))
+                                        .on_hover_text(&d.name)
+                                        .changed()
+                                    {
+                                        a.settings.set_deck(d, v);
+                                        a.settings.enabled = true;
+                                        changed = true;
+                                    }
+                                });
+                            }
+                        });
+
+                    let ui = &mut cols[1];
+                    ui.horizontal(|ui| {
+                        ui.strong("Note types → fields");
+                        ui.checkbox(&mut a.show_unused_types, "show unused");
+                    });
+                    ui.label(RichText::new("Tick the fields that hold the word (not sentences).").weak());
+                    egui::ScrollArea::vertical()
+                        .id_salt("anki-types")
+                        .show(ui, |ui| {
+                            for nt in info
+                                .note_types
+                                .iter()
+                                .filter(|n| n.notes > 0 || a.show_unused_types)
+                            {
+                                let n_sel = nt
+                                    .fields
+                                    .iter()
+                                    .filter(|f| a.settings.field_selected(nt, f))
+                                    .count();
+                                let title = if n_sel > 0 {
+                                    RichText::new(format!("{}  ({} notes, {n_sel} field(s))", nt.name, nt.notes)).strong()
+                                } else {
+                                    RichText::new(format!("{}  ({} notes)", nt.name, nt.notes))
+                                };
+                                egui::CollapsingHeader::new(title)
+                                    .id_salt(("anki-nt", nt.id))
+                                    .default_open(n_sel > 0)
+                                    .show(ui, |ui| {
+                                        for f in &nt.fields {
+                                            let mut v = a.settings.field_selected(nt, f);
+                                            if ui.checkbox(&mut v, f).changed() {
+                                                a.settings.set_field(nt, f, v);
+                                                a.settings.enabled = true;
+                                                changed = true;
+                                            }
+                                        }
+                                    });
+                            }
+                        });
+                });
+                });
             });
         self.anki.window = open;
         if reopen {
