@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.6.0] - 2026-11-15
 
 ### Added
 - **HSK levels and word lists as known words.** A new **📚 HSK & word lists** toolbar button opens a window with two parts. You can tick HSK 3.0 levels (1–6 and 7–9, from the 2025 《HSK 考试大纲》, bundled) and import `.txt` word lists. These words count as known alongside young and mature Anki cards, or on their own when Anki is off. They feed the Overview's known-word tiles and difficulty, the export of words you don't know, and the Characters and Words tabs, which show them with the status "Word list". A young or mature Anki status still takes precedence. Choices and imported lists are saved to `%LOCALAPPDATA%\hanstat\known.json`, so they persist between runs. The CLI gets `--known`, `--hsk N` and `--known-list FILE`.
