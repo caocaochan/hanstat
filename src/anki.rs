@@ -16,7 +16,8 @@
 //! `%LOCALAPPDATA%\hanstat\anki.json`, next to the `models` folder.
 
 use crate::chars;
-use crate::script;
+use crate::script::{self, Variant};
+use crate::segment::{Segmenter, SegmenterKind};
 use regex::Regex;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -327,6 +328,30 @@ pub struct CollectionInfo {
     pub note_types: Vec<NoteType>,
 }
 
+/// How sentence fields are split into words: the same segmenter and forced
+/// words as the book, so that Anki words and book words share boundaries.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct SegConfig {
+    /// `Auto` resolves by the script of the Anki sentences.
+    pub kind: SegmenterKind,
+    pub user_words: Vec<String>,
+}
+
+impl SegConfig {
+    /// The book's resolved segmenter if a book is analysed; otherwise the
+    /// chosen one, with Auto as LTP so that no large model is fetched just to
+    /// summarise a collection.
+    pub fn new(chosen: SegmenterKind, book: Option<SegmenterKind>, user_words: &[String]) -> Self {
+        SegConfig {
+            kind: book.unwrap_or(match chosen {
+                SegmenterKind::Auto => SegmenterKind::Ltp,
+                k => k,
+            }),
+            user_words: user_words.to_vec(),
+        }
+    }
+}
+
 /// Deletes the private copy when the collection is dropped.
 struct TempCopy(PathBuf);
 
@@ -494,8 +519,10 @@ impl Collection {
         })
     }
 
-    /// Classify every word and character in the selected fields.
-    pub fn knowledge(&self, s: &Settings) -> Result<Knowledge, String> {
+    /// Classify every word and character in the selected fields. Field values
+    /// that look like sentences are split into words with `seg`, which should
+    /// match the book's segmentation so that word boundaries agree.
+    pub fn knowledge(&self, s: &Settings, seg: &SegConfig) -> Result<Knowledge, String> {
         let info = &self.info;
         // Selected decks, including subdecks.
         let roots: Vec<&str> = s
@@ -578,6 +605,12 @@ impl Collection {
         }
 
         let mut words: HashMap<String, Status> = HashMap::new();
+        let mut add = |w: &str, st: Status| {
+            let e = words.entry(fold(w, s.match_across_scripts)).or_default();
+            *e = (*e).max(st);
+        };
+        // Sentences and long phrases, segmented together afterwards.
+        let mut to_segment: Vec<(String, Status)> = Vec::new();
         if !note_status.is_empty() {
             let mids: Vec<String> = ords.keys().map(|m| m.to_string()).collect();
             let mut st = self
@@ -601,17 +634,65 @@ impl Collection {
                 let mut any = false;
                 for &o in &ords[&mid] {
                     let Some(f) = parts.get(o) else { continue };
-                    for w in field_words(f, &mut norm) {
-                        any = true;
-                        let key = fold(&w, s.match_across_scripts);
-                        let e = words.entry(key).or_default();
-                        *e = (*e).max(ns);
+                    let text = clean_field(f, &mut norm);
+                    if han_runs(&text).next().is_none() {
+                        continue;
+                    }
+                    any = true;
+                    if looks_like_sentence(&text) {
+                        summary.sentences += 1;
+                        to_segment.push((text, ns));
+                    } else {
+                        for w in han_runs(&text) {
+                            add(w, ns);
+                            // An idiom or set phrase (睁一只眼闭一只眼): known as a
+                            // whole, and its parts are what the book's segmenter
+                            // will produce.
+                            if w.chars().count() > MAX_WORD_RUN {
+                                to_segment.push((w.to_owned(), ns));
+                            }
+                        }
                     }
                 }
                 if !any {
                     summary.notes_without_chinese += 1;
                 }
             }
+        }
+        if !to_segment.is_empty() {
+            let t = &*script::TABLES;
+            let (mut tr, mut si) = (0u64, 0u64);
+            for c in to_segment.iter().flat_map(|(x, _)| x.chars()) {
+                tr += t.trad_only.contains(&c) as u64;
+                si += t.simp_only.contains(&c) as u64;
+            }
+            // Small samples are "Unknown" to `classify`; the majority still tells
+            // the segmenter whether to fold Traditional for its model.
+            let variant = match script::classify(tr, si) {
+                Variant::Unknown if tr > si => Variant::Traditional,
+                Variant::Unknown if si > tr => Variant::Simplified,
+                v => v,
+            };
+            let mut nd = chars::NormStats::default();
+            let forced: Vec<String> = seg
+                .user_words
+                .iter()
+                .map(|w| chars::normalize(w.trim(), &mut nd))
+                .filter(|w| !w.is_empty())
+                .collect();
+            let segmenter = Segmenter::new(seg.kind, &forced, variant)?;
+            let mut chunks: Vec<&str> = Vec::new();
+            let mut chunk_status: Vec<Status> = Vec::new();
+            for (text, st) in &to_segment {
+                for r in han_runs(text) {
+                    chunks.push(r);
+                    chunk_status.push(*st);
+                }
+            }
+            for (toks, st) in segmenter.cut_many(&chunks).into_iter().zip(chunk_status) {
+                toks.into_iter().for_each(|w| add(w, st));
+            }
+            summary.segmenter = Some(segmenter.kind);
         }
         let mut char_status: HashMap<char, Status> = HashMap::new();
         for (w, &st) in &words {
@@ -688,10 +769,9 @@ static RE_BRACKET: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[[^\]]*\]").
 static RE_NUM_ENTITY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"&#(?:[xX]([0-9a-fA-F]+)|([0-9]+));").unwrap());
 
-/// The Chinese words in one field: HTML, cloze markup, sound tags and
-/// bracketed readings are removed, the text is NFC-normalised as book text is,
-/// and every maximal run of Han characters counts as one word.
-pub fn field_words(field: &str, norm: &mut chars::NormStats) -> Vec<String> {
+/// One field's text with HTML, cloze markup, sound tags and bracketed readings
+/// removed, NFC-normalised as book text is.
+pub fn clean_field(field: &str, norm: &mut chars::NormStats) -> String {
     let s = RE_CLOZE.replace_all(field, "$1");
     let s = RE_STYLE.replace_all(&s, " ");
     let s = RE_BLOCK.replace_all(&s, " ");
@@ -708,9 +788,51 @@ pub fn field_words(field: &str, norm: &mut chars::NormStats) -> Vec<String> {
             .map(String::from)
             .unwrap_or_default()
     });
-    let s = chars::normalize(&s, norm);
+    chars::normalize(&s, norm)
+}
+
+/// Maximal runs of Han characters.
+pub fn han_runs(s: &str) -> impl Iterator<Item = &str> {
     s.split(|c: char| !chars::is_han(c))
         .filter(|w| !w.is_empty())
+}
+
+/// Longest run that is only a word. Longer runs without punctuation (idioms,
+/// sayings) count as a word *and* are segmented, because the book's segmenter
+/// usually splits them too. Chengyu are 4 characters.
+const MAX_WORD_RUN: usize = 4;
+
+/// A value is a sentence (segmented only, never a word itself) if it has clause
+/// or sentence punctuation. List separators (、 ; / ·) don't count:
+/// "你好、再見" is two words.
+pub fn looks_like_sentence(text: &str) -> bool {
+    text.chars().any(|c| {
+        matches!(
+            c,
+            '。' | '，'
+                | '！'
+                | '？'
+                | '!'
+                | '?'
+                | '…'
+                | '：'
+                | '「'
+                | '」'
+                | '『'
+                | '』'
+                | '“'
+                | '”'
+                | '‘'
+                | '’'
+                | '《'
+                | '》'
+        )
+    })
+}
+
+/// The Chinese words in one word-like field (each run of Han characters is one word).
+pub fn field_words(field: &str, norm: &mut chars::NormStats) -> Vec<String> {
+    han_runs(&clean_field(field, norm))
         .map(str::to_owned)
         .collect()
 }
@@ -741,6 +863,10 @@ pub struct KnowledgeSummary {
     pub notes: u64,
     /// Of those, notes whose selected fields contain no Chinese characters.
     pub notes_without_chinese: u64,
+    /// Field values that looked like sentences and were split into words.
+    pub sentences: u64,
+    /// The segmenter used for them.
+    pub segmenter: Option<SegmenterKind>,
     pub cards: ByStatus,
     pub suspended_excluded: u64,
     /// Distinct words (Han runs) by status.
@@ -851,6 +977,19 @@ mod tests {
             field_words("<style>.x{content:'字'}</style>&#20320;好&nbsp;OK", &mut n),
             ["你好"]
         );
+    }
+
+    #[test]
+    fn sentence_detection() {
+        let mut n = chars::NormStats::default();
+        let s = |f: &str, n: &mut chars::NormStats| looks_like_sentence(&clean_field(f, n));
+        assert!(s("喀，喀，<b>跫音</b>響徹迴廊。", &mut n));
+        assert!(s("我很好。", &mut n));
+        assert!(!s("睁一只眼闭一只眼", &mut n));
+        assert!(!s("跫音", &mut n));
+        assert!(!s("<b>一路順風</b>", &mut n));
+        assert!(!s("你好、再見", &mut n));
+        assert!(!s("你好[nǐ hǎo]", &mut n));
     }
 
     #[test]

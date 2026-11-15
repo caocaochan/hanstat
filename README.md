@@ -9,7 +9,7 @@ Character and word statistics for Chinese `.epub` and `.txt` files, with countin
 
 Download `hanstat-vX.Y.Z-x86_64-pc-windows-msvc.zip` from [Releases](https://github.com/caocaochan/hanstat/releases/latest), unzip, and run `hanstat.exe`. Open a file, or drag it onto the window. The exe isn't code-signed, so Windows SmartScreen may ask you to confirm the first run. You can check the zip against its `.sha256` file.
 
-The segmentation models are **not bundled**, because their licences differ from this project's. The first time a model is needed, hanstat downloads it from its official Hugging Face repository:
+The segmentation models are **not bundled**, because their licences differ from this project's. On first start, and whenever a model is missing from the cache folder, the app downloads it in the background from its official Hugging Face repository, so it's ready before you need it. The status bar shows progress. The CLI downloads only the model a run needs. The models are:
 - LTP: 32 MB.
 - CKIP: 46 MB.
 
@@ -63,7 +63,7 @@ Click **🃏 Anki** and tick the decks and the fields that hold the word, for ex
 The Overview shows how many of the book's unique characters and unique words you know, where known means young or mature. The Anki window breaks your selection down by every status. The Words and Characters tabs get a status column and a filter (for example "Not young/mature"), and Export can save the book's unknown words in frequency order.
 
 - A note takes the best status of its cards in the selected decks.
-- Every run of Chinese characters in a ticked field is one word. HTML, cloze markup, `[sound:…]` and `[readings]` are stripped.
+- Sentence fields work. A field value with sentence punctuation (。，！？…「」) is split into words with the same segmenter and forced words as the book, so you count as knowing every word and character in your example sentences. Otherwise each run of Chinese characters is one word. Runs longer than 4 characters (idioms such as 睁一只眼闭一只眼) also count their segmented parts. HTML, cloze markup, `[sound:…]` and `[readings]` are stripped.
 - A character is known if it appears in a known word.
 - Traditional and Simplified are folded to Simplified on both sides before matching (you can turn this off).
 - Book words must match a card exactly, so the segmenter's word boundaries affect word coverage. Character coverage doesn't depend on them.

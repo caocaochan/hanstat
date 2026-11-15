@@ -20,8 +20,10 @@ struct AnkiArgs {
     fields: Vec<String>,
 }
 
-/// Saved settings plus command-line overrides. `None` if only listing.
-fn load_anki(a: &AnkiArgs) -> Result<Option<Knowledge>, String> {
+/// Open the collection with the saved settings plus command-line overrides.
+/// `None` if only listing. Classification happens later, once the book's
+/// segmenter is known (sentence fields are segmented like the book).
+fn load_anki(a: &AnkiArgs) -> Result<Option<(anki::Collection, anki::Settings)>, String> {
     let (mut s, warn) = anki::Settings::load();
     if let Some(w) = warn {
         eprintln!("warning: {w}");
@@ -130,7 +132,14 @@ fn load_anki(a: &AnkiArgs) -> Result<Option<Knowledge>, String> {
             anki::Settings::path().display()
         );
     }
-    col.knowledge(&s).map(Some)
+    Ok(Some((col, s)))
+}
+
+fn anki_knowledge(loaded: &(anki::Collection, anki::Settings), seg: &anki::SegConfig) -> Knowledge {
+    loaded.0.knowledge(&loaded.1, seg).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1)
+    })
 }
 
 fn print_anki_summary(k: &KnowledgeSummary) {
@@ -141,13 +150,23 @@ fn print_anki_summary(k: &KnowledgeSummary) {
         )
     };
     println!(
-        "Anki: {} notes ({} with no Chinese in the chosen fields){}",
+        "Anki: {} notes ({} with no Chinese in the chosen fields){}{}",
         k.notes,
         k.notes_without_chinese,
         if k.suspended_excluded > 0 {
             format!(", {} suspended cards ignored", k.suspended_excluded)
         } else {
             String::new()
+        },
+        match k.segmenter {
+            Some(s) if k.sentences > 0 => {
+                format!(
+                    ", {} sentences split into words ({})",
+                    k.sentences,
+                    s.label()
+                )
+            }
+            _ => String::new(),
         }
     );
     println!("  cards       {}", row(&k.cards));
@@ -244,14 +263,25 @@ fn main() {
             _ => file = Some(PathBuf::from(a)),
         }
     }
-    let knowledge = (ak.on || ak.list).then(|| {
+    let anki_col = if ak.on || ak.list {
         load_anki(&ak).unwrap_or_else(|e| {
             eprintln!("{e}");
             std::process::exit(1)
         })
-    });
+    } else {
+        None
+    };
+    let words = dict
+        .map(|d| {
+            hanstat::read_user_dict(&d).unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(1)
+            })
+        })
+        .unwrap_or_default();
     let Some(file) = file else {
-        if let Some(Some(k)) = &knowledge {
+        if let Some(loaded) = &anki_col {
+            let k = anki_knowledge(loaded, &anki::SegConfig::new(kind, None, &words));
             print_anki_summary(&k.summary);
             return;
         }
@@ -261,21 +291,12 @@ fn main() {
         eprintln!("no input file; see --help");
         std::process::exit(2);
     };
-    let knowledge = knowledge.flatten();
     let t0 = std::time::Instant::now();
     let book = extract::load(&file, EncodingChoice::Auto).unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1)
     });
     let t_load = t0.elapsed();
-    let words = dict
-        .map(|d| {
-            hanstat::read_user_dict(&d).unwrap_or_else(|e| {
-                eprintln!("{e}");
-                std::process::exit(1)
-            })
-        })
-        .unwrap_or_default();
     let (tr, si) = analyze::detect_variant(&book);
     if let Some(m) = hanstat::segment::model_for(kind.resolve(hanstat::script::classify(tr, si)))
         && !m.is_cached()
@@ -302,6 +323,7 @@ fn main() {
         .map(|(i, s)| !exclude.contains(&i) && (include_all || s.default_included()))
         .collect();
     let mut words = words;
+    let book_segmenter = prep.segmenter_kind;
     let mut r = analyze::build_report(&book, &prep, &included);
     if auto_dict {
         let known: std::collections::HashSet<String> = words.iter().cloned().collect();
@@ -329,8 +351,12 @@ fn main() {
         });
         r = analyze::build_report(&book, &prep, &included);
     }
-    if let Some(k) = &knowledge {
-        r.anki = Some(BookCoverage::compute(k, &r.char_freq, &r.word_freq));
+    if let Some(loaded) = &anki_col {
+        let k = anki_knowledge(
+            loaded,
+            &anki::SegConfig::new(kind, Some(book_segmenter), &words),
+        );
+        r.anki = Some(BookCoverage::compute(&k, &r.char_freq, &r.word_freq));
     }
     eprintln!("load {:?}, total {:?}", t_load, t0.elapsed());
 

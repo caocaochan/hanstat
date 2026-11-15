@@ -49,16 +49,7 @@ fn main() -> eframe::Result {
                 tab,
                 ..App::default()
             };
-            // Warm the LTP model in the background so the first analysis is fast.
-            // Warm already-downloaded models; never download unprompted.
-            std::thread::spawn(|| {
-                if hanstat::models::LTP.is_cached() {
-                    let _ = hanstat::segment::ltp_model();
-                }
-                if hanstat::models::CKIP.is_cached() {
-                    let _ = hanstat::segment::ckip_model();
-                }
-            });
+            app.models = fetch_models(&cc.egui_ctx);
             app.anki_init(&cc.egui_ctx);
             if let Some(p) = path {
                 app.start(p, cc.egui_ctx.clone());
@@ -115,6 +106,58 @@ enum JobMsg {
     Done(Result<Loaded, String>),
 }
 
+/// Background download of every model missing from the cache folder, started
+/// at launch so a segmenter is ready the moment it's needed.
+#[derive(Default)]
+struct ModelFetch {
+    done: AtomicUsize,
+    total: AtomicUsize,
+    current: Mutex<&'static str>,
+    errors: Mutex<Vec<String>>,
+    finished: std::sync::atomic::AtomicBool,
+}
+
+/// Download missing models (LTP first: it is the default and the smallest),
+/// then load every model into memory. `None` if nothing needs downloading.
+fn fetch_models(ctx: &egui::Context) -> Option<Arc<ModelFetch>> {
+    use hanstat::models::{CKIP, LTP};
+    let missing: Vec<&'static hanstat::models::Model> = [&LTP, &CKIP]
+        .into_iter()
+        .filter(|m| !m.is_cached())
+        .collect();
+    let state = Arc::new(ModelFetch::default());
+    state.total.store(
+        missing.iter().map(|m| m.total_size() as usize).sum(),
+        Ordering::Relaxed,
+    );
+    let (s, ctx) = (state.clone(), ctx.clone());
+    std::thread::spawn(move || {
+        let mut base = 0usize;
+        for m in &missing {
+            *s.current.lock().unwrap() = m.title;
+            let c = ctx.clone();
+            let res = m.ensure(&|d, _| {
+                s.done.store(base + d as usize, Ordering::Relaxed);
+                c.request_repaint_after(std::time::Duration::from_millis(100));
+            });
+            if let Err(e) = res {
+                s.errors.lock().unwrap().push(e);
+            }
+            base += m.total_size() as usize;
+        }
+        s.finished.store(true, Ordering::Relaxed);
+        ctx.request_repaint();
+        // Load into memory so the first analysis doesn't wait for it.
+        if LTP.is_cached() {
+            let _ = hanstat::segment::ltp_model();
+        }
+        if CKIP.is_cached() {
+            let _ = hanstat::segment::ckip_model();
+        }
+    });
+    (state.total.load(Ordering::Relaxed) != 0).then_some(state)
+}
+
 struct Job {
     rx: Receiver<JobMsg>,
     done: Arc<AtomicUsize>,
@@ -150,6 +193,15 @@ struct App {
 
     anki: AnkiState,
     anki_filter: AnkiFilter,
+    /// Grow the window to fit the Overview next time it is drawn.
+    fit_pending: bool,
+    /// Startup download of missing models.
+    models: Option<Arc<ModelFetch>>,
+    /// Keep fitting until this time: late content (the suggestions banner,
+    /// the Anki section) can still push the Overview down after the first frame.
+    fit_until: f64,
+    /// Inner height last asked for, so a resize still in flight isn't requested again.
+    fit_requested: f32,
 }
 
 enum AnkiMsg {
@@ -172,6 +224,8 @@ struct AnkiState {
     error: Option<String>,
     window: bool,
     show_unused_types: bool,
+    /// Segmentation used for the current (or running) classification.
+    built_with: Option<anki::SegConfig>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -257,6 +311,10 @@ impl Default for App {
             selected: HashSet::new(),
             anki: AnkiState::default(),
             anki_filter: AnkiFilter::All,
+            fit_pending: false,
+            models: None,
+            fit_until: 0.0,
+            fit_requested: 0.0,
         }
     }
 }
@@ -410,6 +468,15 @@ impl App {
         self.refresh_anki_coverage();
     }
 
+    /// Sentence fields are segmented like the current book.
+    fn anki_seg_config(&self) -> anki::SegConfig {
+        anki::SegConfig::new(
+            self.segmenter,
+            self.prep.as_ref().map(|p| p.segmenter_kind),
+            &self.user_words,
+        )
+    }
+
     fn anki_rebuild(&mut self, ctx: &egui::Context) {
         if self.anki.rx.is_some() {
             self.anki.dirty = true;
@@ -425,11 +492,13 @@ impl App {
         }
         self.anki.busy = "Classifying Anki notes…";
         let s = self.anki.settings.clone();
+        let seg = self.anki_seg_config();
+        self.anki.built_with = Some(seg.clone());
         let (tx, rx) = channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let col = col.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = tx.send(AnkiMsg::Built(col.knowledge(&s)));
+            let _ = tx.send(AnkiMsg::Built(col.knowledge(&s, &seg)));
             ctx.request_repaint();
         });
         self.anki.rx = Some(rx);
@@ -485,6 +554,7 @@ impl App {
 
     fn refresh_anki_coverage(&mut self) {
         let Some(r) = &mut self.report else { return };
+        let had = r.anki.is_some();
         r.anki = match &self.anki.knowledge {
             Some(k) if self.anki.settings.enabled => {
                 Some(BookCoverage::compute(k, &r.char_freq, &r.word_freq))
@@ -493,6 +563,9 @@ impl App {
         };
         if r.anki.is_none() {
             self.anki_filter = AnkiFilter::All;
+        } else if !had {
+            // The Anki section just appeared on the Overview.
+            self.fit_pending = true;
         }
     }
 
@@ -649,7 +722,7 @@ impl App {
                     let s = &k.summary;
                     ui.add_space(4.0);
                     ui.label(format!(
-                        "{} notes{}{}",
+                        "{} notes{}{}{}",
                         fmt_int(s.notes),
                         if s.notes_without_chinese > 0 {
                             format!(" ({} have no Chinese in the ticked fields)", fmt_int(s.notes_without_chinese))
@@ -660,6 +733,14 @@ impl App {
                             format!(", {} suspended cards ignored", fmt_int(s.suspended_excluded))
                         } else {
                             String::new()
+                        },
+                        match s.segmenter {
+                            Some(k) if s.sentences > 0 => format!(
+                                ", {} sentences split into words ({})",
+                                fmt_int(s.sentences),
+                                k.label()
+                            ),
+                            _ => String::new(),
                         }
                     ));
                     status_grid(ui, "anki-summary", &[("Cards", &s.cards), ("Words", &s.words), ("Characters", &s.chars)]);
@@ -668,7 +749,7 @@ impl App {
                 ui.label(
                     RichText::new(format!(
                         "Young = review interval under {0} days, mature = {0}+ days (Anki's definitions). Learning and relearning cards are not counted as known. \
-                         Each run of Chinese characters in a ticked field is one word; HTML, sound tags and [readings] are ignored. \
+                         A ticked field holding a word counts as that word; one holding a sentence is split into words with the book's segmenter. HTML, sound tags and [readings] are ignored. \
                          The collection is read from a temporary copy and never modified. Choices are saved to {1}.",
                         anki::MATURE_IVL,
                         anki::Settings::path().display()
@@ -697,6 +778,10 @@ impl App {
                     .filter(|c| c.recommended)
                     .map(|c| c.word.clone())
                     .collect();
+                // The Overview's "likely names" banner appears above the content.
+                if !self.selected.is_empty() {
+                    self.fit_pending = true;
+                }
                 self.suggestions = Some(v);
                 self.suggest_rx = None;
             }
@@ -723,7 +808,7 @@ impl App {
         self.rerun(ctx, false);
     }
 
-    fn poll_job(&mut self) {
+    fn poll_job(&mut self, ctx: &egui::Context) {
         let Some(job) = &self.job else { return };
         if let Ok(JobMsg::Done(res)) = job.rx.try_recv() {
             self.job = None;
@@ -741,6 +826,13 @@ impl App {
                     self.book = Some(l.book);
                     self.prep = Some(l.prep);
                     self.rebuild_report();
+                    self.fit_pending = true;
+                    // Anki sentences must be segmented like this book.
+                    if self.anki.col.is_some()
+                        && self.anki.built_with.as_ref() != Some(&self.anki_seg_config())
+                    {
+                        self.anki_rebuild(ctx);
+                    }
                 }
                 Err(e) => self.error = Some(e),
             }
@@ -751,7 +843,7 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.poll_job();
+        self.poll_job(&ctx);
         self.poll_suggestions(&ctx);
         self.poll_anki(&ctx);
 
@@ -928,6 +1020,37 @@ impl eframe::App for App {
                 } else {
                     ui.label("Open or drop an .epub or .txt file.");
                 }
+                if let Some(f) = &self.models {
+                    if !f.finished.load(Ordering::Relaxed) {
+                        let (d, t) = (
+                            f.done.load(Ordering::Relaxed),
+                            f.total.load(Ordering::Relaxed),
+                        );
+                        ui.separator();
+                        ui.spinner();
+                        ui.label(format!(
+                            "Downloading {} ({:.0} of {:.0} MB, first run only)",
+                            *f.current.lock().unwrap(),
+                            d as f64 / 1e6,
+                            t as f64 / 1e6
+                        ));
+                        ui.add(
+                            egui::ProgressBar::new(d as f32 / t.max(1) as f32)
+                                .desired_width(160.0)
+                                .show_percentage(),
+                        );
+                    } else {
+                        let errors = f.errors.lock().unwrap();
+                        if !errors.is_empty() {
+                            ui.separator();
+                            ui.colored_label(
+                                Color32::from_rgb(220, 170, 60),
+                                "⚠ Model download failed; it will be retried when the model is needed",
+                            )
+                            .on_hover_text(errors.join("\n\n"));
+                        }
+                    }
+                }
                 let now = ui.input(|i| i.time);
                 if let Some((m, until)) = &self.toast {
                     if now < *until {
@@ -988,6 +1111,49 @@ impl eframe::App for App {
             self.anki_window(&ctx);
         }
     }
+}
+
+/// Grow the window's inner height to `want` points, without going past the
+/// bottom of the screen (minus the taskbar). Never shrinks; does nothing when
+/// maximised or full-screen.
+fn grow_window(ctx: &egui::Context, want: f32) {
+    /// Windows' taskbar at 100–200% scaling is 40–48 points tall.
+    const TASKBAR: f32 = 48.0;
+    let (inner, outer, monitor, maxed) = ctx.input(|i| {
+        let v = i.viewport();
+        (
+            v.inner_rect,
+            v.outer_rect,
+            v.monitor_size,
+            v.maximized == Some(true) || v.fullscreen == Some(true),
+        )
+    });
+    let (Some(inner), Some(outer), Some(monitor)) = (inner, outer, monitor) else {
+        return;
+    };
+    if maxed {
+        return;
+    }
+    let chrome = (outer.height() - inner.height()).max(0.0);
+    let usable = monitor.y - TASKBAR;
+    let target = want.min(usable - chrome);
+    if target <= inner.height() + 1.0 {
+        return;
+    }
+    // Move the window up if growing would push it below the usable area. Only
+    // when its position looks like it is on the primary monitor (origin 0,0);
+    // otherwise just grow.
+    let bottom = outer.top() + chrome + target;
+    if outer.top() >= 0.0 && outer.top() < monitor.y && bottom > usable {
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+            outer.left(),
+            (usable - chrome - target).max(0.0),
+        )));
+    }
+    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+        inner.width(),
+        target,
+    )));
 }
 
 fn anki_filter_combo(ui: &mut egui::Ui, f: &mut AnkiFilter, available: bool) {
@@ -1096,7 +1262,7 @@ impl App {
             ui.add_space(4.0);
         }
         let r = self.report.as_ref().unwrap();
-        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+        let out = egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             if let Some(t) = &r.title {
                 ui.heading(t);
             }
@@ -1228,6 +1394,28 @@ impl App {
                 }
             });
         });
+        let ctx = ui.ctx().clone();
+        let now = ctx.input(|i| i.time);
+        if std::mem::take(&mut self.fit_pending) {
+            self.fit_until = now + 3.0;
+            self.fit_requested = 0.0;
+        }
+        // Measure only on frames egui will actually show (not sizing passes).
+        if now < self.fit_until && !ctx.will_discard() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            let overflow = out.content_size.y - out.inner_rect.height();
+            let inner_h = ctx.input(|i| i.viewport().inner_rect.map(|r| r.height()));
+            if overflow > 0.5
+                && let Some(h) = inner_h
+            {
+                let want = h + overflow.ceil() + 4.0;
+                // A resize already requested may not have landed yet.
+                if want > self.fit_requested + 1.0 {
+                    self.fit_requested = want;
+                    grow_window(&ctx, want);
+                }
+            }
+        }
     }
 
     fn char_table(&mut self, ui: &mut egui::Ui) {
@@ -1682,5 +1870,5 @@ const METHOD: &[&str] = &[
     "Script folding for the segmenter only: Traditional text is folded to Simplified for LTP/jieba (character-level), and Simplified text to Traditional for CKIP (OpenCC phrase-level, e.g. 以后→以後), matching each model's training script. The conversion is length-preserving and all counts and lists keep the original characters.",
     "Sentences end at 。！？!?… (runs count once) or the end of a paragraph; a sentence must contain a letter or digit.",
     "Coverage = the number of most-frequent distinct characters/words whose occurrences add up to X% of all occurrences.",
-    "Anki: the collection is copied (with its write-ahead log) to a temporary folder and read from there, so it works while Anki is open and is never modified. A review card is mature at an interval of 21+ days and young below that; learning and relearning cards are 'learning'. A note takes its best card's status in the selected decks, a word its best note's, and a character the best status of any known word containing it. Each run of Chinese characters in a ticked field is one word, and book words must match it exactly (after optional Traditional→Simplified folding), so the segmenter's word boundaries matter.",
+    "Anki: the collection is copied (with its write-ahead log) to a temporary folder and read from there, so it works while Anki is open and is never modified. A review card is mature at an interval of 21+ days and young below that; learning and relearning cards are 'learning'. A note takes its best card's status in the selected decks, a word its best note's, and a character the best status of any known word containing it. A ticked field value with sentence punctuation is split into words with the book's segmenter and forced words, so its boundaries agree with the book's. Otherwise each run of Chinese characters is a word; runs longer than 4 characters (idioms, sayings) also count their segmented parts. Book words must match exactly (after optional Traditional→Simplified folding), so the segmenter's word boundaries matter.",
 ];
