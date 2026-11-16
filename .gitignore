@@ -1,4 +1,8 @@
 /target
-# Local model copies (the app downloads models to %LOCALAPPDATA%\hanstat\models)
+# Local model copies (the app downloads models to %LOCALAPPDATA%\hanstat\models;
+# CI and local test runs use HANSTAT_MODEL_DIR=.models)
 /models/
+/.models/
+# macos/bundle.sh output
+/dist/
 *.part

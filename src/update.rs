@@ -2,11 +2,18 @@
 //!
 //! The latest release is looked up through the GitHub API. Its zip is
 //! downloaded into memory and checked against the release's `.sha256` file.
-//! Then each file in it replaces the one next to the running exe. Windows
-//! lets a running exe be renamed but not overwritten, so the old file is
-//! renamed to `<name>.<pid>.hanstat-old` first and deleted at the next start.
+//! On Windows each file in it then replaces the one next to the running exe.
+//! Windows lets a running exe be renamed but not overwritten, so the old file
+//! is renamed to `<name>.<pid>.hanstat-old` first and deleted at the next start.
 //! Every rename is rolled back if any step fails, so a failed update leaves the
 //! old version in place.
+//!
+//! On macOS (from linlin56's PR #1) the zip holds `hanstat.app`, which
+//! replaces the whole bundle the running exe is in: it is unpacked next to it
+//! as `hanstat.app.hanstat-new`, the running bundle is renamed to
+//! `hanstat.app.<pid>.hanstat-old` (macOS keeps running a moved executable)
+//! and the new one takes its name. Writing new files rather than overwriting
+//! the running ones also keeps the kernel's cached code signature valid.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -102,9 +109,20 @@ struct ApiAsset {
     browser_download_url: String,
 }
 
-/// The Windows release zip's asset name. It has no version in it, so
-/// `.../releases/latest/download/<this>` is a permanent link.
+/// The release zip's asset name for this platform. It has no version in it,
+/// so `.../releases/latest/download/<this>` is a permanent link. Platforms
+/// without a release of their own never update (see [`disabled_reason`]).
+#[cfg(not(target_os = "macos"))]
 const ZIP_NAME: &str = "hanstat-x86_64-pc-windows-msvc.zip";
+#[cfg(target_os = "macos")]
+const ZIP_NAME: &str = "hanstat-aarch64-apple-darwin.zip";
+
+/// Whether this build's platform has a release to update to: Windows x64
+/// and Apple silicon. An Intel Mac must not install the arm64 app.
+const HAS_RELEASE: bool = cfg!(any(
+    all(windows, target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+));
 
 /// Parse the `releases/latest` API response. Asset URLs must point at this
 /// repository's own release downloads.
@@ -228,14 +246,14 @@ pub fn exe_path() -> Result<&'static Path, String> {
     .map_err(Clone::clone)
 }
 
-/// Why this copy shouldn't update itself, if it shouldn't: not Windows x64
-/// (the only release this installs), a debug build, a build run from Cargo's
-/// `target` folder, or `HANSTAT_NO_UPDATE` set. On macOS, replacing files
-/// inside the signed app bundle would also break its signature.
+/// Why this copy shouldn't update itself, if it shouldn't: a platform with
+/// no release (see [`HAS_RELEASE`]), a debug build, a build run from Cargo's
+/// `target` folder, `HANSTAT_NO_UPDATE` set, or on macOS an exe that isn't
+/// inside an `.app` bundle or that macOS runs from a read-only copy.
 pub fn disabled_reason() -> Option<String> {
-    if !cfg!(all(windows, target_arch = "x86_64")) {
+    if !HAS_RELEASE {
         return Some(
-            "Automatic updates are Windows-only. New versions are on hanstat's GitHub releases page."
+            "No release for this platform: updates are off. New versions are on hanstat's GitHub releases page."
                 .into(),
         );
     }
@@ -245,17 +263,90 @@ pub fn disabled_reason() -> Option<String> {
     if std::env::var_os("HANSTAT_NO_UPDATE").is_some() {
         return Some("HANSTAT_NO_UPDATE is set: updates are off.".into());
     }
-    match exe_path() {
-        Err(e) => Some(e),
-        Ok(p) => {
-            let in_target = p
-                .parent()
-                .and_then(Path::parent)
-                .and_then(Path::file_name)
-                .is_some_and(|n| n.eq_ignore_ascii_case("target"));
-            in_target.then(|| "Running from a Cargo build folder: updates are off.".into())
+    let p = match exe_path() {
+        Err(e) => return Some(e),
+        Ok(p) => p,
+    };
+    let in_target = p
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .is_some_and(|n| n.eq_ignore_ascii_case("target"));
+    if in_target {
+        return Some("Running from a Cargo build folder: updates are off.".into());
+    }
+    if cfg!(target_os = "macos") {
+        if bundle_of(p).is_none() {
+            return Some("Not running from hanstat.app: updates are off.".into());
+        }
+        if is_translocated(p) {
+            return Some(
+                "macOS is running hanstat from a read-only copy. Move hanstat.app to Applications to get updates."
+                    .into(),
+            );
         }
     }
+    None
+}
+
+/// Whether macOS runs this app through App Translocation: a quarantined app
+/// opened where it was unpacked runs from a randomised read-only mount, so
+/// the bundle there can't be replaced.
+fn is_translocated(exe: &Path) -> bool {
+    exe.components()
+        .any(|c| c.as_os_str() == std::ffi::OsStr::new("AppTranslocation"))
+}
+
+/// Held while [`clean_up_here`] or [`install_here`] work in the install
+/// folder: the startup clean-up deletes `*.hanstat-new`, which is exactly what
+/// an update installed meanwhile stages.
+static INSTALL_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Install a downloaded release zip over the running copy: the files next to
+/// the exe on Windows, the `.app` bundle on macOS.
+pub fn install_here(zip: &[u8]) -> Result<(), String> {
+    let _lock = INSTALL_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let exe = exe_path()?;
+    #[cfg(target_os = "macos")]
+    {
+        let bundle = bundle_of(exe)
+            .ok_or_else(|| format!("{} is not inside an .app bundle", exe.display()))?;
+        install_app(zip, bundle)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let (Some(dir), Some(name)) = (exe.parent(), exe.file_name()) else {
+            return Err(format!("Unexpected exe path {}", exe.display()));
+        };
+        install(zip, dir, &name.to_string_lossy())
+    }
+}
+
+/// Delete what an earlier update left next to the running copy (see [`clean_up`]).
+pub fn clean_up_here() {
+    let _lock = INSTALL_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(exe) = exe_path() else { return };
+    let dir = if cfg!(target_os = "macos") {
+        bundle_of(exe).and_then(Path::parent)
+    } else {
+        exe.parent()
+    };
+    if let Some(dir) = dir {
+        clean_up(dir);
+    }
+}
+
+/// The `.app` bundle an exe is in: `<name>.app/Contents/MacOS/<exe>`.
+fn bundle_of(exe: &Path) -> Option<&Path> {
+    let macos = exe
+        .parent()
+        .filter(|p| p.file_name() == Some("MacOS".as_ref()))?;
+    let contents = macos
+        .parent()
+        .filter(|p| p.file_name() == Some("Contents".as_ref()))?;
+    contents
+        .parent()
+        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("app")))
 }
 
 /// A plain file name that can safely be joined onto the install folder.
@@ -270,6 +361,7 @@ fn safe_file_name(name: &str) -> bool {
 /// The release's files: `(file name, contents)`. The zip holds one top-level
 /// folder (`hanstat/`; `hanstat-<tag>-<target>/` up to 0.3.1) with the files
 /// directly inside it. The folder's name doesn't matter here.
+#[cfg(any(not(target_os = "macos"), test))]
 fn release_files(zip: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
     let mut ar =
         zip::ZipArchive::new(Cursor::new(zip)).map_err(|e| format!("Bad release zip: {e}"))?;
@@ -317,6 +409,7 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 
 /// Install the release zip's files into `dir`. The zip's `hanstat.exe` is
 /// written as `gui_name` (the running exe's file name, in case it was renamed).
+#[cfg(any(not(target_os = "macos"), test))]
 pub fn install(zip: &[u8], dir: &Path, gui_name: &str) -> Result<(), String> {
     let mut files = release_files(zip)?;
     for (name, _) in &mut files {
@@ -389,8 +482,103 @@ pub fn install(zip: &[u8], dir: &Path, gui_name: &str) -> Result<(), String> {
     result
 }
 
-/// Delete files an earlier update left in `dir`. The previous exe is still
-/// running for a moment after the restart, so keep trying for a few seconds.
+/// The `hanstat.app` bundle's files in the release zip: `(path inside the
+/// bundle, contents, Unix mode)`. Anything outside `hanstat.app/` is ignored
+/// (`__MACOSX/` included); links and unsafe names are refused.
+#[cfg(any(target_os = "macos", test))]
+fn release_app_files(zip: &[u8]) -> Result<Vec<(PathBuf, Vec<u8>, u32)>, String> {
+    let bad = |e: zip::result::ZipError| format!("Bad release zip: {e}");
+    let mut ar = zip::ZipArchive::new(Cursor::new(zip)).map_err(bad)?;
+    let mut out = Vec::new();
+    for i in 0..ar.len() {
+        let mut f = ar.by_index(i).map_err(bad)?;
+        let name = f.name().map_err(bad)?.into_owned();
+        let parts: Vec<&str> = name.split('/').filter(|p| !p.is_empty()).collect();
+        let Some((&"hanstat.app", rest)) = parts.split_first() else {
+            continue;
+        };
+        if f.is_dir() || rest.is_empty() {
+            continue;
+        }
+        if f.is_symlink() {
+            return Err(format!("Release zip has a link: {name:?}"));
+        }
+        if !rest.iter().all(|p| safe_file_name(p)) {
+            return Err(format!("Release zip has an unsafe file name: {name:?}"));
+        }
+        if rest.last().is_some_and(|p| p.starts_with("._")) {
+            continue; // AppleDouble metadata, not part of the bundle
+        }
+        let mut data = Vec::with_capacity(f.size() as usize);
+        f.read_to_end(&mut data)
+            .map_err(|e| format!("Bad release zip ({name}): {e}"))?;
+        // Only two modes: executable (anything in Contents/MacOS, even if the
+        // zip lost its mode bits, or marked executable) or not. A zip written
+        // without Unix modes reports synthesised ones (0o775 for DOS entries).
+        let executable = rest.starts_with(&["Contents", "MacOS"])
+            || f.unix_mode().is_some_and(|m| m & 0o111 != 0);
+        let mode = if executable { 0o755 } else { 0o644 };
+        out.push((rest.iter().collect(), data, mode));
+    }
+    for needed in ["Contents/Info.plist", "Contents/MacOS/hanstat"] {
+        if !out.iter().any(|(p, ..)| p == Path::new(needed)) {
+            return Err(format!("Release zip has no hanstat.app/{needed}"));
+        }
+    }
+    Ok(out)
+}
+
+/// Replace the `bundle` (`…/hanstat.app`) with the release zip's
+/// `hanstat.app`. Either the new bundle is in place, or the old one is back
+/// and nothing is left behind but, at worst, a `.hanstat-new` folder that
+/// [`clean_up`] removes.
+#[cfg(any(target_os = "macos", test))]
+pub fn install_app(zip: &[u8], bundle: &Path) -> Result<(), String> {
+    let files = release_app_files(zip)?;
+    let err = |what: &str, p: &Path, e: std::io::Error| format!("{what} {}: {e}", p.display());
+    let new = with_suffix(bundle, NEW_SUFFIX);
+    let old = with_suffix(bundle, &format!("{}.{OLD_SUFFIX}", std::process::id()));
+
+    let unpack = || -> Result<(), String> {
+        if new.exists() {
+            std::fs::remove_dir_all(&new).map_err(|e| err("Cannot remove", &new, e))?;
+        }
+        for (rel, data, mode) in &files {
+            let dest = new.join(rel);
+            if let Some(d) = dest.parent() {
+                std::fs::create_dir_all(d).map_err(|e| err("Cannot create", d, e))?;
+            }
+            std::fs::write(&dest, data).map_err(|e| err("Cannot write", &dest, e))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perm = std::fs::Permissions::from_mode(*mode);
+                std::fs::set_permissions(&dest, perm).map_err(|e| err("Cannot set", &dest, e))?;
+            }
+            #[cfg(not(unix))]
+            let _ = mode;
+        }
+        Ok(())
+    };
+    if let Err(e) = unpack() {
+        let _ = std::fs::remove_dir_all(&new);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(bundle, &old) {
+        let _ = std::fs::remove_dir_all(&new);
+        return Err(err("Cannot move aside", bundle, e));
+    }
+    if let Err(e) = std::fs::rename(&new, bundle) {
+        let _ = std::fs::rename(&old, bundle);
+        let _ = std::fs::remove_dir_all(&new);
+        return Err(err("Cannot replace", bundle, e));
+    }
+    Ok(())
+}
+
+/// Delete files (macOS: bundles) an earlier update left in `dir`. The
+/// previous exe is still running for a moment after the restart, so keep
+/// trying for a few seconds.
 pub fn clean_up(dir: &Path) {
     for _ in 0..40 {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -403,7 +591,13 @@ pub fn clean_up(dir: &Path) {
             if name.ends_with(&format!(".{OLD_SUFFIX}"))
                 || name.ends_with(&format!(".{NEW_SUFFIX}"))
             {
-                left |= std::fs::remove_file(e.path()).is_err();
+                // `file_type` doesn't follow links: a link is removed, never
+                // what it points to.
+                let removed = match e.file_type() {
+                    Ok(t) if t.is_dir() => std::fs::remove_dir_all(e.path()),
+                    _ => std::fs::remove_file(e.path()),
+                };
+                left |= removed.is_err();
             }
         }
         if !left {
@@ -413,7 +607,7 @@ pub fn clean_up(dir: &Path) {
     }
 }
 
-/// Saved in `%LOCALAPPDATA%\hanstat\update.json`.
+/// Saved in `update.json` in [`crate::models::app_dir`].
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct Settings {
@@ -507,7 +701,7 @@ mod tests {
         assert_eq!(r.notes, "### Fixed\n- Things.");
         assert!(
             r.zip_url
-                .ends_with("/releases/download/v9.8.7/hanstat-x86_64-pc-windows-msvc.zip")
+                .ends_with(&format!("/releases/download/v9.8.7/{ZIP_NAME}"))
         );
         // Assets hosted anywhere else are refused.
         assert!(parse_release(&api_json("v9.8.7", "someone/else")).is_err());
@@ -625,5 +819,158 @@ mod tests {
         assert!(install(&zip, &dir, "hanstat.exe").is_err());
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn make_app_zip(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, data, mode) in entries {
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored)
+                .unix_permissions(*mode);
+            w.start_file(*name, opts).unwrap();
+            w.write_all(data).unwrap();
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    fn make_bundle(dir: &Path, exe: &[u8]) -> PathBuf {
+        let app = dir.join("hanstat.app");
+        std::fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        std::fs::write(app.join("Contents/Info.plist"), b"old plist").unwrap();
+        std::fs::write(app.join("Contents/MacOS/hanstat"), exe).unwrap();
+        std::fs::write(app.join("Contents/MacOS/gone"), b"only in the old one").unwrap();
+        app
+    }
+
+    fn app_zip() -> Vec<u8> {
+        make_app_zip(&[
+            ("hanstat.app/Contents/Info.plist", b"new plist", 0o644),
+            ("hanstat.app/Contents/MacOS/hanstat", b"new gui", 0o755),
+            ("hanstat.app/Contents/MacOS/hanstat-cli", b"new cli", 0o755),
+            ("hanstat.app/Contents/MacOS/._hanstat", b"xattrs", 0o644),
+            ("__MACOSX/hanstat.app/._Info.plist", b"xattrs", 0o644),
+        ])
+    }
+
+    #[test]
+    fn bundle_paths() {
+        let exe = Path::new("/Applications/hanstat.app/Contents/MacOS/hanstat");
+        assert_eq!(bundle_of(exe), Some(Path::new("/Applications/hanstat.app")));
+        assert_eq!(bundle_of(Path::new("/usr/local/bin/hanstat")), None);
+        assert_eq!(bundle_of(Path::new("/x/Contents/MacOS/hanstat")), None);
+    }
+
+    #[test]
+    fn install_app_replaces_bundle_and_cleans_up() {
+        let dir = temp_dir("app-ok");
+        let app = make_bundle(&dir, b"old gui");
+        install_app(&app_zip(), &app).unwrap();
+        let exe = app.join("Contents/MacOS/hanstat");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new gui");
+        assert_eq!(
+            std::fs::read(app.join("Contents/Info.plist")).unwrap(),
+            b"new plist"
+        );
+        assert!(!app.join("Contents/MacOS/gone").exists());
+        assert!(!app.join("Contents/MacOS/._hanstat").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&exe), 0o755);
+            assert_eq!(mode(&app.join("Contents/Info.plist")), 0o644);
+        }
+        let old = dir.join(format!("hanstat.app.{}.{OLD_SUFFIX}", std::process::id()));
+        assert_eq!(
+            std::fs::read(old.join("Contents/MacOS/hanstat")).unwrap(),
+            b"old gui"
+        );
+        std::fs::write(dir.join("notes.txt"), b"user file").unwrap();
+        clean_up(&dir);
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["hanstat.app", "notes.txt"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn install_app_rolls_back_on_failure() {
+        let dir = temp_dir("app-fail");
+        let app = make_bundle(&dir, b"old gui");
+        // A non-empty folder where the bundle would be moved aside.
+        let blocker = dir.join(format!("hanstat.app.{}.{OLD_SUFFIX}", std::process::id()));
+        std::fs::create_dir_all(blocker.join("x")).unwrap();
+        assert!(install_app(&app_zip(), &app).is_err());
+        assert_eq!(
+            std::fs::read(app.join("Contents/MacOS/hanstat")).unwrap(),
+            b"old gui"
+        );
+        assert!(!dir.join(format!("hanstat.app.{NEW_SUFFIX}")).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unsafe_or_incomplete_app_zips_are_refused() {
+        let dir = temp_dir("app-bad");
+        let app = make_bundle(&dir, b"old gui");
+        let no_exe = make_app_zip(&[("hanstat.app/Contents/Info.plist", b"p", 0o644)]);
+        let unsafe_name = make_app_zip(&[
+            ("hanstat.app/Contents/Info.plist", b"p", 0o644),
+            ("hanstat.app/Contents/MacOS/hanstat", b"x", 0o755),
+            ("hanstat.app/Contents/../../evil", b"x", 0o644),
+        ]);
+        let wrong_top = make_app_zip(&[
+            ("other.app/Contents/Info.plist", b"p", 0o644),
+            ("other.app/Contents/MacOS/hanstat", b"x", 0o755),
+        ]);
+        for zip in [no_exe, unsafe_name, wrong_top] {
+            assert!(install_app(&zip, &app).is_err());
+            assert_eq!(
+                std::fs::read(app.join("Contents/MacOS/hanstat")).unwrap(),
+                b"old gui"
+            );
+        }
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["hanstat.app"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn programs_stay_executable_without_zip_modes() {
+        // A zip written without Unix modes (DOS entries).
+        let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, data) in [
+            ("hanstat.app/Contents/Info.plist", &b"p"[..]),
+            ("hanstat.app/Contents/MacOS/hanstat", &b"x"[..]),
+        ] {
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored)
+                .system(zip::System::Dos);
+            w.start_file(name, opts).unwrap();
+            w.write_all(data).unwrap();
+        }
+        let zip = w.finish().unwrap().into_inner();
+        let files = release_app_files(&zip).unwrap();
+        let mode = |p: &str| files.iter().find(|(q, ..)| q == Path::new(p)).unwrap().2;
+        assert_eq!(mode("Contents/MacOS/hanstat"), 0o755);
+        assert_eq!(mode("Contents/Info.plist"), 0o644);
+    }
+
+    #[test]
+    fn translocated_paths() {
+        let t = Path::new(
+            "/private/var/folders/ab/T/AppTranslocation/1234/d/hanstat.app/Contents/MacOS/hanstat",
+        );
+        assert!(is_translocated(t));
+        assert!(!is_translocated(Path::new(
+            "/Applications/hanstat.app/Contents/MacOS/hanstat"
+        )));
     }
 }

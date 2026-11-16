@@ -1,5 +1,20 @@
 # Changelog
 
+## [2026.11.16.6] - 2026-11-16
+
+From [@linlin56](https://github.com/linlin56)'s [#1](https://github.com/caocaochan/hanstat/pull/1), with fixes.
+
+### Fixed
+- **Missing strokes in Chinese and Japanese text on macOS.** egui draws Apple's CFF-outline fonts (Hiragino, PingFang, Apple SD Gothic Neo) with strokes missing (了 as 亅, 我 as 找), and the newest PingFang not at all. hanstat now loads TrueType fonts that ship with macOS first: Heiti SC, then Heiti TC for extra Traditional coverage, AppleGothic for Hangul and Apple Symbols. Only characters none of them has still go to the system's font fallback.
+
+### Added
+- **The Mac app updates itself**, like the Windows one: the new `hanstat.app` is unpacked next to the running one and replaces it, and anything that fails puts the old one back. It needs the app out of the folder it was unzipped in (macOS runs it from a read-only copy until it's moved). **2026.11.16.5 can't update itself; download this release once by hand.**
+- **The Mac release zip now holds `hanstat.app` alone**, with `hanstat-cli`, the README, changelog and licences inside the bundle (`hanstat.app/Contents/MacOS/hanstat-cli`), so an update replaces all of it. `macos/bundle.sh` builds it on any Mac.
+
+### Changed
+- Updates are off on Intel Macs and other platforms without a release of their own, rather than installing a build that can't run there.
+- An update can't race the startup clean-up of the previous one: on a slow start the clean-up could delete the new version while it was being unpacked.
+
 ## [2026.11.16.5] - 2026-11-16
 
 ### Added

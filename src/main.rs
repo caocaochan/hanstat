@@ -82,35 +82,67 @@ fn main() -> eframe::Result {
     )
 }
 
-/// egui ships no CJK glyphs; use Windows system fonts as fallbacks. Elsewhere
-/// eframe's system font provider (CoreText on macOS) finds them per character.
+/// egui ships no CJK glyphs; use the system's fonts as fallbacks, in order.
+/// Characters none of them has still go to eframe's system font provider.
 fn install_fonts(ctx: &egui::Context) {
-    if !cfg!(windows) {
-        return;
-    }
-    let dir = std::env::var_os("WINDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
-        .join("Fonts");
-    let candidates = [
-        ("yahei", "msyh.ttc"),             // Microsoft YaHei: BMP CJK
-        ("jhenghei", "msjh.ttc"),          // JhengHei: extra Traditional coverage
-        ("simsun-extb", "simsunb.ttf"),    // SimSun-ExtB: Ext B (SIP)
-        ("simsun-extg", "SimsunExtG.ttf"), // Ext G
-        ("segoe-symbol", "seguisym.ttf"),
-    ];
+    let (dir, candidates) = system_fonts();
     let mut fonts = egui::FontDefinitions::default();
-    for (name, file) in candidates {
-        if let Ok(bytes) = std::fs::read(dir.join(file)) {
-            fonts
-                .font_data
-                .insert(name.to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
+    // Several faces can come from one `.ttc`: read each file once.
+    let mut files: HashMap<&str, Option<egui::epaint::text::Blob>> = HashMap::new();
+    for &(name, file, index) in candidates {
+        let blob = files.entry(file).or_insert_with(|| {
+            let bytes = std::fs::read(dir.join(file)).ok()?;
+            Some(Arc::new(bytes) as egui::epaint::text::Blob)
+        });
+        if let Some(blob) = blob {
+            let data = egui::FontData::from_blob(blob.clone(), index);
+            fonts.font_data.insert(name.to_owned(), Arc::new(data));
             for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
                 fonts.families.entry(fam).or_default().push(name.to_owned());
             }
         }
     }
     ctx.set_fonts(fonts);
+}
+
+/// A fallback font: its name for egui, its file in the font folder, and the
+/// face to use in a `.ttc` collection.
+type SystemFont = (&'static str, &'static str, u32);
+
+/// Windows: the font folder and its CJK fonts.
+#[cfg(not(target_os = "macos"))]
+fn system_fonts() -> (PathBuf, &'static [SystemFont]) {
+    let dir = std::env::var_os("WINDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+        .join("Fonts");
+    let candidates = &[
+        ("yahei", "msyh.ttc", 0),             // Microsoft YaHei: BMP CJK
+        ("jhenghei", "msjh.ttc", 0),          // JhengHei: extra Traditional coverage
+        ("simsun-extb", "simsunb.ttf", 0),    // SimSun-ExtB: Ext B (SIP)
+        ("simsun-extg", "SimsunExtG.ttf", 0), // Ext G
+        ("segoe-symbol", "seguisym.ttf", 0),
+    ];
+    (dir, candidates)
+}
+
+/// macOS: fonts that ship with the system (from linlin56's PR #1). Only
+/// TrueType-outline fonts: egui draws the CFF-outline ones (Hiragino,
+/// PingFang, Apple SD Gothic Neo) with strokes missing (了 as 亅, 我 as 找),
+/// and the newest PingFang's `hvgl` outlines not at all. None covers all of
+/// Ext B as SimSun-ExtB does; Heiti has about 6,300 of its characters.
+#[cfg(target_os = "macos")]
+fn system_fonts() -> (PathBuf, &'static [SystemFont]) {
+    let candidates = &[
+        ("heiti-sc", "STHeiti Light.ttc", 1), // Heiti SC: BMP CJK, kana, Ext B
+        // The collection's other face (Heiti TC): extra Traditional coverage,
+        // as JhengHei on Windows. Characters it lacks too go to eframe's
+        // system font provider, which may pick a CFF font.
+        ("heiti-tc", "STHeiti Light.ttc", 0),
+        ("apple-gothic", "Supplemental/AppleGothic.ttf", 0), // Hangul
+        ("apple-symbols", "Apple Symbols.ttf", 0),
+    ];
+    (PathBuf::from("/System/Library/Fonts"), candidates)
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Default)]
@@ -253,10 +285,7 @@ impl Updater {
         if self.disabled.is_some() {
             return;
         }
-        if let Some(dir) = update::exe_path().ok().and_then(Path::parent) {
-            let dir = dir.to_owned();
-            std::thread::spawn(move || update::clean_up(&dir));
-        }
+        std::thread::spawn(update::clean_up_here);
         if self.settings.auto_update {
             self.check(ctx, true);
         }
@@ -306,13 +335,7 @@ impl Updater {
                 total,
             })
         })
-        .and_then(|zip| {
-            let exe = update::exe_path()?;
-            let (Some(dir), Some(name)) = (exe.parent(), exe.file_name()) else {
-                return Err(format!("Unexpected exe path {}", exe.display()));
-            };
-            update::install(&zip, dir, &name.to_string_lossy())
-        });
+        .and_then(|zip| update::install_here(&zip));
         set(match result {
             Ok(()) => UpdatePhase::Installed(rel),
             Err(e) => UpdatePhase::Failed(format!("Updating to {} failed: {e}", rel.tag)),

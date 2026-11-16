@@ -5,6 +5,8 @@
 
 Character and word statistics for Chinese, Japanese and Korean `.epub` and `.txt` files: totals, unique and once-only characters and words, coverage, per-section breakdowns, reading time, and how much of the book your Anki cards and vocabulary levels already cover.
 
+Runs on Windows and macOS. The Mac app's font handling and self-updating are by [@linlin56](https://github.com/linlin56), from [#1](https://github.com/caocaochan/hanstat/pull/1).
+
 ![hanstat's Overview tab for a Chinese novel: character and word totals, HSK 1–5 coverage and difficulty, composition, coverage table and word-length distribution](docs/screenshot.png)
 
 ## Install
@@ -15,15 +17,20 @@ Character and word statistics for Chinese, Japanese and Korean `.epub` and `.txt
 2. Unzip it and run `hanstat.exe` from the `hanstat` folder.
 3. Open a file or drag it onto the window.
 
-The exe isn't code-signed, so SmartScreen may ask you to confirm the first run. The app updates itself; click the version number in the status bar to check now or turn automatic updates off.
+The exe isn't code-signed, so SmartScreen may ask you to confirm the first run.
 
 ### macOS
 
 1. Download [`hanstat-aarch64-apple-darwin.zip`](https://github.com/caocaochan/hanstat/releases/latest/download/hanstat-aarch64-apple-darwin.zip) (Apple Silicon, macOS 11 or later).
-2. Unzip it and move `hanstat.app` to Applications.
-3. Open it. The app isn't notarised, so macOS refuses the first time: go to **System Settings → Privacy & Security** and click **Open Anyway**. To run `hanstat-cli` from Terminal, clear its quarantine flag first: `xattr -d com.apple.quarantine hanstat-cli`.
+2. Unzip it and move `hanstat.app` to Applications (or any folder you can write to, so it can update itself).
+3. Open it. The app isn't notarised, so macOS refuses the first time: go to **System Settings → Privacy & Security** and click **Open Anyway**.
+4. Open a file or drag it onto the window.
 
-The Mac version doesn't update itself; download new releases from the same link.
+The command-line tool is inside the app, at `hanstat.app/Contents/MacOS/hanstat-cli`. If Terminal refuses to run it, clear the download's quarantine flag once: `xattr -dr com.apple.quarantine /Applications/hanstat.app`.
+
+### Updates
+
+The app updates itself; click the version number in the status bar to check now or turn automatic updates off. On macOS this needs `hanstat.app` moved out of the folder it was unzipped in, since macOS runs it from a read-only copy until then. The Mac release 2026.11.16.5 can't update itself; download a newer one once by hand.
 
 ### Data
 
@@ -58,7 +65,7 @@ hanstat.exe [file] [--tab overview|characters|words|sections|suggestions|notes]
 hanstat-cli.exe file.epub [--ltp|--ckip|--jieba] [--dict names.txt] [--auto-dict] [--json] [--chars-csv f] [--words-csv f] [--anki] [--level N] [--tocfl N] [--known-list words.txt] [--lang zh|ko|ja]
 ```
 
-Run `hanstat-cli.exe --help` for all options. On macOS the CLI is `hanstat-cli`, and the app can be started with a file as `open -a hanstat --args "$PWD/file.epub"` (the path must be absolute).
+Run `hanstat-cli.exe --help` for all options. On macOS the CLI is `hanstat.app/Contents/MacOS/hanstat-cli`, and the app can be started with a file as `open -a hanstat --args "$PWD/file.epub"` (the path must be absolute).
 
 ## Licence
 
