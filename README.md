@@ -15,6 +15,8 @@ The exe isn't code-signed, so SmartScreen may ask you to confirm the first run. 
 
 On first start the app downloads the word-segmentation models (LTP 32 MB, CKIP 46 MB) from Hugging Face into `%LOCALAPPDATA%\hanstat\models`. They aren't bundled because their licences differ (see below). The Korean analyser (Kiwi, 126 MB from its GitHub release) is downloaded the first time you open a Korean book, and the Japanese dictionary (SudachiDict full, about 137 MB from its newest GitHub release, checked at most once a day) the first time you open a Japanese book.
 
+A book's word counts are saved in `%LOCALAPPDATA%\hanstat\cache`, so opening it again doesn't segment it again (45 s down to 0.2 s for a novel with CKIP). The saved counts are used only when the text, the segmenter and its model, the forced and known words, and hanstat's analysis code are all the same as when they were saved; anything else is analysed afresh. The file's name, location and date don't matter. The folder is kept under 1 GB by deleting the analyses unused the longest, and **Notes & method** has a button to delete them all.
+
 ## Korean
 
 hanstat detects the book's language: a book with more Hangul than Chinese characters is Korean. The badge at the right of the toolbar shows the mode (简体中文, 繁體中文, 한국어 or 日本語). Korean books are analysed with [Kiwi](https://github.com/bab2min/Kiwi) and measured in words only. Words are counted in dictionary form: 먹었어요 counts as 먹다, 걸어서 as 걷다, and 공부했다 as 공부하다. Particles and endings aren't words. If Kiwi splits a character's name, apply it from the **Suggested words** tab.
@@ -56,10 +58,12 @@ Click **📚 HSK & word lists** (Korean: **📚 Levels & word lists**; Japanese:
 
 ```
 hanstat.exe [file] [--tab overview|characters|words|sections|suggestions|notes]
-hanstat-cli.exe file.epub [--ltp|--ckip|--jieba] [--dict names.txt] [--auto-dict] [--json] [--chars-csv f] [--words-csv f] [--anki] [--known] [--level N] [--kaishi] [--known-list words.txt] [--lang zh|ko|ja]
+hanstat-cli.exe file.epub [--ltp|--ckip|--jieba] [--dict names.txt] [--auto-dict] [--no-cache] [--json] [--chars-csv f] [--words-csv f] [--anki] [--known] [--level N] [--kaishi] [--known-list words.txt] [--lang zh|ko|ja]
 ```
 
 `--level N` marks levels known in the book's language: HSK 1 to N for Chinese, 1 to N급 for Korean, and N5 down to N`N` for Japanese (`--level 3` is N5–N3). `--hsk N` still works for Chinese books.
+
+`--no-cache` (or the environment variable `HANSTAT_NO_CACHE`, which the window obeys too) analyses the book afresh and saves nothing. `HANSTAT_CACHE_DIR` moves the saved analyses to another folder.
 
 Run `hanstat-cli.exe --help` for all options.
 

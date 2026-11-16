@@ -1,5 +1,6 @@
 pub mod analyze;
 pub mod anki;
+pub mod cache;
 pub mod chars;
 pub mod ckip;
 pub mod discover;

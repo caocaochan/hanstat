@@ -67,6 +67,54 @@ pub fn model_for(kind: SegmenterKind) -> Option<&'static models::Model> {
     }
 }
 
+/// What tells one version of a concrete segmenter's model from another, for
+/// the analysis cache: the model `kind` is expected to load, without loading
+/// it (see [`Segmenter::model_identity`] for the one that was).
+pub fn model_identity(kind: SegmenterKind) -> String {
+    match kind {
+        // Its dictionary is part of the jieba-rs crate, whose version is in
+        // the cache's build fingerprint.
+        SegmenterKind::Jieba => "jieba".to_owned(),
+        // The id has the dictionary's release date; a dictionary found on
+        // disk has no checksum to add.
+        SegmenterKind::Sudachi => models::sudachi().id.to_owned(),
+        // Pinned downloads: the id and the checksum of every file.
+        k => model_for(k).map_or_else(String::new, |m| {
+            let mut s = m.id.to_owned();
+            for f in m.files {
+                s.push(' ');
+                s.push_str(f.sha256);
+            }
+            s
+        }),
+    }
+}
+
+/// Which script folding a concrete segmenter needs for text in `variant`:
+/// (Traditional to Simplified, Simplified to Traditional).
+fn folding(kind: SegmenterKind, variant: Variant) -> (bool, bool) {
+    let trad_like = matches!(variant, Variant::Traditional | Variant::Mixed);
+    match kind {
+        SegmenterKind::Kiwi | SegmenterKind::Sudachi => (false, false),
+        SegmenterKind::Ckip => (false, variant != Variant::Traditional),
+        _ => (trad_like, false),
+    }
+}
+
+/// Human-readable description of the script folding `kind` does for text in
+/// `variant`, if any.
+pub fn folding_note(kind: SegmenterKind, variant: Variant) -> Option<&'static str> {
+    match folding(kind.resolve(variant), variant) {
+        (true, _) => Some(
+            "Text is Traditional/Mixed: it was folded character-by-character to Simplified for the segmenter only (LTP/jieba are trained on Simplified). Counts and word lists keep the original characters.",
+        ),
+        (_, true) => Some(
+            "Text was converted to Traditional (OpenCC phrases, length-preserving) for the CKIP segmenter only (CKIP is trained on Traditional). Counts and word lists keep the original characters.",
+        ),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize)]
 pub enum SegmenterKind {
     /// Best-benchmarked model for the detected script: CKIP for Traditional, LTP otherwise.
@@ -165,11 +213,7 @@ impl Segmenter {
         variant: Variant,
     ) -> Result<Self, String> {
         let kind = kind.resolve(variant);
-        let trad_like = matches!(variant, Variant::Traditional | Variant::Mixed);
-        let (fold_t2s, fold_s2t) = match kind {
-            SegmenterKind::Ckip => (false, variant != Variant::Traditional),
-            _ => (trad_like, false),
-        };
+        let (fold_t2s, fold_s2t) = folding(kind, variant);
         let backend = match kind {
             SegmenterKind::Ltp | SegmenterKind::Auto => Backend::Ltp(ltp_model()?),
             SegmenterKind::Ckip => Backend::Ckip(ckip_model()?),
@@ -341,18 +385,13 @@ impl Segmenter {
         out
     }
 
-    /// Human-readable description of the script folding in effect, if any.
-    pub fn folding_note(&self) -> Option<&'static str> {
-        if self.fold_t2s {
-            Some(
-                "Text is Traditional/Mixed: it was folded character-by-character to Simplified for the segmenter only (LTP/jieba are trained on Simplified). Counts and word lists keep the original characters.",
-            )
-        } else if self.fold_s2t {
-            Some(
-                "Text was converted to Traditional (OpenCC phrases, length-preserving) for the CKIP segmenter only (CKIP is trained on Traditional). Counts and word lists keep the original characters.",
-            )
-        } else {
-            None
+    /// The model this segmenter loaded, as [`model_identity`] names it. It
+    /// differs from the expected one only when Sudachi fell back to its
+    /// tested dictionary.
+    pub fn model_identity(&self) -> String {
+        match &self.backend {
+            Backend::Sudachi(a) => a.dictionary_id().to_owned(),
+            _ => model_identity(self.kind),
         }
     }
 

@@ -1,5 +1,15 @@
 # Changelog
 
+## [2026.11.16.3] - 2026-11-16
+
+### Added
+- **Saved analyses.** A book's counts are saved after it is analysed and read back the next time, so reopening a book, or switching back to a segmenter already tried, no longer segments it again. On a 830,000-character novel this takes 0.05 s instead of 45 s with CKIP and 1.3 s with LTP; on a 3.5-million-character one, 0.2 s instead of 2 s with LTP.
+  - **When they are used.** Only when everything the counts depend on is unchanged: the extracted text (not the file, so a renamed or moved book still matches, and a TXT read with another encoding doesn't), the language and script, the segmenter and its model or dictionary version, the forced words, the known words given to the segmenter, and hanstat's analysis code. Releases that don't change the analysis keep the saved results; one that does starts afresh. The reports are identical to a fresh analysis.
+  - **What never needs a new analysis.** Including or excluding sections, Anki, and vocabulary levels, as before.
+  - **Where.** `%LOCALAPPDATA%\hanstat\cache`, one gzip-compressed JSON file per analysis (0.1–7 MB). The folder is kept under 1 GB by deleting the analyses unused the longest. **Notes & method** shows whether the open book was read from a saved analysis and how much is saved, with a **Delete all** button.
+  - **Turning it off.** `hanstat-cli --no-cache`, or the environment variable `HANSTAT_NO_CACHE` for both programs. `HANSTAT_CACHE_DIR` moves the folder.
+  - **CLI.** The timing line on stderr now shows the analysis time and `(from cache)`.
+
 ## [2026.11.16.2] - 2026-11-16
 
 ### Changed

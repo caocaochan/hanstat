@@ -375,6 +375,7 @@ fn main() {
     let mut words_csv = None;
     let mut suggest: Option<usize> = None;
     let mut auto_dict = false;
+    let mut no_cache = false;
     let mut ak = AnkiArgs::default();
     // Known words, resolved once the book's language is known.
     let mut ka = KnownArgs::default();
@@ -462,15 +463,18 @@ fn main() {
             "--chars-csv" => chars_csv = args.next().map(PathBuf::from),
             "--words-csv" => words_csv = args.next().map(PathBuf::from),
             "--auto-dict" => auto_dict = true,
+            "--no-cache" => no_cache = true,
             "--suggest" => suggest = Some(args.next().and_then(|s| s.parse().ok()).unwrap_or(40)),
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: hanstat-cli <file.epub|file.txt> [--ckip|--ltp|--jieba] [--dict words.txt] [--json] [--top N] [--include-all] [--exclude i,j] [--chars-csv f] [--words-csv f] [--suggest N] [--auto-dict]\n\
+                    "usage: hanstat-cli <file.epub|file.txt> [--ckip|--ltp|--jieba] [--dict words.txt] [--json] [--top N] [--include-all] [--exclude i,j] [--chars-csv f] [--words-csv f] [--suggest N] [--auto-dict] [--no-cache]\n\
                      \x20      [--anki] [--anki-list] [--anki-collection collection.anki2] [--anki-deck NAME]... [--anki-field \"NOTE TYPE:FIELD\"]... [--anki-mature-stability DAYS] [--anki-save]\n\
                      \x20      [--known] [--level N] [--hsk N] [--kaishi] [--known-list words.txt]... [--lang zh|ko|ja]\n\
                      \n\
                      The book's language is detected: Korean books are analysed with Kiwi and have word statistics only;\n\
                      \x20 Japanese books are analysed with Sudachi and have kanji and word statistics (both downloaded on first use).\n\
+                     The word counts of a book are saved in {} and read back when the same text is analysed again with the same\n\
+                     \x20 segmenter, model, --dict and known words by the same analysis code; --no-cache (or HANSTAT_NO_CACHE) analyses afresh and saves nothing.\n\
                      --known adds the levels and word lists marked known in the hanstat window (saved in {} for Chinese, {} for Korean, {} for Japanese).\n\
                      --level N marks levels 1 to N known in the book's language: HSK 3.0 (2025 syllabus; 7, 8, 9: all) for Chinese,\n\
                      \x20 1–6급 of 국립국어원's 국제 통용 한국어 표준 교육과정 vocabulary (the list TOPIK levels follow) for Korean,\n\
@@ -482,6 +486,7 @@ fn main() {
                      --anki-deck/--anki-field replace that choice for this run (repeatable; a deck includes its subdecks); --anki-save keeps it.\n\
                      --anki-mature-stability DAYS counts a review card as mature once its FSRS stability reaches DAYS instead of at an interval of 21+ days (0: interval rule).\n\
                      Without a file, --anki prints the collection summary only, for --lang (default zh).",
+                    hanstat::cache::Cache::default_dir().display(),
                     hanstat::known::Settings::path_for(Language::Chinese).display(),
                     hanstat::known::Settings::path_for(Language::Korean).display(),
                     hanstat::known::Settings::path_for(Language::Japanese).display(),
@@ -557,11 +562,17 @@ fn main() {
             std::process::exit(1);
         }
     }
-    let prep =
-        analyze::analyze_book(&book, kind, &words, &seg_known, &|_, _| {}).unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(1)
-        });
+    let cache = hanstat::cache::Cache::open().filter(|_| !no_cache);
+    let analyse = |words: &[String]| {
+        analyze::analyze_book_cached(&book, kind, words, &seg_known, cache.as_ref(), &|_, _| {})
+            .unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(1)
+            })
+    };
+    let t_analysis = std::time::Instant::now();
+    let prep = analyse(&words);
+    let mut analysis = (t_analysis.elapsed(), prep.cached);
     let included: Vec<bool> = book
         .sections
         .iter()
@@ -591,11 +602,9 @@ fn main() {
             rec.join(" ")
         );
         words.extend(rec);
-        let prep = analyze::analyze_book(&book, kind, &words, &seg_known, &|_, _| {})
-            .unwrap_or_else(|e| {
-                eprintln!("{e}");
-                std::process::exit(1)
-            });
+        let t_analysis = std::time::Instant::now();
+        let prep = analyse(&words);
+        analysis = (analysis.0 + t_analysis.elapsed(), analysis.1 && prep.cached);
         r = analyze::build_report(&book, &prep, &included);
     }
     let anki_k = anki_col.as_ref().map(|loaded| {
@@ -637,7 +646,13 @@ fn main() {
             &r.word_parts,
         ));
     }
-    eprintln!("load {:?}, total {:?}", t_load, t0.elapsed());
+    eprintln!(
+        "load {:?}, analysis {:?}{}, total {:?}",
+        t_load,
+        analysis.0,
+        if analysis.1 { " (from cache)" } else { "" },
+        t0.elapsed()
+    );
 
     if let Some(p) = chars_csv {
         if lang == Language::Korean {

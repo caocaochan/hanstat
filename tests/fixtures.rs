@@ -383,3 +383,56 @@ fn user_dictionary_merges_names() {
         assert_eq!(n, Some(2), "{kind:?}: {:?}", r.word_freq);
     }
 }
+
+#[test]
+fn analysis_cache_gives_the_same_counts() {
+    use hanstat::analyze::analyze_book_cached;
+    use hanstat::cache::Cache;
+
+    let dir = std::env::temp_dir().join(format!("hanstat-fixtures-cache-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let cache = Cache::at(&dir);
+    let text = "第一章 开始\n我们今天下午一起去图书馆看书。然后研究生命的起源问题！\nABC abc 123\n\n第二章 结束\n她只看了一瞬间就走了。\n";
+    let book = extract::txt::load(text.as_bytes(), EncodingChoice::Utf8);
+    let run = |book: &extract::Book, words: &[String], known: &[String], cache: Option<&Cache>| {
+        analyze_book_cached(book, SegmenterKind::Jieba, words, known, cache, &|_, _| {}).unwrap()
+    };
+    let inc: Vec<bool> = book.sections.iter().map(|_| true).collect();
+    let json = |p| serde_json::to_string(&build_report(&book, p, &inc)).unwrap();
+
+    let plain = run(&book, &[], &[], None);
+    let first = run(&book, &[], &[], Some(&cache));
+    let second = run(&book, &[], &[], Some(&cache));
+    assert!(!plain.cached && !first.cached);
+    assert!(second.cached);
+    assert_eq!(plain.stats, first.stats);
+    assert_eq!(plain.stats, second.stats);
+    assert_eq!(json(&plain), json(&second));
+    assert_eq!(cache.usage().0, 1);
+
+    // Other words are another analysis; the first one is still there.
+    let forced = ["研究生命".to_owned()];
+    let a = run(&book, &forced, &[], Some(&cache));
+    assert!(!a.cached);
+    assert_ne!(a.stats, plain.stats);
+    let b = run(&book, &forced, &[], Some(&cache));
+    assert!(b.cached);
+    assert_eq!((a.stats, a.user_words), (b.stats, b.user_words));
+    let known = ["一瞬间".to_owned(), "图书馆".to_owned()];
+    let a = run(&book, &[], &known, Some(&cache));
+    assert!(!a.cached);
+    let b = run(&book, &[], &known, Some(&cache));
+    assert!(b.cached);
+    assert_eq!((a.stats, a.known_words), (b.stats, b.known_words));
+    assert!(run(&book, &[], &[], Some(&cache)).cached);
+    assert_eq!(cache.usage().0, 3);
+
+    // A changed character is another book.
+    let other = extract::txt::load(
+        text.replace("图书馆", "图书店").as_bytes(),
+        EncodingChoice::Utf8,
+    );
+    assert!(!run(&other, &[], &[], Some(&cache)).cached);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

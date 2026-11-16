@@ -53,6 +53,8 @@ const PROPER_NOUN_PROBES: [&str; 3] = ["ディズニーランド", "ポケモン
 /// A loaded dictionary. Read-only; analysed from several threads at once.
 pub struct Analyzer {
     dict: JapaneseDictionary,
+    /// The name of the folder the dictionary was loaded from: its model id.
+    id: String,
 }
 
 impl Analyzer {
@@ -69,8 +71,12 @@ impl Analyzer {
             // Without them a user word would not connect: keep the system dictionary.
             None => String::new(),
         };
+        let id = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         if csv.is_empty() {
-            return Ok(Analyzer { dict: system });
+            return Ok(Analyzer { dict: system, id });
         }
         let mut b = DictBuilder::new_user(&system);
         let user = (|| {
@@ -92,7 +98,13 @@ impl Analyzer {
         data.add_user(Storage::Owned(user));
         let dict = JapaneseDictionary::from_cfg_storage(&cfg, data)
             .map_err(|e| format!("Sudachi user dictionary: {e}"))?;
-        Ok(Analyzer { dict })
+        Ok(Analyzer { dict, id })
+    }
+
+    /// Which dictionary this is (`sudachidict-full-20261015`), as
+    /// [`crate::models::Model::id`] names it.
+    pub fn dictionary_id(&self) -> &str {
+        &self.id
     }
 
     /// The words of each text, analysed in parallel.

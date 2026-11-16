@@ -4,6 +4,7 @@ use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 use hanstat::analyze::{self, Prepared, Report};
 use hanstat::anki::{self, BookCoverage, ByStatus, Difficulty, Status};
+use hanstat::cache::Cache;
 use hanstat::discover::{self, Candidate};
 use hanstat::extract::{self, Book, EncodingChoice, SectionKind};
 use hanstat::known;
@@ -391,6 +392,10 @@ struct App {
     /// Inner height last asked for, so a resize still in flight isn't requested again.
     fit_requested: f32,
     updater: Updater,
+    /// Saved analysis results; `None` when turned off (`HANSTAT_NO_CACHE`).
+    cache: Option<Cache>,
+    /// Entries and bytes in `cache`, for the Notes tab (read when a book is analysed).
+    cache_usage: (usize, u64),
 }
 
 enum AnkiMsg {
@@ -545,6 +550,8 @@ impl Default for App {
             fit_until: 0.0,
             fit_requested: 0.0,
             updater: Updater::default(),
+            cache: Cache::open(),
+            cache_usage: (0, 0),
         }
     }
 }
@@ -569,6 +576,7 @@ impl App {
         let stage = Arc::new(Mutex::new("Reading file…".to_owned()));
         let (d2, t2, s2) = (done.clone(), total.clone(), stage.clone());
         let (kind, enc) = (self.segmenter, self.encoding);
+        let cache = self.cache.clone();
         // The book's language is only known once it is read: take each language's dictionary.
         let mut words_by_lang: HashMap<Language, Vec<String>> = self
             .stash
@@ -625,10 +633,17 @@ impl App {
                     Ordering::Relaxed,
                 );
                 let c2 = ctx.clone();
-                let prep = analyze::analyze_book(&book, kind, &words, &known_words, &|d, _| {
-                    d2.fetch_max(d, Ordering::Relaxed);
-                    c2.request_repaint_after(std::time::Duration::from_millis(100));
-                })?;
+                let prep = analyze::analyze_book_cached(
+                    &book,
+                    kind,
+                    &words,
+                    &known_words,
+                    cache.as_ref(),
+                    &|d, _| {
+                        d2.fetch_max(d, Ordering::Relaxed);
+                        c2.request_repaint_after(std::time::Duration::from_millis(100));
+                    },
+                )?;
                 Ok(Loaded {
                     book,
                     prep: Arc::new(prep),
@@ -1357,6 +1372,7 @@ impl App {
                             .collect();
                     }
                     let lang = l.prep.language;
+                    self.cache_usage = self.cache.as_ref().map_or((0, 0), Cache::usage);
                     self.book = Some(l.book);
                     self.prep = Some(l.prep);
                     // The book's language decides which dictionary, Anki selection and word lists apply.
@@ -3077,6 +3093,8 @@ impl App {
 
     fn notes(&mut self, ui: &mut egui::Ui) {
         let r = self.report.as_ref().unwrap();
+        let from_cache = self.prep.as_ref().is_some_and(|p| p.cached);
+        let mut clear_cache = false;
         egui::ScrollArea::vertical()
             .auto_shrink(false)
             .show(ui, |ui| {
@@ -3126,6 +3144,40 @@ impl App {
                     .weak(),
                 );
                 ui.add_space(12.0);
+                ui.heading("Saved analyses");
+                match &self.cache {
+                    Some(cache) => {
+                        ui.label(if from_cache {
+                            "• This book's counts were read from an earlier analysis of the same text with the same segmenter, model and words."
+                        } else {
+                            "• This book was analysed just now; its counts are saved for the next time it is opened."
+                        });
+                        ui.label("• A saved analysis is used only if the text, the segmenter and its model, the forced and known words and hanstat's analysis code are all unchanged. Including or excluding sections, Anki and vocabulary levels never need a new analysis.");
+                        ui.horizontal(|ui| {
+                            let (n, bytes) = self.cache_usage;
+                            ui.label(format!(
+                                "• {} saved ({:.1} MB of at most {:.0} MB; the ones unused the longest are deleted first)",
+                                fmt_int(n as u64),
+                                bytes as f64 / 1e6,
+                                hanstat::cache::MAX_BYTES as f64 / 1e6
+                            ));
+                            if ui
+                                .add_enabled(n > 0, egui::Button::new("Delete all").small())
+                                .on_hover_text("Books are analysed again the next time they are opened.")
+                                .clicked()
+                            {
+                                clear_cache = true;
+                            }
+                        });
+                        ui.label(
+                            RichText::new(format!("   Folder: {}", cache.dir().display())).weak(),
+                        );
+                    }
+                    None => {
+                        ui.label("• Off (HANSTAT_NO_CACHE is set): every book is analysed afresh.");
+                    }
+                }
+                ui.add_space(12.0);
                 ui.heading("How things are counted");
                 let method = match r.language {
                     Language::Chinese => METHOD,
@@ -3136,6 +3188,12 @@ impl App {
                     ui.label(format!("• {line}"));
                 }
             });
+        if clear_cache && let Some(cache) = &self.cache {
+            if let Err(e) = cache.clear() {
+                self.error = Some(e);
+            }
+            self.cache_usage = cache.usage();
+        }
     }
 }
 

@@ -2,11 +2,12 @@
 //! then included sections are merged into a [`Report`]. Toggling a section
 //! only re-merges; it does not re-segment.
 
+use crate::cache::{Cache, Key};
 use crate::chars::{self, Class, NormStats};
 use crate::extract::{Book, SectionKind};
 use crate::lang::{self, Language};
 use crate::script::{self, Variant};
-use crate::segment::{Segmenter, SegmenterKind};
+use crate::segment::{self, Segmenter, SegmenterKind};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -14,7 +15,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 pub const COVERAGE_TARGETS: [f64; 8] = [50.0, 80.0, 90.0, 95.0, 98.0, 99.0, 99.5, 100.0];
 
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Clone, Debug, PartialEq)]
 pub struct SectionStats {
     /// Indexed by `class_index`.
     pub class_counts: [u64; 9],
@@ -168,6 +169,8 @@ pub struct Prepared {
     /// The known words given to the segmenter, as passed in (Chinese only;
     /// empty for Korean and Japanese). Compared to see if the book needs re-segmenting.
     pub known_words: Vec<String>,
+    /// The counts were read from the analysis cache instead of segmenting the book.
+    pub cached: bool,
 }
 
 /// Paragraphs per work unit: CKIP batches the chunks of one group together.
@@ -184,6 +187,21 @@ pub fn analyze_book(
     kind: SegmenterKind,
     user_words: &[String],
     known_words: &[String],
+    progress: &(dyn Fn(usize, usize) + Sync),
+) -> Result<Prepared, String> {
+    analyze_book_cached(book, kind, user_words, known_words, None, progress)
+}
+
+/// [`analyze_book`], reading the counts from `cache` if the same text was
+/// analysed before with the same segmenter, model and words by the same
+/// analysis code (see [`crate::cache`]), and saving them there otherwise.
+/// A hit does not load the model.
+pub fn analyze_book_cached(
+    book: &Book,
+    kind: SegmenterKind,
+    user_words: &[String],
+    known_words: &[String],
+    cache: Option<&Cache>,
     progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Result<Prepared, String> {
     let language = detect_language(book);
@@ -208,9 +226,53 @@ pub fn analyze_book(
             .collect(),
         Language::Korean | Language::Japanese => Vec::new(),
     };
-    let seg =
-        Segmenter::new(kind.resolve_in(language, variant), &words, variant)?.with_known(&known)?;
+    let resolved = kind.resolve_in(language, variant);
     let total: usize = book.sections.iter().map(|s| s.paragraphs.len()).sum();
+    let prepared = |stats: Vec<SectionStats>, cached: bool| Prepared {
+        language,
+        segmenter_kind: resolved,
+        variant,
+        folding_note: segment::folding_note(resolved, variant),
+        stats,
+        user_words: words.len(),
+        known_words: match language {
+            Language::Chinese => known_words.to_vec(),
+            Language::Korean | Language::Japanese => Vec::new(),
+        },
+        cached,
+    };
+    let lookup = |model: &str| {
+        let cache = cache?;
+        let key = Key::new(book, language, variant, resolved, model, &words, &known);
+        let stats = cache.get(&key, book.sections.len());
+        if stats.is_some() {
+            progress(total, total);
+        }
+        Some((key, stats))
+    };
+    // The model the segmenter is expected to load: enough to find a saved
+    // result without loading it.
+    let expected = cache.map(|_| segment::model_identity(resolved));
+    let mut key = None;
+    if let Some((k, stats)) = expected.as_deref().and_then(lookup) {
+        if let Some(stats) = stats {
+            return Ok(prepared(stats, true));
+        }
+        key = Some(k);
+    }
+    let seg = Segmenter::new(resolved, &words, variant)?.with_known(&known)?;
+    // Sudachi falls back to its tested dictionary when the newest can't be loaded.
+    if let Some(e) = &expected {
+        let loaded = seg.model_identity();
+        if *e != loaded
+            && let Some((k, stats)) = lookup(&loaded)
+        {
+            if let Some(stats) = stats {
+                return Ok(prepared(stats, true));
+            }
+            key = Some(k);
+        }
+    }
     let done = std::sync::atomic::AtomicUsize::new(0);
     let stats = book
         .sections
@@ -231,19 +293,12 @@ pub fn analyze_book(
                 })
                 .reduce(SectionStats::default, SectionStats::merge)
         })
-        .collect();
-    Ok(Prepared {
-        language,
-        segmenter_kind: seg.kind,
-        variant,
-        folding_note: seg.folding_note(),
-        stats,
-        user_words: words.len(),
-        known_words: match language {
-            Language::Chinese => known_words.to_vec(),
-            Language::Korean | Language::Japanese => Vec::new(),
-        },
-    })
+        .collect::<Vec<SectionStats>>();
+    if let (Some(cache), Some(key)) = (cache, &key) {
+        // Not being able to save only means analysing again next time.
+        let _ = cache.put(key, &stats);
+    }
+    Ok(prepared(stats, false))
 }
 
 fn analyze_group(acc: &mut SectionStats, raw: &[String], seg: &Segmenter) {

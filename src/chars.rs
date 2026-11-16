@@ -5,13 +5,13 @@
 //! matter how the producer of the file encoded it.
 
 use crate::lang::Language;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use unicode_general_category::{GeneralCategory as Gc, get_general_category};
 use unicode_normalization::UnicodeNormalization;
 use unicode_script::{Script, UnicodeScript};
 
 /// What was changed by [`normalize`]; reported so the user can see it.
-#[derive(Default, Clone, Debug, Serialize)]
+#[derive(Default, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NormStats {
     /// CJK Compatibility Ideographs (U+F900.., U+2F800..) mapped to their unified form by NFC.
     pub compat_ideographs: u64,
