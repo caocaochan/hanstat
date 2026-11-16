@@ -5,6 +5,8 @@
 
 Character and word statistics for Chinese, Japanese and Korean `.epub` and `.txt` files: totals, unique and once-only characters and words, coverage, per-section breakdowns, reading time, and how much of the book your Anki cards and vocabulary levels already cover.
 
+![hanstat's Overview tab for a Chinese novel: character and word totals, HSK 1–5 coverage and difficulty, composition, coverage table and word-length distribution](docs/screenshot.png)
+
 ## Install
 
 1. Download [`hanstat-x86_64-pc-windows-msvc.zip`](https://github.com/caocaochan/hanstat/releases/latest/download/hanstat-x86_64-pc-windows-msvc.zip) (Windows x64).
