@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [2026.11.16.1] - 2026-11-16
 
 ### Added
 - **Japanese books.** A book whose kana are at least a tenth as many as its kanji is analysed as Japanese, with the badge 日本語.
