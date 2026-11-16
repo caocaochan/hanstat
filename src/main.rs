@@ -415,7 +415,7 @@ struct AnkiState {
     built_with: Option<anki::SegConfig>,
 }
 
-/// HSK bands and word lists marked known (saved in known.json).
+/// Vocabulary levels and word lists marked known (saved in known.json / known-ko.json).
 #[derive(Default)]
 struct KnownState {
     settings: known::Settings,
@@ -855,7 +855,7 @@ impl App {
     }
 
     fn refresh_anki_coverage(&mut self) {
-        // Anki (if on) plus the HSK bands and word lists marked known.
+        // Anki (if on) plus the levels and word lists marked known.
         let base = self
             .anki
             .knowledge
@@ -1508,12 +1508,12 @@ impl eframe::App for App {
                 ui.separator();
                 let label = match (self.known.settings.is_empty(), self.language) {
                     (true, Language::Chinese) => "📚 HSK & word lists…".to_owned(),
-                    (true, Language::Korean) => "📚 Word lists…".to_owned(),
+                    (true, Language::Korean) => "📚 Levels & word lists…".to_owned(),
                     (false, _) => format!("📚 Known: {}", self.known.settings.label()),
                 };
                 let hover = match self.language {
                     Language::Chinese => "Mark HSK 3.0 levels and imported word lists as known, in addition to your Anki cards",
-                    Language::Korean => "Mark imported Korean word lists as known, in addition to your Anki cards",
+                    Language::Korean => "Mark vocabulary levels 1–6급 and imported Korean word lists as known, in addition to your Anki cards",
                 };
                 if ui
                     .selectable_label(self.known.window, label)
@@ -1734,7 +1734,7 @@ impl App {
         let lang = self.language;
         let title = match lang {
             Language::Chinese => "Known words: HSK & word lists (中文)",
-            Language::Korean => "Known words: word lists (한국어)",
+            Language::Korean => "Known words: levels & word lists (한국어)",
         };
         egui::Window::new(title)
             .id(egui::Id::unique("known-window"))
@@ -1742,22 +1742,35 @@ impl App {
             .default_width(560.0)
             .show(ctx, |ui| {
                 let k = &mut self.known;
-                if lang == Language::Chinese {
-                ui.strong("HSK 3.0 vocabulary");
-                ui.label(
-                    RichText::new(
-                        "《HSK 考试大纲》, released November 2025 (exams from July 2026). Tick each level whose new words you know; levels 7–9 share one list.",
-                    )
-                    .weak(),
-                );
+                let bands = known::bands(lang);
+                match lang {
+                    Language::Chinese => {
+                        ui.strong("HSK 3.0 vocabulary");
+                        ui.label(
+                            RichText::new(
+                                "《HSK 考试大纲》, released November 2025 (exams from July 2026). Tick each level whose new words you know; levels 7–9 share one list.",
+                            )
+                            .weak(),
+                        );
+                    }
+                    Language::Korean => {
+                        ui.strong("Vocabulary by level (1–6급, as in TOPIK)");
+                        ui.label(
+                            RichText::new(
+                                "국립국어원's 국제 통용 한국어 표준 교육과정 list (2017, revised 2020). TOPIK publishes no word list; this is the one TOPIK vocabulary lists follow. Tick each level whose new words you know. A 하다/되다 verb counts with its noun once 2급 is ticked.",
+                            )
+                            .weak(),
+                        );
+                    }
+                }
                 ui.horizontal_wrapped(|ui| {
                     let mut cum = 0;
-                    for b in known::BANDS {
-                        let n = known::hsk_count(b);
+                    for &b in bands {
+                        let n = known::band_count(lang, b);
                         cum += n;
                         let mut v = k.settings.band_on(b);
                         if ui
-                            .checkbox(&mut v, format!("{} ({})", known::band_label(b), fmt_int(n as u64)))
+                            .checkbox(&mut v, format!("{} ({})", known::band_label(lang, b), fmt_int(n as u64)))
                             .on_hover_text(format!(
                                 "{} words introduced at this level; {} up to and including it",
                                 fmt_int(n as u64),
@@ -1772,20 +1785,21 @@ impl App {
                 });
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("All up to:").weak());
-                    for b in known::BANDS {
-                        let short = known::band_label(b).trim_start_matches("HSK ");
-                        if ui.small_button(short).on_hover_text(format!("Tick HSK 1 to {short} only")).clicked() {
-                            k.settings.hsk = known::BANDS.iter().copied().filter(|x| *x <= b).collect();
+                    for &b in bands {
+                        let label = known::band_label(lang, b);
+                        let short = label.trim_start_matches("HSK ");
+                        let first = known::band_label(lang, bands[0]);
+                        if ui.small_button(short).on_hover_text(format!("Tick {first} to {label} only")).clicked() {
+                            k.settings.levels = bands.iter().copied().filter(|x| *x <= b).collect();
                             changed = true;
                         }
                     }
-                    if ui.small_button("None").clicked() && !k.settings.hsk.is_empty() {
-                        k.settings.hsk.clear();
+                    if ui.small_button("None").clicked() && !k.settings.levels.is_empty() {
+                        k.settings.levels.clear();
                         changed = true;
                     }
                 });
                 ui.separator();
-                }
 
                 ui.horizontal(|ui| {
                     ui.strong("Word lists");
@@ -1948,7 +1962,7 @@ impl App {
         }
     }
 
-    /// HSK bands, lists or marked words changed: save them and recompute coverage.
+    /// Levels, lists or marked words changed: save them and recompute coverage.
     fn known_changed(&mut self) {
         if let Err(e) = self.known.settings.save() {
             self.known.error = Some(e);
@@ -2262,7 +2276,7 @@ impl App {
                                  Words you know but have no Anki card for (and aren't in a ticked HSK level or word list) count as unknown, so the book may be easier than this."
                             } else {
                                 "Thresholds from L2 reading research: 98% coverage for comfortable reading of fiction (Hu & Nation 2000), 95% as the minimum for adequate comprehension (Laufer 1989). \
-                                 Words you know but have no Anki card for (and aren't in a word list) count as unknown, so the book may be easier than this."
+                                 Words you know but have no Anki card for (and aren't in a ticked level or word list) count as unknown, so the book may be easier than this."
                             })
                             .weak()
                             .small(),

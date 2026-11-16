@@ -31,19 +31,24 @@ Words from your imported word lists and words you marked known (not the HSK leve
 
 Click **🃏 Anki**, tick your decks and the fields that hold the word (sentence fields work too), and hanstat shows which of the book's characters and words you already know, what share of the running text that covers, and a difficulty rating from it. Young and mature cards count as known. Mature means an interval of 21+ days, as in Anki, or, if you use FSRS and tick **Mature by FSRS stability**, a stability of at least the days you set on the slider, which doesn't shift with desired retention. Your collection is only read from a copy, never modified.
 
-## HSK levels and word lists
+## Vocabulary levels and word lists
 
-Click **📚 HSK & word lists** to mark words as known without Anki cards. You can tick HSK 3.0 levels, or import `.txt` word lists with one word per line (exports with pinyin or definitions after a tab or comma work too). You can also click **+** next to any unknown word in the **Words** tab to mark that word known. These words count as known alongside your Anki cards, or on their own if Anki is off. The HSK vocabulary is the 2025 《HSK 考试大纲》 (11,000 entries, 10,896 distinct words), bundled with the app. Your choices, imported lists and marked words are saved to `%LOCALAPPDATA%\hanstat\known.json` and kept between runs.
+Click **📚 HSK & word lists** (Korean: **📚 Levels & word lists**) to mark words as known without Anki cards. You can tick vocabulary levels, or import `.txt` word lists with one word per line (exports with pinyin or definitions after a tab or comma work too). You can also click **+** next to any unknown word in the **Words** tab to mark that word known. These words count as known alongside your Anki cards, or on their own if Anki is off. Your choices, imported lists and marked words are saved to `%LOCALAPPDATA%\hanstat\known.json` (Korean: `known-ko.json`) and kept between runs.
+
+- **Chinese:** HSK 3.0 levels from the 2025 《HSK 考试大纲》 (11,000 entries, 10,896 distinct words).
+- **Korean:** levels 1–6급 from 국립국어원's 국제 통용 한국어 표준 교육과정 vocabulary (10,635 entries, 9,977 words). TOPIK publishes no word list of its own; this is the list that TOPIK vocabulary lists by level follow. Most 하다/되다 verbs are listed only through their noun, with the affixes -하다 and -되다 taught at 2급. So with 2급 ticked, 말하다 and 생각되다 count as known when 말 and 생각 are in a ticked level. A few words the list teaches as part of a grammar pattern count at that pattern's level: 싶다 (-고 싶다, 1급), 때문 (-기 때문에, 2급), 듯하다 (-는 듯하다, 5급) and similar.
 
 ## Command line
 
 ```
 hanstat.exe [file] [--tab overview|characters|words|sections|suggestions|notes]
-hanstat-cli.exe file.epub [--ltp|--ckip|--jieba] [--dict names.txt] [--auto-dict] [--json] [--chars-csv f] [--words-csv f] [--anki] [--known] [--hsk N] [--known-list words.txt] [--lang zh|ko]
+hanstat-cli.exe file.epub [--ltp|--ckip|--jieba] [--dict names.txt] [--auto-dict] [--json] [--chars-csv f] [--words-csv f] [--anki] [--known] [--level N] [--known-list words.txt] [--lang zh|ko]
 ```
+
+`--level N` marks levels 1 to N known in the book's language: HSK for Chinese, 급 for Korean. `--hsk N` still works for Chinese books.
 
 Run `hanstat-cli.exe --help` for all options.
 
 ## Licence
 
-MIT or Apache-2.0, at your option. Bundled OpenCC data is Apache-2.0; the jieba dictionary is MIT. The HSK word list comes from the official syllabus via [ofou/hsk](https://github.com/ofou/hsk) (MIT). The downloaded models have their own licences: [LTP](https://huggingface.co/LTP/legacy) is free for research and individual use (commercial use needs a licence from HIT-SCIR), [CKIP bert-tiny](https://huggingface.co/ckiplab/bert-tiny-chinese-ws) is GPL-3.0, and [Kiwi](https://github.com/bab2min/Kiwi) is Apache-2.0.
+MIT or Apache-2.0, at your option. Bundled OpenCC data is Apache-2.0; the jieba dictionary is MIT. The HSK word list comes from the official syllabus via [ofou/hsk](https://github.com/ofou/hsk) (MIT). The Korean level list is 국립국어원's [국제 통용 한국어 표준 교육과정 vocabulary list](https://www.korean.go.kr/front/reportData/reportDataView.do?mn_id=45&report_seq=932), free to use under Article 24-2 of the Korean Copyright Act (public works). The downloaded models have their own licences: [LTP](https://huggingface.co/LTP/legacy) is free for research and individual use (commercial use needs a licence from HIT-SCIR), [CKIP bert-tiny](https://huggingface.co/ckiplab/bert-tiny-chinese-ws) is GPL-3.0, and [Kiwi](https://github.com/bab2min/Kiwi) is Apache-2.0.

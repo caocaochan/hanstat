@@ -1,5 +1,13 @@
 # Changelog
 
+## [2026.11.16.0] - 2026-11-16
+
+### Added
+- **Korean vocabulary levels.** In Korean mode, the known-words window (now **📚 Levels & word lists**) has checkboxes for levels 1–6급. The list is 국립국어원's 국제 통용 한국어 표준 교육과정 vocabulary (2017, revised 2020; 10,635 entries, 9,977 words after splitting variant pairs, merging homographs and dropping affixes). TOPIK publishes no word list of its own; this is the list that TOPIK vocabulary lists by level follow. The list has most 하다/되다 verbs only as their noun plus the 2급 affixes -하다/-되다. So once 2급 is ticked, a book's X하다 or X되다 counts as known when X is in a ticked level. Fifteen words the list teaches only inside a grammar pattern (싶다 from -고 싶다, 때문 from -기 때문에, 듯하다, 척하다, 뿐, 만큼…) are added at that pattern's level, and six (않다, 수, 적, 대로, 탓, 뻔하다) move down to it. On 404호 호러맨스 1, 1–6급 cover 91.0% of running words, with 45.1% at 1급, 64.7% at 1–2급 and 83.3% at 1–4급. CLI: `--level N` marks levels 1 to N in the book's language (`--hsk N` still works for Chinese).
+
+### Changed
+- `known.json` and `known-ko.json` store the ticked levels as `levels` instead of `hsk`. Older files are still read. Versions 2026.11.15.1 and earlier don't read the new key, so they show no levels ticked.
+
 ## [2026.11.15.1] - 2026-11-15
 
 ### Added

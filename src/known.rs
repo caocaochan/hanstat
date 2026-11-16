@@ -1,10 +1,20 @@
-//! Words known outside Anki: HSK 3.0 bands and imported word lists.
+//! Words known outside Anki: graded vocabulary levels and imported word lists.
 //!
-//! The HSK vocabulary is the 2025 《HSK 考试大纲》 (中外语言交流合作中心,
-//! in force from July 2026), bundled in `data/HSK30-2025.tsv`. The choice of
-//! bands and the imported lists (copied in, so the source files may move) are
-//! saved per language: `%LOCALAPPDATA%\hanstat\known.json` for Chinese and
-//! `known-ko.json` for Korean (word lists and marked words only).
+//! Chinese: the HSK 3.0 vocabulary of the 2025 《HSK 考试大纲》
+//! (中外语言交流合作中心, in force from July 2026), bundled in
+//! `data/HSK30-2025.tsv`.
+//!
+//! Korean: levels 1급–6급 of 국립국어원's 국제 통용 한국어 표준 교육과정
+//! vocabulary, bundled in `data/KO-standard-2020.tsv`. TOPIK has no official
+//! word list; this is the list TOPIK level vocabularies are built from. It
+//! lists most 하다/되다 verbs only through their noun plus the 2급 affixes
+//! -하다/-되다, so a book's X하다 or X되다 counts as known when X is listed
+//! at a ticked level, or at a lower one if 2급 is ticked (see
+//! [`Settings::apply`]).
+//!
+//! The ticked levels and the imported lists (copied in, so the source files
+//! may move) are saved per language: `%LOCALAPPDATA%\hanstat\known.json` for
+//! Chinese and `known-ko.json` for Korean.
 
 use crate::anki::{self, Knowledge};
 use crate::chars;
@@ -15,57 +25,93 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 static HSK_TSV: &str = include_str!("../data/HSK30-2025.tsv");
+static KO_TSV: &str = include_str!("../data/KO-standard-2020.tsv");
 
 /// HSK bands: 1–6, and 7 for the shared 7–9 list.
 pub const BANDS: [u8; 7] = [1, 2, 3, 4, 5, 6, 7];
 
-/// (band, word), each word once, at the lowest band it is introduced.
-static HSK: LazyLock<Vec<(u8, &'static str)>> = LazyLock::new(|| {
-    HSK_TSV
-        .lines()
+/// Korean levels 1급–6급.
+pub const KO_LEVELS: [u8; 6] = [1, 2, 3, 4, 5, 6];
+
+/// The level at which the Korean affixes -하다 and -되다 are introduced.
+const KO_HADA_LEVEL: u8 = 2;
+
+/// `level<TAB>word[<TAB>note]` lines, each word once, at its lowest level.
+fn parse_levels(tsv: &'static str) -> Vec<(u8, &'static str)> {
+    tsv.lines()
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .map(|l| {
-            let (b, w) = l.split_once('\t').expect("band<TAB>word");
-            (b.parse().expect("band number"), w)
+            let mut f = l.split('\t');
+            let b = f.next().unwrap().parse().expect("level number");
+            (b, f.next().expect("level<TAB>word"))
         })
         .collect()
-});
+}
 
-pub fn band_label(band: u8) -> &'static str {
-    match band {
-        1 => "HSK 1",
-        2 => "HSK 2",
-        3 => "HSK 3",
-        4 => "HSK 4",
-        5 => "HSK 5",
-        6 => "HSK 6",
-        _ => "HSK 7–9",
+/// (band, word), each word once, at the lowest band it is introduced.
+static HSK: LazyLock<Vec<(u8, &'static str)>> = LazyLock::new(|| parse_levels(HSK_TSV));
+static KO: LazyLock<Vec<(u8, &'static str)>> = LazyLock::new(|| parse_levels(KO_TSV));
+
+fn table(lang: Language) -> &'static [(u8, &'static str)] {
+    match lang {
+        Language::Chinese => &HSK,
+        Language::Korean => &KO,
     }
 }
 
-/// Words introduced at `band`.
+/// The levels that can be ticked in `lang`.
+pub fn bands(lang: Language) -> &'static [u8] {
+    match lang {
+        Language::Chinese => &BANDS,
+        Language::Korean => &KO_LEVELS,
+    }
+}
+
+/// "HSK 3", "HSK 7–9", "3급".
+pub fn band_label(lang: Language, band: u8) -> String {
+    match (lang, band) {
+        (Language::Chinese, 7) => "HSK 7–9".to_owned(),
+        (Language::Chinese, b) => format!("HSK {b}"),
+        (Language::Korean, b) => format!("{b}급"),
+    }
+}
+
+/// Words introduced at `band` in `lang`.
+pub fn band_words(lang: Language, band: u8) -> impl Iterator<Item = &'static str> {
+    table(lang)
+        .iter()
+        .filter(move |(b, _)| *b == band)
+        .map(|(_, w)| *w)
+}
+
+pub fn band_count(lang: Language, band: u8) -> usize {
+    band_words(lang, band).count()
+}
+
+/// Words introduced at HSK `band`.
 pub fn hsk_words(band: u8) -> impl Iterator<Item = &'static str> {
-    HSK.iter().filter(move |(b, _)| *b == band).map(|(_, w)| *w)
+    band_words(Language::Chinese, band)
 }
 
 pub fn hsk_count(band: u8) -> usize {
-    hsk_words(band).count()
+    band_count(Language::Chinese, band)
 }
 
-/// "HSK 1–3", "HSK 1, 3, 5–6", "HSK 1–9".
-pub fn bands_label(bands: &[u8]) -> String {
+/// "HSK 1–3", "HSK 1, 3, 5–6", "HSK 1–9"; Korean "1–3급", "1, 3, 5–6급".
+pub fn bands_label(lang: Language, bands: &[u8]) -> String {
     let mut b: Vec<u8> = bands.to_vec();
     b.sort_unstable();
     b.dedup();
+    let hsk_top = lang == Language::Chinese;
     let num = |x: u8| {
-        if x == 7 {
+        if hsk_top && x == 7 {
             "9".to_owned()
         } else {
             x.to_string()
         }
     };
     let first = |x: u8| {
-        if x == 7 {
+        if hsk_top && x == 7 {
             "7–9".to_owned()
         } else {
             x.to_string()
@@ -85,7 +131,10 @@ pub fn bands_label(bands: &[u8]) -> String {
         });
         i = j + 1;
     }
-    format!("HSK {}", parts.join(", "))
+    match lang {
+        Language::Chinese => format!("HSK {}", parts.join(", ")),
+        Language::Korean => format!("{}급", parts.join(", ")),
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,8 +150,10 @@ pub struct WordList {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Ticked HSK bands (see [`BANDS`]).
-    pub hsk: Vec<u8>,
+    /// Ticked levels (see [`bands`]): HSK bands for Chinese, 급 for Korean.
+    /// Saved as `hsk` before Korean levels existed.
+    #[serde(alias = "hsk")]
+    pub levels: Vec<u8>,
     pub lists: Vec<WordList>,
     /// Words marked known one by one with + in the Words tab, as the book wrote them.
     pub marked: Vec<String>,
@@ -166,7 +217,7 @@ impl Settings {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.hsk.is_empty()
+        self.levels.is_empty()
             && self.lists.iter().all(|l| l.words.is_empty())
             && self.marked.is_empty()
     }
@@ -187,14 +238,14 @@ impl Settings {
     }
 
     pub fn band_on(&self, band: u8) -> bool {
-        self.hsk.contains(&band)
+        self.levels.contains(&band)
     }
 
     pub fn set_band(&mut self, band: u8, on: bool) {
-        self.hsk.retain(|b| *b != band);
+        self.levels.retain(|b| *b != band);
         if on {
-            self.hsk.push(band);
-            self.hsk.sort_unstable();
+            self.levels.push(band);
+            self.levels.sort_unstable();
         }
     }
 
@@ -208,20 +259,34 @@ impl Settings {
 
     /// Every word marked known (may repeat).
     pub fn words(&self) -> impl Iterator<Item = &str> {
-        let hsk = HSK
+        let levels = table(self.language)
             .iter()
-            .filter(|(b, _)| self.hsk.contains(b))
+            .filter(|(b, _)| self.levels.contains(b))
             .map(|(_, w)| *w);
-        hsk.chain(
-            self.lists
-                .iter()
-                .flat_map(|l| l.words.iter().map(String::as_str)),
-        )
-        .chain(self.marked.iter().map(String::as_str))
+        levels
+            .chain(
+                self.lists
+                    .iter()
+                    .flat_map(|l| l.words.iter().map(String::as_str)),
+            )
+            .chain(self.marked.iter().map(String::as_str))
+    }
+
+    /// Korean words X whose X하다 and X되다 count as known: X is at a level L
+    /// such that the later of L and 2급 (where -하다/-되다 are taught) is
+    /// ticked. Empty for Chinese.
+    pub fn hada_stems(&self) -> HashSet<&'static str> {
+        if self.language != Language::Korean {
+            return HashSet::new();
+        }
+        KO.iter()
+            .filter(|(b, _)| self.levels.contains(&(*b).max(KO_HADA_LEVEL)))
+            .map(|(_, w)| *w)
+            .collect()
     }
 
     /// The words given to the segmenter (imported lists and marked words, not
-    /// HSK), sorted and deduplicated so two sets compare equal.
+    /// the levels), sorted and deduplicated so two sets compare equal.
     pub fn segmenter_words(&self) -> Vec<String> {
         let mut w: Vec<String> = self
             .lists
@@ -239,8 +304,8 @@ impl Settings {
     pub fn label(&self) -> String {
         let n = self.lists.iter().filter(|l| !l.words.is_empty()).count();
         let mut parts = Vec::new();
-        if !self.hsk.is_empty() {
-            parts.push(bands_label(&self.hsk));
+        if !self.levels.is_empty() {
+            parts.push(bands_label(self.language, &self.levels));
         }
         match n {
             0 => {}
@@ -264,6 +329,7 @@ impl Settings {
             None => Knowledge::empty(fold),
         };
         k.add_listed(self.words(), self.label());
+        k.hada_stems = self.hada_stems().into_iter().map(str::to_owned).collect();
         Some(k)
     }
 }
@@ -384,12 +450,70 @@ mod tests {
     }
 
     #[test]
+    fn korean_data_matches_the_list() {
+        // 10,635 entries (735/1100/1655/2200/2365/2580) → 9,962 distinct words
+        // after splitting variant pairs, merging homographs and dropping
+        // affixes, plus 15 lemmas from the grammar sheet (6 more lowered).
+        let counts: Vec<usize> = KO_LEVELS
+            .iter()
+            .map(|&b| band_count(Language::Korean, b))
+            .collect();
+        assert_eq!(counts, [716, 1068, 1528, 2067, 2130, 2468]);
+        assert_eq!(KO.len(), 9_977);
+        let all: HashSet<&str> = KO.iter().map(|(_, w)| *w).collect();
+        assert_eq!(all.len(), KO.len());
+        assert!(all.iter().all(|w| w.chars().all(chars::is_hangul)));
+        let level = |w: &str| KO.iter().find(|(_, x)| *x == w).map(|(b, _)| *b);
+        assert_eq!(level("가다"), Some(1));
+        assert_eq!(level("싶다"), Some(1)); // -고 싶다
+        assert_eq!(level("않다"), Some(1)); // -지 않다, 3급 as a vocabulary item
+        assert_eq!(level("때문"), Some(2));
+        assert_eq!(level("말하다"), None); // only 말 + -하다
+    }
+
+    #[test]
+    fn korean_hada_verbs_follow_their_noun() {
+        let mut s = Settings {
+            language: Language::Korean,
+            ..Default::default()
+        };
+        s.set_band(1, true);
+        // 말 and 생각 are 1급, but -하다 is taught at 2급.
+        let k = s.apply(None, false).unwrap();
+        assert_eq!(k.word("말"), Status::Listed);
+        assert!(!k.word("말하다").is_known());
+        s.set_band(2, true);
+        let k = s.apply(None, false).unwrap();
+        assert_eq!(k.word("말하다"), Status::Listed);
+        assert_eq!(k.word("생각되다"), Status::Listed);
+        // Not for words outside the ticked levels, nor in Chinese.
+        assert!(!k.word("몽유병하다").is_known());
+        assert!(s.label().starts_with("1–2급"));
+        let mut zh = Settings::default();
+        zh.set_band(1, true);
+        assert!(zh.hada_stems().is_empty());
+        assert_eq!(zh.label(), "HSK 1");
+    }
+
+    #[test]
+    fn old_settings_files_load() {
+        let s: Settings = serde_json::from_str(r#"{"hsk":[1,2],"lists":[],"marked":[]}"#).unwrap();
+        assert_eq!(s.levels, [1, 2]);
+    }
+
+    #[test]
     fn band_labels() {
-        assert_eq!(bands_label(&[1, 2, 3]), "HSK 1–3");
-        assert_eq!(bands_label(&[3, 1]), "HSK 1, 3");
-        assert_eq!(bands_label(&[1, 2, 3, 4, 5, 6, 7]), "HSK 1–9");
-        assert_eq!(bands_label(&[7]), "HSK 7–9");
-        assert_eq!(bands_label(&[5, 6, 7]), "HSK 5–9");
+        let zh = Language::Chinese;
+        assert_eq!(bands_label(zh, &[1, 2, 3]), "HSK 1–3");
+        assert_eq!(bands_label(zh, &[3, 1]), "HSK 1, 3");
+        assert_eq!(bands_label(zh, &[1, 2, 3, 4, 5, 6, 7]), "HSK 1–9");
+        assert_eq!(bands_label(zh, &[7]), "HSK 7–9");
+        assert_eq!(bands_label(zh, &[5, 6, 7]), "HSK 5–9");
+        let ko = Language::Korean;
+        assert_eq!(bands_label(ko, &[1, 2, 3]), "1–3급");
+        assert_eq!(bands_label(ko, &[1, 3, 5, 6]), "1, 3, 5–6급");
+        assert_eq!(band_label(ko, 4), "4급");
+        assert_eq!(band_label(zh, 7), "HSK 7–9");
     }
 
     #[test]
@@ -430,7 +554,7 @@ mod tests {
         base.chars.insert('我', Status::Mature);
         base.chars.insert('看', Status::Learning);
         let s = Settings {
-            hsk: vec![],
+            levels: vec![],
             marked: vec!["跑步".into(), "我".into()],
             lists: vec![WordList {
                 name: "a.txt".into(),

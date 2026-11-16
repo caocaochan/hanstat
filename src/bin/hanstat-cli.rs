@@ -10,10 +10,13 @@ use hanstat::lang::Language;
 use hanstat::segment::SegmenterKind;
 use std::path::PathBuf;
 
-/// `--known`, `--hsk`, `--known-list`: applied in the book's language.
+/// `--known`, `--level`/`--hsk`, `--known-list`: applied in the book's language.
 #[derive(Default)]
 struct KnownArgs {
     saved: bool,
+    /// `--level N`: levels 1 to N in the book's language.
+    level: Option<u8>,
+    /// `--hsk N`: Chinese only.
     hsk: Option<u8>,
     lists: Vec<PathBuf>,
 }
@@ -21,16 +24,19 @@ struct KnownArgs {
 impl KnownArgs {
     /// The words marked known for `lang`, or `None` if none of the options was given.
     fn resolve(&self, lang: Language) -> Option<hanstat::known::Settings> {
-        if !self.saved && self.hsk.is_none() && self.lists.is_empty() {
+        if !self.saved && self.level.is_none() && self.hsk.is_none() && self.lists.is_empty() {
             return None;
         }
-        let mut k = hanstat::known::Settings::default();
+        let mut k = hanstat::known::Settings {
+            language: lang,
+            ..Default::default()
+        };
         if self.saved {
             let (s, warn) = hanstat::known::Settings::load_for(lang);
             if let Some(w) = warn {
                 eprintln!("warning: {w}");
             }
-            for b in s.hsk {
+            for b in s.levels {
                 k.set_band(b, true);
             }
             k.lists.extend(s.lists);
@@ -40,8 +46,20 @@ impl KnownArgs {
         }
         match (self.hsk, lang) {
             (Some(n), Language::Chinese) => (1..=n).for_each(|b| k.set_band(b, true)),
-            (Some(_), Language::Korean) => eprintln!("--hsk ignored: the book is Korean"),
+            (Some(_), Language::Korean) => {
+                eprintln!("--hsk ignored: the book is Korean (use --level)")
+            }
             (None, _) => {}
+        }
+        if let Some(n) = self.level {
+            let bands = hanstat::known::bands(lang);
+            let top = *bands.last().unwrap();
+            if lang == Language::Korean && n > top {
+                eprintln!("--level {n}: Korean levels go up to {top}급; marking 1–{top}급");
+            }
+            for &b in bands.iter().filter(|&&b| b <= n.min(top)) {
+                k.set_band(b, true);
+            }
         }
         for p in &self.lists {
             let l = hanstat::known::read_word_list_in(p, lang).unwrap_or_else(|e| {
@@ -340,6 +358,19 @@ fn main() {
                 };
                 ka.hsk = Some(n);
             }
+            "--level" => {
+                let n: u8 = match args.next().and_then(|s| s.parse().ok()) {
+                    // Chinese 7, 8, 9 share one list (band 7).
+                    Some(n @ 1..=9) => n.min(7),
+                    _ => {
+                        eprintln!(
+                            "--level expects a level from 1 to 9 (HSK) or 1 to 6 (Korean 급)"
+                        );
+                        std::process::exit(2)
+                    }
+                };
+                ka.level = Some(n);
+            }
             "--known-list" => ka
                 .lists
                 .push(PathBuf::from(args.next().unwrap_or_default())),
@@ -399,11 +430,13 @@ fn main() {
                 eprintln!(
                     "usage: hanstat-cli <file.epub|file.txt> [--ckip|--ltp|--jieba] [--dict words.txt] [--json] [--top N] [--include-all] [--exclude i,j] [--chars-csv f] [--words-csv f] [--suggest N] [--auto-dict]\n\
                      \x20      [--anki] [--anki-list] [--anki-collection collection.anki2] [--anki-deck NAME]... [--anki-field \"NOTE TYPE:FIELD\"]... [--anki-mature-stability DAYS] [--anki-save]\n\
-                     \x20      [--known] [--hsk N] [--known-list words.txt]... [--lang zh|ko]\n\
+                     \x20      [--known] [--level N] [--hsk N] [--known-list words.txt]... [--lang zh|ko]\n\
                      \n\
                      The book's language is detected: Korean books are analysed with Kiwi (downloaded on first use) and have word statistics only.\n\
-                     --known adds the HSK levels and word lists marked known in the hanstat window (saved in {} for Chinese, {} for Korean).\n\
-                     --hsk N marks HSK 3.0 (2025 syllabus) levels 1 to N known (7, 8, 9: all; Chinese only); --known-list adds a word list (one word per line).\n\
+                     --known adds the levels and word lists marked known in the hanstat window (saved in {} for Chinese, {} for Korean).\n\
+                     --level N marks levels 1 to N known in the book's language: HSK 3.0 (2025 syllabus; 7, 8, 9: all) for Chinese,\n\
+                     \x20 1–6급 of 국립국어원's 국제 통용 한국어 표준 교육과정 vocabulary (the list TOPIK levels follow) for Korean.\n\
+                     --hsk N is --level N for Chinese books only; --known-list adds a word list (one word per line).\n\
                      These count as known together with young/mature Anki cards, or on their own without --anki.\n\
                      --anki uses the decks/note types/fields chosen in the hanstat window for the book's language (saved in {} / {}).\n\
                      --anki-deck/--anki-field replace that choice for this run (repeatable; a deck includes its subdecks); --anki-save keeps it.\n\

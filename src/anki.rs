@@ -41,7 +41,7 @@ pub enum Status {
     NotInAnki,
     New,
     Learning,
-    /// Not young/mature in Anki, but in a ticked HSK band or an imported word
+    /// Not young/mature in Anki, but in a ticked level (HSK, 급) or an imported word
     /// list (see `crate::known`). Counts as known.
     Listed,
     Young,
@@ -817,6 +817,7 @@ impl Collection {
             summary,
             from_anki: true,
             listed: ListedSummary::default(),
+            hada_stems: HashSet::new(),
         })
     }
 }
@@ -1024,6 +1025,9 @@ pub struct Knowledge {
     /// Built from an Anki collection, not from word lists alone.
     pub from_anki: bool,
     pub listed: ListedSummary,
+    /// Korean: listed words X whose X하다 and X되다 are known too
+    /// ([`Status::Listed`]); see `crate::known::Settings::hada_stems`.
+    pub hada_stems: HashSet<String>,
 }
 
 impl Knowledge {
@@ -1036,6 +1040,7 @@ impl Knowledge {
             summary: KnowledgeSummary::default(),
             from_anki: false,
             listed: ListedSummary::default(),
+            hada_stems: HashSet::new(),
         }
     }
 
@@ -1067,10 +1072,25 @@ impl Knowledge {
     }
 
     pub fn word(&self, w: &str) -> Status {
-        self.words
+        let s = self
+            .words
             .get(&fold(w, self.fold))
             .copied()
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if !s.is_known() && self.hada_stem_known(w) {
+            Status::Listed
+        } else {
+            s
+        }
+    }
+
+    /// `w` is X하다 or X되다 with X in [`Self::hada_stems`].
+    fn hada_stem_known(&self, w: &str) -> bool {
+        !self.hada_stems.is_empty()
+            && ["하다", "되다"].iter().any(|sfx| {
+                w.strip_suffix(sfx)
+                    .is_some_and(|x| !x.is_empty() && self.hada_stems.contains(x))
+            })
     }
     pub fn char(&self, c: char) -> Status {
         self.chars
@@ -1310,6 +1330,7 @@ mod tests {
             summary: KnowledgeSummary::default(),
             from_anki: true,
             listed: ListedSummary::default(),
+            hada_stems: HashSet::new(),
         };
         let word_freq = vec![
             ("我".to_string(), 50),
@@ -1398,6 +1419,7 @@ mod tests {
             summary: Default::default(),
             from_anki: true,
             listed: Default::default(),
+            hada_stems: Default::default(),
         };
         assert_eq!(k.word("响彻"), Status::Mature);
         assert_eq!(k.word("響徹"), Status::Mature);
