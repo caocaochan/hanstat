@@ -9,13 +9,25 @@ Character and word statistics for Chinese, Japanese and Korean `.epub` and `.txt
 
 ## Install
 
+### Windows
+
 1. Download [`hanstat-x86_64-pc-windows-msvc.zip`](https://github.com/caocaochan/hanstat/releases/latest/download/hanstat-x86_64-pc-windows-msvc.zip) (Windows x64).
 2. Unzip it and run `hanstat.exe` from the `hanstat` folder.
 3. Open a file or drag it onto the window.
 
 The exe isn't code-signed, so SmartScreen may ask you to confirm the first run. The app updates itself; click the version number in the status bar to check now or turn automatic updates off.
 
-The analysers are downloaded on first use into `%LOCALAPPDATA%\hanstat\models`: the Chinese models (LTP 32 MB, CKIP 46 MB) on first start, Kiwi (126 MB) with your first Korean book, and SudachiDict (about 137 MB) with your first Japanese book. Analyses are saved, so reopening a book is instant.
+### macOS
+
+1. Download [`hanstat-aarch64-apple-darwin.zip`](https://github.com/caocaochan/hanstat/releases/latest/download/hanstat-aarch64-apple-darwin.zip) (Apple Silicon, macOS 11 or later).
+2. Unzip it and move `hanstat.app` to Applications.
+3. Open it. The app isn't notarised, so macOS refuses the first time: go to **System Settings → Privacy & Security** and click **Open Anyway**. To run `hanstat-cli` from Terminal, clear its quarantine flag first: `xattr -d com.apple.quarantine hanstat-cli`.
+
+The Mac version doesn't update itself; download new releases from the same link.
+
+### Data
+
+The analysers are downloaded on first use into `%LOCALAPPDATA%\hanstat\models` (macOS: `~/Library/Application Support/hanstat/models`): the Chinese models (LTP 32 MB, CKIP 46 MB) on first start, Kiwi (about 130 MB) with your first Korean book, and SudachiDict (about 137 MB) with your first Japanese book. Analyses are saved, so reopening a book is instant.
 
 ## Languages
 
@@ -46,7 +58,7 @@ hanstat.exe [file] [--tab overview|characters|words|sections|suggestions|notes]
 hanstat-cli.exe file.epub [--ltp|--ckip|--jieba] [--dict names.txt] [--auto-dict] [--json] [--chars-csv f] [--words-csv f] [--anki] [--level N] [--tocfl N] [--known-list words.txt] [--lang zh|ko|ja]
 ```
 
-Run `hanstat-cli.exe --help` for all options.
+Run `hanstat-cli.exe --help` for all options. On macOS the CLI is `hanstat-cli`, and the app can be started with a file as `open -a hanstat --args "$PWD/file.epub"` (the path must be absolute).
 
 ## Licence
 

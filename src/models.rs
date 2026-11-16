@@ -127,14 +127,33 @@ macro_rules! kiwi_model_files {
     };
 }
 
-/// Kiwi Korean morphological analyser (library + CoNg base model). The DLL is
-/// loaded at run time (see `crate::kiwi`), so a build never needs it.
-pub const KIWI: Model = Model {
-    id: "kiwi-v0.24.1",
-    title: "Kiwi v0.24.1 Korean morphological analyser (bab2min)",
-    licence: "Apache-2.0",
-    homepage: "https://github.com/bab2min/Kiwi",
-    files: &[
+/// Kiwi's CoNg base model, the same on every platform.
+const KIWI_MODEL: ModelFile = ModelFile {
+    name: "kiwi_model_v0.24.1_base.tgz",
+    url: kiwi_url!("kiwi_model_v0.24.1_base.tgz"),
+    sha256: "50d163e1af817444ef21f7ec5ea07ef69fb347282d57a6b49260f2039d4dc346",
+    size: 87_967_233,
+    unpack: Unpack::TarGz(kiwi_model_files![
+        "combiningRule.txt" = 3_611,
+        "cong.mdl" = 75_854_705,
+        "default.dict" = 3_090_954,
+        "dialect.dict" = 644,
+        "extract.mdl" = 17_370,
+        "multi.dict" = 12_064_440,
+        "nounchr.mdl" = 9_734_234,
+        "sj.morph" = 8_462_892,
+        "typo.dict" = 395,
+    ]),
+};
+
+/// Kiwi's C library: this platform's release build and the file taken out of
+/// it. Only Windows x64 and macOS arm64 are wired up; elsewhere [`KIWI_LIB`]
+/// is `None` and Korean books can't be analysed.
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod kiwi_lib {
+    use super::*;
+    pub const NAME: Option<&str> = Some("kiwi.dll");
+    pub const FILES: &[ModelFile] = &[
         ModelFile {
             name: "kiwi_win_x64_v0.24.1.zip",
             url: kiwi_url!("kiwi_win_x64_v0.24.1.zip"),
@@ -146,24 +165,53 @@ pub const KIWI: Model = Model {
                 size: 23_307_264,
             }]),
         },
+        KIWI_MODEL,
+    ];
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod kiwi_lib {
+    use super::*;
+    pub const NAME: Option<&str> = Some("libkiwi.dylib");
+    pub const FILES: &[ModelFile] = &[
         ModelFile {
-            name: "kiwi_model_v0.24.1_base.tgz",
-            url: kiwi_url!("kiwi_model_v0.24.1_base.tgz"),
-            sha256: "50d163e1af817444ef21f7ec5ea07ef69fb347282d57a6b49260f2039d4dc346",
-            size: 87_967_233,
-            unpack: Unpack::TarGz(kiwi_model_files![
-                "combiningRule.txt" = 3_611,
-                "cong.mdl" = 75_854_705,
-                "default.dict" = 3_090_954,
-                "dialect.dict" = 644,
-                "extract.mdl" = 17_370,
-                "multi.dict" = 12_064_440,
-                "nounchr.mdl" = 9_734_234,
-                "sj.morph" = 8_462_892,
-                "typo.dict" = 395,
-            ]),
+            name: "kiwi_mac_arm64_v0.24.1.tgz",
+            url: kiwi_url!("kiwi_mac_arm64_v0.24.1.tgz"),
+            sha256: "510680643980c4af94bee57151020b6373a098bac809084e7cb26080fc5bd9b9",
+            size: 41_371_847,
+            // libkiwi.dylib and libkiwi.0.dylib are symlinks to this file.
+            unpack: Unpack::TarGz(&[Member {
+                path: "lib/libkiwi.0.24.1.dylib",
+                name: "libkiwi.dylib",
+                size: 28_742_272,
+            }]),
         },
-    ],
+        KIWI_MODEL,
+    ];
+}
+
+#[cfg(not(any(
+    all(windows, target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+)))]
+mod kiwi_lib {
+    use super::*;
+    pub const NAME: Option<&str> = None;
+    pub const FILES: &[ModelFile] = &[KIWI_MODEL];
+}
+
+/// File name of Kiwi's C library in [`KIWI`]'s folder; `None` on platforms
+/// without a build of it.
+pub const KIWI_LIB: Option<&str> = kiwi_lib::NAME;
+
+/// Kiwi Korean morphological analyser (library + CoNg base model). The
+/// library is loaded at run time (see `crate::kiwi`), so a build never needs it.
+pub const KIWI: Model = Model {
+    id: "kiwi-v0.24.1",
+    title: "Kiwi v0.24.1 Korean morphological analyser (bab2min)",
+    licence: "Apache-2.0",
+    homepage: "https://github.com/bab2min/Kiwi",
+    files: kiwi_lib::FILES,
 };
 
 /// SudachiDict full 20261015 from its GitHub release, the dictionary of the
@@ -396,14 +444,18 @@ fn leak_sudachi_model(r: &SudachiRelease) -> &'static Model {
     }))
 }
 
-/// hanstat's per-user data folder (`%LOCALAPPDATA%\hanstat`): models and saved settings.
+/// hanstat's per-user data folder (`%LOCALAPPDATA%\hanstat`, on macOS
+/// `~/Library/Application Support/hanstat`): models and saved settings.
 pub fn app_dir() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("hanstat")
+    let base = if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support"))
+    } else {
+        std::env::var_os("LOCALAPPDATA")
+            .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+    };
+    base.unwrap_or_else(std::env::temp_dir).join("hanstat")
 }
 
 /// Root cache directory for all models.

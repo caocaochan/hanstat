@@ -82,8 +82,12 @@ fn main() -> eframe::Result {
     )
 }
 
-/// egui ships no CJK glyphs; use Windows system fonts as fallbacks.
+/// egui ships no CJK glyphs; use Windows system fonts as fallbacks. Elsewhere
+/// eframe's system font provider (CoreText on macOS) finds them per character.
 fn install_fonts(ctx: &egui::Context) {
+    if !cfg!(windows) {
+        return;
+    }
     let dir = std::env::var_os("WINDIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
@@ -806,7 +810,7 @@ impl App {
         }
         self.anki.busy = if self.language == Language::Korean && !hanstat::models::KIWI.is_cached()
         {
-            "Downloading Kiwi (126 MB, first Korean use only), then classifying Anki notes…"
+            "Downloading Kiwi (about 130 MB, first Korean use only), then classifying Anki notes…"
         } else if self.language == Language::Japanese
             && !hanstat::models::sudachi_local().is_cached()
         {
@@ -994,7 +998,9 @@ impl App {
                     ui.colored_label(Color32::from_rgb(220, 80, 80), format!("⚠ {e}"));
                 }
                 if a.profiles.is_empty() && a.settings.collection.is_none() {
-                    ui.label("No Anki profiles found in %APPDATA%\\Anki2. Use Browse… to pick a collection.anki2.");
+                    let base = anki::anki_base()
+                        .map_or_else(|| "Anki's data folder".to_owned(), |b| b.display().to_string());
+                    ui.label(format!("No Anki profiles found in {base}. Use Browse… to pick a collection.anki2."));
                 }
                 let Some(info) = a.info.clone() else { return };
                 // Options and results are pinned to the bottom; the deck and
@@ -2113,8 +2119,14 @@ impl App {
 /// bottom of the screen (minus the taskbar). Never shrinks; does nothing when
 /// maximised or full-screen.
 fn grow_window(ctx: &egui::Context, want: f32) {
-    /// Windows' taskbar at 100–200% scaling is 40–48 points tall.
-    const TASKBAR: f32 = 48.0;
+    /// Windows' taskbar at 100–200% scaling is 40–48 points tall. On macOS the
+    /// menu bar (24–37 points with a notch) and the default Dock (about 70)
+    /// are both taken from the screen height.
+    const TASKBAR: f32 = if cfg!(target_os = "macos") {
+        110.0
+    } else {
+        48.0
+    };
     let (inner, outer, monitor, maxed) = ctx.input(|i| {
         let v = i.viewport();
         (

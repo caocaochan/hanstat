@@ -130,12 +130,17 @@ pub struct Profile {
     pub collection: PathBuf,
 }
 
-/// Anki's data folder: `ANKI_BASE` if set (as Anki itself honours), else `%APPDATA%\Anki2`.
+/// Anki's data folder: `ANKI_BASE` if set (as Anki itself honours), else
+/// `%APPDATA%\Anki2`, on macOS `~/Library/Application Support/Anki2`.
 pub fn anki_base() -> Option<PathBuf> {
     if let Some(b) = std::env::var_os("ANKI_BASE") {
         return Some(PathBuf::from(b));
     }
-    std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("Anki2"))
+    if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support/Anki2"))
+    } else {
+        std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("Anki2"))
+    }
 }
 
 /// Every profile folder that contains a `collection.anki2`.

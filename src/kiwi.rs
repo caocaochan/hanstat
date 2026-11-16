@@ -1,8 +1,9 @@
 //! Korean analysis with Kiwi (bab2min/Kiwi, Apache-2.0) through its C API.
 //!
-//! `kiwi.dll` and the CoNg base model are downloaded on first use
-//! ([`crate::models::KIWI`]) and the DLL is loaded at run time, so building
-//! hanstat never needs Kiwi and the Chinese modes never load it.
+//! Kiwi's library (`kiwi.dll` on Windows, `libkiwi.dylib` on macOS) and the
+//! CoNg base model are downloaded on first use ([`crate::models::KIWI`]) and
+//! the library is loaded at run time, so building hanstat never needs Kiwi and
+//! the Chinese modes never load it.
 //!
 //! Words are counted as dictionary forms (lemmas): Kiwi restores irregular
 //! stems (걸어 → 걷/VV, 도와 → 돕/VV), predicates get 다 (먹었어요 → 먹다), and a
@@ -54,16 +55,22 @@ const MATCH_ALL_WITH_NORMALIZING: c_int = 0x3F | (1 << 23) | (1 << 16);
 
 static API: OnceLock<Result<Api, String>> = OnceLock::new();
 
+/// Korean analysis is unavailable on this platform (no Kiwi library build).
+fn unsupported() -> String {
+    "Korean books need Kiwi, which hanstat has no build of for this platform.".into()
+}
+
 fn api(dir: &Path) -> Result<&'static Api, String> {
-    API.get_or_init(|| load_api(&dir.join("kiwi.dll")))
+    let lib = models::KIWI_LIB.ok_or_else(unsupported)?;
+    API.get_or_init(|| load_api(&dir.join(lib)))
         .as_ref()
         .map_err(Clone::clone)
 }
 
 fn load_api(dll: &Path) -> Result<Api, String> {
     let fail = |e: libloading::Error| format!("Cannot load {}: {e}", dll.display());
-    // SAFETY: kiwi.dll is the SHA-256-verified Kiwi v0.24.1 release build; its
-    // initialisers have no requirements, and each symbol's type matches capi.h.
+    // SAFETY: the library is the SHA-256-verified Kiwi v0.24.1 release build;
+    // its initialisers have no requirements, and each symbol's type matches capi.h.
     unsafe {
         let lib = libloading::Library::new(dll).map_err(fail)?;
         macro_rules! sym {
@@ -145,7 +152,7 @@ fn user_word_ok(w: &str) -> bool {
 }
 
 impl Kiwi {
-    /// Build from the model folder (`kiwi.dll` plus the model files), with
+    /// Build from the model folder (the library plus the model files), with
     /// `user_words` added as proper nouns so they are kept whole.
     pub fn build(dir: &Path, user_words: &[String]) -> Result<Kiwi, String> {
         let api = api(dir)?;
@@ -278,6 +285,8 @@ pub fn shared(user_words: &[String]) -> Result<Arc<Kiwi>, String> {
     }
     // Free the old one before building (unless a caller still holds it).
     *g = None;
+    // Don't download the model where the library can't be loaded anyway.
+    models::KIWI_LIB.ok_or_else(unsupported)?;
     let dir = models::KIWI.ensure(&|_, _| {})?;
     let k = Arc::new(Kiwi::build(&dir, user_words)?);
     *g = Some((user_words.to_vec(), k.clone()));

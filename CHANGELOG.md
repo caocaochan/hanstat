@@ -1,5 +1,15 @@
 # Changelog
 
+## [2026.11.16.5] - 2026-11-16
+
+### Added
+- **macOS build.** Releases now include `hanstat-aarch64-apple-darwin.zip` for Apple Silicon Macs (macOS 11 or later): `hanstat.app` and `hanstat-cli`, with the same features as on Windows, Korean included (Kiwi's macOS library is downloaded instead of `kiwi.dll`).
+  - **First start.** The app is ad-hoc signed but not notarised, so macOS blocks it the first time; allow it under **System Settings → Privacy & Security → Open Anyway**. `hanstat-cli` needs `xattr -d com.apple.quarantine hanstat-cli` before Terminal will run it.
+  - **Where things are saved.** `~/Library/Application Support/hanstat` (models, saved analyses and settings). Anki profiles are looked up in `~/Library/Application Support/Anki2`.
+  - **Fonts.** Chinese, Japanese and Korean text is drawn with the system's fonts, found per character through macOS's font fallback.
+  - **Not yet.** The Mac version doesn't update itself; download new releases from GitHub. Opening a book from Finder (**Open With**) isn't supported; open it from the app or drag it onto the window.
+- **Both platforms are tested.** CI runs the tests on Windows and macOS, and publishes a release only when both pass. Every CI run keeps both packaged builds as downloadable artifacts for 14 days.
+
 ## [2026.11.16.4] - 2026-11-16
 
 ### Added

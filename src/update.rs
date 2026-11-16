@@ -102,7 +102,7 @@ struct ApiAsset {
     browser_download_url: String,
 }
 
-/// The release zip's asset name. It has no version in it, so
+/// The Windows release zip's asset name. It has no version in it, so
 /// `.../releases/latest/download/<this>` is a permanent link.
 const ZIP_NAME: &str = "hanstat-x86_64-pc-windows-msvc.zip";
 
@@ -228,9 +228,17 @@ pub fn exe_path() -> Result<&'static Path, String> {
     .map_err(Clone::clone)
 }
 
-/// Why this copy shouldn't update itself, if it shouldn't: a debug build, a
-/// build run from Cargo's `target` folder, or `HANSTAT_NO_UPDATE` set.
+/// Why this copy shouldn't update itself, if it shouldn't: not Windows x64
+/// (the only release this installs), a debug build, a build run from Cargo's
+/// `target` folder, or `HANSTAT_NO_UPDATE` set. On macOS, replacing files
+/// inside the signed app bundle would also break its signature.
 pub fn disabled_reason() -> Option<String> {
+    if !cfg!(all(windows, target_arch = "x86_64")) {
+        return Some(
+            "Automatic updates are Windows-only. New versions are on hanstat's GitHub releases page."
+                .into(),
+        );
+    }
     if cfg!(debug_assertions) {
         return Some("Debug build: updates are off.".into());
     }
