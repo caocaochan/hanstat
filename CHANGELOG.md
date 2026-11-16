@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.16.7] - 2026-11-16
+
+### Fixed
+- **Table rows are vertically centred.** In the Characters, Words, Sections and Suggested words tables, text sat at the top of each row, so numbers and labels looked misaligned against the larger Chinese, Japanese and Korean text. Cells now centre their content, on Windows and macOS alike. Cell text no longer wraps: an over-long section name is clipped instead.
+
 ## [2026.11.16.6] - 2026-11-16
 
 From [@linlin56](https://github.com/linlin56)'s [#1](https://github.com/caocaochan/hanstat/pull/1), with fixes.

@@ -2748,6 +2748,8 @@ impl App {
             .collect();
         let total = r.han_total.max(1) as f64;
         TableBuilder::new(ui)
+            // Cells otherwise inherit the top-down layout: text sits at the row top.
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .striped(true)
             .column(Column::exact(70.0))
             .column(Column::exact(70.0))
@@ -2836,6 +2838,8 @@ impl App {
         // (word, mark) from a +/− click, applied after the table.
         let mut toggle: Option<(String, bool)> = None;
         TableBuilder::new(ui)
+            // Cells otherwise inherit the top-down layout: text sits at the row top.
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .striped(true)
             .column(Column::exact(70.0))
             .column(Column::exact(30.0))
@@ -2959,6 +2963,8 @@ impl App {
         let skip = if chinese { 0 } else { 3 };
         let mut toggles: Vec<usize> = Vec::new();
         TableBuilder::new(ui)
+            // Cells otherwise inherit the top-down layout: text sits at the row top.
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .striped(true)
             .column(Column::exact(28.0))
             .column(Column::exact(44.0))
@@ -3099,6 +3105,8 @@ impl App {
         });
         let mut toggles: Vec<String> = Vec::new();
         TableBuilder::new(ui)
+            // Cells otherwise inherit the top-down layout: text sits at the row top.
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .striped(true)
             .column(Column::exact(28.0))
             .column(Column::exact(150.0))
