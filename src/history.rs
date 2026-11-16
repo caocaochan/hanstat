@@ -188,9 +188,11 @@ impl History {
         {
             return Ok(false);
         }
-        // A replaced entry of another file (same path, changed contents) takes its cover with it.
+        // A replaced entry of another file (same path, changed contents) takes
+        // its cover and vocabulary profile with it.
         for old in self.entries.iter().filter(|e| same(e) && e.id != entry.id) {
             let _ = std::fs::remove_file(self.cover(&old.id));
+            let _ = std::fs::remove_file(self.profile(&old.id));
         }
         self.entries.retain(|e| !same(e));
         self.entries.insert(0, entry);
@@ -201,6 +203,7 @@ impl History {
         self.entries.retain(|e| e.id != id);
         if !self.read_only {
             let _ = std::fs::remove_file(self.cover(id));
+            let _ = std::fs::remove_file(self.profile(id));
         }
         self.save()
     }
@@ -208,6 +211,12 @@ impl History {
     /// Where the cover thumbnail of book `id` is kept (it may not exist).
     pub fn cover(&self, id: &str) -> PathBuf {
         cover_in(&self.path, id)
+    }
+
+    /// Where the vocabulary profile of book `id` is kept (it may not exist);
+    /// see [`crate::profile`].
+    pub fn profile(&self, id: &str) -> PathBuf {
+        crate::profile::path_in(&self.path, id)
     }
 
     /// Written to a temporary file and renamed, so a crash never leaves half a file.

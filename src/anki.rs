@@ -1032,7 +1032,9 @@ pub fn field_words(field: &str, norm: &mut chars::NormStats) -> Vec<String> {
         .collect()
 }
 
-fn fold(s: &str, on: bool) -> String {
+/// Traditional → Simplified, character by character, when `on`: how
+/// [`Knowledge`] keys its words.
+pub fn fold(s: &str, on: bool) -> String {
     if !on {
         return s.to_owned();
     }

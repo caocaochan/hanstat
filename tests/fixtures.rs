@@ -436,3 +436,58 @@ fn analysis_cache_gives_the_same_counts() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// What the reading path's "Analyse" does for a book without word data:
+/// analyse the file, save its profile, and plan with it.
+#[test]
+fn book_file_to_profile_to_reading_path() {
+    use hanstat::plan::{Library, Params, Study};
+    use hanstat::profile::{Profile, analyse_file, path_in};
+    let dir = std::env::temp_dir().join(format!("hanstat-path-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut books = Vec::new();
+    for (name, text) in [
+        (
+            "a.txt",
+            "温简言看向不远处的黑方小队。温简言笑了。我们今天去学校。\n",
+        ),
+        ("b.txt", "我们今天去学校。温简言看向黑方小队。\n"),
+    ] {
+        let file = dir.join(name);
+        std::fs::write(&file, text).unwrap();
+        let a = analyse_file(
+            &file,
+            SegmenterKind::Jieba,
+            &|_| vec!["温简言".into()],
+            &|_| Vec::new(),
+            None,
+        )
+        .unwrap();
+        let id = a.file_id.unwrap();
+        assert!(a.names.iter().any(|n| n == "温简言"));
+        let p = Profile::from_report(&id, &a.report, &a.names);
+        let path = path_in(&dir.join("history.json"), &id);
+        p.save(&path).unwrap();
+        books.push((name.to_owned(), Profile::load(&path).unwrap()));
+    }
+    let lib = Library::build(hanstat::lang::Language::Chinese, true, books);
+    let k0 = lib.known(None);
+    let p = lib.evaluate(
+        &k0,
+        &Params {
+            study: Study::Target(100.0),
+            ..Params::default()
+        },
+        &[0, 1],
+    );
+    // The name is never studied; b's words all come from a.
+    assert!(p.steps[0].study.iter().all(|&w| lib.word(w) != "温简言"));
+    assert!(
+        p.steps[1].study.is_empty(),
+        "{:?}",
+        lib.study_list(1, &p.steps[1].study)
+    );
+    assert_eq!(p.steps[1].reached, 100.0);
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -11,6 +11,8 @@ pub mod kiwi;
 pub mod known;
 pub mod lang;
 pub mod models;
+pub mod plan;
+pub mod profile;
 pub mod script;
 pub mod segment;
 pub mod update;

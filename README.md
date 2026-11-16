@@ -15,7 +15,7 @@ Runs on Windows and macOS. The Mac app's font handling and self-updating are by 
 
 1. Download [`hanstat-x86_64-pc-windows-msvc.zip`](https://github.com/caocaochan/hanstat/releases/latest/download/hanstat-x86_64-pc-windows-msvc.zip) (Windows x64).
 2. Unzip it and run `hanstat.exe` from the `hanstat` folder.
-3. Open a file or drag it onto the window.
+3. Open a file or drag it onto the window (several at once are all analysed and added to the History, and the last is shown).
 
 The exe isn't code-signed, so SmartScreen may ask you to confirm the first run.
 
@@ -24,7 +24,7 @@ The exe isn't code-signed, so SmartScreen may ask you to confirm the first run.
 1. Download [`hanstat-aarch64-apple-darwin.zip`](https://github.com/caocaochan/hanstat/releases/latest/download/hanstat-aarch64-apple-darwin.zip) (Apple Silicon, macOS 11 or later).
 2. Unzip it and move `hanstat.app` to Applications (or any folder you can write to, so it can update itself).
 3. Open it. The app isn't notarised, so macOS refuses the first time: go to **System Settings → Privacy & Security** and click **Open Anyway**.
-4. Open a file or drag it onto the window.
+4. Open a file or drag it onto the window (several at once are all analysed and added to the History, and the last is shown).
 
 The command-line tool is inside the app, at `hanstat.app/Contents/MacOS/hanstat-cli`. If Terminal refuses to run it, clear the download's quarantine flag once: `xattr -dr com.apple.quarantine /Applications/hanstat.app`.
 
@@ -62,12 +62,27 @@ Click **📚 HSK & word lists** (Korean: **Levels**, Japanese: **JLPT**) to mark
 
 Click **🕘 History** to list every book you've analysed, with its cover: length, unique words, the share of running words you knew, difficulty and reading time. Click a column to sort, or a title to open the book again. Analysing a book again replaces its row; a book is recognised by its file's contents, so a renamed or moved copy is still the same book. The list is kept in `%LOCALAPPDATA%\hanstat\history.json` (macOS: `~/Library/Application Support/hanstat/history.json`), and small copies of the covers in `covers` next to it.
 
+## Reading path
+
+**🕘 History → 🧭 Reading path** puts the analysed books of one language in an order to read them. Before each book you study some of its unknown words, until a share of its running words is known (95% by default) or a fixed number of them. Those words stay known for every book after it, so each book makes the next ones easier. For each book the table shows how much you know now, how much when the path reaches it, the words to study, what reading it next would take instead, and how many of its words the earlier books taught. **💾** saves a book's study list (word, tab, count) to import as a word list once learned, or to make Anki cards from.
+
+- **Which words.** A book's study words are weighed by how often the books still to come use them too (**Look ahead**, 2 by default), not only by their frequency in this book. On 69 novels from JJWXC, this cut the words studied in all by 20–26% against studying each book's most frequent unknown words, for learners knowing HSK 1–3, 1–5 or 1–9 with targets of 95% and 98%.
+- **Which order.** The longest study list is made as short as it can be, then the words studied in all. Against reading the easiest book first, the order matters less than the choice of words: on the same books (HSK 1–5, 95%) it needs 34,817 words with at most 3,859 before one book, where easiest-first needs 36,801 with at most 5,319.
+- **Your own order.** ⏶⏷ move a book; the planner's order is shown alongside, with a button to go back to it. The planner doesn't know which books are sequels, so put a series in order yourself. ✖ leaves a book out (read, or not to be read).
+- **Words learned from reading** can count too: tick **Words read N+ times are learned**. It's off by default, as how many encounters it takes varies widely.
+- Books analysed by an earlier version have no word data yet; **Analyse** reads them again in the background.
+
+Each book's words are kept in `profiles` next to `history.json`, about 100 KB per novel, and deleted with its History row. The settings are in `plan.json`.
+
 ## Command line
 
 ```
-hanstat.exe [file] [--tab overview|characters|words|sections|suggestions|notes]
-hanstat-cli.exe file.epub [--ltp|--ckip|--jieba] [--dict names.txt] [--auto-dict] [--json] [--chars-csv f] [--words-csv f] [--anki] [--level N] [--tocfl N] [--known-list words.txt] [--lang zh|ko|ja]
+hanstat.exe [file...] [--tab overview|characters|words|sections|suggestions|notes|history|path]
+hanstat-cli.exe file.epub [--ltp|--ckip|--jieba] [--dict names.txt] [--auto-dict] [--json] [--chars-csv f] [--words-csv f] [--anki] [--level N] [--tocfl N] [--known-list words.txt] [--lang zh|ko|ja] [--history]
+hanstat-cli.exe --plan [--lang zh|ko|ja] [--target 95 | --learn N] [--incidental M] [--lookahead X] [--objective peak|total] [--width W] [--study-lists DIR] [--json] [--anki] [--known] [--level N] ...
 ```
+
+`--history` records a book in the History as the window does, so a library can be added from a script. `--plan` prints the reading path of the History's books against the known words given; `--study-lists DIR` writes each book's study list.
 
 Run `hanstat-cli.exe --help` for all options. On macOS the CLI is `hanstat.app/Contents/MacOS/hanstat-cli`, and the app can be started with a file as `open -a hanstat --args "$PWD/file.epub"` (the path must be absolute).
 

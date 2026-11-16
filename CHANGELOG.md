@@ -1,5 +1,21 @@
 # Changelog
 
+## [2026.11.16.9] - 2026-11-16
+
+### Added
+- **Reading path.** History has a new **🧭 Reading path** view that orders the analysed books of the current language for reading. Before each book you study some of its unknown words, until a target share of its running words is known (95% by default) or a fixed number of them. Those words stay known for the books after it. Each row shows the share known now, when the path reaches the book and while reading it, the words to study, what reading it next would take instead, and how many of its words earlier books taught. It is recomputed in the background whenever the known words, the books or the settings change: 3–6 s for 69 novels.
+  - **Study words that the rest of the library needs.** A word's value is its share of this book's running words plus **Look ahead** (default 2) times its share in every book still to come. On 69 JJWXC novels, for learners knowing HSK 1–3, 1–5 and 1–9 with targets of 95% and 98%, this cut the words studied in all by 20–26% against each book's most frequent unknown words (HSK 1–5, 95%: 34,817 instead of 46,840). The total was lowest at a weight of about 2, so that is the default.
+  - **Order.** Orders are compared by their longest study list, then by the words studied in all, and found by beam search, keeping greedy or easiest-first when either does better. Order matters less than the choice of words: easiest-first with the same study words needs 36,801 words with at most 5,319 before one book, against 34,817 and 3,859. On random 7-book subsets, the search matched the best of all 5,040 orders on the longest list in 7 of 8, within 1% in the eighth, and within 0.3% on the total. Comparing every step (largest, then next largest) was tried first and rejected: one book needing about 5,400 words wherever it went set the largest step, and the search traded total words for smaller second and third steps, ending 7% above easiest-first.
+  - **Your own order**: ⏶⏷ move a book, and the planner's order is shown beside yours. ✖ leaves a book out. **💾** saves a book's study list (word, tab, count in the book). **Words read N+ times are learned** (off by default) counts incidental learning.
+  - **Word data.** Each book's word counts, names and (Japanese) word parts are saved in `profiles/<id>.json.gz` next to `history.json` when it is analysed (about 100 KB per novel), and deleted with its History row. Books analysed by an earlier version have none; **Analyse** reads them again in the background. Settings are in `plan.json`.
+- **CLI.** `hanstat-cli file --history` records a book in the History (and its word data) as the window does. `hanstat-cli --plan [--lang zh|ko|ja] [--target P | --learn N] [--incidental M] [--lookahead X] [--objective peak|total] [--width W] [--study-lists DIR] [--json]` prints the reading path against the known words given (`--anki`, `--known`, `--level` …).
+- **Open several books at once.** Select several files in **📂 Open…**, drop several onto the window, or pass several to `hanstat.exe`: all but the last are analysed one after another in the background ("Analysing 2 of 4: …" in the status bar, with **Stop**) and added to the History with their covers and word data, with what counts as known in their language when it is loaded. Then the last is opened, so the book shown is the last one analysed. Each uses the current segmenter, its language's dictionary and its default sections, as opening it alone would.
+- `hanstat --tab history` and `--tab path` start in the History view.
+- `examples/plan_eval.rs` measures the reading path on the books of a History.
+
+### Changed
+- Saved analyses are made again once after updating: the analysis fingerprint no longer includes `lib.rs` (its module list) or the History, so later changes there keep them.
+
 ## [2026.11.16.8] - 2026-11-16
 
 ### Added

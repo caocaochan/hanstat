@@ -21,12 +21,17 @@ fn icon() {
 /// Sources that cannot change what `analyze::analyze_book` counts for a given
 /// text, segmenter, model and word lists: the windows, the CLI, what happens
 /// before the text exists (`extract`: the text itself is in the cache key),
-/// what is applied to the counts afterwards (Anki, known words, discovery),
-/// and downloading (the model's identity is in the key). Anything not listed
+/// what is applied to the counts afterwards (Anki, known words, discovery,
+/// History, profiles and the reading path), the module list in `lib.rs`, and
+/// downloading (the model's identity is in the key). Anything not listed
 /// here, including a file added later, is part of the fingerprint.
 const NOT_ANALYSIS: &[&str] = &[
     "src/main.rs",
+    "src/lib.rs",
     "src/bin",
+    "src/history.rs",
+    "src/profile.rs",
+    "src/plan.rs",
     "src/extract",
     "src/anki.rs",
     "src/known.rs",

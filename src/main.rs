@@ -10,19 +10,24 @@ use hanstat::extract::{self, Book, EncodingChoice, SectionKind};
 use hanstat::history::{self, History};
 use hanstat::known;
 use hanstat::lang::Language;
+use hanstat::plan;
+use hanstat::profile::{self, Profile};
 use hanstat::script::Variant;
 use hanstat::segment::SegmenterKind;
 use hanstat::update::{self, Release};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
 
 fn main() -> eframe::Result {
-    // hanstat [file] [--tab overview|characters|words|sections|notes]
-    let mut path = None;
+    // hanstat [file...] [--tab overview|characters|words|sections|notes|history|path]
+    // Several files are analysed one after another and the last is shown.
+    let mut paths = Vec::new();
     let mut tab = Tab::Overview;
+    // --tab history / path: start in the History view, on its books or the reading path.
+    let mut history_tab = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         if a == "--tab" {
@@ -32,10 +37,18 @@ fn main() -> eframe::Result {
                 Some("sections") => Tab::Sections,
                 Some("notes") => Tab::Notes,
                 Some("suggestions") => Tab::Suggestions,
+                Some("history") => {
+                    history_tab = Some(HistTab::Books);
+                    Tab::Overview
+                }
+                Some("path") => {
+                    history_tab = Some(HistTab::Path);
+                    Tab::Overview
+                }
                 _ => Tab::Overview,
             };
         } else {
-            path = Some(PathBuf::from(a));
+            paths.push(PathBuf::from(a));
         }
     }
     let options = eframe::NativeOptions {
@@ -76,8 +89,16 @@ fn main() -> eframe::Result {
             app.updater.start(&cc.egui_ctx);
             app.anki_init(&cc.egui_ctx);
             (app.history, app.history_error) = History::load();
-            if let Some(p) = path {
-                app.start(p, cc.egui_ctx.clone());
+            (app.plan.settings, app.plan.error) = plan::Settings::load();
+            if let Some(t) = history_tab {
+                app.show_history = true;
+                app.history_tab = t;
+            }
+            match paths.len() {
+                0 => {}
+                // As before: a history view asked for stays up.
+                1 => app.start(paths.pop().unwrap(), cc.egui_ctx.clone()),
+                _ => app.open_files(paths, &cc.egui_ctx),
             }
             Ok(Box::new(app))
         }),
@@ -448,6 +469,99 @@ struct App {
     covers: HashMap<String, Option<egui::TextureHandle>>,
     /// The next recording is a fresh analysis: save it even if nothing changed.
     history_touch: bool,
+    /// The History view shows the books, or the reading path.
+    history_tab: HistTab,
+    plan: PlanState,
+    /// What the open book's profile was last written from (id, hash), so
+    /// that it is written again only when its words or names change.
+    profile_written: Option<(String, u64)>,
+    /// Bumped whenever a profile is written or removed: the reading path reloads.
+    profiles_version: u64,
+    batch: Option<Batch>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum HistTab {
+    #[default]
+    Books,
+    Path,
+}
+
+/// The reading path ([`plan`]) of the History's books in the current language.
+#[derive(Default)]
+struct PlanState {
+    settings: plan::Settings,
+    error: Option<String>,
+    /// History ids of the books with a profile, and what they were listed for.
+    have: Option<((Language, u64, usize), Vec<String>)>,
+    /// The library last built, and what from.
+    lib: Option<(LibKey, Arc<plan::Library>)>,
+    /// What `result`, or the running job, was computed from.
+    inputs: Option<PlanInputs>,
+    result: Option<PlanDone>,
+    job: Option<(Receiver<PlanDone>, Arc<AtomicBool>)>,
+}
+
+#[derive(Clone, PartialEq)]
+struct LibKey {
+    lang: Language,
+    fold: bool,
+    ids: Vec<String>,
+    version: u64,
+}
+
+#[derive(Clone, PartialEq)]
+struct PlanInputs {
+    lib: LibKey,
+    /// The known words (`Arc` address; 0: none).
+    knowledge: usize,
+    params: plan::Params,
+    /// The books on the path, by History id.
+    books: Vec<String>,
+    manual: Option<Vec<String>>,
+}
+
+struct PlanDone {
+    key: LibKey,
+    lib: Arc<plan::Library>,
+    path: plan::Path,
+    /// Reading the book with the most words known first, then the next.
+    naive: plan::Path,
+    /// With an order set by hand: the planner's own.
+    optimised: Option<plan::Path>,
+    known_words: usize,
+    secs: f64,
+}
+
+/// Books analysed one after another in the background, each recorded in the
+/// History: several opened at once, or books with no word data yet.
+struct Batch {
+    rx: Receiver<BatchMsg>,
+    done: Arc<AtomicUsize>,
+    /// Including `then_open`.
+    total: usize,
+    current: Arc<Mutex<String>>,
+    cancel: Arc<AtomicBool>,
+    failed: Vec<String>,
+    /// Opened (analysed and shown) once the others are done, unless stopped.
+    then_open: Option<PathBuf>,
+}
+
+enum BatchMsg {
+    Book(Box<history::Entry>),
+    Failed(String),
+    Finished,
+}
+
+/// What a click in the reading path asks for.
+enum PlanAction {
+    Open(PathBuf),
+    Move(usize, isize),
+    LeaveOut(String),
+    Include(String),
+    SaveList(usize),
+    Optimise,
+    Backfill,
 }
 
 /// Columns of the History table that sort.
@@ -628,6 +742,11 @@ impl Default for App {
             report_id: None,
             history_touch: false,
             covers: HashMap::new(),
+            history_tab: HistTab::Books,
+            plan: PlanState::default(),
+            profile_written: None,
+            profiles_version: 0,
+            batch: None,
         }
     }
 }
@@ -1005,15 +1124,32 @@ impl App {
             // The Anki section just appeared on the Overview.
             self.fit_pending = true;
         }
-        self.record_history();
+        self.record_history(&names);
     }
 
     /// Save the Overview's numbers as the book's history entry, replacing
-    /// the one from an earlier analysis.
-    fn record_history(&mut self) {
+    /// the one from an earlier analysis, and its words for the reading path
+    /// when they changed. `names`: as left out of the difficulty.
+    fn record_history(&mut self, names: &HashSet<String>) {
         let (Some(r), Some(id), Some(path)) = (&self.report, &self.report_id, &self.path) else {
             return;
         };
+        let digest = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::hash::DefaultHasher::new();
+            id.hash(&mut h);
+            r.segmenter.label().hash(&mut h);
+            (r.words_total, r.words_unique).hash(&mut h);
+            self.included.hash(&mut h);
+            let mut n: Vec<&String> = names.iter().collect();
+            n.sort_unstable();
+            n.hash(&mut h);
+            h.finish()
+        };
+        let profile_path = self.history.profile(id);
+        let profile = (self.profile_written.as_ref() != Some(&(id.clone(), digest))
+            || !profile_path.is_file())
+        .then(|| Profile::from_report(id, r, names));
         let entry = history::Entry {
             id: id.clone(),
             path: std::path::absolute(path).unwrap_or_else(|_| path.clone()),
@@ -1028,6 +1164,15 @@ impl App {
         let touch = std::mem::take(&mut self.history_touch);
         if let Err(e) = self.history.record(entry, touch) {
             self.history_error = Some(e);
+        }
+        if let Some(p) = profile {
+            match p.save(&profile_path) {
+                Ok(()) => {
+                    self.profile_written = Some((p.id, digest));
+                    self.profiles_version += 1;
+                }
+                Err(e) => self.history_error = Some(e),
+            }
         }
     }
 
@@ -1517,6 +1662,8 @@ impl eframe::App for App {
         self.poll_job(&ctx);
         self.poll_suggestions(&ctx);
         self.poll_anki(&ctx);
+        self.poll_plan(&ctx);
+        self.poll_batch(&ctx);
 
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
@@ -1526,20 +1673,23 @@ impl eframe::App for App {
                 .filter(|p| !p.as_os_str().is_empty())
                 .collect()
         });
-        if let Some(p) = dropped.into_iter().next() {
-            self.open(p, &ctx);
+        if !dropped.is_empty() {
+            self.open_files(dropped, &ctx);
         }
 
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
-                if ui.button("📂 Open…").clicked()
-                    && let Some(p) = rfd::FileDialog::new()
+                if ui
+                    .button("📂 Open…")
+                    .on_hover_text("Open a book, or select several: each is analysed and added to the History, and the last one is shown")
+                    .clicked()
+                    && let Some(files) = rfd::FileDialog::new()
                         .add_filter("E-books and text", &["epub", "txt", "text"])
                         .add_filter("All files", &["*"])
-                        .pick_file()
+                        .pick_files()
                 {
-                    self.open(p, &ctx);
+                    self.open_files(files, &ctx);
                 }
                 ui.separator();
                 ui.label("Segmenter:");
@@ -1697,6 +1847,10 @@ impl eframe::App for App {
 
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
+                if self.batch.is_some() {
+                    self.batch_status(ui);
+                    ui.separator();
+                }
                 if let Some(job) = &self.job {
                     ui.spinner();
                     let (d, t) = (
@@ -1778,10 +1932,10 @@ impl eframe::App for App {
             if self.report.is_none() {
                 ui.centered_and_justified(|ui| {
                     ui.label(
-                        RichText::new(if self.job.is_some() {
+                        RichText::new(if self.job.is_some() || self.batch.is_some() {
                             "Analysing…"
                         } else {
-                            "Drop an .epub or .txt file here, or click Open…"
+                            "Drop .epub or .txt files here, or click Open…"
                         })
                         .size(22.0)
                         .weak(),
@@ -3545,10 +3699,19 @@ impl App {
     fn history_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             ui.heading("History");
+            ui.add_space(8.0);
+            ui.selectable_value(&mut self.history_tab, HistTab::Books, "Books")
+                .on_hover_text("Every book analysed, with its statistics");
+            ui.selectable_value(&mut self.history_tab, HistTab::Path, "🧭 Reading path")
+                .on_hover_text(
+                    "An order to read the books in, where the words you study for one book make the next ones easier",
+                );
+            ui.add_space(8.0);
             ui.label(
-                RichText::new(
-                    "Books analysed before, with the statistics from their last analysis. Analysing a book again replaces its row. Click a title to open the book.",
-                )
+                RichText::new(match self.history_tab {
+                    HistTab::Books => "Books analysed before, with the statistics from their last analysis. Analysing a book again replaces its row. Click a title to open the book.",
+                    HistTab::Path => "Study some words before each book; they stay known for every book after it. The path orders the books so that the longest study list is as short as it can be, then the fewest words in all.",
+                })
                 .weak(),
             );
         });
@@ -3556,6 +3719,10 @@ impl App {
             ui.colored_label(Color32::from_rgb(220, 170, 60), format!("⚠ {e}"));
         }
         ui.separator();
+        if self.history_tab == HistTab::Path {
+            self.plan_view(ui, ctx);
+            return;
+        }
         if self.history.entries.is_empty() {
             ui.centered_and_justified(|ui| {
                 ui.label(
@@ -3828,9 +3995,850 @@ impl App {
             if let Err(e) = self.history.remove(&id) {
                 self.history_error = Some(e);
             }
+            self.profiles_version += 1;
         }
         if let Some(p) = open {
             self.open(p, ctx);
+        }
+    }
+}
+
+impl App {
+    /// History ids of the current language's books that have a profile.
+    fn plan_have(&mut self) -> Vec<String> {
+        let key = (
+            self.language,
+            self.profiles_version,
+            self.history.entries.len(),
+        );
+        if let Some((k, ids)) = &self.plan.have
+            && *k == key
+        {
+            return ids.clone();
+        }
+        let ids: Vec<String> = self
+            .history
+            .entries
+            .iter()
+            .filter(|e| e.stats.language == self.language && self.history.profile(&e.id).is_file())
+            .map(|e| e.id.clone())
+            .collect();
+        self.plan.have = Some((key, ids.clone()));
+        ids
+    }
+
+    /// Plan in the background; a running plan is cancelled.
+    fn start_plan(&mut self, inputs: PlanInputs, ctx: &egui::Context) {
+        if let Some((_, c)) = self.plan.job.take() {
+            c.store(true, Ordering::Relaxed);
+        }
+        self.plan.inputs = Some(inputs.clone());
+        if inputs.books.is_empty() {
+            self.plan.result = None;
+            return;
+        }
+        let cached = self
+            .plan
+            .lib
+            .as_ref()
+            .filter(|(k, _)| *k == inputs.lib)
+            .map(|(_, l)| l.clone());
+        let titles: HashMap<&str, &str> = self
+            .history
+            .entries
+            .iter()
+            .map(|e| (e.id.as_str(), e.title.as_str()))
+            .collect();
+        let files: Vec<(String, PathBuf)> = inputs
+            .lib
+            .ids
+            .iter()
+            .map(|id| {
+                (
+                    titles.get(id.as_str()).unwrap_or(&"?").to_string(),
+                    self.history.profile(id),
+                )
+            })
+            .collect();
+        let k = self.known.merged.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c2 = cancel.clone();
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            let key = inputs.lib.clone();
+            let lib = cached.unwrap_or_else(|| {
+                let books: Vec<(String, Profile)> = files
+                    .into_iter()
+                    .filter_map(|(t, p)| Profile::load(&p).map(|p| (t, p)))
+                    .collect();
+                Arc::new(plan::Library::build(key.lang, key.fold, books))
+            });
+            let index: HashMap<&str, usize> = lib
+                .books
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (b.id.as_str(), i))
+                .collect();
+            let books: Vec<usize> = inputs
+                .books
+                .iter()
+                .filter_map(|id| index.get(id.as_str()).copied())
+                .collect();
+            let k0 = lib.known(k.as_deref());
+            let params = inputs.params;
+            let width = plan::width_for(&lib, &books, plan::SEARCH_BUDGET);
+            let Some(best) = lib.optimise(&k0, &params, &books, width, &c2) else {
+                return;
+            };
+            let naive = lib.evaluate(&k0, &params, &lib.easiest_now(&k0, &books));
+            let (path, optimised) = match &inputs.manual {
+                Some(order) => {
+                    // The hand-set order, then books added since, as the planner placed them.
+                    let mut o: Vec<usize> = order
+                        .iter()
+                        .filter_map(|id| index.get(id.as_str()).copied())
+                        .filter(|b| books.contains(b))
+                        .collect();
+                    for s in &best.steps {
+                        if !o.contains(&s.book) {
+                            o.push(s.book);
+                        }
+                    }
+                    (lib.evaluate(&k0, &params, &o), Some(best))
+                }
+                None => (best, None),
+            };
+            let _ = tx.send(PlanDone {
+                key,
+                known_words: k0.len(),
+                lib: lib.clone(),
+                path,
+                naive,
+                optimised,
+                secs: t.elapsed().as_secs_f64(),
+            });
+            ctx.request_repaint();
+        });
+        self.plan.job = Some((rx, cancel));
+    }
+
+    fn poll_plan(&mut self, ctx: &egui::Context) {
+        let Some((rx, _)) = &self.plan.job else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(d) => {
+                self.plan.lib = Some((d.key.clone(), d.lib.clone()));
+                self.plan.result = Some(d);
+                self.plan.job = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100))
+            }
+            Err(_) => self.plan.job = None,
+        }
+    }
+
+    /// Open `files`: one is opened as usual; of several, all but the last
+    /// are analysed in the background and recorded in the History, then the
+    /// last is opened, so the book shown is the last one analysed.
+    fn open_files(&mut self, mut files: Vec<PathBuf>, ctx: &egui::Context) {
+        let Some(last) = files.pop() else { return };
+        if files.is_empty() {
+            self.open(last, ctx);
+            return;
+        }
+        if self.batch.is_some() {
+            self.toast = Some((
+                "Still analysing the books opened before: open these once it has finished.".into(),
+                ctx.input(|i| i.time) + 4.0,
+            ));
+            return;
+        }
+        let todo = files.into_iter().map(|p| (file_name(&p), p)).collect();
+        self.start_batch(todo, Some(last), ctx);
+    }
+
+    /// Analyse `todo` (label, file) one after another in the background, the
+    /// way opening each does with its default sections, and record each in
+    /// the History with its word data and cover. Then open `then_open`, if
+    /// given and not stopped.
+    fn start_batch(
+        &mut self,
+        todo: Vec<(String, PathBuf)>,
+        then_open: Option<PathBuf>,
+        ctx: &egui::Context,
+    ) {
+        let kind = self.segmenter;
+        // Each language's dictionary, known words for the segmenter, and
+        // knowledge for the History's "Known" (languages not used yet: none).
+        let mut words: HashMap<Language, Vec<String>> = self
+            .stash
+            .iter()
+            .map(|(l, d)| (*l, d.user_words.clone()))
+            .collect();
+        words.insert(self.language, self.user_words.clone());
+        let mut known_words: HashMap<Language, Vec<String>> = self
+            .stash
+            .iter()
+            .map(|(l, d)| (*l, d.known.settings.segmenter_words()))
+            .collect();
+        known_words.insert(self.language, self.known.settings.segmenter_words());
+        let mut knowledge: HashMap<Language, Arc<anki::Knowledge>> = self
+            .stash
+            .iter()
+            .filter_map(|(l, d)| d.known.merged.clone().map(|k| (*l, k)))
+            .collect();
+        if let Some(k) = &self.known.merged {
+            knowledge.insert(self.language, k.clone());
+        }
+        let cache = self.cache.clone();
+        let history_path = History::path();
+        let (tx, rx) = channel();
+        let done = Arc::new(AtomicUsize::new(0));
+        let current = Arc::new(Mutex::new(String::new()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (d2, cur2, c2) = (done.clone(), current.clone(), cancel.clone());
+        let total = todo.len() + usize::from(then_open.is_some());
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            for (label, path) in todo {
+                if c2.load(Ordering::Relaxed) {
+                    break;
+                }
+                *cur2.lock().unwrap() = label.clone();
+                ctx.request_repaint();
+                let res = profile::analyse_file(
+                    &path,
+                    kind,
+                    &|l| words.get(&l).cloned().unwrap_or_default(),
+                    &|l| {
+                        known_words
+                            .get(&l)
+                            .cloned()
+                            .unwrap_or_else(|| known::Settings::load_for(l).0.segmenter_words())
+                    },
+                    cache.as_ref(),
+                )
+                .and_then(|a| {
+                    let id = a
+                        .file_id
+                        .ok_or_else(|| format!("cannot read {}", path.display()))?;
+                    let mut r = a.report;
+                    let names: HashSet<String> = a.names.into_iter().collect();
+                    if let Some(k) = knowledge.get(&r.language) {
+                        r.anki = Some(BookCoverage::compute(
+                            k,
+                            &r.char_freq,
+                            &r.word_freq,
+                            &names,
+                            &r.word_parts,
+                        ));
+                    }
+                    if let Some(cover) = &a.book.cover {
+                        let dest = history::cover_path(&id);
+                        if !dest.is_file() {
+                            let _ = history::save_cover(cover, &dest);
+                        }
+                    }
+                    Profile::from_report(&id, &r, &names)
+                        .save(&profile::path_in(&history_path, &id))?;
+                    Ok(history::Entry {
+                        id,
+                        path: std::path::absolute(&path).unwrap_or_else(|_| path.clone()),
+                        title: r
+                            .title
+                            .clone()
+                            .filter(|t| !t.trim().is_empty())
+                            .unwrap_or_else(|| file_stem(&path)),
+                        analysed: history::now(),
+                        stats: history::Stats::from_report(&r),
+                    })
+                });
+                let _ = tx.send(match res {
+                    Ok(e) => BatchMsg::Book(Box::new(e)),
+                    Err(e) => BatchMsg::Failed(format!("{label}: {e}")),
+                });
+                d2.fetch_add(1, Ordering::Relaxed);
+                ctx.request_repaint();
+            }
+            let _ = tx.send(BatchMsg::Finished);
+            ctx.request_repaint();
+        });
+        self.batch = Some(Batch {
+            rx,
+            done,
+            total,
+            current,
+            cancel,
+            failed: Vec::new(),
+            then_open,
+        });
+    }
+
+    fn poll_batch(&mut self, ctx: &egui::Context) {
+        let Some(b) = &mut self.batch else {
+            return;
+        };
+        let mut finished = false;
+        while let Ok(m) = b.rx.try_recv() {
+            match m {
+                BatchMsg::Book(e) => {
+                    if let Err(e) = self.history.record(*e, true) {
+                        self.history_error = Some(e);
+                    }
+                    self.profiles_version += 1;
+                }
+                BatchMsg::Failed(m) => b.failed.push(m),
+                BatchMsg::Finished => finished = true,
+            }
+        }
+        if !finished {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            return;
+        }
+        let b = self.batch.take().unwrap();
+        if let Some(p) = b.then_open
+            && !b.cancel.load(Ordering::Relaxed)
+        {
+            self.open(p, ctx);
+        }
+        // After opening, which clears the error line.
+        if !b.failed.is_empty() {
+            self.error = Some(format!("Could not analyse {}", b.failed.join("; ")));
+        }
+    }
+
+    /// The batch's progress, with a button to stop it.
+    fn batch_status(&self, ui: &mut egui::Ui) {
+        let Some(b) = &self.batch else { return };
+        ui.spinner();
+        let done = b.done.load(Ordering::Relaxed);
+        ui.label(format!(
+            "Analysing {} of {}: {}",
+            (done + 1).min(b.total),
+            b.total,
+            b.current.lock().unwrap()
+        ));
+        if ui
+            .small_button("Stop")
+            .on_hover_text(
+                "Stop after the current book; the books analysed so far stay in the History",
+            )
+            .clicked()
+        {
+            b.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// The reading path of the History's books in the current language.
+    fn plan_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let lang = self.language;
+        let fixed_lang = self.prep.is_some() || self.job.is_some();
+        let mut pick_lang = None;
+        let mut changed = false;
+        let st = &mut self.plan.settings;
+        ui.horizontal_wrapped(|ui| {
+            if fixed_lang {
+                ui.label(RichText::new(format!("{} books", lang.name())).strong())
+                    .on_hover_text("The open book's language. Close it (or open another) to plan another language.");
+            } else {
+                egui::ComboBox::from_id_salt("plan_lang")
+                    .selected_text(format!("{} books", lang.name()))
+                    .show_ui(ui, |ui| {
+                        for l in Language::ALL {
+                            if ui.selectable_label(l == lang, l.name()).clicked() {
+                                pick_lang = Some(l);
+                            }
+                        }
+                    });
+            }
+            ui.separator();
+            ui.label("Before each book, study");
+            changed |= ui.radio_value(&mut st.fixed, false, "until").changed();
+            changed |= ui
+                .add_enabled(
+                    !st.fixed,
+                    egui::DragValue::new(&mut st.target)
+                        .range(50.0..=100.0)
+                        .speed(0.1)
+                        .max_decimals(1)
+                        .suffix("%"),
+                )
+                .on_hover_text("95%: adequate comprehension; 98%: comfortable reading (L2 lexical-coverage research, as on the Overview)")
+                .changed();
+            ui.label("of its running words are known, or");
+            changed |= ui.radio_value(&mut st.fixed, true, "").changed();
+            changed |= ui
+                .add_enabled(
+                    st.fixed,
+                    egui::DragValue::new(&mut st.learn).range(0..=20_000).speed(5.0),
+                )
+                .changed();
+            ui.label("of its words");
+            ui.separator();
+            changed |= ui
+                .checkbox(&mut st.incidental_on, "Words read")
+                .on_hover_text(
+                    "Count an unknown word read this many times in a book as learned from reading it. \
+                     Off by default: how many encounters it takes varies widely, and words learned this way are often forgotten.",
+                )
+                .changed();
+            changed |= ui
+                .add_enabled(
+                    st.incidental_on,
+                    egui::DragValue::new(&mut st.incidental).range(2..=1000).suffix("+ times"),
+                )
+                .changed();
+            ui.label("are learned");
+            ui.separator();
+            ui.label("Look ahead").on_hover_text(
+                "How much the books still to come count when choosing which words to study: \
+                 0 studies each book's most frequent unknown words (the fewest for that book); \
+                 higher prefers words the rest of the path needs too.",
+            );
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut st.lookahead)
+                        .range(0.0..=5.0)
+                        .speed(0.01)
+                        .max_decimals(2),
+                )
+                .changed();
+        });
+        if changed && let Err(e) = st.save() {
+            self.plan.error = Some(e);
+        }
+        if let Some(l) = pick_lang {
+            self.set_language(l, ctx);
+            return;
+        }
+        if let Some(e) = &self.plan.error {
+            ui.colored_label(Color32::from_rgb(220, 170, 60), format!("⚠ {e}"));
+        }
+
+        let have = self.plan_have();
+        let missing: Vec<(String, PathBuf)> = self
+            .history
+            .entries
+            .iter()
+            .filter(|e| e.stats.language == lang && !have.contains(&e.id))
+            .map(|e| (e.title.clone(), e.path.clone()))
+            .collect();
+        let st = &self.plan.settings;
+        let k = self.known.merged.clone();
+        let inputs = PlanInputs {
+            lib: LibKey {
+                lang,
+                fold: plan::Library::fold_for(
+                    k.as_deref(),
+                    lang,
+                    self.anki.settings.match_across_scripts,
+                ),
+                ids: have.clone(),
+                version: self.profiles_version,
+            },
+            knowledge: k.as_ref().map_or(0, |k| Arc::as_ptr(k) as usize),
+            params: st.params(),
+            books: have
+                .iter()
+                .filter(|id| !st.left_out.contains(id))
+                .cloned()
+                .collect(),
+            manual: st.manual_order(lang).cloned(),
+        };
+        if self.plan.inputs.as_ref() != Some(&inputs) {
+            self.start_plan(inputs, ctx);
+        }
+        let entries: Vec<&history::Entry> = self
+            .history
+            .entries
+            .iter()
+            .filter(|e| e.stats.language == lang)
+            .collect();
+
+        let mut act: Option<PlanAction> = None;
+        // Books without word data.
+        if self.batch.is_some() {
+            ui.horizontal(|ui| self.batch_status(ui));
+        } else if !missing.is_empty() {
+            let can = missing.iter().filter(|(_, p)| p.is_file()).count();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!(
+                    "{} of the {} {} books have no word data yet (analysed by an older version) and are not on the path.",
+                    missing.len(),
+                    entries.len(),
+                    lang.name()
+                ));
+                if can > 0
+                    && ui
+                        .button(format!("Analyse {can}"))
+                        .on_hover_text("Analyse them again in the background, with their default sections and the current segmenter")
+                        .clicked()
+                {
+                    act = Some(PlanAction::Backfill);
+                }
+                if can < missing.len() {
+                    ui.label(
+                        RichText::new(format!("{} are no longer where they were.", missing.len() - can))
+                            .weak(),
+                    );
+                }
+            });
+        }
+
+        let Some(res) = &self.plan.result else {
+            ui.add_space(20.0);
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    RichText::new(if self.plan.job.is_some() {
+                        "Planning…"
+                    } else if entries.is_empty() {
+                        "No books in this language yet. Open or drop an .epub or .txt file."
+                    } else {
+                        "No books on the path."
+                    })
+                    .size(20.0)
+                    .weak(),
+                );
+            });
+            self.apply_plan_action(act, ui, ctx);
+            return;
+        };
+        let lib = &res.lib;
+        let path = &res.path;
+        let fixed = matches!(path.params.study, plan::Study::Fixed(_));
+        let source = k
+            .as_ref()
+            .map(|k| match (k.from_anki, k.listed.source.is_empty()) {
+                (true, true) => "Anki".to_owned(),
+                (true, false) => format!("Anki + {}", k.listed.source),
+                (false, _) => k.listed.source.clone(),
+            })
+            .unwrap_or_else(|| "nothing marked known".to_owned());
+        ui.horizontal_wrapped(|ui| {
+            if self.plan.job.is_some() {
+                ui.spinner();
+            }
+            ui.label(format!(
+                "{} books · you know {} of their {} distinct words ({source})",
+                path.steps.len(),
+                fmt_int(res.known_words as u64),
+                fmt_int(lib.vocab_len() as u64),
+            ));
+            ui.label(RichText::new(format!("· planned in {:.1} s", res.secs)).weak());
+        });
+        let summary = |p: &plan::Path| {
+            if fixed {
+                format!(
+                    "lowest coverage while reading {:.1}%, average {:.1}%",
+                    p.lowest_reading(),
+                    p.steps.iter().map(|s| s.reading).sum::<f64>() / p.steps.len().max(1) as f64
+                )
+            } else {
+                format!(
+                    "{} words to study in all, at most {} before one book",
+                    fmt_int(p.total_study() as u64),
+                    fmt_int(p.peak() as u64)
+                )
+            }
+        };
+        ui.horizontal_wrapped(|ui| {
+            match &res.optimised {
+                Some(best) => {
+                    ui.label(RichText::new(format!("Your order: {}.", summary(path))).strong());
+                    ui.label(format!("The planner's order: {}.", summary(best)));
+                    if ui.button("Use the planner's order").clicked() {
+                        act = Some(PlanAction::Optimise);
+                    }
+                }
+                None => {
+                    ui.label(RichText::new(format!("This order: {}.", summary(path))).strong());
+                }
+            }
+            ui.label(
+                RichText::new(format!(
+                    "Reading the easiest book first, then the next: {}.",
+                    summary(&res.naive)
+                ))
+                .weak(),
+            );
+        });
+        let books: Vec<usize> = path.order();
+        let segs = lib.segmenters(&books);
+        if segs.len() > 1 {
+            ui.label(
+                RichText::new(format!(
+                    "The books were segmented with {}: words they share are undercounted where the segmenters split them differently.",
+                    segs.join(", ")
+                ))
+                .weak(),
+            );
+        }
+        ui.add_space(4.0);
+
+        let by_id: HashMap<&str, &history::Entry> =
+            entries.iter().map(|e| (e.id.as_str(), *e)).collect();
+        let covers = &mut self.covers;
+        let hist = &self.history;
+        let n = path.steps.len();
+        let dash = || RichText::new("–").weak();
+        let left_out: Vec<(String, String)> = self
+            .plan
+            .settings
+            .left_out
+            .iter()
+            .filter_map(|id| {
+                by_id
+                    .get(id.as_str())
+                    .map(|e| (id.clone(), e.title.clone()))
+            })
+            .collect();
+        let table_h =
+            (ui.available_height() - if left_out.is_empty() { 0.0 } else { 72.0 }).max(120.0);
+        TableBuilder::new(ui)
+            .id_salt("plan_table")
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .striped(true)
+            .max_scroll_height(table_h)
+            .column(Column::exact(88.0))
+            .column(
+                Column::initial(300.0)
+                    .at_least(140.0)
+                    .resizable(true)
+                    .clip(true),
+            )
+            .columns(Column::exact(96.0), 6)
+            .column(Column::remainder())
+            .header(24.0, |mut h| {
+                let heads: [(&str, &str); 9] = [
+                    ("#", "Reading order. ⏶⏷ set your own order; the planner's is shown alongside"),
+                    ("Book", "Click a title to open the book"),
+                    ("Known now", "Running words you know now (names left out)"),
+                    ("When reached", "Running words known when the path reaches the book, before studying for it"),
+                    (
+                        "Study",
+                        "Words to study before reading it",
+                    ),
+                    (
+                        if fixed { "" } else { "If read now" },
+                        "Words it would take to reach the target if you read it next",
+                    ),
+                    ("From earlier", "Words of this book you don't know now that the path teaches before it"),
+                    ("While reading", "Running words known while reading it, after studying"),
+                    ("", ""),
+                ];
+                for (t, hover) in heads {
+                    h.col(|ui| {
+                        ui.strong(t).on_hover_text(hover);
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(COVER_ROW, n, |mut row| {
+                    let i = row.index();
+                    let s = &path.steps[i];
+                    let b = &lib.books[s.book];
+                    let e = by_id.get(b.id.as_str());
+                    row.col(|ui| {
+                        ui.label(RichText::new(format!("{}", i + 1)).strong());
+                        if ui.add_enabled(i > 0, egui::Button::new("⏶").small()).on_hover_text("Read earlier").clicked() {
+                            act = Some(PlanAction::Move(i, -1));
+                        }
+                        if ui.add_enabled(i + 1 < n, egui::Button::new("⏷").small()).on_hover_text("Read later").clicked() {
+                            act = Some(PlanAction::Move(i, 1));
+                        }
+                    });
+                    row.col(|ui| {
+                        let tex = covers
+                            .entry(b.id.clone())
+                            .or_insert_with(|| load_cover(ctx, &hist.cover(&b.id)));
+                        let (w, h) = COVER_SIZE;
+                        match tex {
+                            Some(t) => {
+                                let [tw, th] = t.size().map(|x| x as f32);
+                                let k = (w / tw).min(h / th);
+                                ui.allocate_ui(egui::vec2(w, h), |ui| {
+                                    ui.centered_and_justified(|ui| {
+                                        ui.add(
+                                            egui::Image::new(&*t)
+                                                .fit_to_exact_size(egui::vec2(tw * k, th * k))
+                                                .corner_radius(2.0),
+                                        );
+                                    });
+                                });
+                            }
+                            None => {
+                                ui.allocate_space(egui::vec2(w, h));
+                            }
+                        }
+                        ui.add_space(6.0);
+                        let hover = format!(
+                            "{}\n{} · {} distinct words, {} running",
+                            e.map(|e| e.path.display().to_string()).unwrap_or_default(),
+                            b.segmenter,
+                            fmt_int(b.unique_words() as u64),
+                            fmt_int(b.running_words()),
+                        );
+                        match e.filter(|e| e.path.is_file()) {
+                            Some(e) => {
+                                if ui.link(&b.title).on_hover_text(hover).clicked() {
+                                    act = Some(PlanAction::Open(e.path.clone()));
+                                }
+                            }
+                            None => {
+                                ui.label(RichText::new(&b.title).weak()).on_hover_text(hover);
+                            }
+                        }
+                    });
+                    row.col(|ui| {
+                        ui.label(format!("{:.1}%", s.now));
+                    });
+                    row.col(|ui| {
+                        let up = s.reached - s.now;
+                        let t = ui.label(format!("{:.1}%", s.reached));
+                        if up >= 0.05 {
+                            t.on_hover_text(format!("+{up:.1} points from the books before it"));
+                        }
+                    });
+                    row.col(|ui| {
+                        ui.label(RichText::new(fmt_int(s.study.len() as u64)).strong());
+                    });
+                    row.col(|ui| match s.study_now {
+                        Some(x) => {
+                            ui.label(fmt_int(x as u64));
+                        }
+                        None => {
+                            ui.label(dash());
+                        }
+                    });
+                    row.col(|ui| {
+                        let t = ui.label(fmt_int(s.gained as u64));
+                        if s.by_reading > 0 {
+                            t.on_hover_text(format!(
+                                "Reading it teaches {} more (read {}+ times)",
+                                fmt_int(s.by_reading as u64),
+                                path.params.incidental.unwrap_or(0)
+                            ));
+                        }
+                    });
+                    row.col(|ui| {
+                        let d = Difficulty::from_percent(s.reading);
+                        ui.label(RichText::new(format!("{:.1}%", s.reading)).color(difficulty_color(d)))
+                            .on_hover_text(format!("{}: {}", d.label(), d.description()));
+                    });
+                    row.col(|ui| {
+                        if ui
+                            .add_enabled(!s.study.is_empty(), egui::Button::new("💾").small())
+                            .on_hover_text("Save the words to study before it (word, tab, count in the book): import it as a word list once learned, or make Anki cards from it")
+                            .clicked()
+                        {
+                            act = Some(PlanAction::SaveList(i));
+                        }
+                        if ui
+                            .small_button("✖")
+                            .on_hover_text("Leave it out of the path (read, or not to be read)")
+                            .clicked()
+                        {
+                            act = Some(PlanAction::LeaveOut(b.id.clone()));
+                        }
+                    });
+                });
+            });
+        if !left_out.is_empty() {
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(format!("Left out ({}):", left_out.len())).weak());
+                for (id, title) in &left_out {
+                    if ui
+                        .small_button(format!("↩ {title}"))
+                        .on_hover_text("Put it back on the path")
+                        .clicked()
+                    {
+                        act = Some(PlanAction::Include(id.clone()));
+                    }
+                }
+            });
+        }
+        self.apply_plan_action(act, ui, ctx);
+    }
+
+    fn apply_plan_action(&mut self, act: Option<PlanAction>, ui: &egui::Ui, ctx: &egui::Context) {
+        let Some(act) = act else { return };
+        let lang = self.language.name().to_owned();
+        let st = &mut self.plan.settings;
+        let mut save_settings = true;
+        match act {
+            PlanAction::Open(p) => {
+                save_settings = false;
+                self.open(p, ctx);
+            }
+            PlanAction::Move(i, d) => {
+                let Some(res) = &self.plan.result else { return };
+                let mut ids: Vec<String> = res
+                    .path
+                    .steps
+                    .iter()
+                    .map(|s| res.lib.books[s.book].id.clone())
+                    .collect();
+                let j = (i as isize + d) as usize;
+                ids.swap(i, j);
+                st.manual.insert(lang, ids);
+            }
+            PlanAction::LeaveOut(id) => {
+                if !st.left_out.contains(&id) {
+                    st.left_out.push(id);
+                }
+            }
+            PlanAction::Include(id) => st.left_out.retain(|x| *x != id),
+            PlanAction::Optimise => {
+                st.manual.remove(&lang);
+            }
+            PlanAction::SaveList(i) => {
+                save_settings = false;
+                let Some(res) = &self.plan.result else { return };
+                let s = &res.path.steps[i];
+                let title = &res.lib.books[s.book].title;
+                let mut text = format!(
+                    "# Words to study before {title} (step {} of the reading path), with their counts in the book\n",
+                    i + 1
+                );
+                for (w, n) in res.lib.study_list(s.book, &s.study) {
+                    text.push_str(&format!("{w}\t{n}\n"));
+                }
+                let name: String = title
+                    .chars()
+                    .map(|c| {
+                        if r#"<>:"/\|?*"#.contains(c) || c.is_control() {
+                            '_'
+                        } else {
+                            c
+                        }
+                    })
+                    .collect();
+                if let Some(m) = save(&format!("{} - study list.txt", name.trim()), "txt", text) {
+                    self.toast = Some((m, ui.input(|i| i.time) + 3.0));
+                }
+            }
+            PlanAction::Backfill => {
+                save_settings = false;
+                let have = self.plan_have();
+                let todo: Vec<(String, PathBuf)> = self
+                    .history
+                    .entries
+                    .iter()
+                    .filter(|e| e.stats.language == self.language && !have.contains(&e.id))
+                    .filter(|e| e.path.is_file())
+                    .map(|e| (e.title.clone(), e.path.clone()))
+                    .collect();
+                self.plan.error = None;
+                self.start_batch(todo, None, ctx);
+            }
+        }
+        if save_settings && let Err(e) = self.plan.settings.save() {
+            self.plan.error = Some(e);
         }
     }
 }
