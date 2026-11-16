@@ -33,7 +33,7 @@ Click **🃏 Anki**, tick your decks and the fields that hold the word (sentence
 
 Click **📚 HSK & word lists** (Korean: **Levels**, Japanese: **JLPT**) to mark words known without Anki: tick vocabulary levels, import `.txt` word lists (one word per line), or click **+** next to a word in the **Words** tab.
 
-- **Chinese:** HSK 3.0 levels 1–6 and 7–9 (2025 syllabus).
+- **Chinese:** HSK 3.0 levels 1–6 and 7–9 (2025 syllabus), and TOCFL Novice 1–2 and Level 1–5 (SC-TOP's 華語八千詞表, 2024 edition).
 - **Korean:** 1–6급 from 국립국어원's standard curriculum, the list TOPIK vocabulary lists follow.
 - **Japanese:** JLPT N5–N1 (Jonathan Waller's lists, as used by jisho.org), and the Kaishi 1.5k deck.
 
@@ -41,11 +41,11 @@ Click **📚 HSK & word lists** (Korean: **Levels**, Japanese: **JLPT**) to mark
 
 ```
 hanstat.exe [file] [--tab overview|characters|words|sections|suggestions|notes]
-hanstat-cli.exe file.epub [--ltp|--ckip|--jieba] [--dict names.txt] [--auto-dict] [--json] [--chars-csv f] [--words-csv f] [--anki] [--level N] [--known-list words.txt] [--lang zh|ko|ja]
+hanstat-cli.exe file.epub [--ltp|--ckip|--jieba] [--dict names.txt] [--auto-dict] [--json] [--chars-csv f] [--words-csv f] [--anki] [--level N] [--tocfl N] [--known-list words.txt] [--lang zh|ko|ja]
 ```
 
 Run `hanstat-cli.exe --help` for all options.
 
 ## Licence
 
-MIT or Apache-2.0, at your option. Bundled data: OpenCC (Apache-2.0); jieba dictionary (MIT); HSK list from the official syllabus via [ofou/hsk](https://github.com/ofou/hsk) (MIT); JLPT list by Jonathan Waller (CC BY) with fixes from [stephenmk/yomitan-jlpt-vocab](https://github.com/stephenmk/yomitan-jlpt-vocab), CC BY-SA 4.0 (see `data/JLPT-LICENSE.txt`); Kaishi 1.5k headwords from [donkuri/Kaishi](https://github.com/donkuri/Kaishi) (no licence published); Korean levels from 국립국어원's [국제 통용 한국어 표준 교육과정 vocabulary list](https://www.korean.go.kr/front/reportData/reportDataView.do?mn_id=45&report_seq=932) (public work, Korean Copyright Act Art. 24-2). Downloaded models: [LTP](https://huggingface.co/LTP/legacy) is free for research and individual use (commercial use needs a licence from HIT-SCIR), [CKIP bert-tiny](https://huggingface.co/ckiplab/bert-tiny-chinese-ws) is GPL-3.0, [Kiwi](https://github.com/bab2min/Kiwi) and [SudachiDict](https://github.com/WorksApplications/SudachiDict) are Apache-2.0.
+MIT or Apache-2.0, at your option. Bundled data: OpenCC (Apache-2.0); jieba dictionary (MIT); HSK list from the official syllabus via [ofou/hsk](https://github.com/ofou/hsk) (MIT); TOCFL list from [SC-TOP's 華語八千詞表](https://tocfl.edu.tw/tocfl/index.php/exam/download) (free download, no licence stated; only the words are bundled); JLPT list by Jonathan Waller (CC BY) with fixes from [stephenmk/yomitan-jlpt-vocab](https://github.com/stephenmk/yomitan-jlpt-vocab), CC BY-SA 4.0 (see `data/JLPT-LICENSE.txt`); Kaishi 1.5k headwords from [donkuri/Kaishi](https://github.com/donkuri/Kaishi) (no licence published); Korean levels from 국립국어원's [국제 통용 한국어 표준 교육과정 vocabulary list](https://www.korean.go.kr/front/reportData/reportDataView.do?mn_id=45&report_seq=932) (public work, Korean Copyright Act Art. 24-2). Downloaded models: [LTP](https://huggingface.co/LTP/legacy) is free for research and individual use (commercial use needs a licence from HIT-SCIR), [CKIP bert-tiny](https://huggingface.co/ckiplab/bert-tiny-chinese-ws) is GPL-3.0, [Kiwi](https://github.com/bab2min/Kiwi) and [SudachiDict](https://github.com/WorksApplications/SudachiDict) are Apache-2.0.

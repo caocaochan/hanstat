@@ -1,5 +1,15 @@
 # Changelog
 
+## [2026.11.16.4] - 2026-11-16
+
+### Added
+- **TOCFL levels.** In Chinese mode the known-words window (now **📚 HSK, TOCFL & word lists**) has checkboxes for TOCFL Novice 1, Novice 2 and Level 1–5, with an **All up to** row like HSK's. They can be ticked alongside or instead of HSK levels, and the toolbar shows both (`HSK 1–3 + TOCFL Novice 1–Level 2`). Level 6 (精通級) has no word list of its own.
+  - **The list.** SC-TOP's official 華語八千詞表, edition 2024-09-23 (7,517 entries: 160/234/347/485/1,173/2,342/2,776 per level), from tocfl.edu.tw. Each entry is split into its variants (你/妳, 台灣/臺灣, 爸爸/爸), and both forms of an optional part are kept (車(子) gives 車 and 車子). Zhuyin reading notes are dropped. This gives 7,496 words, each at the first level it appears.
+  - **Simplified books.** The list is in Traditional characters. It matches Simplified books when **Match Traditional ↔ Simplified** is on (the default). 着 is added for 著 read zhe/zháo/zhuó (著, 接著, 著急), because character folding keeps 著 as 著. 反复, 答复, 借口 and 复苏 are added for the same reason.
+  - **Measured.** On 黄金台 (Simplified), TOCFL Novice 1–Level 5 covers 71.0% of running words, HSK 1–6 covers 68.4%, and both together cover 73.6%.
+  - **CLI.** `--tocfl N` marks levels 1 to N (1–2 are Novice 1–2, 3–7 are Level 1–5). `--known` includes the TOCFL levels ticked in the window.
+  - Saved in `known.json` as `tocfl`. Older versions ignore the key.
+
 ## [2026.11.16.3] - 2026-11-16
 
 ### Added

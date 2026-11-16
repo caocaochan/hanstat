@@ -2,7 +2,8 @@
 //!
 //! Chinese: the HSK 3.0 vocabulary of the 2025 《HSK 考试大纲》
 //! (中外语言交流合作中心, in force from July 2026), bundled in
-//! `data/HSK30-2025.tsv`.
+//! `data/HSK30-2025.tsv`; and, ticked separately, the TOCFL levels of SC-TOP's
+//! 華語八千詞表 (2024-09 edition, Traditional), in `data/TOCFL-2024.tsv`.
 //!
 //! Korean: levels 1급–6급 of 국립국어원's 국제 통용 한국어 표준 교육과정
 //! vocabulary, bundled in `data/KO-standard-2020.tsv`. TOPIK has no official
@@ -33,6 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 static HSK_TSV: &str = include_str!("../data/HSK30-2025.tsv");
+static TOCFL_TSV: &str = include_str!("../data/TOCFL-2024.tsv");
 static KO_TSV: &str = include_str!("../data/KO-standard-2020.tsv");
 static JLPT_TSV: &str = include_str!("../data/JLPT-waller.tsv");
 static KAISHI_TSV: &str = include_str!("../data/Kaishi-1.5k.tsv");
@@ -57,6 +59,73 @@ pub fn kaishi_count() -> usize {
 /// HSK bands: 1–6, and 7 for the shared 7–9 list.
 pub const BANDS: [u8; 7] = [1, 2, 3, 4, 5, 6, 7];
 
+/// TOCFL word-list levels, easiest first: Novice 1–2 (準備級), then Level 1
+/// (入門級, band A) to Level 5 (流利級, band C). Level 6 (精通級) has no list
+/// of its own; it is tested on Level 5's.
+pub const TOCFL_LEVELS: [u8; 7] = [1, 2, 3, 4, 5, 6, 7];
+
+/// "Novice 1", "Level 1", "Level 5".
+pub fn tocfl_level_name(level: u8) -> &'static str {
+    match level {
+        1 => "Novice 1",
+        2 => "Novice 2",
+        3 => "Level 1",
+        4 => "Level 2",
+        5 => "Level 3",
+        6 => "Level 4",
+        7 => "Level 5",
+        _ => "?",
+    }
+}
+
+/// "Novice", "A", "B", "C".
+pub fn tocfl_band(level: u8) -> &'static str {
+    match level {
+        1 | 2 => "Novice",
+        3 | 4 => "A",
+        5 | 6 => "B",
+        _ => "C",
+    }
+}
+
+/// Words introduced at TOCFL `level`.
+pub fn tocfl_words(level: u8) -> impl Iterator<Item = &'static str> {
+    TOCFL
+        .iter()
+        .filter(move |(b, _)| *b == level)
+        .map(|(_, w)| *w)
+}
+
+pub fn tocfl_count(level: u8) -> usize {
+    tocfl_words(level).count()
+}
+
+/// "TOCFL Novice 1–Level 2", "TOCFL Level 1, Level 3–5".
+pub fn tocfl_label(levels: &[u8]) -> String {
+    let mut b: Vec<u8> = levels.to_vec();
+    b.sort_unstable();
+    b.dedup();
+    let mut parts = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let mut j = i;
+        while j + 1 < b.len() && b[j + 1] == b[j] + 1 {
+            j += 1;
+        }
+        let (first, last) = (tocfl_level_name(b[i]), tocfl_level_name(b[j]));
+        parts.push(if i == j {
+            first.to_owned()
+        } else if first.split(' ').next() == last.split(' ').next() {
+            // Same kind: "Level 3–5", "Novice 1–2".
+            format!("{first}–{}", last.rsplit(' ').next().unwrap())
+        } else {
+            format!("{first}–{last}")
+        });
+        i = j + 1;
+    }
+    format!("TOCFL {}", parts.join(", "))
+}
+
 /// Korean levels 1급–6급.
 pub const KO_LEVELS: [u8; 6] = [1, 2, 3, 4, 5, 6];
 
@@ -80,6 +149,7 @@ fn parse_levels(tsv: &'static str) -> Vec<(u8, &'static str)> {
 
 /// (band, word), each word once, at the lowest band it is introduced.
 static HSK: LazyLock<Vec<(u8, &'static str)>> = LazyLock::new(|| parse_levels(HSK_TSV));
+static TOCFL: LazyLock<Vec<(u8, &'static str)>> = LazyLock::new(|| parse_levels(TOCFL_TSV));
 static KO: LazyLock<Vec<(u8, &'static str)>> = LazyLock::new(|| parse_levels(KO_TSV));
 static JLPT: LazyLock<Vec<(u8, &'static str)>> = LazyLock::new(|| parse_levels(JLPT_TSV));
 /// JLPT key → the list's headword (会う, 為る → する), for the kanji it teaches.
@@ -226,6 +296,9 @@ pub struct Settings {
     /// Japanese: the words of the Kaishi 1.5k Anki deck count as known.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub kaishi: bool,
+    /// Chinese: ticked TOCFL levels (see [`TOCFL_LEVELS`]), alongside the HSK ones.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tocfl: Vec<u8>,
     /// Which language's file these settings belong to (not stored in it).
     #[serde(skip)]
     pub language: Language,
@@ -290,11 +363,33 @@ impl Settings {
             && self.lists.iter().all(|l| l.words.is_empty())
             && self.marked.is_empty()
             && !self.kaishi_on()
+            && self.tocfl_levels().is_empty()
     }
 
     /// The Kaishi 1.5k words are marked known (Japanese only).
     pub fn kaishi_on(&self) -> bool {
         self.kaishi && self.language == Language::Japanese
+    }
+
+    /// The ticked TOCFL levels that apply (Chinese only).
+    pub fn tocfl_levels(&self) -> &[u8] {
+        if self.language == Language::Chinese {
+            &self.tocfl
+        } else {
+            &[]
+        }
+    }
+
+    pub fn tocfl_on(&self, level: u8) -> bool {
+        self.tocfl.contains(&level)
+    }
+
+    pub fn set_tocfl(&mut self, level: u8, on: bool) {
+        self.tocfl.retain(|b| *b != level);
+        if on {
+            self.tocfl.push(level);
+            self.tocfl.sort_unstable();
+        }
     }
 
     pub fn is_marked(&self, w: &str) -> bool {
@@ -338,7 +433,12 @@ impl Settings {
             .iter()
             .filter(|(b, _)| self.levels.contains(b))
             .map(|(_, w)| *w);
+        let tocfl = TOCFL
+            .iter()
+            .filter(|(b, _)| self.tocfl_levels().contains(b))
+            .map(|(_, w)| *w);
         levels
+            .chain(tocfl)
             .chain(
                 self.lists
                     .iter()
@@ -375,12 +475,15 @@ impl Settings {
         w
     }
 
-    /// "HSK 1–3 + 2 word lists + 15 marked", "N5–N4 + Kaishi 1.5k".
+    /// "HSK 1–3 + 2 word lists + 15 marked", "TOCFL Novice 1–A2", "N5–N4 + Kaishi 1.5k".
     pub fn label(&self) -> String {
         let n = self.lists.iter().filter(|l| !l.words.is_empty()).count();
         let mut parts = Vec::new();
         if !self.levels.is_empty() {
             parts.push(bands_label(self.language, &self.levels));
+        }
+        if !self.tocfl_levels().is_empty() {
+            parts.push(tocfl_label(self.tocfl_levels()));
         }
         if self.kaishi_on() {
             parts.push(KAISHI_NAME.to_owned());
@@ -531,6 +634,71 @@ mod tests {
         assert_eq!(all.len(), HSK.len());
         assert!(all.iter().all(|w| w.chars().all(chars::is_han)));
         assert!(hsk_words(1).any(|w| w == "爸爸"));
+    }
+
+    #[test]
+    fn tocfl_data_matches_the_list() {
+        // 7,517 entries (160/234/347/485/1173/2342/2776) → 7,496 words after
+        // splitting variants (你/妳) and optional parts (車(子)), each at its
+        // first level, plus Simplified forms folding misses (着 for 著 read zhe).
+        let counts: Vec<usize> = TOCFL_LEVELS.iter().map(|&b| tocfl_count(b)).collect();
+        assert_eq!(counts, [184, 269, 392, 503, 1128, 2287, 2733]);
+        assert_eq!(TOCFL.len(), 7_496);
+        let all: HashSet<&str> = TOCFL.iter().map(|(_, w)| *w).collect();
+        assert_eq!(all.len(), TOCFL.len());
+        assert!(all.iter().all(|w| w.chars().all(chars::is_han)));
+        let level = |w: &str| TOCFL.iter().find(|(_, x)| *x == w).map(|(b, _)| *b);
+        assert_eq!(level("臺灣"), Some(1));
+        assert_eq!(level("台灣"), Some(1));
+        assert_eq!(level("車子"), Some(1));
+        assert_eq!(level("車"), Some(1));
+        // Zhuyin notes dropped: 著(ㄓㄠ)急, 名字(˙ㄗ).
+        assert_eq!(level("著急"), Some(5));
+        assert_eq!(level("名字"), Some(1));
+        assert_eq!(level("古跡"), Some(5));
+        // 著 is not in OpenCC's character table: the 着 forms are listed too,
+        // but not for 著 read zhù.
+        assert_eq!(level("着"), Some(2));
+        assert_eq!(level("着急"), Some(5));
+        assert_eq!(level("着名"), None);
+        assert_eq!(level("借口"), Some(7));
+    }
+
+    #[test]
+    fn tocfl_levels_mark_words() {
+        let mut s = Settings::default();
+        assert!(s.is_empty());
+        s.set_tocfl(3, true);
+        s.set_tocfl(1, true);
+        s.set_tocfl(2, true);
+        assert_eq!(s.tocfl, [1, 2, 3]);
+        assert_eq!(s.label(), "TOCFL Novice 1–Level 1");
+        s.set_band(1, true);
+        assert_eq!(s.label(), "HSK 1 + TOCFL Novice 1–Level 1");
+        s.levels.clear();
+        // Traditional list words match a Simplified book when folding.
+        let k = s.apply(None, true).unwrap();
+        assert_eq!(k.word("台湾"), Status::Listed);
+        assert_eq!(k.word("臺灣"), Status::Listed);
+        assert!(!k.word("著急").is_known());
+        assert_eq!(k.word("着"), Status::Listed);
+        let k = s.apply(None, false).unwrap();
+        assert_eq!(k.word("臺灣"), Status::Listed);
+        assert!(!k.word("台湾").is_known());
+        // Saved only when ticked, and only Chinese uses it.
+        let off = serde_json::to_string(&Settings::default()).unwrap();
+        assert!(!off.contains("tocfl"), "{off}");
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.tocfl, [1, 2, 3]);
+        let ko = Settings {
+            tocfl: vec![1],
+            language: Language::Korean,
+            ..Default::default()
+        };
+        assert!(ko.is_empty() && ko.label().is_empty());
+        assert_eq!(tocfl_label(&[3, 5, 6, 7]), "TOCFL Level 1, Level 3–5");
+        assert_eq!(tocfl_label(&[1, 2]), "TOCFL Novice 1–2");
+        assert_eq!(tocfl_band(7), "C");
     }
 
     #[test]

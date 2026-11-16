@@ -1539,13 +1539,13 @@ impl eframe::App for App {
 
                 ui.separator();
                 let label = match (self.known.settings.is_empty(), self.language) {
-                    (true, Language::Chinese) => "📚 HSK & word lists…".to_owned(),
+                    (true, Language::Chinese) => "📚 HSK, TOCFL & word lists…".to_owned(),
                     (true, Language::Korean) => "📚 Levels & word lists…".to_owned(),
                     (true, Language::Japanese) => "📚 JLPT & word lists…".to_owned(),
                     (false, _) => format!("📚 Known: {}", self.known.settings.label()),
                 };
                 let hover = match self.language {
-                    Language::Chinese => "Mark HSK 3.0 levels and imported word lists as known, in addition to your Anki cards",
+                    Language::Chinese => "Mark HSK 3.0 or TOCFL levels and imported word lists as known, in addition to your Anki cards",
                     Language::Korean => "Mark vocabulary levels 1–6급 and imported Korean word lists as known, in addition to your Anki cards",
                     Language::Japanese => "Mark JLPT levels N5–N1 and imported Japanese word lists as known, in addition to your Anki cards",
                 };
@@ -1770,7 +1770,7 @@ impl App {
         let mut changed = false;
         let lang = self.language;
         let title = match lang {
-            Language::Chinese => "Known words: HSK & word lists (中文)",
+            Language::Chinese => "Known words: HSK, TOCFL & word lists (中文)",
             Language::Korean => "Known words: levels & word lists (한국어)",
             Language::Japanese => "Known words: JLPT & word lists (日本語)",
         };
@@ -1848,6 +1848,56 @@ impl App {
                         changed = true;
                     }
                 });
+                if lang == Language::Chinese {
+                    ui.add_space(6.0);
+                    ui.strong("TOCFL vocabulary (華語八千詞表)");
+                    ui.label(
+                        RichText::new(
+                            "SC-TOP's official list for the TOCFL (2024 edition, Traditional characters): Novice 1–2, then Level 1–2 (band A), Level 3–4 (band B) and Level 5 (band C). Level 6 has no list of its own; it is tested on Level 5's. \
+                             Tick each level whose new words you know, alongside or instead of HSK. Variants count as listed (你/妳, 台灣/臺灣, 車/車子); with Match Traditional ↔ Simplified on, they match Simplified books too.",
+                        )
+                        .weak(),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        let mut cum = 0;
+                        for &b in &known::TOCFL_LEVELS {
+                            let n = known::tocfl_count(b);
+                            cum += n;
+                            let mut v = k.settings.tocfl_on(b);
+                            if ui
+                                .checkbox(&mut v, format!("{} ({})", known::tocfl_level_name(b), fmt_int(n as u64)))
+                                .on_hover_text(format!(
+                                    "Band {}. {} words introduced at this level; {} up to and including it",
+                                    known::tocfl_band(b),
+                                    fmt_int(n as u64),
+                                    fmt_int(cum as u64)
+                                ))
+                                .changed()
+                            {
+                                k.settings.set_tocfl(b, v);
+                                changed = true;
+                            }
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("All up to:").weak());
+                        for (i, &b) in known::TOCFL_LEVELS.iter().enumerate() {
+                            let label = known::tocfl_level_name(b);
+                            if ui
+                                .small_button(label)
+                                .on_hover_text(format!("Tick Novice 1 to {label} only"))
+                                .clicked()
+                            {
+                                k.settings.tocfl = known::TOCFL_LEVELS[..=i].to_vec();
+                                changed = true;
+                            }
+                        }
+                        if ui.small_button("None").clicked() && !k.settings.tocfl.is_empty() {
+                            k.settings.tocfl.clear();
+                            changed = true;
+                        }
+                    });
+                }
                 if lang == Language::Japanese {
                     ui.add_space(4.0);
                     if ui
@@ -2379,7 +2429,7 @@ impl App {
                         ui.label(
                             RichText::new(if chinese {
                                 "Thresholds from L2 reading research: 98% coverage for comfortable reading of fiction (Hu & Nation 2000), 95% as the minimum for adequate comprehension (Laufer 1989). \
-                                 Words you know but have no Anki card for (and aren't in a ticked HSK level or word list) count as unknown, so the book may be easier than this."
+                                 Words you know but have no Anki card for (and aren't in a ticked HSK or TOCFL level or word list) count as unknown, so the book may be easier than this."
                             } else if japanese {
                                 "Thresholds from L2 reading research: 98% coverage for comfortable reading of fiction (Hu & Nation 2000), 95% as the minimum for adequate comprehension (Laufer 1989). \
                                  Words you know but have no Anki card for (and aren't in a ticked JLPT level or word list) count as unknown, so the book may be easier than this."

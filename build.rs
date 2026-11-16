@@ -39,6 +39,7 @@ const NOT_ANALYSIS: &[&str] = &[
 /// vocabulary lists of `known.rs`.
 const NOT_ANALYSIS_DATA: &[&str] = &[
     "data/HSK30-2025.tsv",
+    "data/TOCFL-2024.tsv",
     "data/KO-standard-2020.tsv",
     "data/JLPT-waller.tsv",
     "data/Kaishi-1.5k.tsv",
