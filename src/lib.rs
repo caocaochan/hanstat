@@ -5,6 +5,7 @@ pub mod chars;
 pub mod ckip;
 pub mod discover;
 pub mod extract;
+pub mod history;
 pub mod japanese;
 pub mod kiwi;
 pub mod known;

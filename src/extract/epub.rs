@@ -352,13 +352,130 @@ pub fn load(bytes: Vec<u8>) -> Result<Book, String> {
         notes.push(format!("{orphan} XHTML documents are in the manifest but not in the spine; not counted (not part of reading order)."));
     }
 
+    let cover = find_cover(&mut z, &opf, &manifest, &spine, &opf_dir);
+
     Ok(Book {
         title,
         format: "EPUB",
         sections,
         notes,
         decode_errors,
+        cover,
     })
+}
+
+/// The cover image, found as readers do: the EPUB 3 `cover-image` item, the
+/// EPUB 2 `<meta name="cover">` item, the image on the guide's cover page,
+/// an image item named "cover", and last the image on the first spine page
+/// if that page has next to no text.
+fn find_cover(
+    z: &mut Zip,
+    opf: &roxmltree::Document,
+    manifest: &HashMap<String, Item>,
+    spine: &[(String, bool)],
+    opf_dir: &str,
+) -> Option<Vec<u8>> {
+    let is_image = |i: &Item| {
+        i.media_type.starts_with("image/") && i.media_type != "image/svg+xml" || {
+            let h = i.href.to_ascii_lowercase();
+            [".jpg", ".jpeg", ".png", ".gif", ".webp"]
+                .iter()
+                .any(|e| h.ends_with(e))
+        }
+    };
+    let mut hrefs: Vec<String> = Vec::new();
+    // EPUB 3.
+    hrefs.extend(
+        manifest
+            .values()
+            .filter(|i| i.properties.split_whitespace().any(|p| p == "cover-image"))
+            .map(|i| i.href.clone()),
+    );
+    // EPUB 2: the content is an item id (some books put the href there).
+    if let Some(c) = opf
+        .descendants()
+        .find(|n| n.tag_name().name() == "meta" && n.attribute("name") == Some("cover"))
+        .and_then(|n| n.attribute("content"))
+    {
+        match manifest.get(c) {
+            Some(i) => hrefs.push(i.href.clone()),
+            None => hrefs.extend(
+                manifest
+                    .values()
+                    .filter(|i| i.href.ends_with(c))
+                    .map(|i| i.href.clone()),
+            ),
+        }
+    }
+    for href in &hrefs {
+        if let Some(i) = manifest.values().find(|i| &i.href == href)
+            && is_image(i)
+            && let Some(b) = z.read(href)
+        {
+            return Some(b);
+        }
+    }
+    // A cover page: the guide's, then the first spine document if it is
+    // (almost) all picture.
+    let guide_page = opf
+        .descendants()
+        .find(|n| n.tag_name().name() == "reference" && n.attribute("type") == Some("cover"))
+        .and_then(|n| n.attribute("href"))
+        .map(|h| resolve(opf_dir, h));
+    if let Some(page) = guide_page
+        && let Some(img) = page_image(z, &page, false)
+    {
+        return Some(img);
+    }
+    let named = manifest
+        .iter()
+        .filter(|(_, i)| is_image(i))
+        .find(|(id, i)| {
+            id.to_ascii_lowercase().contains("cover")
+                || i.href
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|f| f.to_ascii_lowercase().contains("cover"))
+        })
+        .map(|(_, i)| i.href.clone());
+    if let Some(href) = named
+        && let Some(b) = z.read(&href)
+    {
+        return Some(b);
+    }
+    let first = spine.first().and_then(|(id, _)| manifest.get(id))?;
+    page_image(z, &first.href.clone(), true)
+}
+
+/// The first image of an XHTML page (`<img>` or SVG `<image>`). With
+/// `picture_only`, only if the page has hardly any text (a cover, not a chapter).
+fn page_image(z: &mut Zip, page: &str, picture_only: bool) -> Option<Vec<u8>> {
+    let (src, _) = decode_markup(&z.read(page)?);
+    let doc = scraper::Html::parse_document(&src);
+    if picture_only {
+        let body = scraper::Selector::parse("body").unwrap();
+        let text: usize = doc
+            .select(&body)
+            .flat_map(|b| b.text())
+            .map(|t| t.chars().filter(|c| !c.is_whitespace()).count())
+            .sum();
+        if text > 40 {
+            return None;
+        }
+    }
+    let sel = scraper::Selector::parse("img, image").unwrap();
+    let href = doc.select(&sel).find_map(|e| {
+        let v = e.value();
+        v.attr("src")
+            .or_else(|| v.attr("href"))
+            .or_else(|| v.attr("xlink:href"))
+            .or_else(|| {
+                v.attrs()
+                    .find(|(k, _)| k.ends_with("href"))
+                    .map(|(_, val)| val)
+            })
+    })?;
+    z.read(&resolve(dir_of(page), href))
 }
 
 fn is_toc_like(paras: &[String], toc: &HashSet<String>) -> bool {

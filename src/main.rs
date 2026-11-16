@@ -7,6 +7,7 @@ use hanstat::anki::{self, BookCoverage, ByStatus, Difficulty, Status};
 use hanstat::cache::Cache;
 use hanstat::discover::{self, Candidate};
 use hanstat::extract::{self, Book, EncodingChoice, SectionKind};
+use hanstat::history::{self, History};
 use hanstat::known;
 use hanstat::lang::Language;
 use hanstat::script::Variant;
@@ -74,6 +75,7 @@ fn main() -> eframe::Result {
             app.models = fetch_models(&cc.egui_ctx);
             app.updater.start(&cc.egui_ctx);
             app.anki_init(&cc.egui_ctx);
+            (app.history, app.history_error) = History::load();
             if let Some(p) = path {
                 app.start(p, cc.egui_ctx.clone());
             }
@@ -173,6 +175,8 @@ impl Tab {
 struct Loaded {
     book: Arc<Book>,
     prep: Arc<Prepared>,
+    /// SHA-256 of the file, which identifies the book in the history.
+    file_id: Option<String>,
 }
 
 enum JobMsg {
@@ -394,6 +398,12 @@ struct App {
     tab: Tab,
     char_filter: String,
     word_filter: String,
+    /// The word selected in the Words tab (its key), moved with the arrow keys.
+    word_sel: Option<String>,
+    /// Its row in the filtered list, to select the row now there if it drops
+    /// out of the list after A (the "Not known" filter).
+    word_sel_pos: usize,
+    word_sel_refill: bool,
     /// Reading speed for Chinese (characters per minute).
     cpm: f32,
     /// Reading speed for Korean (words per minute, as counted: content words).
@@ -423,6 +433,34 @@ struct App {
     cache: Option<Cache>,
     /// Entries and bytes in `cache`, for the Notes tab (read when a book is analysed).
     cache_usage: (usize, u64),
+
+    /// Books analysed before (history.json).
+    history: History,
+    history_error: Option<String>,
+    /// The History view replaces the book's tabs.
+    show_history: bool,
+    history_sort: (HistCol, bool),
+    /// SHA-256 of the open book's file, and of the book `report` was built
+    /// from (they differ between a new book arriving and its report).
+    book_id: Option<String>,
+    report_id: Option<String>,
+    /// Cover thumbnails by book id, loaded when first shown (`None`: the book has none).
+    covers: HashMap<String, Option<egui::TextureHandle>>,
+    /// The next recording is a fresh analysis: save it even if nothing changed.
+    history_touch: bool,
+}
+
+/// Columns of the History table that sort.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HistCol {
+    Title,
+    Language,
+    Unique,
+    Known,
+    Chars,
+    Words,
+    Time,
+    Analysed,
 }
 
 enum AnkiMsg {
@@ -562,6 +600,9 @@ impl Default for App {
             tab: Tab::Overview,
             char_filter: String::new(),
             word_filter: String::new(),
+            word_sel: None,
+            word_sel_pos: 0,
+            word_sel_refill: false,
             cpm: 300.0,
             wpm: 100.0,
             ja_cpm: 300.0,
@@ -579,6 +620,14 @@ impl Default for App {
             updater: Updater::default(),
             cache: Cache::open(),
             cache_usage: (0, 0),
+            history: History::default(),
+            history_error: None,
+            show_history: false,
+            history_sort: (HistCol::Analysed, true),
+            book_id: None,
+            report_id: None,
+            history_touch: false,
+            covers: HashMap::new(),
         }
     }
 }
@@ -671,9 +720,18 @@ impl App {
                         c2.request_repaint_after(std::time::Duration::from_millis(100));
                     },
                 )?;
+                let file_id = history::file_id(&path).ok();
+                // The cover's thumbnail for the History view; the same file always has the same cover.
+                if let (Some(id), Some(cover)) = (&file_id, &book.cover) {
+                    let dest = history::cover_path(id);
+                    if !dest.is_file() {
+                        let _ = history::save_cover(cover, &dest);
+                    }
+                }
                 Ok(Loaded {
                     book,
                     prep: Arc::new(prep),
+                    file_id,
                 })
             })();
             let _ = tx.send(JobMsg::Done(res));
@@ -688,6 +746,7 @@ impl App {
     }
 
     fn open(&mut self, path: PathBuf, ctx: &egui::Context) {
+        self.show_history = false;
         self.book = None;
         self.prep = None;
         self.report = None;
@@ -723,6 +782,7 @@ impl App {
             });
             self.suggest_rx = Some(rx);
             self.report = Some(r);
+            self.report_id = self.book_id.clone();
             self.refresh_anki_coverage();
         }
     }
@@ -944,6 +1004,30 @@ impl App {
         } else if !had {
             // The Anki section just appeared on the Overview.
             self.fit_pending = true;
+        }
+        self.record_history();
+    }
+
+    /// Save the Overview's numbers as the book's history entry, replacing
+    /// the one from an earlier analysis.
+    fn record_history(&mut self) {
+        let (Some(r), Some(id), Some(path)) = (&self.report, &self.report_id, &self.path) else {
+            return;
+        };
+        let entry = history::Entry {
+            id: id.clone(),
+            path: std::path::absolute(path).unwrap_or_else(|_| path.clone()),
+            title: r
+                .title
+                .clone()
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| file_stem(path)),
+            analysed: history::now(),
+            stats: history::Stats::from_report(r),
+        };
+        let touch = std::mem::take(&mut self.history_touch);
+        if let Err(e) = self.history.record(entry, touch) {
+            self.history_error = Some(e);
         }
     }
 
@@ -1404,6 +1488,12 @@ impl App {
                     self.cache_usage = self.cache.as_ref().map_or((0, 0), Cache::usage);
                     self.book = Some(l.book);
                     self.prep = Some(l.prep);
+                    // The old report is not this book's: drop it before the
+                    // language switch recomputes its coverage (and records it).
+                    self.report = None;
+                    self.report_id = None;
+                    self.book_id = l.file_id;
+                    self.history_touch = true;
                     // The book's language decides which dictionary, Anki selection and word lists apply.
                     self.set_language(lang, ctx);
                     self.rebuild_report();
@@ -1586,6 +1676,18 @@ impl eframe::App for App {
                     self.known.window = !self.known.window;
                 }
 
+                ui.separator();
+                if ui
+                    .selectable_label(
+                        self.show_history,
+                        format!("🕘 History ({})", self.history.entries.len()),
+                    )
+                    .on_hover_text("Every book analysed before, with its statistics")
+                    .clicked()
+                {
+                    self.show_history = !self.show_history;
+                }
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     self.mode_badge_ui(ui, &ctx);
                 });
@@ -1668,6 +1770,10 @@ impl eframe::App for App {
             if let Some(e) = &self.error {
                 ui.colored_label(Color32::from_rgb(220, 80, 80), format!("⚠ {e}"));
                 ui.separator();
+            }
+            if self.show_history {
+                self.history_view(ui, &ctx);
+                return;
             }
             if self.report.is_none() {
                 ui.centered_and_justified(|ui| {
@@ -2806,6 +2912,8 @@ impl App {
     }
 
     fn word_table(&mut self, ui: &mut egui::Ui) {
+        /// Row height of the Words table.
+        const ROW_H: f32 = 26.0;
         let r = self.report.as_ref().unwrap();
         ui.horizontal(|ui| {
             ui.label("Filter:");
@@ -2819,6 +2927,7 @@ impl App {
                 "{} unique words",
                 fmt_int(r.word_freq.len() as u64)
             ));
+            ui.label(RichText::new("↑ ↓ select a word · A marks it known or unmarks it").weak());
         });
         let status = r.anki.as_ref().map(|c| &c.word_status);
         // Word length is counted in Chinese characters; Korean and Japanese
@@ -2835,12 +2944,88 @@ impl App {
             .collect();
         let total = r.words_total.max(1) as f64;
         let known = &self.known.settings;
-        // (word, mark) from a +/− click, applied after the table.
+        // (word, mark) from a +/− click or A, applied after the table.
         let mut toggle: Option<(String, bool)> = None;
-        TableBuilder::new(ui)
+        // A on a word known from Anki or a list: why nothing happened.
+        let mut note: Option<String> = None;
+
+        // The selection's row in the filtered list.
+        let word_of = |p: usize| &r.word_freq[rows[p]].0;
+        let mut pos = self
+            .word_sel
+            .as_ref()
+            .and_then(|sel| (0..rows.len()).find(|&p| word_of(p) == sel));
+        let refill = std::mem::take(&mut self.word_sel_refill);
+        if pos.is_none() && refill && !rows.is_empty() {
+            pos = Some(self.word_sel_pos.min(rows.len() - 1));
+        }
+        // Keys, unless the filter box is being typed in.
+        let mut moved = false;
+        if !ui.ctx().egui_wants_keyboard_input() && !rows.is_empty() {
+            let last = rows.len() - 1;
+            let page = ((ui.available_height() / ROW_H) as isize - 2).max(1);
+            let (home, end, steps, mark) = ui.input_mut(|i| {
+                use egui::{Key, Modifiers};
+                let mut n = |key| i.count_and_consume_key(Modifiers::NONE, key) as isize;
+                let steps = n(Key::ArrowDown) - n(Key::ArrowUp)
+                    + page * (n(Key::PageDown) - n(Key::PageUp));
+                let (home, end) = (n(Key::Home) > 0, n(Key::End) > 0);
+                (home, end, steps, i.consume_key(Modifiers::NONE, Key::A))
+            });
+            let mut target = pos;
+            if home {
+                target = Some(0);
+            }
+            if end {
+                target = Some(last);
+            }
+            // With nothing selected, the first step selects the top row.
+            if steps != 0 {
+                target = Some(match target {
+                    None => 0,
+                    Some(p) => (p as isize + steps).clamp(0, last as isize) as usize,
+                });
+            }
+            if home || end || steps != 0 {
+                pos = target;
+                moved = true;
+                // The scroll to the row happens next frame; egui only draws on input.
+                ui.ctx().request_repaint();
+                // egui also moves keyboard focus between widgets with the
+                // arrows (after a click on a tab or +/−); the list has them.
+                ui.memory_mut(|m| {
+                    if let Some(id) = m.focused() {
+                        m.surrender_focus(id);
+                    }
+                });
+            }
+            if mark && let Some(p) = pos {
+                let (i, w) = (rows[p], word_of(p));
+                if known.is_marked(w) {
+                    toggle = Some((w.clone(), false));
+                } else if let Some(st) = status.map(|s| s[i]).filter(|s| s.is_known()) {
+                    let from = if st == Status::Listed {
+                        "a ticked level or word list"
+                    } else {
+                        "Anki"
+                    };
+                    note = Some(format!(
+                        "{} is known from {from}; A only unmarks words you marked",
+                        r.display(w)
+                    ));
+                } else {
+                    toggle = Some((w.clone(), true));
+                }
+            }
+        }
+        // Clicking a row also selects it (below).
+        let mut clicked: Option<usize> = None;
+
+        let mut table = TableBuilder::new(ui)
             // Cells otherwise inherit the top-down layout: text sits at the row top.
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .striped(true)
+            .sense(egui::Sense::click())
             .column(Column::exact(70.0))
             .column(Column::exact(30.0))
             .column(Column::exact(200.0))
@@ -2848,7 +3033,11 @@ impl App {
             .column(Column::exact(90.0))
             .column(Column::exact(110.0))
             .column(Column::exact(if status.is_some() { 100.0 } else { 0.0 }))
-            .column(Column::remainder())
+            .column(Column::remainder());
+        if moved && let Some(p) = pos {
+            table = table.scroll_to_row(p, None);
+        }
+        table
             .header(24.0, |mut h| {
                 let anki_h = if status.is_some() { "Status" } else { "" };
                 for t in [
@@ -2867,9 +3056,10 @@ impl App {
                 }
             })
             .body(|body| {
-                body.rows(26.0, rows.len(), |mut row| {
+                body.rows(ROW_H, rows.len(), |mut row| {
                     let i = rows[row.index()];
                     let (w, n) = &r.word_freq[i];
+                    row.set_selected(pos == Some(row.index()));
                     row.col(|ui| {
                         ui.label((i + 1).to_string());
                     });
@@ -2922,8 +3112,25 @@ impl App {
                             ui.label(w.chars().count().to_string());
                         }
                     });
+                    if row.response().clicked() {
+                        clicked = Some(row.index());
+                    }
                 });
             });
+        if clicked.is_some() {
+            pos = clicked;
+        }
+        if let Some(p) = pos {
+            self.word_sel = Some(word_of(p).clone());
+            self.word_sel_pos = p;
+        }
+        if toggle.is_some() {
+            // If the word leaves the list ("Not known"), the next one takes its place.
+            self.word_sel_refill = true;
+        }
+        if let Some(m) = note {
+            self.toast = Some((m, ui.input(|i| i.time) + 4.0));
+        }
         if let Some((w, on)) = toggle
             && self.known.settings.set_marked(&w, on)
         {
@@ -3331,3 +3538,315 @@ const METHOD: &[&str] = &[
     "Coverage = the number of most-frequent distinct characters/words whose occurrences add up to X% of all occurrences.",
     "Anki: the collection is copied (with its write-ahead log) to a temporary folder and read from there, so it works while Anki is open and is never modified. A review card is mature at an interval of 21+ days and young below that, or, with \"Mature by FSRS stability\" on, at the chosen stability (cards without FSRS data keep the interval rule); learning and relearning cards are 'learning'. A note takes its best card's status in the selected decks, a word its best note's, and a character the best status of any known word containing it. A ticked field value with sentence punctuation is split into words with the book's segmenter and forced words, so its boundaries agree with the book's. Otherwise each run of Chinese characters is a word; runs longer than 4 characters (idioms, sayings) also count their segmented parts. Book words must match exactly (after optional Traditional→Simplified folding), so the segmenter's word boundaries matter.",
 ];
+
+impl App {
+    /// Every book analysed before, as recorded when its analysis (or what
+    /// counts as known) last changed. A click on a title opens the book.
+    fn history_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            ui.heading("History");
+            ui.label(
+                RichText::new(
+                    "Books analysed before, with the statistics from their last analysis. Analysing a book again replaces its row. Click a title to open the book.",
+                )
+                .weak(),
+            );
+        });
+        if let Some(e) = &self.history_error {
+            ui.colored_label(Color32::from_rgb(220, 170, 60), format!("⚠ {e}"));
+        }
+        ui.separator();
+        if self.history.entries.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    RichText::new("No books analysed yet. Open or drop an .epub or .txt file.")
+                        .size(22.0)
+                        .weak(),
+                );
+            });
+            return;
+        }
+
+        // Reading time at the speeds set on the Overview, as there.
+        let (cpm, ja_cpm, wpm) = (self.cpm as f64, self.ja_cpm as f64, self.wpm as f64);
+        let minutes = |s: &history::Stats| match s.language {
+            Language::Chinese => s.han_total as f64 / cpm,
+            Language::Japanese => (s.han_total + s.kana_total) as f64 / ja_cpm,
+            Language::Korean => s.words_total as f64 / wpm,
+        };
+        let (col, desc) = self.history_sort;
+        let hist = &self.history;
+        let entries = &hist.entries;
+        let covers = &mut self.covers;
+        let key = |i: usize| -> f64 {
+            let s = &entries[i].stats;
+            match col {
+                HistCol::Chars => s.han_total as f64,
+                HistCol::Words => s.words_total as f64,
+                HistCol::Unique => s.words_unique as f64,
+                // Books with nothing known sort below every percentage.
+                HistCol::Known => s.known.as_ref().map_or(-1.0, |k| k.running_words),
+                HistCol::Time => minutes(s),
+                HistCol::Analysed => entries[i].analysed as f64,
+                HistCol::Title | HistCol::Language => 0.0,
+            }
+        };
+        let lang_key = |i: usize| {
+            (
+                entries[i].stats.language as u8,
+                entries[i].stats.variant.as_str(),
+            )
+        };
+        let mut rows: Vec<usize> = (0..entries.len()).collect();
+        rows.sort_by(|&a, &b| {
+            let o = match col {
+                HistCol::Title => entries[a]
+                    .title
+                    .to_lowercase()
+                    .cmp(&entries[b].title.to_lowercase()),
+                HistCol::Language => lang_key(a).cmp(&lang_key(b)),
+                _ => key(a).total_cmp(&key(b)),
+            };
+            if desc { o.reverse() } else { o }
+        });
+
+        let now = history::now();
+        let mut open: Option<PathBuf> = None;
+        let mut remove: Option<String> = None;
+        let mut sort = None;
+        let dash = || RichText::new("–").weak();
+        TableBuilder::new(ui)
+            // Cells otherwise inherit the top-down layout: text sits at the row top.
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .striped(true)
+            .column(
+                Column::initial(320.0)
+                    .at_least(140.0)
+                    .resizable(true)
+                    .clip(true),
+            )
+            .column(Column::exact(90.0))
+            .columns(Column::exact(100.0), 3)
+            .column(Column::exact(80.0))
+            .column(Column::exact(100.0))
+            .column(Column::exact(80.0))
+            .column(Column::exact(100.0))
+            .column(Column::remainder())
+            .header(24.0, |mut h| {
+                let heads: [(Option<HistCol>, &str, &str); 10] = [
+                    (Some(HistCol::Title), "Book", "The book's title, or its file name"),
+                    (Some(HistCol::Language), "Language", "Language, and script for Chinese"),
+                    (
+                        Some(HistCol::Chars),
+                        "Characters",
+                        "Chinese characters, or kanji in a Japanese book (Korean books have none)",
+                    ),
+                    (Some(HistCol::Words), "Words", "Running words, as the segmenter counted them"),
+                    (Some(HistCol::Unique), "Unique words", "Distinct words"),
+                    (
+                        Some(HistCol::Known),
+                        "Known",
+                        "Running words you knew (Anki cards and the levels and word lists marked known) at the last analysis; names are left out",
+                    ),
+                    (None, "Difficulty", "From the share of running words known, as on the Overview"),
+                    (Some(HistCol::Time), "Reading", "Reading time at the speeds set on the Overview"),
+                    (Some(HistCol::Analysed), "Analysed", "When the book was last analysed"),
+                    (None, "", ""),
+                ];
+                for (c, t, hover) in heads {
+                    h.col(|ui| {
+                        let Some(c) = c else {
+                            ui.strong(t).on_hover_text(hover);
+                            return;
+                        };
+                        let arrow = match (col == c, desc) {
+                            (false, _) => "",
+                            (true, true) => " ⏷",
+                            (true, false) => " ⏶",
+                        };
+                        if ui
+                            .add(
+                                egui::Label::new(RichText::new(format!("{t}{arrow}")).strong())
+                                    .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text(hover)
+                            .clicked()
+                        {
+                            // Numbers and dates start largest first, text A–Z.
+                            let first_desc = !matches!(c, HistCol::Title | HistCol::Language);
+                            sort = Some((c, if col == c { !desc } else { first_desc }));
+                        }
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(COVER_ROW, rows.len(), |mut row| {
+                    let e = &entries[rows[row.index()]];
+                    let s = &e.stats;
+                    row.col(|ui| {
+                        let tex = covers
+                            .entry(e.id.clone())
+                            .or_insert_with(|| load_cover(ctx, &hist.cover(&e.id)));
+                        let (w, h) = COVER_SIZE;
+                        match tex {
+                            Some(t) => {
+                                // Fit the box, keeping the cover's proportions.
+                                let [tw, th] = t.size().map(|x| x as f32);
+                                let k = (w / tw).min(h / th);
+                                ui.allocate_ui(egui::vec2(w, h), |ui| {
+                                    ui.centered_and_justified(|ui| {
+                                        ui.add(
+                                            egui::Image::new(&*t)
+                                                .fit_to_exact_size(egui::vec2(tw * k, th * k))
+                                                .corner_radius(2.0),
+                                        )
+                                        .on_hover_ui(|ui| {
+                                            let k = 2.5 * k;
+                                            ui.add(
+                                                egui::Image::new(&*t)
+                                                    .fit_to_exact_size(egui::vec2(tw * k, th * k)),
+                                            );
+                                        });
+                                    });
+                                });
+                            }
+                            None => {
+                                ui.allocate_space(egui::vec2(w, h));
+                            }
+                        }
+                        ui.add_space(6.0);
+                        let mut hover = format!(
+                            "{}\n{} · {} · {} of {} sections included",
+                            e.path.display(),
+                            s.format,
+                            s.segmenter,
+                            s.sections_included,
+                            s.sections_total
+                        );
+                        if let Some(k) = &s.known {
+                            hover.push_str(&format!(
+                                "\nKnown from {}: {:.1}% of unique words ({} not known)",
+                                k.source,
+                                k.unique_words,
+                                fmt_int(k.unknown_words)
+                            ));
+                            if s.language != Language::Korean {
+                                hover.push_str(&format!(
+                                    ", {:.1}% of unique characters",
+                                    k.unique_chars
+                                ));
+                            }
+                        }
+                        if s.words_for_98 > 0 {
+                            hover.push_str(&format!(
+                                "\n{} most frequent words cover 98% of the text",
+                                fmt_int(s.words_for_98)
+                            ));
+                        }
+                        if e.path.is_file() {
+                            if ui.link(&e.title).on_hover_text(hover).clicked() {
+                                open = Some(e.path.clone());
+                            }
+                        } else {
+                            ui.label(RichText::new(&e.title).weak())
+                                .on_hover_text(format!("{hover}\n\nThe file is no longer there."));
+                        }
+                    });
+                    row.col(|ui| {
+                        let variant = match s.variant.as_str() {
+                            "Simplified" => Some(Variant::Simplified),
+                            "Traditional" => Some(Variant::Traditional),
+                            "Mixed" => Some(Variant::Mixed),
+                            _ => None,
+                        };
+                        ui.label(mode_badge(s.language, variant).0);
+                    });
+                    row.col(|ui| {
+                        if s.language == Language::Korean {
+                            ui.label(dash());
+                        } else {
+                            ui.label(fmt_int(s.han_total));
+                        }
+                    });
+                    row.col(|ui| {
+                        ui.label(fmt_int(s.words_total));
+                    });
+                    row.col(|ui| {
+                        ui.label(fmt_int(s.words_unique));
+                    });
+                    match &s.known {
+                        Some(k) => {
+                            row.col(|ui| {
+                                ui.label(format!("{:.1}%", k.running_words))
+                                    .on_hover_text(format!("Known from {}", k.source));
+                            });
+                            row.col(|ui| {
+                                let d = k.difficulty();
+                                ui.label(RichText::new(d.label()).color(difficulty_color(d)))
+                                    .on_hover_text(d.description());
+                            });
+                        }
+                        None => {
+                            row.col(|ui| {
+                                ui.label(dash()).on_hover_text(
+                                    "Nothing was marked known: Anki was off and no levels or word lists were ticked",
+                                );
+                            });
+                            row.col(|ui| {
+                                ui.label(dash());
+                            });
+                        }
+                    }
+                    row.col(|ui| {
+                        let mins = minutes(s);
+                        ui.label(format!(
+                            "{}h {:02}m",
+                            (mins / 60.0) as u64,
+                            (mins % 60.0) as u64
+                        ));
+                    });
+                    row.col(|ui| {
+                        ui.label(history::age(e.analysed, now))
+                            .on_hover_text(history::date_time(e.analysed));
+                    });
+                    row.col(|ui| {
+                        if ui
+                            .small_button("✖")
+                            .on_hover_text("Remove from the history (the book itself is not touched)")
+                            .clicked()
+                        {
+                            remove = Some(e.id.clone());
+                        }
+                    });
+                });
+            });
+        if let Some(s) = sort {
+            self.history_sort = s;
+        }
+        if let Some(id) = remove {
+            self.covers.remove(&id);
+            if let Err(e) = self.history.remove(&id) {
+                self.history_error = Some(e);
+            }
+        }
+        if let Some(p) = open {
+            self.open(p, ctx);
+        }
+    }
+}
+
+/// Size cover thumbnails are drawn at in the History table (points), and its row height.
+const COVER_SIZE: (f32, f32) = (32.0, 44.0);
+const COVER_ROW: f32 = 50.0;
+
+/// A saved cover thumbnail as a texture; `None` if there is none (or it can't be read).
+fn load_cover(ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
+    let img = image::open(path).ok()?.into_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    let pixels = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+    Some(ctx.load_texture(
+        format!("cover {}", path.display()),
+        pixels,
+        egui::TextureOptions::LINEAR,
+    ))
+}

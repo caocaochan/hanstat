@@ -52,11 +52,15 @@ Click **🃏 Anki**, tick your decks and the fields that hold the word (sentence
 
 ## Vocabulary levels and word lists
 
-Click **📚 HSK & word lists** (Korean: **Levels**, Japanese: **JLPT**) to mark words known without Anki: tick vocabulary levels, import `.txt` word lists (one word per line), or click **+** next to a word in the **Words** tab.
+Click **📚 HSK & word lists** (Korean: **Levels**, Japanese: **JLPT**) to mark words known without Anki: tick vocabulary levels, import `.txt` word lists (one word per line), or click **+** next to a word in the **Words** tab (or select it with ↑/↓ and press **A**; **A** again unmarks it).
 
 - **Chinese:** HSK 3.0 levels 1–6 and 7–9 (2025 syllabus), and TOCFL Novice 1–2 and Level 1–5 (SC-TOP's 華語八千詞表, 2024 edition).
 - **Korean:** 1–6급 from 국립국어원's standard curriculum, the list TOPIK vocabulary lists follow.
 - **Japanese:** JLPT N5–N1 (Jonathan Waller's lists, as used by jisho.org), and the Kaishi 1.5k deck.
+
+## History
+
+Click **🕘 History** to list every book you've analysed, with its cover: length, unique words, the share of running words you knew, difficulty and reading time. Click a column to sort, or a title to open the book again. Analysing a book again replaces its row; a book is recognised by its file's contents, so a renamed or moved copy is still the same book. The list is kept in `%LOCALAPPDATA%\hanstat\history.json` (macOS: `~/Library/Application Support/hanstat/history.json`), and small copies of the covers in `covers` next to it.
 
 ## Command line
 

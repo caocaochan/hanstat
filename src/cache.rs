@@ -447,6 +447,7 @@ mod tests {
                 .collect(),
             notes: Vec::new(),
             decode_errors: 0,
+            cover: None,
         }
     }
 

@@ -44,6 +44,9 @@ pub struct Book {
     pub notes: Vec<String>,
     /// Decoding errors (bytes that were not valid in the detected encoding).
     pub decode_errors: u64,
+    /// EPUB: the cover image as stored in the book (JPEG, PNG, GIF or WebP).
+    #[serde(skip)]
+    pub cover: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]

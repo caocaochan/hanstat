@@ -1,5 +1,11 @@
 # Changelog
 
+## [2026.11.16.8] - 2026-11-16
+
+### Added
+- **History.** A new **🕘 History** button in the toolbar lists every book analysed: its cover (EPUBs), length, unique words, the share of running words known, difficulty, reading time and when it was analysed. Columns sort; a title opens the book again; ✖ removes a row. Analysing a book again replaces its row, as does changing its sections, segmenter or what counts as known while it's open. A book is identified by the SHA-256 of its file (a renamed or moved copy is the same book) or by its path (a file changed in place). Saved in `history.json` next to the other settings; cover thumbnails (at most 120 × 168 pixels) go in `covers`, and a row's cover is deleted with it.
+- **Keyboard in the Words tab.** ↑/↓ select a word (Page Up/Down, Home and End jump), and the list scrolls to follow; clicking a row selects it too. **A** marks the selected word known, or unmarks a word you marked, like the +/− button. A word known from Anki or a ticked level or list can't be unmarked; **A** on it says so. With the **Not known** filter, a word marked known leaves the list and the next one is selected, so you can work down the list pressing **A**. The keys do nothing while the filter box is being typed in.
+
 ## [2026.11.16.7] - 2026-11-16
 
 ### Fixed
