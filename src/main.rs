@@ -82,31 +82,55 @@ fn main() -> eframe::Result {
     )
 }
 
-/// egui ships no CJK glyphs; use Windows system fonts as fallbacks.
+/// egui ships no CJK glyphs; use the system's fonts as fallbacks, in order.
 fn install_fonts(ctx: &egui::Context) {
-    let dir = std::env::var_os("WINDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
-        .join("Fonts");
-    let candidates = [
-        ("yahei", "msyh.ttc"),             // Microsoft YaHei: BMP CJK
-        ("jhenghei", "msjh.ttc"),          // JhengHei: extra Traditional coverage
-        ("simsun-extb", "simsunb.ttf"),    // SimSun-ExtB: Ext B (SIP)
-        ("simsun-extg", "SimsunExtG.ttf"), // Ext G
-        ("segoe-symbol", "seguisym.ttf"),
-    ];
+    let (dir, candidates) = system_fonts();
     let mut fonts = egui::FontDefinitions::default();
-    for (name, file) in candidates {
+    for &(name, file, index) in candidates {
         if let Ok(bytes) = std::fs::read(dir.join(file)) {
-            fonts
-                .font_data
-                .insert(name.to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
+            let data = egui::FontData::from_blob(Arc::new(bytes), index);
+            fonts.font_data.insert(name.to_owned(), Arc::new(data));
             for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
                 fonts.families.entry(fam).or_default().push(name.to_owned());
             }
         }
     }
     ctx.set_fonts(fonts);
+}
+
+/// A fallback font: its name for egui, its file in the font folder, and the
+/// face to use in a `.ttc` collection.
+type SystemFont = (&'static str, &'static str, u32);
+
+/// Windows: the font folder and its CJK fonts.
+#[cfg(not(target_os = "macos"))]
+fn system_fonts() -> (PathBuf, &'static [SystemFont]) {
+    let dir = std::env::var_os("WINDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+        .join("Fonts");
+    let candidates = &[
+        ("yahei", "msyh.ttc", 0),             // Microsoft YaHei: BMP CJK
+        ("jhenghei", "msjh.ttc", 0),          // JhengHei: extra Traditional coverage
+        ("simsun-extb", "simsunb.ttf", 0),    // SimSun-ExtB: Ext B (SIP)
+        ("simsun-extg", "SimsunExtG.ttf", 0), // Ext G
+        ("segoe-symbol", "seguisym.ttf", 0),
+    ];
+    (dir, candidates)
+}
+
+/// macOS: fonts that ship with the system. Only TrueType-outline fonts:
+/// egui draws the CFF-outline ones (Hiragino, PingFang, Apple SD Gothic Neo)
+/// with strokes missing (了 as 亅, 我 as 找). None covers all of Ext B as
+/// SimSun-ExtB does; Heiti has about 6,300 of its characters.
+#[cfg(target_os = "macos")]
+fn system_fonts() -> (PathBuf, &'static [SystemFont]) {
+    let candidates = &[
+        ("heiti-sc", "STHeiti Light.ttc", 1), // Heiti SC: BMP CJK, kana, Ext B
+        ("apple-gothic", "Supplemental/AppleGothic.ttf", 0), // Hangul
+        ("apple-symbols", "Apple Symbols.ttf", 0),
+    ];
+    (PathBuf::from("/System/Library/Fonts"), candidates)
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Default)]
@@ -249,10 +273,7 @@ impl Updater {
         if self.disabled.is_some() {
             return;
         }
-        if let Some(dir) = update::exe_path().ok().and_then(Path::parent) {
-            let dir = dir.to_owned();
-            std::thread::spawn(move || update::clean_up(&dir));
-        }
+        std::thread::spawn(update::clean_up_here);
         if self.settings.auto_update {
             self.check(ctx, true);
         }
@@ -302,13 +323,7 @@ impl Updater {
                 total,
             })
         })
-        .and_then(|zip| {
-            let exe = update::exe_path()?;
-            let (Some(dir), Some(name)) = (exe.parent(), exe.file_name()) else {
-                return Err(format!("Unexpected exe path {}", exe.display()));
-            };
-            update::install(&zip, dir, &name.to_string_lossy())
-        });
+        .and_then(|zip| update::install_here(&zip));
         set(match result {
             Ok(()) => UpdatePhase::Installed(rel),
             Err(e) => UpdatePhase::Failed(format!("Updating to {} failed: {e}", rel.tag)),
@@ -994,7 +1009,7 @@ impl App {
                     ui.colored_label(Color32::from_rgb(220, 80, 80), format!("⚠ {e}"));
                 }
                 if a.profiles.is_empty() && a.settings.collection.is_none() {
-                    ui.label("No Anki profiles found in %APPDATA%\\Anki2. Use Browse… to pick a collection.anki2.");
+                    ui.label(format!("No Anki profiles found in {}. Use Browse… to pick a collection.anki2.", anki::anki_base_label()));
                 }
                 let Some(info) = a.info.clone() else { return };
                 // Options and results are pinned to the bottom; the deck and

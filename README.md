@@ -9,13 +9,24 @@ Character and word statistics for Chinese, Japanese and Korean `.epub` and `.txt
 
 ## Install
 
-1. Download [`hanstat-x86_64-pc-windows-msvc.zip`](https://github.com/caocaochan/hanstat/releases/latest/download/hanstat-x86_64-pc-windows-msvc.zip) (Windows x64).
+**Windows (x64)**
+
+1. Download [`hanstat-x86_64-pc-windows-msvc.zip`](https://github.com/caocaochan/hanstat/releases/latest/download/hanstat-x86_64-pc-windows-msvc.zip).
 2. Unzip it and run `hanstat.exe` from the `hanstat` folder.
 3. Open a file or drag it onto the window.
 
-The exe isn't code-signed, so SmartScreen may ask you to confirm the first run. The app updates itself; click the version number in the status bar to check now or turn automatic updates off.
+The exe isn't code-signed, so SmartScreen may ask you to confirm the first run.
 
-The analysers are downloaded on first use into `%LOCALAPPDATA%\hanstat\models`: the Chinese models (LTP 32 MB, CKIP 46 MB) on first start, Kiwi (126 MB) with your first Korean book, and SudachiDict (about 137 MB) with your first Japanese book. Analyses are saved, so reopening a book is instant.
+**macOS (Apple silicon)**
+
+1. Download [`hanstat-aarch64-apple-darwin.zip`](https://github.com/caocaochan/hanstat/releases/latest/download/hanstat-aarch64-apple-darwin.zip).
+2. Unzip it and move `hanstat.app` to Applications (or any folder you can write to, so it can update itself).
+3. Open it. The app isn't notarised by Apple, so the first time macOS refuses: open **System Settings → Privacy & Security** and click **Open Anyway**.
+4. Open a file or drag it onto the window. The command-line tool is `hanstat.app/Contents/MacOS/hanstat-cli`.
+
+The app updates itself; click the version number in the status bar to check now or turn automatic updates off.
+
+The analysers are downloaded on first use into `%LOCALAPPDATA%\hanstat\models` (macOS: `~/Library/Application Support/hanstat/models`): the Chinese models (LTP 32 MB, CKIP 46 MB) on first start, Kiwi (126 MB) with your first Korean book, and SudachiDict (about 137 MB) with your first Japanese book. Analyses are saved, so reopening a book is instant.
 
 ## Languages
 

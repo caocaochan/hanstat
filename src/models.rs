@@ -1,7 +1,7 @@
 //! Segmentation models are not bundled (their licences differ from this
 //! project's). They are downloaded on first use from their official Hugging
 //! Face repositories or GitHub releases, pinned to an exact commit or release
-//! and verified by SHA-256, then cached in `%LOCALAPPDATA%\hanstat\models`
+//! and verified by SHA-256, then cached in `models` under [`app_dir`]
 //! (override: `HANSTAT_MODEL_DIR`). SudachiDict is the exception: it follows
 //! its newest GitHub release (see [`sudachi`]), verified by the SHA-256 that
 //! GitHub reports for the asset.
@@ -127,25 +127,50 @@ macro_rules! kiwi_model_files {
     };
 }
 
-/// Kiwi Korean morphological analyser (library + CoNg base model). The DLL is
-/// loaded at run time (see `crate::kiwi`), so a build never needs it.
+/// Kiwi's shared library for this platform, as saved in the model folder.
+#[cfg(not(target_os = "macos"))]
+pub const KIWI_LIB: &str = "kiwi.dll";
+#[cfg(target_os = "macos")]
+pub const KIWI_LIB: &str = "libkiwi.dylib";
+
+/// The release archive holding [`KIWI_LIB`].
+#[cfg(not(target_os = "macos"))]
+const KIWI_LIB_FILE: ModelFile = ModelFile {
+    name: "kiwi_win_x64_v0.24.1.zip",
+    url: kiwi_url!("kiwi_win_x64_v0.24.1.zip"),
+    sha256: "857576c5e8492ec66f8327e35572b20f286b092a8e760fe780ace1a99afc3b30",
+    size: 38_261_195,
+    unpack: Unpack::Zip(&[Member {
+        path: "lib/kiwi.dll",
+        name: KIWI_LIB,
+        size: 23_307_264,
+    }]),
+};
+
+/// Apple silicon build. `libkiwi.0.dylib` and `libkiwi.dylib` in the archive
+/// are symlinks to this file; it needs only the system's libc++.
+#[cfg(target_os = "macos")]
+const KIWI_LIB_FILE: ModelFile = ModelFile {
+    name: "kiwi_mac_arm64_v0.24.1.tgz",
+    url: kiwi_url!("kiwi_mac_arm64_v0.24.1.tgz"),
+    sha256: "510680643980c4af94bee57151020b6373a098bac809084e7cb26080fc5bd9b9",
+    size: 41_371_847,
+    unpack: Unpack::TarGz(&[Member {
+        path: "lib/libkiwi.0.24.1.dylib",
+        name: KIWI_LIB,
+        size: 28_742_272,
+    }]),
+};
+
+/// Kiwi Korean morphological analyser (library + CoNg base model). The
+/// library is loaded at run time (see `crate::kiwi`), so a build never needs it.
 pub const KIWI: Model = Model {
     id: "kiwi-v0.24.1",
     title: "Kiwi v0.24.1 Korean morphological analyser (bab2min)",
     licence: "Apache-2.0",
     homepage: "https://github.com/bab2min/Kiwi",
     files: &[
-        ModelFile {
-            name: "kiwi_win_x64_v0.24.1.zip",
-            url: kiwi_url!("kiwi_win_x64_v0.24.1.zip"),
-            sha256: "857576c5e8492ec66f8327e35572b20f286b092a8e760fe780ace1a99afc3b30",
-            size: 38_261_195,
-            unpack: Unpack::Zip(&[Member {
-                path: "lib/kiwi.dll",
-                name: "kiwi.dll",
-                size: 23_307_264,
-            }]),
-        },
+        KIWI_LIB_FILE,
         ModelFile {
             name: "kiwi_model_v0.24.1_base.tgz",
             url: kiwi_url!("kiwi_model_v0.24.1_base.tgz"),
@@ -396,8 +421,13 @@ fn leak_sudachi_model(r: &SudachiRelease) -> &'static Model {
     }))
 }
 
-/// hanstat's per-user data folder (`%LOCALAPPDATA%\hanstat`): models and saved settings.
+/// hanstat's per-user data folder (`%LOCALAPPDATA%\hanstat`; on macOS
+/// `~/Library/Application Support/hanstat`): models and saved settings.
 pub fn app_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    if let Some(h) = std::env::var_os("HOME") {
+        return PathBuf::from(h).join("Library/Application Support/hanstat");
+    }
     let base = std::env::var_os("LOCALAPPDATA")
         .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
         .map(PathBuf::from)

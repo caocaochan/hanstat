@@ -1,7 +1,8 @@
 name: CI
 
-# Every push to main is tested; if the tests pass and the Cargo.toml version
-# has no tag yet, the same job builds, tags yyyy.mm.dd.n and publishes a release.
+# Every push to main is tested on Windows and macOS; if the tests pass and the
+# Cargo.toml version has no tag yet, both builds are packaged and the release
+# job tags yyyy.mm.dd.n and publishes them together.
 # Pushes that don't bump the version are tested only.
 
 on:
@@ -15,16 +16,46 @@ env:
   # Models are downloaded (pinned + SHA-256 verified) by the tests on first use.
   HANSTAT_MODEL_DIR: ${{ github.workspace }}/.models
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
-  test:
+  version:
+    name: Decide whether to release
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.rel.outputs.release }}
+      tag: ${{ steps.rel.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Decide whether to release
+        id: rel
+        shell: pwsh
+        run: |
+          # Releases are yyyy.mm.dd.n (n = 0, 1, … for releases on the same day).
+          # Cargo.toml can't hold leading zeros, so it has yyyy.Mdd.n
+          # (2026.1115.0 -> 2026.11.15.0); src/update.rs decodes it the same way.
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"$' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($v -notmatch '^(\d{4})\.(\d{3,4})\.(\d+)$') { throw "Cargo.toml version $v is not yyyy.Mdd.n" }
+          $md = [int]$Matches[2]
+          $tag = '{0}.{1:D2}.{2:D2}.{3}' -f $Matches[1], [int][math]::Floor($md / 100), ($md % 100), $Matches[3]
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          if ("${{ github.event_name }}" -ne 'push' -or "${{ github.ref }}" -ne 'refs/heads/main') {
+            "release=false" >> $env:GITHUB_OUTPUT
+          } elseif (git ls-remote --tags origin "refs/tags/$tag") {
+            "Version $tag is already released; bump Cargo.toml to publish a new release."
+            "release=false" >> $env:GITHUB_OUTPUT
+          } else {
+            "Releasing $tag."
+            "release=true" >> $env:GITHUB_OUTPUT
+          }
+
+  windows:
     name: Test (Windows)
+    needs: version
     runs-on: windows-latest
-    permissions:
-      # Creating the release (and its tag). Fork PRs always get a read-only token.
-      contents: write
-    concurrency:
-      group: ci-${{ github.ref }}
-      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     steps:
       - uses: actions/checkout@v7
 
@@ -38,7 +69,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: .models
-          key: models-${{ hashFiles('src/models.rs') }}
+          key: models-windows-${{ hashFiles('src/models.rs') }}
 
       - name: Format
         run: cargo fmt --check
@@ -49,47 +80,12 @@ jobs:
       - name: Test
         run: cargo test --release --locked
 
-      - name: Decide whether to release
-        id: rel
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        shell: pwsh
-        run: |
-          # Releases are yyyy.mm.dd.n (n = 0, 1, … for releases on the same day).
-          # Cargo.toml can't hold leading zeros, so it has yyyy.Mdd.n
-          # (2026.1115.0 -> 2026.11.15.0); src/update.rs decodes it the same way.
-          $v = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
-          if ($v -notmatch '^(\d{4})\.(\d{3,4})\.(\d+)$') { throw "Cargo.toml version $v is not yyyy.Mdd.n" }
-          $md = [int]$Matches[2]
-          $tag = '{0}.{1:D2}.{2:D2}.{3}' -f $Matches[1], [int][math]::Floor($md / 100), ($md % 100), $Matches[3]
-          "tag=$tag" >> $env:GITHUB_OUTPUT
-          if (git ls-remote --tags origin "refs/tags/$tag") {
-            "Version $tag is already released; bump Cargo.toml to publish a new release."
-            "release=false" >> $env:GITHUB_OUTPUT
-          } else {
-            "Releasing $tag."
-            "release=true" >> $env:GITHUB_OUTPUT
-          }
-
-      - name: Release notes from CHANGELOG.md
-        if: steps.rel.outputs.release == 'true'
-        shell: pwsh
-        run: |
-          $ver = "${{ steps.rel.outputs.tag }}"
-          $lines = Get-Content CHANGELOG.md
-          $start = ($lines | Select-String -Pattern "^## \[$([regex]::Escape($ver))\]").LineNumber
-          if (-not $start) { throw "No CHANGELOG.md section for $ver" }
-          $rest = $lines[$start..($lines.Count - 1)]
-          $end = ($rest | Select-String -Pattern '^## \[' | Select-Object -First 1).LineNumber
-          $body = if ($end) { $rest[0..($end - 2)] } else { $rest }
-          $body | Out-File -Encoding utf8 notes.md
-
       - name: Build
-        if: steps.rel.outputs.release == 'true'
+        if: needs.version.outputs.release == 'true'
         run: cargo build --release --locked --bins
 
       - name: Package
-        id: package
-        if: steps.rel.outputs.release == 'true'
+        if: needs.version.outputs.release == 'true'
         shell: pwsh
         run: |
           # Fixed names, no version: .../releases/latest/download/<name>.zip is
@@ -102,19 +98,94 @@ jobs:
           Copy-Item data/OpenCC-LICENSE.txt "$dir/LICENSE-OpenCC-data.txt"
           Copy-Item data/HSK-LICENSE.txt "$dir/LICENSE-HSK-data.txt"
           Copy-Item data/JLPT-LICENSE.txt "$dir/LICENSE-JLPT-data.txt"
-          Compress-Archive -Path $dir -DestinationPath "$name.zip"
-          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
-          "$hash  $name.zip" | Out-File -Encoding ascii "$name.zip.sha256"
-          "name=$name" >> $env:GITHUB_OUTPUT
+          New-Item -ItemType Directory dist | Out-Null
+          Compress-Archive -Path $dir -DestinationPath "dist/$name.zip"
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File -Encoding ascii "dist/$name.zip.sha256"
+
+      - uses: actions/upload-artifact@v5
+        if: needs.version.outputs.release == 'true'
+        with:
+          name: windows
+          path: dist/hanstat-x86_64-pc-windows-msvc.zip*
+          if-no-files-found: error
+
+  macos:
+    name: Test (macOS)
+    needs: version
+    # Apple silicon.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache segmentation models
+        uses: actions/cache@v6
+        with:
+          path: .models
+          key: models-macos-${{ hashFiles('src/models.rs') }}
+
+      - name: Clippy
+        run: cargo clippy --release --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Build
+        if: needs.version.outputs.release == 'true'
+        run: cargo build --release --locked --bins
+
+      # hanstat.app as hanstat-aarch64-apple-darwin.zip, the asset the
+      # in-app updater looks for on macOS.
+      - name: Package
+        if: needs.version.outputs.release == 'true'
+        run: macos/bundle.sh dist
+
+      - uses: actions/upload-artifact@v5
+        if: needs.version.outputs.release == 'true'
+        with:
+          name: macos
+          path: dist/hanstat-aarch64-apple-darwin.zip*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [version, windows, macos]
+    if: needs.version.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      # Creating the release (and its tag).
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v6
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Release notes from CHANGELOG.md
+        shell: pwsh
+        run: |
+          $ver = "${{ needs.version.outputs.tag }}"
+          $lines = Get-Content CHANGELOG.md
+          $start = ($lines | Select-String -Pattern "^## \[$([regex]::Escape($ver))\]").LineNumber
+          if (-not $start) { throw "No CHANGELOG.md section for $ver" }
+          $rest = $lines[$start..($lines.Count - 1)]
+          $end = ($rest | Select-String -Pattern '^## \[' | Select-Object -First 1).LineNumber
+          $body = if ($end) { $rest[0..($end - 2)] } else { $rest }
+          $body | Out-File -Encoding utf8 notes.md
 
       - name: Publish GitHub release
-        if: steps.rel.outputs.release == 'true'
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "${{ steps.rel.outputs.tag }}"
-          $name = "${{ steps.package.outputs.name }}"
           # Creates the tag on the tested commit.
-          gh release create $tag "$name.zip" "$name.zip.sha256" `
+          tag="${{ needs.version.outputs.tag }}"
+          gh release create "$tag" dist/* \
             --target "${{ github.sha }}" --title "hanstat $tag" --notes-file notes.md

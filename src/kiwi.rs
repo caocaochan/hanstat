@@ -1,6 +1,7 @@
 //! Korean analysis with Kiwi (bab2min/Kiwi, Apache-2.0) through its C API.
 //!
-//! `kiwi.dll` and the CoNg base model are downloaded on first use
+//! Kiwi's library (`kiwi.dll`, `libkiwi.dylib` on macOS) and the CoNg base
+//! model are downloaded on first use
 //! ([`crate::models::KIWI`]) and the DLL is loaded at run time, so building
 //! hanstat never needs Kiwi and the Chinese modes never load it.
 //!
@@ -55,14 +56,14 @@ const MATCH_ALL_WITH_NORMALIZING: c_int = 0x3F | (1 << 23) | (1 << 16);
 static API: OnceLock<Result<Api, String>> = OnceLock::new();
 
 fn api(dir: &Path) -> Result<&'static Api, String> {
-    API.get_or_init(|| load_api(&dir.join("kiwi.dll")))
+    API.get_or_init(|| load_api(&dir.join(models::KIWI_LIB)))
         .as_ref()
         .map_err(Clone::clone)
 }
 
 fn load_api(dll: &Path) -> Result<Api, String> {
     let fail = |e: libloading::Error| format!("Cannot load {}: {e}", dll.display());
-    // SAFETY: kiwi.dll is the SHA-256-verified Kiwi v0.24.1 release build; its
+    // SAFETY: the library is the SHA-256-verified Kiwi v0.24.1 release build; its
     // initialisers have no requirements, and each symbol's type matches capi.h.
     unsafe {
         let lib = libloading::Library::new(dll).map_err(fail)?;
@@ -145,7 +146,7 @@ fn user_word_ok(w: &str) -> bool {
 }
 
 impl Kiwi {
-    /// Build from the model folder (`kiwi.dll` plus the model files), with
+    /// Build from the model folder (Kiwi's library plus the model files), with
     /// `user_words` added as proper nouns so they are kept whole.
     pub fn build(dir: &Path, user_words: &[String]) -> Result<Kiwi, String> {
         let api = api(dir)?;
