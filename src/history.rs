@@ -376,9 +376,13 @@ mod tests {
             .unwrap();
         // Same file, moved: replaced.
         h.record(entry("a", "D:/a.epub", 11, 3), true).unwrap();
-        // Same path, file changed: replaced.
-        h.record(entry("c", "c:/BOOKS/b.epub", 21, 4), true)
-            .unwrap();
+        // Same path, file changed: replaced (on Windows, whatever the case).
+        let b = if cfg!(windows) {
+            "c:/BOOKS/b.epub"
+        } else {
+            "C:/books/b.epub"
+        };
+        h.record(entry("c", b, 21, 4), true).unwrap();
         let ids: Vec<&str> = h.entries.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, ["c", "a"]);
         // Unchanged statistics are not rewritten unless touched.
