@@ -18,6 +18,8 @@ pub const COVERAGE_TARGETS: [f64; 8] = [50.0, 80.0, 90.0, 95.0, 98.0, 99.0, 99.5
 pub struct SectionStats {
     /// Indexed by `class_index`.
     pub class_counts: [u64; 9],
+    /// Japanese: kana (see [`chars::is_kana`]), which `class_counts` holds among the letters.
+    pub kana: u64,
     pub han: HashMap<char, u32>,
     pub words: HashMap<String, u32>,
     pub foreign_words: HashMap<String, u32>,
@@ -52,6 +54,7 @@ impl SectionStats {
         for i in 0..9 {
             self.class_counts[i] += o.class_counts[i];
         }
+        self.kana += o.kana;
         for (k, v) in &o.han {
             *self.han.entry(*k).or_default() += v;
         }
@@ -90,6 +93,7 @@ impl SectionStats {
         for i in 0..9 {
             self.class_counts[i] += o.class_counts[i];
         }
+        self.kana += o.kana;
         for (k, v) in o.han {
             *self.han.entry(k).or_default() += v;
         }
@@ -353,6 +357,9 @@ fn count_paragraph(acc: &mut SectionStats, p: &str, lang: Language) {
     for (i, &c) in cs.iter().enumerate() {
         let cl = chars::classify_in(c, lang);
         acc.class_counts[class_index(cl)] += 1;
+        if lang == Language::Japanese && chars::is_kana(c) {
+            acc.kana += 1;
+        }
         match cl {
             Class::Han => {
                 *acc.han.entry(c).or_default() += 1;
@@ -444,6 +451,9 @@ pub struct Report {
     pub han_total: u64,
     pub han_unique: usize,
     pub han_hapax: usize,
+    /// Japanese: kana, which with the kanji of `han_total` are the characters
+    /// reading time is measured in. Zero for Chinese and Korean.
+    pub kana_total: u64,
     pub nonspace_total: u64,
     pub letters: u64,
     pub digits: u64,
@@ -678,6 +688,7 @@ pub fn build_report(book: &Book, prep: &Prepared, included: &[bool]) -> Report {
         han_total,
         han_unique: char_freq.len(),
         han_hapax: char_freq.iter().filter(|(_, n)| *n == 1).count(),
+        kana_total: total.kana,
         nonspace_total: c.iter().sum::<u64>() - c[5],
         letters: c[1],
         digits: c[2],

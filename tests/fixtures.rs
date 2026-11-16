@@ -313,6 +313,15 @@ fn japanese_book_counts_normalized_words_and_kanji() {
     }
     // Kanji are counted as characters.
     assert!(r.han_total > 0 && r.char_freq.iter().any(|(c, _)| *c == '冒'));
+    // Kana are counted too: with the kanji they are the characters of reading time.
+    let kana = book
+        .sections
+        .iter()
+        .flat_map(|s| s.paragraphs.iter())
+        .map(|p| p.chars().filter(|c| hanstat::chars::is_kana(*c)).count() as u64)
+        .sum::<u64>();
+    assert!(kana > 0);
+    assert_eq!(r.kana_total, kana);
     assert!(r.avg_sentence_words.unwrap() > 0.0);
     // Known words: JLPT N5 marks 行く, and 冒険者 counts through its parts
     // once 冒険 and 者 are marked.

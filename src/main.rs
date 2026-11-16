@@ -368,8 +368,10 @@ struct App {
     word_filter: String,
     /// Reading speed for Chinese (characters per minute).
     cpm: f32,
-    /// Reading speed for Korean and Japanese (words per minute, as counted: content words).
+    /// Reading speed for Korean (words per minute, as counted: content words).
     wpm: f32,
+    /// Reading speed for Japanese (kanji and kana per minute).
+    ja_cpm: f32,
     toast: Option<(String, f64)>,
 
     suggestions: Option<Vec<Candidate>>,
@@ -530,6 +532,7 @@ impl Default for App {
             word_filter: String::new(),
             cpm: 300.0,
             wpm: 100.0,
+            ja_cpm: 300.0,
             toast: None,
             suggestions: None,
             suggest_rx: None,
@@ -2434,6 +2437,7 @@ impl App {
                         ];
                         if japanese {
                             rows.insert(1, ("Kanji (total)".into(), r.han_total));
+                            rows.insert(2, ("Kana (total)".into(), r.kana_total));
                         }
                         for (k, v) in rows {
                             ui.label(k);
@@ -2458,12 +2462,25 @@ impl App {
                         ui.end_row();
                         ui.label("Reading time");
                         ui.horizontal(|ui| {
-                            let mins = r.words_total as f64 / self.wpm as f64;
+                            // Japanese reading speed is measured in characters (文字/分), Korean in words.
+                            let mins = if japanese {
+                                (r.han_total + r.kana_total) as f64 / self.ja_cpm as f64
+                            } else {
+                                r.words_total as f64 / self.wpm as f64
+                            };
                             ui.label(format!("{}h {:02}m at", (mins / 60.0) as u64, (mins % 60.0) as u64));
-                            ui.add(egui::DragValue::new(&mut self.wpm).range(20.0..=1000.0).speed(2.0).suffix(" words/min"));
+                            if japanese {
+                                ui.add(egui::DragValue::new(&mut self.ja_cpm).range(50.0..=2000.0).speed(5.0).suffix(" chars/min"));
+                            } else {
+                                ui.add(egui::DragValue::new(&mut self.wpm).range(20.0..=1000.0).speed(2.0).suffix(" words/min"));
+                            }
                         })
                         .response
-                        .on_hover_text("Words as counted here: dictionary forms of content words, without particles and endings (Japanese: without particles and auxiliaries).");
+                        .on_hover_text(if japanese {
+                            "Characters are kanji and kana. Punctuation, digits and Latin letters are not counted."
+                        } else {
+                            "Words as counted here: dictionary forms of content words, without particles and endings."
+                        });
                         ui.end_row();
                     });
 
@@ -3137,7 +3154,7 @@ const KOREAN_METHOD: &[&str] = &[
 
 const JAPANESE_METHOD: &[&str] = &[
     "Language: a book is Japanese when its kana are at least a tenth as many as its kanji (a Chinese book has at most a few kana). The badge at the top right shows the mode; Anki decks and fields, word lists, marked words and the user dictionary are kept separately for each language.",
-    "Characters are kanji (Script=Han letters), counted exactly as in Chinese books; kana are letters. Words, lengths and reading time are in words.",
+    "Characters are kanji (Script=Han letters), counted exactly as in Chinese books; kana are letters. Sentence and paragraph lengths are in words. Reading time is in characters per minute, where the characters are kanji and kana; punctuation, digits and Latin letters are not counted.",
     "Words come from Sudachi, a Japanese morphological analyser, with SudachiDict full in its long-unit mode C: compounds a dictionary lists whole stay whole (事務所, 一生懸命, 冒険者). Each word is counted by Sudachi's normalized form, which merges inflections and spellings (わかった, 分かる → 分かる; かわいく → 可愛い; ウソ → うそ), and shown as the book usually spells it. Two different words the book spells alike are told apart by their normalized form: いる (要る).",
     "Particles, auxiliaries (た, ます, ない…), punctuation, numbers in digits and Latin words are not Japanese words. Numerals in kanji keep their spelling (二十四).",
     "Before analysis, dialogue noise that Sudachi misreads is removed: an emphatic small っ at the end of a word (ですっ」), stretched vowels and long marks after two or more kana (ますぅ, まーす), and stutters (い、いいんですか; こ、これ). Short interjections such as はぁ, えー and えーと are kept. On five novels this changed Sudachi's reading in a few hundred places, mostly for the better (49 of 81 judged by hand; 6 worse, all stretched interjections like あはー).",

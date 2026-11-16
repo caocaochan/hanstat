@@ -1,5 +1,13 @@
 # Changelog
 
+## [2026.11.16.2] - 2026-11-16
+
+### Changed
+- **Japanese reading time.** Reading time for a Japanese book is now measured in characters per minute (300 by default) instead of words per minute. The characters are kanji and kana; punctuation, digits and Latin letters are not counted. The rate is set separately from the Chinese and Korean ones.
+
+### Added
+- **Kana count.** For a Japanese book, the Overview's Composition table has a **Kana (total)** row, and the JSON report has `kana_total`.
+
 ## [2026.11.16.1] - 2026-11-16
 
 ### Added
