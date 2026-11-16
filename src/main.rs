@@ -349,7 +349,7 @@ struct App {
     language: Language,
     /// Data of the languages not in use.
     stash: HashMap<Language, LangData>,
-    /// The Chinese segmenter choice (a Korean book always uses Kiwi).
+    /// The Chinese segmenter choice (a Korean book always uses Kiwi, a Japanese one Sudachi).
     segmenter: SegmenterKind,
     encoding: EncodingChoice,
     user_words: Vec<String>,
@@ -368,7 +368,7 @@ struct App {
     word_filter: String,
     /// Reading speed for Chinese (characters per minute).
     cpm: f32,
-    /// Reading speed for Korean (words per minute, as counted: content words).
+    /// Reading speed for Korean and Japanese (words per minute, as counted: content words).
     wpm: f32,
     toast: Option<(String, f64)>,
 
@@ -415,7 +415,7 @@ struct AnkiState {
     built_with: Option<anki::SegConfig>,
 }
 
-/// Vocabulary levels and word lists marked known (saved in known.json / known-ko.json).
+/// Vocabulary levels and word lists marked known (saved in known.json, known-ko.json, known-ja.json).
 #[derive(Default)]
 struct KnownState {
     settings: known::Settings,
@@ -468,6 +468,7 @@ impl AnkiFilter {
 fn mode_badge(lang: Language, variant: Option<Variant>) -> (&'static str, Color32) {
     match (lang, variant) {
         (Language::Korean, _) => ("한국어", Color32::from_rgb(0, 86, 168)),
+        (Language::Japanese, _) => ("日本語", Color32::from_rgb(120, 60, 150)),
         (Language::Chinese, Some(Variant::Simplified)) => {
             ("简体中文", Color32::from_rgb(196, 43, 43))
         }
@@ -483,6 +484,7 @@ fn language_label(lang: Language) -> &'static str {
     match lang {
         Language::Chinese => "中文 (Chinese)",
         Language::Korean => "한국어 (Korean)",
+        Language::Japanese => "日本語 (Japanese)",
     }
 }
 
@@ -787,6 +789,8 @@ impl App {
         self.anki.busy = if self.language == Language::Korean && !hanstat::models::KIWI.is_cached()
         {
             "Downloading Kiwi (126 MB, first Korean use only), then classifying Anki notes…"
+        } else if self.language == Language::Japanese && !hanstat::models::SUDACHI.is_cached() {
+            "Downloading SudachiDict (77 MB, first Japanese use only), then classifying Anki notes…"
         } else {
             "Classifying Anki notes…"
         };
@@ -884,11 +888,10 @@ impl App {
         );
         let Some(r) = &mut self.report else { return };
         let had = r.anki.is_some();
-        r.anki = self
-            .known
-            .merged
-            .as_ref()
-            .map(|k| BookCoverage::compute(k, &r.char_freq, &r.word_freq, &names));
+        r.anki =
+            self.known.merged.as_ref().map(|k| {
+                BookCoverage::compute(k, &r.char_freq, &r.word_freq, &names, &r.word_parts)
+            });
         if r.anki.is_none() {
             self.anki_filter = AnkiFilter::All;
         } else if !had {
@@ -905,6 +908,7 @@ impl App {
         let title = match lang {
             Language::Chinese => "Anki (中文)",
             Language::Korean => "Anki (한국어)",
+            Language::Japanese => "Anki (日本語)",
         };
         egui::Window::new(title)
             .id(egui::Id::unique("anki-window"))
@@ -1054,6 +1058,7 @@ impl App {
                     match lang {
                         Language::Chinese => status_grid(ui, "anki-summary", &[("Cards", &s.cards), ("Words", &s.words), ("Characters", &s.chars)]),
                         Language::Korean => status_grid(ui, "anki-summary", &[("Cards", &s.cards), ("Words", &s.words)]),
+                        Language::Japanese => status_grid(ui, "anki-summary", &[("Cards", &s.cards), ("Words", &s.words), ("Kanji", &s.chars)]),
                     }
                 }
                 ui.add_space(6.0);
@@ -1076,6 +1081,7 @@ impl App {
                         match lang {
                             Language::Chinese => "A ticked field holding a word counts as that word; one holding a sentence is split into words with the book's segmenter.",
                             Language::Korean => "Every ticked field is analysed with Kiwi and counts as the dictionary forms of its words (먹었어요 → 먹다), like the book.",
+                            Language::Japanese => "Every ticked field is analysed with Sudachi and counts as its words in dictionary form with spellings merged (わかった, 分かる → 分かる), like the book; furigana readings (会[あ]う) are ignored.",
                         }
                     ))
                     .weak()
@@ -1397,9 +1403,10 @@ impl eframe::App for App {
                 }
                 ui.separator();
                 ui.label("Segmenter:");
-                if self.language == Language::Korean {
-                    ui.label(RichText::new("Kiwi").strong())
-                        .on_hover_text(SegmenterKind::Kiwi.description());
+                if self.language != Language::Chinese {
+                    let k = SegmenterKind::Auto.resolve_in(self.language, hanstat::script::Variant::Unknown);
+                    ui.label(RichText::new(k.label()).strong())
+                        .on_hover_text(k.description());
                 } else {
                     let before = self.segmenter;
                     egui::ComboBox::from_id_salt("seg").selected_text(self.segmenter.label()).show_ui(ui, |ui| {
@@ -1416,6 +1423,7 @@ impl eframe::App for App {
                     let hover = match self.language {
                         Language::Chinese => "Always segmented as single words. Added from the Suggested words tab.",
                         Language::Korean => "Kiwi keeps these whole, as proper nouns. Added from the Suggested words tab; kept separately from the Chinese ones.",
+                        Language::Japanese => "Sudachi keeps these whole, as proper nouns. Kept separately from the Chinese and Korean ones.",
                     };
                     ui.label(format!("📖 {} forced words", self.user_words.len())).on_hover_text(hover);
                     if ui.small_button("✖").on_hover_text("Remove all forced words").clicked() {
@@ -1464,12 +1472,15 @@ impl eframe::App for App {
                         let stem = self.path.as_deref().map(file_stem).unwrap_or_else(|| "hanstat".into());
                         let r = self.report.as_ref().unwrap();
                         let mut msg = None;
-                        let chinese = r.language == Language::Chinese;
+                        // A Korean book has no character statistics; a Japanese one counts kanji.
+                        let chinese = r.language != Language::Korean;
+                        // Japanese word keys are shown as the book spells them.
+                        let shown: Vec<(&str, u32)> = r.word_freq.iter().map(|(w, n)| (r.display(w), *n)).collect();
                         if chinese && ui.button("Character frequency (CSV)…").clicked() {
                             msg = save(&format!("{stem}-characters.csv"), "csv", analyze::freq_csv(&r.char_freq, "character"));
                         }
                         if ui.button("Word frequency (CSV)…").clicked() {
-                            msg = save(&format!("{stem}-words.csv"), "csv", analyze::freq_csv(&r.word_freq, "word"));
+                            msg = save(&format!("{stem}-words.csv"), "csv", analyze::freq_csv(&shown, "word"));
                         }
                         if ui.button("Full report (JSON)…").clicked() {
                             msg = save(&format!("{stem}-report.json"), "json", serde_json::to_string_pretty(r).unwrap());
@@ -1482,7 +1493,7 @@ impl eframe::App for App {
                                 .iter()
                                 .zip(&c.word_status)
                                 .filter(|(_, s)| !s.is_known())
-                                .map(|((w, _), _)| w.as_str())
+                                .map(|((w, _), _)| r.display(w))
                                 .collect();
                             msg = save(&format!("{stem}-unknown-words.txt"), "txt", list.join("\n") + "\n");
                         }
@@ -1495,7 +1506,7 @@ impl eframe::App for App {
                             msg = Some(format!("Copied {} characters", r.char_freq.len()));
                         }
                         if ui.button("Copy unique words (one per line)").clicked() {
-                            ctx.copy_text(r.word_freq.iter().map(|x| x.0.as_str()).collect::<Vec<_>>().join("\n"));
+                            ctx.copy_text(shown.iter().map(|x| x.0).collect::<Vec<_>>().join("\n"));
                             msg = Some(format!("Copied {} words", r.word_freq.len()));
                         }
                         if let Some(m) = msg {
@@ -1509,11 +1520,13 @@ impl eframe::App for App {
                 let label = match (self.known.settings.is_empty(), self.language) {
                     (true, Language::Chinese) => "📚 HSK & word lists…".to_owned(),
                     (true, Language::Korean) => "📚 Levels & word lists…".to_owned(),
+                    (true, Language::Japanese) => "📚 JLPT & word lists…".to_owned(),
                     (false, _) => format!("📚 Known: {}", self.known.settings.label()),
                 };
                 let hover = match self.language {
                     Language::Chinese => "Mark HSK 3.0 levels and imported word lists as known, in addition to your Anki cards",
                     Language::Korean => "Mark vocabulary levels 1–6급 and imported Korean word lists as known, in addition to your Anki cards",
+                    Language::Japanese => "Mark JLPT levels N5–N1 and imported Japanese word lists as known, in addition to your Anki cards",
                 };
                 if ui
                     .selectable_label(self.known.window, label)
@@ -1620,12 +1633,15 @@ impl eframe::App for App {
                 });
                 return;
             }
-            // A Korean book has word statistics only, and no suggested words.
-            let korean = self
-                .report
-                .as_ref()
-                .is_some_and(|r| r.language == Language::Korean);
-            if korean && matches!(self.tab, Tab::Characters | Tab::Suggestions) {
+            // A Korean book has word statistics only; Korean and Japanese
+            // books have no suggested words.
+            let lang = self.report.as_ref().map(|r| r.language);
+            let korean = lang == Some(Language::Korean);
+            let no_suggestions = lang.is_some_and(|l| l != Language::Chinese);
+            let hidden = |t: Tab| {
+                (korean && t == Tab::Characters) || (no_suggestions && t == Tab::Suggestions)
+            };
+            if hidden(self.tab) {
                 self.tab = Tab::Overview;
             }
             let tab_before = self.tab;
@@ -1638,7 +1654,7 @@ impl eframe::App for App {
                     (Tab::Suggestions, "Suggested words"),
                     (Tab::Notes, "Notes & method"),
                 ] {
-                    if korean && matches!(t, Tab::Characters | Tab::Suggestions) {
+                    if hidden(t) {
                         continue;
                     }
                     ui.selectable_value(&mut self.tab, t, RichText::new(name).size(15.0));
@@ -1689,7 +1705,7 @@ impl App {
                     .corner_radius(egui::CornerRadius::same(6)),
             )
             .on_hover_text(
-                "Language mode, detected from the book: Korean when Hangul outnumbers Chinese characters. \
+                "Language mode, detected from the book: Korean when Hangul outnumbers Chinese characters, Japanese when kana are at least a tenth as many as kanji. \
                  Anki decks and fields, word lists, marked words and the user dictionary are kept separately for each language. Click for details.",
             );
         let fixed = self.prep.is_some() || self.job.is_some();
@@ -1735,6 +1751,7 @@ impl App {
         let title = match lang {
             Language::Chinese => "Known words: HSK & word lists (中文)",
             Language::Korean => "Known words: levels & word lists (한국어)",
+            Language::Japanese => "Known words: JLPT & word lists (日本語)",
         };
         egui::Window::new(title)
             .id(egui::Id::unique("known-window"))
@@ -1762,6 +1779,15 @@ impl App {
                             .weak(),
                         );
                     }
+                    Language::Japanese => {
+                        ui.strong("JLPT vocabulary (N5–N1)");
+                        ui.label(
+                            RichText::new(
+                                "Jonathan Waller's lists, as used by jisho.org. The JLPT has published no word list since 2010, so these are an informed estimate. Tick each level whose new words you know. A long word that isn't on the list (冒険者) counts as known when its parts (冒険, 者) are.",
+                            )
+                            .weak(),
+                        );
+                    }
                 }
                 ui.horizontal_wrapped(|ui| {
                     let mut cum = 0;
@@ -1785,12 +1811,14 @@ impl App {
                 });
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("All up to:").weak());
-                    for &b in bands {
+                    for (i, &b) in bands.iter().enumerate() {
                         let label = known::band_label(lang, b);
                         let short = label.trim_start_matches("HSK ");
                         let first = known::band_label(lang, bands[0]);
                         if ui.small_button(short).on_hover_text(format!("Tick {first} to {label} only")).clicked() {
-                            k.settings.levels = bands.iter().copied().filter(|x| *x <= b).collect();
+                            // Bands are listed easiest first (JLPT counts down from N5).
+                            k.settings.levels = bands[..=i].to_vec();
+                            k.settings.levels.sort_unstable();
                             changed = true;
                         }
                     }
@@ -1799,6 +1827,26 @@ impl App {
                         changed = true;
                     }
                 });
+                if lang == Language::Japanese {
+                    ui.add_space(4.0);
+                    if ui
+                        .checkbox(
+                            &mut k.settings.kaishi,
+                            format!(
+                                "{} deck ({} words)",
+                                known::KAISHI_NAME,
+                                fmt_int(known::kaishi_count() as u64)
+                            ),
+                        )
+                        .on_hover_text(
+                            "Every word of the Kaishi 1.5k Anki deck (donkuri/Kaishi v2.4.3, 1,500 cards) counts as known, for when you studied it outside the Anki collection hanstat reads. \
+                             If the deck is in that collection, tick it in the Anki window instead, so that only the cards you have learned count.",
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                }
                 ui.separator();
 
                 ui.horizontal(|ui| {
@@ -1851,6 +1899,8 @@ impl App {
                         Language::Chinese => "One word per line. The first item on a line that contains Chinese is used, so exports with pinyin or definitions after a tab, comma or space work; # starts a comment. \
                          Lists are copied in: import a file again to update it.",
                         Language::Korean => "One word per line, in dictionary form (먹다, 공부하다, 사과), since the book's words are counted that way. The first item on a line that contains Hangul is used, so exports with definitions after a tab, comma or space work; # starts a comment. \
+                         Lists are copied in: import a file again to update it.",
+                        Language::Japanese => "One word per line, in any spelling or form: entries are read with Sudachi like the book, so 分かる, わかる and わかった all mark 分かる, and each word of an entry such as 勉強する counts. The first item on a line that contains kana or kanji is used, so exports with readings or definitions after a tab, comma or space work; furigana in [brackets] is dropped; # starts a comment. \
                          Lists are copied in: import a file again to update it.",
                     })
                     .weak()
@@ -1919,16 +1969,17 @@ impl App {
                     }
                     Some(m) => {
                         let l = &m.listed;
+                        let chars = if lang == Language::Japanese { "kanji" } else { "characters" };
                         ui.label(if anki_on {
                             format!(
-                                "{} distinct words marked known; {} of them are not young/mature in Anki, adding {} characters.",
+                                "{} distinct words marked known; {} of them are not young/mature in Anki, adding {} {chars}.",
                                 fmt_int(l.words),
                                 fmt_int(l.new_words),
                                 fmt_int(l.new_chars)
                             )
                         } else {
                             format!(
-                                "{} distinct words marked known ({} characters). Anki is off, so only these count.",
+                                "{} distinct words marked known ({} {chars}). Anki is off, so only these count.",
                                 fmt_int(l.words),
                                 fmt_int(l.new_chars)
                             )
@@ -1949,6 +2000,11 @@ impl App {
                         Language::Korean => format!(
                             "These words count as known (\"Word list\" in the Words tab) alongside young and mature Anki cards. \
                              Korean lists and marked words are kept apart from the Chinese ones. Saved to {}.",
+                            known::Settings::path_for(lang).display()
+                        ),
+                        Language::Japanese => format!(
+                            "These words count as known (\"Word list\" in the Characters and Words tabs) alongside young and mature Anki cards, and a kanji is known if it is in a known word. \
+                             Japanese lists and marked words are kept apart from the Chinese and Korean ones. Saved to {}.",
                             known::Settings::path_for(lang).display()
                         ),
                     })
@@ -2146,8 +2202,12 @@ impl App {
             ui.add_space(4.0);
         }
         let r = self.report.as_ref().unwrap();
-        // A Korean book has word statistics only.
+        // A Korean book has word statistics only; a Japanese one has words
+        // laid out like Korean, plus kanji.
         let chinese = r.language == Language::Chinese;
+        let japanese = r.language == Language::Japanese;
+        let has_chars = chinese || japanese;
+        let lang_name = r.language.name();
         let out = egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             if let Some(t) = &r.title {
                 ui.heading(t);
@@ -2163,6 +2223,11 @@ impl App {
                     included,
                     sections
                 )
+            } else if japanese {
+                format!(
+                    "{} · Japanese · words are counted in dictionary form with spellings merged (わかった, 分かる → 分かる) · {} of {} sections included",
+                    r.format, included, sections
+                )
             } else {
                 format!(
                     "{} · Korean · words are counted in dictionary form (먹었어요 → 먹다) · {} of {} sections included",
@@ -2176,10 +2241,16 @@ impl App {
                     big_stat(ui, "Unique characters", r.han_unique as u64, &format!("{} needed for 99% coverage", r.char_coverage.iter().find(|c| c.percent == 99.0).map(|c| c.items).unwrap_or(0)));
                     big_stat(ui, "Chinese words (total)", r.words_total, &format!("segmenter: {}", r.segmenter.label()));
                 } else {
-                    big_stat(ui, "Korean words (total)", r.words_total, &format!("analyser: {}", r.segmenter.label()));
+                    if japanese {
+                        big_stat(ui, "Kanji (total)", r.han_total, &format!("{} occur only once", fmt_int(r.han_hapax as u64)));
+                        big_stat(ui, "Unique kanji", r.han_unique as u64, &format!("{} needed for 99% coverage", r.char_coverage.iter().find(|c| c.percent == 99.0).map(|c| c.items).unwrap_or(0)));
+                    }
+                    big_stat(ui, &format!("{lang_name} words (total)"), r.words_total, &format!("analyser: {}", r.segmenter.label()));
                 }
                 big_stat(ui, "Unique words", r.words_unique as u64, &format!("{} occur only once", fmt_int(r.words_hapax as u64)));
-                if !chinese {
+                // Korean only: a Japanese book already has four tiles, and the
+                // coverage table below gives the same number.
+                if !has_chars {
                     big_stat(ui, "Words for 98% coverage", r.word_coverage.iter().find(|c| c.percent == 98.0).map_or(0, |c| c.items as u64), "most frequent words, see Coverage below");
                 }
             });
@@ -2196,6 +2267,11 @@ impl App {
                     let tiles: &[(&str, &anki::KnownCount)] = if chinese {
                         &[
                             ("Unique characters you know", &c.unique_chars),
+                            ("Unique words you know", &c.unique_words),
+                        ]
+                    } else if japanese {
+                        &[
+                            ("Unique kanji you know", &c.unique_chars),
                             ("Unique words you know", &c.unique_words),
                         ]
                     } else {
@@ -2230,6 +2306,15 @@ impl App {
                         format!(
                             "Every occurrence counts, so frequent words weigh more. {} of {} word occurrences are known; {} occurrences of names (your user dictionary and the recommended Suggested words) are left out. \
                              Of the running characters, {:.1}% are known.",
+                            fmt_int(rw.known),
+                            fmt_int(rw.total),
+                            fmt_int(c.name_tokens),
+                            c.running_chars.percent()
+                        )
+                    } else if japanese {
+                        format!(
+                            "Every occurrence counts, so frequent words weigh more. {} of {} word occurrences are known; {} occurrences of names (your user dictionary) are left out. \
+                             Particles and auxiliaries are grammar, not words. Of the running kanji, {:.1}% are known.",
                             fmt_int(rw.known),
                             fmt_int(rw.total),
                             fmt_int(c.name_tokens),
@@ -2274,6 +2359,9 @@ impl App {
                             RichText::new(if chinese {
                                 "Thresholds from L2 reading research: 98% coverage for comfortable reading of fiction (Hu & Nation 2000), 95% as the minimum for adequate comprehension (Laufer 1989). \
                                  Words you know but have no Anki card for (and aren't in a ticked HSK level or word list) count as unknown, so the book may be easier than this."
+                            } else if japanese {
+                                "Thresholds from L2 reading research: 98% coverage for comfortable reading of fiction (Hu & Nation 2000), 95% as the minimum for adequate comprehension (Laufer 1989). \
+                                 Words you know but have no Anki card for (and aren't in a ticked JLPT level or word list) count as unknown, so the book may be easier than this."
                             } else {
                                 "Thresholds from L2 reading research: 98% coverage for comfortable reading of fiction (Hu & Nation 2000), 95% as the minimum for adequate comprehension (Laufer 1989). \
                                  Words you know but have no Anki card for (and aren't in a ticked level or word list) count as unknown, so the book may be easier than this."
@@ -2283,11 +2371,12 @@ impl App {
                         );
                     });
                 });
-                let anki_part = if chinese {
+                let anki_part = if has_chars {
                     format!(
-                        "on a young or mature card in your selected decks ({} words, {} characters)",
+                        "on a young or mature card in your selected decks ({} words, {} {})",
                         fmt_int(c.anki.words.known()),
                         fmt_int(c.anki.chars.known()),
+                        if japanese { "kanji" } else { "characters" },
                     )
                 } else {
                     format!(
@@ -2315,6 +2404,10 @@ impl App {
                         format!(
                             "Known = {known_def}. A character is known if it appears in a known word. Hover the last two tiles for details."
                         )
+                    } else if japanese {
+                        format!(
+                            "Known = {known_def}. A kanji is known if it appears in a known word, and a long word (冒険者) if all its parts (冒険, 者) are known. Hover the last two tiles for details."
+                        )
                     } else {
                         format!("Known = {known_def}. Hover the last two tiles for details.")
                     })
@@ -2324,19 +2417,22 @@ impl App {
             }
 
             if !chinese {
-                // Korean: words only.
+                // Korean: words only. Japanese: words, plus kanji.
                 ui.columns(2, |cols| {
                     let ui = &mut cols[0];
                     ui.heading("Composition");
                     egui::Grid::new("comp").striped(true).num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
-                        let rows: [(&str, u64); 6] = [
-                            ("Korean words (total)", r.words_total),
-                            ("Non-Korean words (total)", r.foreign_words_total),
-                            ("Non-Korean words (unique)", r.foreign_words_unique as u64),
-                            ("Numbers", r.numbers),
-                            ("Private-use characters (unreadable)", r.private_use),
-                            ("Decode errors (U+FFFD)", r.replacement),
+                        let mut rows: Vec<(String, u64)> = vec![
+                            (format!("{lang_name} words (total)"), r.words_total),
+                            (format!("Non-{lang_name} words (total)"), r.foreign_words_total),
+                            (format!("Non-{lang_name} words (unique)"), r.foreign_words_unique as u64),
+                            ("Numbers".into(), r.numbers),
+                            ("Private-use characters (unreadable)".into(), r.private_use),
+                            ("Decode errors (U+FFFD)".into(), r.replacement),
                         ];
+                        if japanese {
+                            rows.insert(1, ("Kanji (total)".into(), r.han_total));
+                        }
                         for (k, v) in rows {
                             ui.label(k);
                             ui.label(fmt_int(v));
@@ -2365,23 +2461,39 @@ impl App {
                             ui.add(egui::DragValue::new(&mut self.wpm).range(20.0..=1000.0).speed(2.0).suffix(" words/min"));
                         })
                         .response
-                        .on_hover_text("Words as counted here: dictionary forms of content words, without particles and endings.");
+                        .on_hover_text("Words as counted here: dictionary forms of content words, without particles and endings (Japanese: without particles and auxiliaries).");
                         ui.end_row();
                     });
 
                     let ui = &mut cols[1];
                     ui.heading("Coverage");
-                    ui.label(RichText::new("How many of the most frequent words you must know to recognise X% of the running words.").weak());
-                    egui::Grid::new("cov").striped(true).num_columns(2).spacing([32.0, 4.0]).show(ui, |ui| {
-                        ui.strong("Coverage");
-                        ui.strong("Words");
-                        ui.end_row();
-                        for w in &r.word_coverage {
-                            ui.label(format!("{}%", w.percent));
-                            ui.label(fmt_int(w.items as u64));
+                    if japanese {
+                        ui.label(RichText::new("How many of the most frequent words (kanji) you must know to recognise X% of the running words (kanji).").weak());
+                        egui::Grid::new("cov").striped(true).num_columns(3).spacing([32.0, 4.0]).show(ui, |ui| {
+                            ui.strong("Coverage");
+                            ui.strong("Words");
+                            ui.strong("Kanji");
                             ui.end_row();
-                        }
-                    });
+                            for (i, w) in r.word_coverage.iter().enumerate() {
+                                ui.label(format!("{}%", w.percent));
+                                ui.label(fmt_int(w.items as u64));
+                                ui.label(r.char_coverage.get(i).map_or("–".into(), |c| fmt_int(c.items as u64)));
+                                ui.end_row();
+                            }
+                        });
+                    } else {
+                        ui.label(RichText::new("How many of the most frequent words you must know to recognise X% of the running words.").weak());
+                        egui::Grid::new("cov").striped(true).num_columns(2).spacing([32.0, 4.0]).show(ui, |ui| {
+                            ui.strong("Coverage");
+                            ui.strong("Words");
+                            ui.end_row();
+                            for w in &r.word_coverage {
+                                ui.label(format!("{}%", w.percent));
+                                ui.label(fmt_int(w.items as u64));
+                                ui.end_row();
+                            }
+                        });
+                    }
                 });
                 return;
             }
@@ -2587,12 +2699,16 @@ impl App {
             ));
         });
         let status = r.anki.as_ref().map(|c| &c.word_status);
-        // Word length is counted in Chinese characters; Korean words have no length column.
+        // Word length is counted in Chinese characters; Korean and Japanese
+        // words have no length column.
         let show_len = r.language == Language::Chinese;
         let af = self.anki_filter;
         let f = self.word_filter.trim();
         let rows: Vec<usize> = (0..r.word_freq.len())
-            .filter(|&i| f.is_empty() || r.word_freq[i].0.contains(f))
+            .filter(|&i| {
+                let w = &r.word_freq[i].0;
+                f.is_empty() || w.contains(f) || r.display(w).contains(f)
+            })
             .filter(|&i| status.is_none_or(|s| af.matches(s[i])))
             .collect();
         let total = r.words_total.max(1) as f64;
@@ -2655,7 +2771,13 @@ impl App {
                         }
                     });
                     row.col(|ui| {
-                        ui.label(RichText::new(w).size(18.0));
+                        let shown = r.display(w);
+                        let l = ui.label(RichText::new(shown).size(18.0));
+                        if shown != w {
+                            l.on_hover_text(format!(
+                                "Counted as {w}, which merges its spellings and forms"
+                            ));
+                        }
                     });
                     row.col(|ui| {
                         ui.label(fmt_int(*n as u64));
@@ -2681,10 +2803,14 @@ impl App {
         if let Some((w, on)) = toggle
             && self.known.settings.set_marked(&w, on)
         {
+            let shown = self
+                .report
+                .as_ref()
+                .map_or(w.clone(), |r| r.display(&w).to_owned());
             let msg = if on {
-                format!("Marked {w} as known")
+                format!("Marked {shown} as known")
             } else {
-                format!("Unmarked {w}")
+                format!("Unmarked {shown}")
             };
             self.toast = Some((msg, ui.input(|i| i.time) + 3.0));
             self.known_changed();
@@ -2708,8 +2834,8 @@ impl App {
         });
         let r = self.report.as_ref().unwrap();
         let n = r.sections.len();
-        // A Korean book has word columns only.
-        let chinese = r.language == Language::Chinese;
+        // A Korean book has word columns only (a Japanese one counts kanji).
+        let chinese = r.language != Language::Korean;
         let skip = if chinese { 0 } else { 3 };
         let mut toggles: Vec<usize> = Vec::new();
         TableBuilder::new(ui)
@@ -2957,6 +3083,7 @@ impl App {
                     &hanstat::models::LTP,
                     &hanstat::models::CKIP,
                     &hanstat::models::KIWI,
+                    &hanstat::models::SUDACHI,
                 ] {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(format!(
@@ -2984,6 +3111,7 @@ impl App {
                 let method = match r.language {
                     Language::Chinese => METHOD,
                     Language::Korean => KOREAN_METHOD,
+                    Language::Japanese => JAPANESE_METHOD,
                 };
                 for line in method {
                     ui.label(format!("• {line}"));
@@ -3003,6 +3131,21 @@ const KOREAN_METHOD: &[&str] = &[
     "Sentences end at . ? ! … (a full stop counts when a space, quote or the paragraph end follows) or the end of a paragraph.",
     "Coverage = the number of most-frequent distinct words whose occurrences add up to X% of all word occurrences.",
     "Anki: the collection is copied (with its write-ahead log) to a temporary folder and read from there, so it works while Anki is open and is never modified. A review card is mature at an interval of 21+ days and young below that, or, with \"Mature by FSRS stability\" on, at the chosen stability (cards without FSRS data keep the interval rule). Every ticked field is analysed with Kiwi and the user dictionary, so a card for 먹다 or 먹어요 matches the book's 먹다.",
+];
+
+const JAPANESE_METHOD: &[&str] = &[
+    "Language: a book is Japanese when its kana are at least a tenth as many as its kanji (a Chinese book has at most a few kana). The badge at the top right shows the mode; Anki decks and fields, word lists, marked words and the user dictionary are kept separately for each language.",
+    "Characters are kanji (Script=Han letters), counted exactly as in Chinese books; kana are letters. Words, lengths and reading time are in words.",
+    "Words come from Sudachi, a Japanese morphological analyser, with SudachiDict core in its long-unit mode C: compounds a dictionary lists whole stay whole (事務所, 一生懸命, 冒険者). Each word is counted by Sudachi's normalized form, which merges inflections and spellings (わかった, 分かる → 分かる; かわいく → 可愛い; ウソ → うそ), and shown as the book usually spells it. Two different words the book spells alike are told apart by their normalized form: いる (要る).",
+    "Particles, auxiliaries (た, ます, ない…), punctuation, numbers in digits and Latin words are not Japanese words. Numerals in kanji keep their spelling (二十四).",
+    "Before analysis, dialogue noise that Sudachi misreads is removed: an emphatic small っ at the end of a word (ですっ」), stretched vowels and long marks after two or more kana (ますぅ, まーす), and stutters (い、いいんですか; こ、これ). Short interjections such as はぁ, えー and えーと are kept. On five novels this changed Sudachi's reading in a few hundred places, mostly for the better (49 of 81 judged by hand; 6 worse, all stretched interjections like あはー).",
+    "Sudachi was chosen over UniDic analysers (Lindera, Vibrato) after a comparison on five novels: it keeps character names whole (UniDic splits most invented names) and gives learner-sized words; on other words the two were about even. Words in the user dictionary are added to Sudachi as proper nouns and are always kept whole.",
+    "Known words: a long word that is not known itself counts as known when all its short-unit parts are (冒険者 with 冒険 and 者 known), with the weakest of their statuses. The JLPT levels are Jonathan Waller's N5–N1 lists (as used by jisho.org), keyed by Sudachi's normalized form, so they match however the book writes a word.",
+    "EPUB: only documents in the spine are read, in reading order, each once. <head>, scripts, styles, ruby annotations (<rt>/<rp>, so furigana is not counted), hidden elements and image alt text are excluded. Block elements and <br> end paragraphs. Line breaks in the HTML source between Japanese characters are removed, as browsers do.",
+    "TXT: encoding from BOM, strict UTF-8 validation, UTF-16 statistics, then chardetng. Each line is a paragraph unless the file is detected as hard-wrapped.",
+    "Sentences end at 。！？!?… (runs count once) or the end of a paragraph.",
+    "Coverage = the number of most-frequent distinct words (kanji) whose occurrences add up to X% of all word (kanji) occurrences.",
+    "Anki: the collection is copied (with its write-ahead log) to a temporary folder and read from there, so it works while Anki is open and is never modified. A review card is mature at an interval of 21+ days and young below that, or, with \"Mature by FSRS stability\" on, at the chosen stability (cards without FSRS data keep the interval rule). Every ticked field is analysed with Sudachi and the user dictionary, with furigana readings (会[あ]う) removed, so a card for 分かる, わかる or わかった matches the book's 分かる. A kanji is known if it is written in a known word on a card.",
 ];
 
 const METHOD: &[&str] = &[

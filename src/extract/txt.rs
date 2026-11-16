@@ -1,7 +1,7 @@
 //! Plain-text loading: encoding detection, paragraphs, chapter detection.
 
 use super::{Book, EncodingChoice, Section, SectionKind};
-use crate::chars::{is_han, is_hangul, is_sentence_end};
+use crate::chars::{is_han, is_hangul, is_kana, is_sentence_end};
 use encoding_rs::Encoding;
 use regex::Regex;
 use std::sync::LazyLock;
@@ -121,14 +121,21 @@ pub fn load(bytes: &[u8], choice: EncodingChoice) -> Book {
     let lines: Vec<&str> = text.lines().collect();
 
     // Korean text wraps between Hangul syllables, and its lines rejoin with a
-    // space (Korean separates words with spaces); Chinese rejoins without one.
+    // space (Korean separates words with spaces); Chinese and Japanese rejoin
+    // without one, and Japanese lines may end in kana.
     let korean = {
         let (hangul, han) = text.chars().fold((0usize, 0usize), |(a, b), c| {
             (a + is_hangul(c) as usize, b + is_han(c) as usize)
         });
         hangul > han
     };
-    let is_main = |c: char| if korean { is_hangul(c) } else { is_han(c) };
+    let is_main = |c: char| {
+        if korean {
+            is_hangul(c)
+        } else {
+            is_han(c) || is_kana(c)
+        }
+    };
 
     // Hard-wrap detection: in paragraph-per-line files almost every non-empty line ends
     // in punctuation; in hard-wrapped files many end mid-sentence on a Han character.

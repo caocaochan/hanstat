@@ -160,6 +160,38 @@ pub const KIWI: Model = Model {
     ],
 };
 
+/// SudachiDict core, the dictionary of the Sudachi Japanese analyser (see
+/// `crate::japanese`), from Works Applications' official download bucket.
+pub const SUDACHI: Model = Model {
+    id: "sudachidict-core-20261015",
+    title: "SudachiDict core 20261015 (Works Applications)",
+    licence: "Apache-2.0",
+    homepage: "https://github.com/WorksApplications/SudachiDict",
+    files: &[ModelFile {
+        name: "sudachi-dictionary-20261015-core.zip",
+        url: "https://sudachi.s3.ap-northeast-1.amazonaws.com/sudachidict/v1/sudachi-dictionary-20261015-core.zip",
+        sha256: "5cf5cb7f1ea943a988e2fb5d285a9a8b3538861faefa7a2604c2cd18c387f503",
+        size: 76_937_904,
+        unpack: Unpack::Zip(&[
+            Member {
+                path: "sudachi-dictionary-20261015/system_core.dic",
+                name: "system_core.dic",
+                size: 202_236_003,
+            },
+            Member {
+                path: "sudachi-dictionary-20261015/LICENSE-2.0.txt",
+                name: "LICENSE-2.0.txt",
+                size: 11_358,
+            },
+            Member {
+                path: "sudachi-dictionary-20261015/LEGAL",
+                name: "LEGAL",
+                size: 6_037,
+            },
+        ]),
+    }],
+};
+
 /// hanstat's per-user data folder (`%LOCALAPPDATA%\hanstat`): models and saved settings.
 pub fn app_dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")

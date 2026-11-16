@@ -270,6 +270,100 @@ fn korean_book_counts_dictionary_forms_only() {
 }
 
 #[test]
+fn japanese_book_counts_normalized_words_and_kanji() {
+    use hanstat::lang::Language;
+    let text = "第一章 始まり\n「お母さん、わかった？」\n「い、いいんですか。ありがとうございますっ」\n\
+                ぬるま湯ぬいは冒険者だ。昨日、学校に行った。ウソはやめてください。\n\
+                彼はもう分かっている。ぬるま湯ぬいは笑った。\n";
+    let book = extract::txt::load(text.as_bytes(), EncodingChoice::Auto);
+    assert_eq!(hanstat::analyze::detect_language(&book), Language::Japanese);
+    // The Chinese segmenter choice is ignored: Japanese always uses Sudachi.
+    let prep = analyze_book(
+        &book,
+        SegmenterKind::Ltp,
+        &["ぬるま湯ぬい".into()],
+        &[],
+        &|_, _| {},
+    )
+    .unwrap();
+    assert_eq!(prep.language, Language::Japanese);
+    assert_eq!(prep.segmenter_kind, SegmenterKind::Sudachi);
+    let r = build_report(&book, &prep, &vec![true; book.sections.len()]);
+    let count = |w: &str| r.word_freq.iter().find(|(x, _)| x == w).map(|x| x.1);
+    // わかった and 分かっ are one word, keyed by the normalized form and shown
+    // as the book spells it most (a tie goes to the first in sort order).
+    assert_eq!(count("分かる"), Some(2), "{:?}", r.word_freq);
+    assert!(["わかる", "分かる"].contains(&r.display("分かる")));
+    assert_eq!(count("行く"), Some(1));
+    assert_eq!(count("うそ"), Some(1));
+    // The user dictionary keeps the name whole.
+    assert_eq!(count("ぬるま湯ぬい"), Some(2), "{:?}", r.word_freq);
+    // Long units keep their short-unit parts.
+    assert_eq!(count("冒険者"), Some(1));
+    assert_eq!(
+        r.word_parts.get("冒険者").map(Vec::as_slice),
+        Some(&["冒険".to_string(), "者".to_string()][..])
+    );
+    // The stutter (い、) and the emphatic っ are filtered: no 行く from い, and
+    // ございます is read as a word.
+    assert_eq!(count("御座る"), Some(1));
+    // Particles and auxiliaries are not words.
+    for g in ["は", "に", "た", "ます", "です"] {
+        assert_eq!(count(g), None, "{g}: {:?}", r.word_freq);
+    }
+    // Kanji are counted as characters.
+    assert!(r.han_total > 0 && r.char_freq.iter().any(|(c, _)| *c == '冒'));
+    assert!(r.avg_sentence_words.unwrap() > 0.0);
+    // Known words: JLPT N5 marks 行く, and 冒険者 counts through its parts
+    // once 冒険 and 者 are marked.
+    let mut known = hanstat::known::Settings {
+        language: Language::Japanese,
+        ..Default::default()
+    };
+    known.set_band(5, true);
+    known.set_marked("冒険", true);
+    known.set_marked("者", true);
+    let k = known.apply(None, false).unwrap();
+    let c = hanstat::anki::BookCoverage::compute(
+        &k,
+        &r.char_freq,
+        &r.word_freq,
+        &Default::default(),
+        &r.word_parts,
+    );
+    let status = |w: &str| {
+        let i = r.word_freq.iter().position(|(x, _)| x == w).unwrap();
+        c.word_status[i]
+    };
+    assert!(status("行く").is_known());
+    assert!(status("冒険者").is_known());
+    assert!(!status("ぬるま湯ぬい").is_known());
+}
+
+/// Many paragraphs with long units on the same threads: the reused short-unit
+/// list must not carry morphemes over (it panicked inside Sudachi before).
+#[test]
+fn japanese_long_units_across_many_paragraphs() {
+    let mut text = String::from("第一章\n");
+    for i in 0..400 {
+        text.push_str(&format!(
+            "{}冒険者ギルドの生徒会長が、事務所で一生懸命に話した。\n",
+            "あ".repeat(i % 7)
+        ));
+    }
+    let book = extract::txt::load(text.as_bytes(), EncodingChoice::Auto);
+    let prep = analyze_book(&book, SegmenterKind::Auto, &[], &[], &|_, _| {}).unwrap();
+    let r = build_report(&book, &prep, &vec![true; book.sections.len()]);
+    let count = |w: &str| r.word_freq.iter().find(|(x, _)| x == w).map(|x| x.1);
+    assert_eq!(count("冒険者"), Some(400), "{:?}", r.word_freq);
+    assert_eq!(count("事務所"), Some(400));
+    assert_eq!(
+        r.word_parts.get("冒険者").map(Vec::as_slice),
+        Some(&["冒険".to_string(), "者".to_string()][..])
+    );
+}
+
+#[test]
 fn user_dictionary_merges_names() {
     let text = "温简言看向不远处的黑方小队。温简言笑了。\n";
     let book = extract::txt::load(text.as_bytes(), EncodingChoice::Auto);

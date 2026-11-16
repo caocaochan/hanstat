@@ -17,8 +17,8 @@
 //! words containing it.
 //!
 //! The user's choice of collection, decks, note types and fields is saved per
-//! language: `%LOCALAPPDATA%\hanstat\anki.json` for Chinese and `anki-ko.json`
-//! for Korean, next to the `models` folder.
+//! language: `%LOCALAPPDATA%\hanstat\anki.json` for Chinese, `anki-ko.json`
+//! for Korean and `anki-ja.json` for Japanese, next to the `models` folder.
 
 use crate::chars;
 use crate::lang::Language;
@@ -397,8 +397,9 @@ impl SegConfig {
         }
     }
 
-    /// As [`SegConfig::new`] for Chinese; Kiwi for Korean, where every field
-    /// value is analysed into dictionary forms like the book.
+    /// As [`SegConfig::new`] for Chinese; Kiwi for Korean and Sudachi for
+    /// Japanese, where every field value is analysed into dictionary forms
+    /// like the book.
     pub fn for_language(
         lang: Language,
         chosen: SegmenterKind,
@@ -409,6 +410,10 @@ impl SegConfig {
             Language::Chinese => Self::new(chosen, book, user_words),
             Language::Korean => SegConfig {
                 kind: SegmenterKind::Kiwi,
+                user_words: user_words.to_vec(),
+            },
+            Language::Japanese => SegConfig {
+                kind: SegmenterKind::Sudachi,
                 user_words: user_words.to_vec(),
             },
         }
@@ -679,14 +684,22 @@ impl Collection {
             }
         }
 
+        // Sentences and long phrases, segmented together afterwards. In Korean
+        // and Japanese, every field value: Kiwi or Sudachi turns it into
+        // dictionary forms like the book.
+        let korean = seg.kind == SegmenterKind::Kiwi;
+        let japanese = seg.kind == SegmenterKind::Sudachi;
+        // Traditional ↔ Simplified folding is for Chinese; it would merge
+        // distinct Japanese kanji.
+        let fold_on = s.match_across_scripts && !japanese;
         let mut words: HashMap<String, Status> = HashMap::new();
         let mut add = |w: &str, st: Status| {
-            let e = words.entry(fold(w, s.match_across_scripts)).or_default();
+            let e = words.entry(fold(w, fold_on)).or_default();
             *e = (*e).max(st);
         };
-        // Sentences and long phrases, segmented together afterwards. In Korean,
-        // every field value: Kiwi turns it into dictionary forms like the book.
-        let korean = seg.kind == SegmenterKind::Kiwi;
+        // Japanese: the spellings the cards use, for the kanji they teach (a
+        // word's key may be a normalized form such as 為る for する).
+        let mut spelled: Vec<(String, Status)> = Vec::new();
         let mut to_segment: Vec<(String, Status)> = Vec::new();
         if !note_status.is_empty() {
             let mids: Vec<String> = ords.keys().map(|m| m.to_string()).collect();
@@ -711,6 +724,18 @@ impl Collection {
                 let mut any = false;
                 for &o in &ords[&mid] {
                     let Some(f) = parts.get(o) else { continue };
+                    if japanese {
+                        let text = clean_field_ja(f, &mut norm);
+                        if !text.chars().any(|c| chars::is_main(c, Language::Japanese)) {
+                            continue;
+                        }
+                        any = true;
+                        if looks_like_sentence(&text) {
+                            summary.sentences += 1;
+                        }
+                        to_segment.push((text, ns));
+                        continue;
+                    }
                     let text = clean_field(f, &mut norm);
                     if korean {
                         if !text.chars().any(chars::is_hangul) {
@@ -763,6 +788,27 @@ impl Collection {
                 }
             }
             summary.segmenter = Some(SegmenterKind::Kiwi);
+        } else if japanese && !to_segment.is_empty() {
+            let mut nd = chars::NormStats::default();
+            let forced: Vec<String> = seg
+                .user_words
+                .iter()
+                .map(|w| chars::normalize(w.trim(), &mut nd))
+                .filter(|w| !w.is_empty())
+                .collect();
+            let segmenter = Segmenter::new(SegmenterKind::Sudachi, &forced, Variant::Unknown)?;
+            let texts: Vec<&str> = to_segment.iter().map(|(t, _)| t.as_str()).collect();
+            for (ws, (_, st)) in segmenter
+                .japanese_words_many(&texts)?
+                .into_iter()
+                .zip(&to_segment)
+            {
+                for w in ws {
+                    add(&w.key, *st);
+                    spelled.push((w.spelling, *st));
+                }
+            }
+            summary.segmenter = Some(SegmenterKind::Sudachi);
         } else if !to_segment.is_empty() {
             let t = &*script::TABLES;
             let (mut tr, mut si) = (0u64, 0u64);
@@ -799,13 +845,25 @@ impl Collection {
             summary.segmenter = Some(segmenter.kind);
         }
         let mut char_status: HashMap<char, Status> = HashMap::new();
-        for (w, &st) in &words {
-            summary.words.add(st, 1);
-            // Korean has word statistics only: no per-syllable status.
-            for c in w.chars().filter(|c| !chars::is_hangul(*c)) {
+        let mut add_chars = |w: &str, st: Status| {
+            // Korean has word statistics only: no per-syllable status; Japanese
+            // counts kanji only.
+            for c in w
+                .chars()
+                .filter(|c| !chars::is_hangul(*c) && !(japanese && !chars::is_han(*c)))
+            {
                 let e = char_status.entry(c).or_default();
                 *e = (*e).max(st);
             }
+        };
+        for (w, &st) in &words {
+            summary.words.add(st, 1);
+            if !japanese {
+                add_chars(w, st);
+            }
+        }
+        for (w, st) in &spelled {
+            add_chars(w, *st);
         }
         for &st in char_status.values() {
             summary.chars.add(st, 1);
@@ -813,7 +871,7 @@ impl Collection {
         Ok(Knowledge {
             words,
             chars: char_status,
-            fold: s.match_across_scripts,
+            fold: fold_on,
             summary,
             from_anki: true,
             listed: ListedSummary::default(),
@@ -888,6 +946,18 @@ static RE_TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<[^>]*>").unw
 static RE_BRACKET: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[[^\]]*\]").unwrap());
 static RE_NUM_ENTITY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"&#(?:[xX]([0-9a-fA-F]+)|([0-9]+));").unwrap());
+
+/// Anki's Japanese furigana, `日本語[にほんご]を 勉強[べんきょう]する`: the
+/// reading and the space that may start the annotated word go, as in Anki's
+/// `kanji:` filter.
+static RE_FURIGANA: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r" ?([^ >\[\]]+?)\[[^\]]*\]").unwrap());
+
+/// [`clean_field`] for Japanese: furigana readings are removed without
+/// splitting the word they annotate (会[あ]う → 会う).
+pub fn clean_field_ja(field: &str, norm: &mut chars::NormStats) -> String {
+    clean_field(&RE_FURIGANA.replace_all(field, "$1"), norm)
+}
 
 /// One field's text with HTML, cloze markup, sound tags and bracketed readings
 /// removed, NFC-normalised as book text is.
@@ -982,7 +1052,7 @@ pub struct KnowledgeSummary {
     /// Selected notes with at least one card in the selected decks.
     pub notes: u64,
     /// Of those, notes whose selected fields contain no Chinese characters
-    /// (for Korean settings: no Hangul).
+    /// (for Korean settings: no Hangul; for Japanese: no kana or kanji).
     pub notes_without_chinese: u64,
     /// Field values that looked like sentences and were split into words.
     pub sentences: u64,
@@ -1047,19 +1117,47 @@ impl Knowledge {
     /// Mark `words` known as [`Status::Listed`], keeping a better (young or
     /// mature) Anki status. Their characters become known too.
     pub fn add_listed<'a>(&mut self, words: impl IntoIterator<Item = &'a str>, source: String) {
+        self.add_listed_with(words.into_iter().map(|w| (w, w)), source, |c| {
+            // Korean has word statistics only: no per-syllable status.
+            !chars::is_hangul(c)
+        });
+    }
+
+    /// Japanese: mark (key, spelling) pairs known; the kanji of the spelling
+    /// become known (a key such as 為る is not how the word is written).
+    pub fn add_listed_spelled<'a>(
+        &mut self,
+        words: impl IntoIterator<Item = (&'a str, &'a str)>,
+        source: String,
+    ) {
+        self.add_listed_with(words, source, chars::is_han);
+    }
+
+    fn add_listed_with<'a>(
+        &mut self,
+        words: impl IntoIterator<Item = (&'a str, &'a str)>,
+        source: String,
+        counts_as_char: impl Fn(char) -> bool,
+    ) {
         let mut seen: HashSet<String> = HashSet::new();
-        for w in words {
+        for (w, spelling) in words {
             let key = fold(w, self.fold);
-            if key.is_empty() || !seen.insert(key.clone()) {
+            if key.is_empty() {
                 continue;
             }
-            // Korean has word statistics only: no per-syllable status.
-            for c in key.chars().filter(|c| !chars::is_hangul(*c)) {
+            let first = seen.insert(key.clone());
+            for c in fold(spelling, self.fold)
+                .chars()
+                .filter(|c| counts_as_char(*c))
+            {
                 let e = self.chars.entry(c).or_default();
                 if !e.is_known() {
                     self.listed.new_chars += 1;
                     *e = Status::Listed;
                 }
+            }
+            if !first {
+                continue;
             }
             let e = self.words.entry(key).or_default();
             if !e.is_known() {
@@ -1204,13 +1302,30 @@ impl BookCoverage {
     /// Suggested words). Readers don't need to know a name to follow a text,
     /// so any word containing one is left out of the running-word coverage
     /// that sets the difficulty (as coverage studies treat proper nouns).
+    ///
+    /// `parts` (Japanese, `Report::word_parts`): a long unit that is not known
+    /// itself (冒険者) counts as known when all its short-unit parts (冒険, 者)
+    /// are, with the weakest of their statuses.
     pub fn compute(
         k: &Knowledge,
         char_freq: &[(char, u32)],
         word_freq: &[(String, u32)],
         names: &HashSet<String>,
+        parts: &HashMap<String, Vec<String>>,
     ) -> Self {
-        let word_status: Vec<Status> = word_freq.iter().map(|(w, _)| k.word(w)).collect();
+        let word_status: Vec<Status> = word_freq
+            .iter()
+            .map(|(w, _)| {
+                let s = k.word(w);
+                match parts.get(w) {
+                    Some(p) if !s.is_known() && !p.is_empty() => {
+                        let weakest = p.iter().map(|x| k.word(x)).min().unwrap_or_default();
+                        if weakest.is_known() { weakest } else { s }
+                    }
+                    _ => s,
+                }
+            })
+            .collect();
         let char_status: Vec<Status> = char_freq.iter().map(|(c, _)| k.char(*c)).collect();
         let count = |v: &[Status]| KnownCount {
             known: v.iter().filter(|s| s.is_known()).count() as u64,
@@ -1292,6 +1407,17 @@ mod tests {
     }
 
     #[test]
+    fn japanese_furigana() {
+        let mut n = chars::NormStats::default();
+        assert_eq!(
+            clean_field_ja("日本語[にほんご]を 勉強[べんきょう]する", &mut n),
+            "日本語を勉強する"
+        );
+        assert_eq!(clean_field_ja(" 会[あ]う[sound:au.mp3]", &mut n), "会う");
+        assert_eq!(clean_field_ja("<b>食[た]べる</b>", &mut n), "食べる");
+    }
+
+    #[test]
     fn sentence_detection() {
         let mut n = chars::NormStats::default();
         let s = |f: &str, n: &mut chars::NormStats| looks_like_sentence(&clean_field(f, n));
@@ -1341,7 +1467,7 @@ mod tests {
         ];
         let char_freq = vec![('我', 50), ('看', 30), ('顾', 15), ('飞', 15)];
         let names: HashSet<String> = ["顾飞".to_string(), "飞".to_string()].into();
-        let c = BookCoverage::compute(&k, &char_freq, &word_freq, &names);
+        let c = BookCoverage::compute(&k, &char_freq, &word_freq, &names, &HashMap::new());
         // 顾飞 and 顾飞说 are names; the one-character "name" 飞 is ignored.
         assert_eq!(c.name_tokens, 15);
         assert_eq!((c.running_words.known, c.running_words.total), (80, 85));

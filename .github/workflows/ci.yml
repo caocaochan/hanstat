@@ -101,6 +101,7 @@ jobs:
           Copy-Item target/release/hanstat.exe, target/release/hanstat-cli.exe, README.md, CHANGELOG.md, LICENSE-MIT, LICENSE-APACHE $dir
           Copy-Item data/OpenCC-LICENSE.txt "$dir/LICENSE-OpenCC-data.txt"
           Copy-Item data/HSK-LICENSE.txt "$dir/LICENSE-HSK-data.txt"
+          Copy-Item data/JLPT-LICENSE.txt "$dir/LICENSE-JLPT-data.txt"
           Compress-Archive -Path $dir -DestinationPath "$name.zip"
           $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
           "$hash  $name.zip" | Out-File -Encoding ascii "$name.zip.sha256"

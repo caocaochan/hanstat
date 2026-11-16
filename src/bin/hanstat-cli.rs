@@ -10,21 +10,28 @@ use hanstat::lang::Language;
 use hanstat::segment::SegmenterKind;
 use std::path::PathBuf;
 
-/// `--known`, `--level`/`--hsk`, `--known-list`: applied in the book's language.
+/// `--known`, `--level`/`--hsk`, `--known-list`, `--kaishi`: applied in the book's language.
 #[derive(Default)]
 struct KnownArgs {
     saved: bool,
-    /// `--level N`: levels 1 to N in the book's language.
+    /// `--level N`: levels 1 to N in the book's language (Japanese: N5 to N`N`).
     level: Option<u8>,
     /// `--hsk N`: Chinese only.
     hsk: Option<u8>,
     lists: Vec<PathBuf>,
+    /// `--kaishi`: Japanese only.
+    kaishi: bool,
 }
 
 impl KnownArgs {
     /// The words marked known for `lang`, or `None` if none of the options was given.
     fn resolve(&self, lang: Language) -> Option<hanstat::known::Settings> {
-        if !self.saved && self.level.is_none() && self.hsk.is_none() && self.lists.is_empty() {
+        if !self.saved
+            && self.level.is_none()
+            && self.hsk.is_none()
+            && self.lists.is_empty()
+            && !self.kaishi
+        {
             return None;
         }
         let mut k = hanstat::known::Settings {
@@ -43,22 +50,41 @@ impl KnownArgs {
             for w in &s.marked {
                 k.set_marked(w, true);
             }
+            k.kaishi = s.kaishi;
+        }
+        if self.kaishi {
+            if lang == Language::Japanese {
+                k.kaishi = true;
+            } else {
+                eprintln!("--kaishi ignored: the book is {}", lang.name());
+            }
         }
         match (self.hsk, lang) {
             (Some(n), Language::Chinese) => (1..=n).for_each(|b| k.set_band(b, true)),
-            (Some(_), Language::Korean) => {
-                eprintln!("--hsk ignored: the book is Korean (use --level)")
+            (Some(_), lang) => {
+                eprintln!("--hsk ignored: the book is {} (use --level)", lang.name())
             }
             (None, _) => {}
         }
         if let Some(n) = self.level {
             let bands = hanstat::known::bands(lang);
-            let top = *bands.last().unwrap();
-            if lang == Language::Korean && n > top {
-                eprintln!("--level {n}: Korean levels go up to {top}급; marking 1–{top}급");
-            }
-            for &b in bands.iter().filter(|&&b| b <= n.min(top)) {
-                k.set_band(b, true);
+            if lang == Language::Japanese {
+                // JLPT counts down: --level 3 is N5, N4 and N3.
+                if n > 5 {
+                    eprintln!("--level {n}: JLPT levels are N5 to N1; marking N5 only");
+                }
+                let n = n.min(5);
+                for &b in bands.iter().filter(|&&b| b >= n) {
+                    k.set_band(b, true);
+                }
+            } else {
+                let top = *bands.last().unwrap();
+                if lang == Language::Korean && n > top {
+                    eprintln!("--level {n}: Korean levels go up to {top}급; marking 1–{top}급");
+                }
+                for &b in bands.iter().filter(|&&b| b <= n.min(top)) {
+                    k.set_band(b, true);
+                }
             }
         }
         for p in &self.lists {
@@ -255,12 +281,15 @@ fn print_anki_summary(k: &KnowledgeSummary, lang: Language) {
     );
     println!("  cards       {}", row(&k.cards));
     println!("  words       {}", row(&k.words));
-    if lang == Language::Chinese {
-        println!("  characters  {}", row(&k.chars));
+    match lang {
+        Language::Chinese => println!("  characters  {}", row(&k.chars)),
+        Language::Japanese => println!("  kanji       {}", row(&k.chars)),
+        Language::Korean => {}
     }
 }
 
-fn print_coverage(c: &BookCoverage, top: usize, lang: Language) {
+fn print_coverage(c: &BookCoverage, top: usize, r: &Report) {
+    let lang = r.language;
     if c.from_anki {
         print_anki_summary(&c.anki, lang);
     }
@@ -276,15 +305,18 @@ fn print_coverage(c: &BookCoverage, top: usize, lang: Language) {
             }
         );
     }
-    // Known = on a young or mature card, or in a known word list. Korean has words only.
-    let chinese = lang == Language::Chinese;
-    let unique: &[(&str, &anki::KnownCount)] = if chinese {
-        &[
+    // Known = on a young or mature card, or in a known word list. Korean has
+    // words only; Japanese characters are kanji.
+    let unique: &[(&str, &anki::KnownCount)] = match lang {
+        Language::Chinese => &[
             ("Unique characters", &c.unique_chars),
             ("Unique words", &c.unique_words),
-        ]
-    } else {
-        &[("Unique words", &c.unique_words)]
+        ],
+        Language::Japanese => &[
+            ("Unique kanji", &c.unique_chars),
+            ("Unique words", &c.unique_words),
+        ],
+        Language::Korean => &[("Unique words", &c.unique_words)],
     };
     for (label, k) in unique {
         println!(
@@ -295,13 +327,16 @@ fn print_coverage(c: &BookCoverage, top: usize, lang: Language) {
             k.not_known()
         );
     }
-    let running: &[(&str, &anki::KnownCount)] = if chinese {
-        &[
+    let running: &[(&str, &anki::KnownCount)] = match lang {
+        Language::Chinese => &[
             ("Running chars", &c.running_chars),
             ("Running words", &c.running_words),
-        ]
-    } else {
-        &[("Running words", &c.running_words)]
+        ],
+        Language::Japanese => &[
+            ("Running kanji", &c.running_chars),
+            ("Running words", &c.running_words),
+        ],
+        Language::Korean => &[("Running words", &c.running_words)],
     };
     for (label, k) in running {
         println!(
@@ -322,7 +357,7 @@ fn print_coverage(c: &BookCoverage, top: usize, lang: Language) {
         .top_unknown_words
         .iter()
         .take(top)
-        .map(|(w, n)| format!("{w}:{n}"))
+        .map(|(w, n)| format!("{}:{n}", r.display(w)))
         .collect();
     println!("Top words not known: {}", tw.join(" "));
 }
@@ -364,13 +399,14 @@ fn main() {
                     Some(n @ 1..=9) => n.min(7),
                     _ => {
                         eprintln!(
-                            "--level expects a level from 1 to 9 (HSK) or 1 to 6 (Korean 급)"
+                            "--level expects a level from 1 to 9 (HSK), 1 to 6 (Korean 급) or 1 to 5 (JLPT N5–N1: 3 is N5–N3)"
                         );
                         std::process::exit(2)
                     }
                 };
                 ka.level = Some(n);
             }
+            "--kaishi" => ka.kaishi = true,
             "--known-list" => ka
                 .lists
                 .push(PathBuf::from(args.next().unwrap_or_default())),
@@ -378,8 +414,9 @@ fn main() {
                 lang_arg = match args.next().as_deref() {
                     Some("zh") => Some(Language::Chinese),
                     Some("ko") => Some(Language::Korean),
+                    Some("ja") => Some(Language::Japanese),
                     _ => {
-                        eprintln!("--lang expects zh or ko");
+                        eprintln!("--lang expects zh, ko or ja");
                         std::process::exit(2)
                     }
                 }
@@ -430,13 +467,16 @@ fn main() {
                 eprintln!(
                     "usage: hanstat-cli <file.epub|file.txt> [--ckip|--ltp|--jieba] [--dict words.txt] [--json] [--top N] [--include-all] [--exclude i,j] [--chars-csv f] [--words-csv f] [--suggest N] [--auto-dict]\n\
                      \x20      [--anki] [--anki-list] [--anki-collection collection.anki2] [--anki-deck NAME]... [--anki-field \"NOTE TYPE:FIELD\"]... [--anki-mature-stability DAYS] [--anki-save]\n\
-                     \x20      [--known] [--level N] [--hsk N] [--known-list words.txt]... [--lang zh|ko]\n\
+                     \x20      [--known] [--level N] [--hsk N] [--kaishi] [--known-list words.txt]... [--lang zh|ko|ja]\n\
                      \n\
-                     The book's language is detected: Korean books are analysed with Kiwi (downloaded on first use) and have word statistics only.\n\
-                     --known adds the levels and word lists marked known in the hanstat window (saved in {} for Chinese, {} for Korean).\n\
+                     The book's language is detected: Korean books are analysed with Kiwi and have word statistics only;\n\
+                     \x20 Japanese books are analysed with Sudachi and have kanji and word statistics (both downloaded on first use).\n\
+                     --known adds the levels and word lists marked known in the hanstat window (saved in {} for Chinese, {} for Korean, {} for Japanese).\n\
                      --level N marks levels 1 to N known in the book's language: HSK 3.0 (2025 syllabus; 7, 8, 9: all) for Chinese,\n\
-                     \x20 1–6급 of 국립국어원's 국제 통용 한국어 표준 교육과정 vocabulary (the list TOPIK levels follow) for Korean.\n\
-                     --hsk N is --level N for Chinese books only; --known-list adds a word list (one word per line).\n\
+                     \x20 1–6급 of 국립국어원's 국제 통용 한국어 표준 교육과정 vocabulary (the list TOPIK levels follow) for Korean,\n\
+                     \x20 JLPT N5 down to N`N` for Japanese (Jonathan Waller's lists; --level 3 is N5–N3).\n\
+                     --hsk N is --level N for Chinese books only; --kaishi marks the words of the Kaishi 1.5k deck known (Japanese books only);\n\
+                     \x20 --known-list adds a word list (one word per line).\n\
                      These count as known together with young/mature Anki cards, or on their own without --anki.\n\
                      --anki uses the decks/note types/fields chosen in the hanstat window for the book's language (saved in {} / {}).\n\
                      --anki-deck/--anki-field replace that choice for this run (repeatable; a deck includes its subdecks); --anki-save keeps it.\n\
@@ -444,6 +484,7 @@ fn main() {
                      Without a file, --anki prints the collection summary only, for --lang (default zh).",
                     hanstat::known::Settings::path_for(Language::Chinese).display(),
                     hanstat::known::Settings::path_for(Language::Korean).display(),
+                    hanstat::known::Settings::path_for(Language::Japanese).display(),
                     hanstat::anki::Settings::path_for(Language::Chinese).display(),
                     hanstat::anki::Settings::path_for(Language::Korean).display()
                 );
@@ -593,6 +634,7 @@ fn main() {
             &r.char_freq,
             &r.word_freq,
             &names,
+            &r.word_parts,
         ));
     }
     eprintln!("load {:?}, total {:?}", t_load, t0.elapsed());
@@ -605,10 +647,16 @@ fn main() {
         }
     }
     if let Some(p) = words_csv {
-        std::fs::write(p, analyze::freq_csv(&r.word_freq, "word")).expect("write csv");
+        // Japanese word keys are written as the book spells them.
+        let shown: Vec<(&str, u32)> = r
+            .word_freq
+            .iter()
+            .map(|(w, n)| (r.display(w), *n))
+            .collect();
+        std::fs::write(p, analyze::freq_csv(&shown, "word")).expect("write csv");
     }
     if let Some(n) = suggest {
-        if lang == Language::Korean {
+        if lang != Language::Chinese {
             eprintln!("--suggest: word discovery is for Chinese books only");
             return;
         }
@@ -655,8 +703,8 @@ fn print_text(r: &Report, top: usize) {
         r.title.as_deref().unwrap_or("-"),
         r.format
     );
-    if r.language == Language::Korean {
-        print_text_korean(r, top);
+    if r.language != Language::Chinese {
+        print_text_words(r, top);
         return;
     }
     println!(
@@ -720,7 +768,7 @@ fn print_text(r: &Report, top: usize) {
     println!("Top words: {}", tw.join(" "));
     println!();
     if let Some(c) = &r.anki {
-        print_coverage(c, top, Language::Chinese);
+        print_coverage(c, top, r);
         println!();
     }
     println!("Sections ({}):", r.sections.len());
@@ -749,20 +797,38 @@ fn print_notes(r: &Report) {
     }
 }
 
-/// A Korean book: word statistics only.
-fn print_text_korean(r: &Report, top: usize) {
-    println!("Language: Korean (words in dictionary form)");
+/// A Korean book (word statistics only) or a Japanese one (words, plus kanji).
+fn print_text_words(r: &Report, top: usize) {
+    let japanese = r.language == Language::Japanese;
+    let name = r.language.name();
+    if japanese {
+        println!(
+            "Language: Japanese (words in dictionary form, spellings merged; shown as the book spells them)"
+        );
+    } else {
+        println!("Language: Korean (words in dictionary form)");
+    }
     println!();
+    if japanese {
+        println!(
+            "Kanji               total {:>10}   unique {:>7}   once-only {:>6}",
+            r.han_total, r.han_unique, r.han_hapax
+        );
+    }
     println!(
-        "Korean words        total {:>10}   unique {:>7}   once-only {:>6}   [{}]",
+        "{:<20}total {:>10}   unique {:>7}   once-only {:>6}   [{}]",
+        format!("{name} words"),
         r.words_total,
         r.words_unique,
         r.words_hapax,
         r.segmenter.label()
     );
     println!(
-        "Non-Korean words    total {:>10}   unique {:>7}   numbers {}",
-        r.foreign_words_total, r.foreign_words_unique, r.numbers
+        "{:<20}total {:>10}   unique {:>7}   numbers {}",
+        format!("Non-{name} words"),
+        r.foreign_words_total,
+        r.foreign_words_unique,
+        r.numbers
     );
     println!(
         "Paragraphs {}   sentences {}   avg sentence {:.1} words   avg paragraph {:.1} words",
@@ -772,21 +838,41 @@ fn print_text_korean(r: &Report, top: usize) {
         r.avg_paragraph_words.unwrap_or(0.0)
     );
     println!();
-    println!("Coverage   words");
-    for w in &r.word_coverage {
-        println!("{:>6}% {:>7}", w.percent, w.items);
+    if japanese {
+        println!("Coverage   words   kanji");
+        for (i, w) in r.word_coverage.iter().enumerate() {
+            let k = r
+                .char_coverage
+                .get(i)
+                .map_or("-".into(), |c| c.items.to_string());
+            println!("{:>6}% {:>7} {:>7}", w.percent, w.items, k);
+        }
+    } else {
+        println!("Coverage   words");
+        for w in &r.word_coverage {
+            println!("{:>6}% {:>7}", w.percent, w.items);
+        }
     }
     println!();
+    if japanese {
+        let tc: Vec<String> = r
+            .char_freq
+            .iter()
+            .take(top)
+            .map(|(c, n)| format!("{c}{n}"))
+            .collect();
+        println!("Top kanji: {}", tc.join(" "));
+    }
     let tw: Vec<String> = r
         .word_freq
         .iter()
         .take(top)
-        .map(|(w, n)| format!("{w}:{n}"))
+        .map(|(w, n)| format!("{}:{n}", r.display(w)))
         .collect();
     println!("Top words: {}", tw.join(" "));
     println!();
     if let Some(c) = &r.anki {
-        print_coverage(c, top, Language::Korean);
+        print_coverage(c, top, r);
         println!();
     }
     println!("Sections ({}):", r.sections.len());

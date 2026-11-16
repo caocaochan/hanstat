@@ -126,21 +126,35 @@ pub fn is_hangul(c: char) -> bool {
     ('\u{AC00}'..='\u{D7A3}').contains(&c)
 }
 
-/// A character of the book's main script: Han for Chinese, Hangul syllables for Korean.
+/// Hiragana or katakana (with the long mark ー, the iteration marks ゝゞヽヾ,
+/// small ヵヶ, the katakana extensions ㇰ–ㇿ and halfwidth katakana), not the
+/// middle dot ・.
+#[inline]
+pub fn is_kana(c: char) -> bool {
+    matches!(c,
+        '\u{3041}'..='\u{3096}' | '\u{309D}'..='\u{309F}'
+        | '\u{30A1}'..='\u{30FA}' | '\u{30FC}'..='\u{30FF}'
+        | '\u{31F0}'..='\u{31FF}' | '\u{FF66}'..='\u{FF9D}')
+}
+
+/// A character of the book's main script: Han for Chinese, Hangul syllables
+/// for Korean, kana and kanji for Japanese.
 #[inline]
 pub fn is_main(c: char, lang: Language) -> bool {
     match lang {
         Language::Chinese => is_han(c),
         Language::Korean => is_hangul(c),
+        Language::Japanese => is_han(c) || is_kana(c),
     }
 }
 
 /// [`classify`] for a book in `lang`. A Korean book has no character
-/// statistics (only words), so Hanja there are letters like Hangul.
+/// statistics (only words), so Hanja there are letters like Hangul. In a
+/// Japanese book kanji are the characters counted; kana are letters.
 #[inline]
 pub fn classify_in(c: char, lang: Language) -> Class {
     match lang {
-        Language::Chinese => classify(c),
+        Language::Chinese | Language::Japanese => classify(c),
         Language::Korean if is_han(c) => Class::Letter,
         Language::Korean => classify(c),
     }
@@ -241,6 +255,20 @@ mod tests {
         for c in ['，', '。', 'A', '1', '⼀', '⺀', 'あ', '　', '・', '㇀'] {
             assert!(!is_han(c), "{c:?} U+{:04X}", c as u32);
         }
+    }
+
+    #[test]
+    fn kana() {
+        for c in ['あ', 'ん', 'ア', 'ヶ', 'ー', 'ゞ', 'ｱ', 'ㇷ'] {
+            assert!(is_kana(c), "{c:?}");
+        }
+        for c in ['・', '漢', '한', 'a', '。', '゛'] {
+            assert!(!is_kana(c), "{c:?}");
+        }
+        let j = Language::Japanese;
+        assert!(is_main('か', j) && is_main('漢', j) && !is_main('、', j));
+        assert_eq!(classify_in('漢', j), Class::Han);
+        assert_eq!(classify_in('か', j), Class::Letter);
     }
 
     #[test]
