@@ -2,11 +2,15 @@
 //! project's). They are downloaded on first use from their official Hugging
 //! Face repositories or GitHub releases, pinned to an exact commit or release
 //! and verified by SHA-256, then cached in `%LOCALAPPDATA%\hanstat\models`
-//! (override: `HANSTAT_MODEL_DIR`).
+//! (override: `HANSTAT_MODEL_DIR`). SudachiDict is the exception: it follows
+//! its newest GitHub release (see [`sudachi`]), verified by the SHA-256 that
+//! GitHub reports for the asset.
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 pub struct ModelFile {
     pub name: &'static str,
@@ -23,6 +27,8 @@ pub struct Member {
     pub path: &'static str,
     /// File name it is saved as in the model folder.
     pub name: &'static str,
+    /// Expected size; 0 when not known in advance (the archive was verified
+    /// by its SHA-256, and members are written under a temporary name).
     pub size: u64,
 }
 
@@ -39,7 +45,7 @@ impl ModelFile {
     /// Everything this file provides is in `dir` with the expected size.
     fn is_present(&self, dir: &Path) -> bool {
         let ok = |name: &str, size: u64| {
-            std::fs::metadata(dir.join(name)).is_ok_and(|m| m.len() == size)
+            std::fs::metadata(dir.join(name)).is_ok_and(|m| size == 0 || m.len() == size)
         };
         match self.unpack {
             Unpack::Keep => ok(self.name, self.size),
@@ -160,23 +166,28 @@ pub const KIWI: Model = Model {
     ],
 };
 
-/// SudachiDict core, the dictionary of the Sudachi Japanese analyser (see
-/// `crate::japanese`), from Works Applications' official download bucket.
+/// SudachiDict full 20261015 from its GitHub release, the dictionary of the
+/// Sudachi Japanese analyser (see `crate::japanese`). Full rather than core:
+/// it adds proper nouns and set phrases, so more names and nicknames stay
+/// whole (なっちゃん, 持崎湯葉). The version hanstat was tested with, and the fallback when the newest release can't be found or
+/// doesn't load (see [`sudachi`]). GitHub is used rather than Works
+/// Applications' S3 bucket, which serves the same file far more slowly
+/// outside Japan.
 pub const SUDACHI: Model = Model {
-    id: "sudachidict-core-20261015",
-    title: "SudachiDict core 20261015 (Works Applications)",
+    id: "sudachidict-full-20261015",
+    title: "SudachiDict full 20261015 (Works Applications)",
     licence: "Apache-2.0",
     homepage: "https://github.com/WorksApplications/SudachiDict",
     files: &[ModelFile {
-        name: "sudachi-dictionary-20261015-core.zip",
-        url: "https://sudachi.s3.ap-northeast-1.amazonaws.com/sudachidict/v1/sudachi-dictionary-20261015-core.zip",
-        sha256: "5cf5cb7f1ea943a988e2fb5d285a9a8b3538861faefa7a2604c2cd18c387f503",
-        size: 76_937_904,
+        name: "sudachi-dictionary-20261015-full.zip",
+        url: "https://github.com/WorksApplications/SudachiDict/releases/download/v20261015/sudachi-dictionary-20261015-full.zip",
+        sha256: "b38318ca26a444cd713a5a377a353308ef38c733c64cc0be905122527516c793",
+        size: 137_444_817,
         unpack: Unpack::Zip(&[
             Member {
-                path: "sudachi-dictionary-20261015/system_core.dic",
-                name: "system_core.dic",
-                size: 202_236_003,
+                path: "sudachi-dictionary-20261015/system_full.dic",
+                name: "system_full.dic",
+                size: 330_506_339,
             },
             Member {
                 path: "sudachi-dictionary-20261015/LICENSE-2.0.txt",
@@ -191,6 +202,199 @@ pub const SUDACHI: Model = Model {
         ]),
     }],
 };
+
+const SUDACHI_REPO: &str = "WorksApplications/SudachiDict";
+
+/// How often to ask GitHub for a newer SudachiDict.
+const SUDACHI_CHECK_SECS: u64 = 24 * 60 * 60;
+
+/// The last answer from GitHub, kept in the model cache so that it is asked
+/// at most once a day.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SudachiRelease {
+    /// Unix time of the check.
+    checked: u64,
+    /// `20261015`.
+    version: String,
+    url: String,
+    sha256: String,
+    size: u64,
+}
+
+/// SudachiDict full from its newest GitHub release that has a full zip
+/// (some releases have only Python wheels). GitHub is asked at most once a
+/// day; without an answer, the newest dictionary already downloaded is used,
+/// and failing that the tested [`SUDACHI`]. Resolved once per run.
+pub fn sudachi() -> &'static Model {
+    static M: OnceLock<&'static Model> = OnceLock::new();
+    M.get_or_init(|| {
+        let state = cache_root().join("sudachidict-latest.json");
+        let saved: Option<SudachiRelease> = std::fs::read(&state)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let fresh = saved
+            .as_ref()
+            .filter(|s| now.saturating_sub(s.checked) < SUDACHI_CHECK_SECS)
+            .cloned();
+        let release = fresh.or_else(|| match latest_sudachi_release(now) {
+            Ok(r) => {
+                let _ = std::fs::create_dir_all(cache_root());
+                let _ = std::fs::write(&state, serde_json::to_vec_pretty(&r).unwrap());
+                Some(r)
+            }
+            Err(_) => saved,
+        });
+        match release {
+            Some(r) if r.version == "20261015" => &SUDACHI,
+            Some(r) => leak_sudachi_model(&r),
+            None => sudachi_local(),
+        }
+    })
+}
+
+/// The newest SudachiDict already downloaded, or [`SUDACHI`]; never asks
+/// the network (for display and quick checks).
+pub fn sudachi_local() -> &'static Model {
+    static M: OnceLock<&'static Model> = OnceLock::new();
+    M.get_or_init(|| {
+        let newest = std::fs::read_dir(cache_root())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let v = name.strip_prefix("sudachidict-full-")?.to_owned();
+                (v.len() == 8
+                    && v.bytes().all(|b| b.is_ascii_digit())
+                    && e.path().join("system_full.dic").is_file())
+                .then_some(v)
+            })
+            .max();
+        match newest {
+            Some(v) if v.as_str() > "20261015" => leak_sudachi_model(&SudachiRelease {
+                checked: 0,
+                url: sudachi_url(&v),
+                version: v,
+                // Already unpacked, so never downloaded again.
+                sha256: String::new(),
+                size: 0,
+            }),
+            _ => &SUDACHI,
+        }
+    })
+}
+
+fn sudachi_url(version: &str) -> String {
+    format!(
+        "https://github.com/{SUDACHI_REPO}/releases/download/v{version}/sudachi-dictionary-{version}-full.zip"
+    )
+}
+
+#[derive(Deserialize)]
+struct GhRelease {
+    draft: bool,
+    prerelease: bool,
+    assets: Vec<GhAsset>,
+}
+
+#[derive(Deserialize)]
+struct GhAsset {
+    name: String,
+    size: u64,
+    browser_download_url: String,
+    /// `sha256:<hex>`, computed by GitHub.
+    digest: Option<String>,
+}
+
+/// The newest release with a full zip and a SHA-256, from the list GitHub
+/// returns newest first.
+fn parse_sudachi_releases(json: &str, now: u64) -> Result<SudachiRelease, String> {
+    let rs: Vec<GhRelease> =
+        serde_json::from_str(json).map_err(|e| format!("Unexpected GitHub response: {e}"))?;
+    let prefix = format!("https://github.com/{SUDACHI_REPO}/releases/download/");
+    rs.iter()
+        .filter(|r| !r.draft && !r.prerelease)
+        .flat_map(|r| &r.assets)
+        .find_map(|a| {
+            let v = a
+                .name
+                .strip_prefix("sudachi-dictionary-")?
+                .strip_suffix("-full.zip")?;
+            let sha = a.digest.as_deref()?.strip_prefix("sha256:")?;
+            (v.len() == 8
+                && v.bytes().all(|b| b.is_ascii_digit())
+                && sha.len() == 64
+                && a.browser_download_url.starts_with(&prefix))
+            .then(|| SudachiRelease {
+                checked: now,
+                version: v.to_owned(),
+                url: a.browser_download_url.clone(),
+                sha256: sha.to_ascii_lowercase(),
+                size: a.size,
+            })
+        })
+        .ok_or_else(|| "No SudachiDict release with a full dictionary zip".to_owned())
+}
+
+fn latest_sudachi_release(now: u64) -> Result<SudachiRelease, String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .build()
+        .into();
+    let json = agent
+        .get(format!(
+            "https://api.github.com/repos/{SUDACHI_REPO}/releases?per_page=10"
+        ))
+        .header("User-Agent", concat!("hanstat/", env!("CARGO_PKG_VERSION")))
+        .header("Accept", "application/vnd.github+json")
+        .call()
+        .map_err(|e| e.to_string())?
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| e.to_string())?;
+    parse_sudachi_releases(&json, now)
+}
+
+/// A [`Model`] for a SudachiDict release found at run time (kept for the
+/// rest of the run).
+fn leak_sudachi_model(r: &SudachiRelease) -> &'static Model {
+    let s = |x: String| -> &'static str { Box::leak(x.into_boxed_str()) };
+    let v = &r.version;
+    let members: &'static [Member] = Box::leak(Box::new([
+        Member {
+            path: s(format!("sudachi-dictionary-{v}/system_full.dic")),
+            name: "system_full.dic",
+            size: 0,
+        },
+        Member {
+            path: s(format!("sudachi-dictionary-{v}/LICENSE-2.0.txt")),
+            name: "LICENSE-2.0.txt",
+            size: 0,
+        },
+        Member {
+            path: s(format!("sudachi-dictionary-{v}/LEGAL")),
+            name: "LEGAL",
+            size: 0,
+        },
+    ]));
+    let files: &'static [ModelFile] = Box::leak(Box::new([ModelFile {
+        name: s(format!("sudachi-dictionary-{v}-full.zip")),
+        url: s(r.url.clone()),
+        sha256: s(r.sha256.clone()),
+        size: r.size,
+        unpack: Unpack::Zip(members),
+    }]));
+    Box::leak(Box::new(Model {
+        id: s(format!("sudachidict-full-{v}")),
+        title: s(format!("SudachiDict full {v} (Works Applications)")),
+        licence: "Apache-2.0",
+        homepage: "https://github.com/WorksApplications/SudachiDict",
+        files,
+    }))
+}
 
 /// hanstat's per-user data folder (`%LOCALAPPDATA%\hanstat`): models and saved settings.
 pub fn app_dir() -> PathBuf {
@@ -283,14 +487,14 @@ fn save_member(mut r: impl Read, dir: &Path, m: &Member) -> Result<(), String> {
     let mut out = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
     let n = std::io::copy(&mut r, &mut out).map_err(|e| e.to_string())?;
     drop(out);
-    if n != m.size {
+    if m.size != 0 && n != m.size {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("{}: expected {} bytes, got {n}", m.path, m.size));
     }
     std::fs::rename(&tmp, &dest).or_else(|e| {
         let _ = std::fs::remove_file(&tmp);
         // Another process unpacked the same file first.
-        if std::fs::metadata(&dest).is_ok_and(|x| x.len() == m.size) {
+        if std::fs::metadata(&dest).is_ok_and(|x| m.size == 0 || x.len() == m.size) {
             Ok(())
         } else {
             Err(e.to_string())
@@ -331,6 +535,9 @@ fn unpack_tar_gz(archive: &Path, dir: &Path, members: &[Member]) -> Result<(), S
 static DOWNLOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn download(f: &ModelFile, dest: &std::path::Path, progress: &dyn Fn(u64)) -> Result<(), String> {
+    if f.sha256.is_empty() {
+        return Err("no checksum known for this file".to_owned());
+    }
     let mut resp = ureq::get(f.url)
         .header("User-Agent", concat!("hanstat/", env!("CARGO_PKG_VERSION")))
         .call()
@@ -374,5 +581,67 @@ fn download(f: &ModelFile, dest: &std::path::Path, progress: &dyn Fn(u64)) -> Re
             Ok(())
         }
         Err(e) => Err(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn newest_sudachi_release_with_a_full_zip() {
+        let sha = "b38318ca26a444cd713a5a377a353308ef38c733c64cc0be905122527516c793";
+        let url = |t: &str, n: &str| {
+            format!("https://github.com/WorksApplications/SudachiDict/releases/download/{t}/{n}")
+        };
+        // Newest first; the newest has only wheels, a prerelease is skipped.
+        let json = serde_json::json!([
+            {"draft": false, "prerelease": true, "assets": [
+                {"name": "sudachi-dictionary-20270101-full.zip", "size": 1,
+                 "browser_download_url": url("v20270101", "sudachi-dictionary-20270101-full.zip"),
+                 "digest": format!("sha256:{sha}")}]},
+            {"draft": false, "prerelease": false, "assets": [
+                {"name": "sudachidict_core-20261201-py3-none-any.whl", "size": 1,
+                 "browser_download_url": url("v20261201", "sudachidict_core-20261201-py3-none-any.whl"),
+                 "digest": format!("sha256:{sha}")}]},
+            {"draft": false, "prerelease": false, "assets": [
+                {"name": "sudachi-dictionary-20261015-core.zip", "size": 2,
+                 "browser_download_url": url("v20261015", "sudachi-dictionary-20261015-core.zip"),
+                 "digest": format!("sha256:{sha}")},
+                {"name": "sudachi-dictionary-20261015-full.zip", "size": 137444817,
+                 "browser_download_url": url("v20261015", "sudachi-dictionary-20261015-full.zip"),
+                 "digest": format!("sha256:{}", sha.to_uppercase())}]}
+        ])
+        .to_string();
+        let r = parse_sudachi_releases(&json, 7).unwrap();
+        assert_eq!(r.version, "20261015");
+        assert_eq!(r.size, 137_444_817);
+        assert_eq!(r.sha256, sha);
+        assert_eq!(r.checked, 7);
+        assert_eq!(r.url, sudachi_url("20261015"));
+        // An asset hosted elsewhere, or without a digest, is not used.
+        let bad = json.replace(
+            "https://github.com/WorksApplications/SudachiDict/",
+            "https://example.com/",
+        );
+        assert!(parse_sudachi_releases(&bad, 0).is_err());
+    }
+
+    #[test]
+    fn runtime_sudachi_model() {
+        let m = leak_sudachi_model(&SudachiRelease {
+            checked: 0,
+            version: "20270101".into(),
+            url: sudachi_url("20270101"),
+            sha256: "ab".repeat(32),
+            size: 9,
+        });
+        assert_eq!(m.id, "sudachidict-full-20270101");
+        assert_eq!(m.files[0].name, "sudachi-dictionary-20270101-full.zip");
+        let Unpack::Zip(ms) = m.files[0].unpack else {
+            panic!()
+        };
+        assert_eq!(ms[0].path, "sudachi-dictionary-20270101/system_full.dic");
+        assert_eq!(ms[0].name, "system_full.dic");
     }
 }

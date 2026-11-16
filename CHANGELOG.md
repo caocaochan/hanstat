@@ -4,7 +4,7 @@
 
 ### Added
 - **Japanese books.** A book whose kana are at least a tenth as many as its kanji is analysed as Japanese, with the badge 日本語.
-  - **Analyser.** Words come from [Sudachi](https://github.com/WorksApplications/sudachi.rs) (v0.7.0) with SudachiDict core 20261015 (77 MB, Apache-2.0). The dictionary is downloaded from Works Applications' official bucket the first time a Japanese book is opened.
+  - **Analyser.** Words come from [Sudachi](https://github.com/WorksApplications/sudachi.rs) (v0.7.0) and SudachiDict full (Apache-2.0), which adds proper nouns and set phrases to the core dictionary, so more names and nicknames stay whole. The dictionary (137 MB for 20261015) is downloaded from SudachiDict's newest GitHub release the first time a Japanese book is opened. hanstat checks for a newer release at most once a day, and uses the tested 20261015 if the newest one can't be downloaded or loaded.
   - **Word units.** Sudachi runs in its long-unit mode, so compounds that a dictionary lists whole stay whole (事務所, 一生懸命, 冒険者).
   - **Counting.** Each word is counted by Sudachi's normalized form, which merges inflections and spellings (わかった, 分かる → 分かる; かわいく → 可愛い). The Words tab, exports and CLI show the book's own usual spelling (する and こと, not the normalized 為る and 事).
   - **What isn't a word.** Particles, auxiliaries, punctuation, digits and Latin words are not counted.
@@ -17,14 +17,14 @@
     
     Of 81 changed places judged by hand, it was better in 49 and worse in 6.
 - **JLPT levels.** In Japanese mode the known-words window (**📚 JLPT & word lists**) has N5–N1 checkboxes. The levels come from Jonathan Waller's lists, as used by jisho.org, with JMdict ids and spelling fixes from stephenmk/yomitan-jlpt-vocab (CC BY-SA 4.0). The JLPT has published no word list since 2010.
-  - **Keys.** The 8,293 entries are keyed by Sudachi's normalized form, giving 7,440 words: N5 638, N4 603, N3 1,578, N2 1,673, N1 2,948. 133 set phrases (気を付ける, ごめんください) are not single words and are left out.
+  - **Keys.** The 8,293 entries are keyed by Sudachi's normalized form, giving 7,452 words: N5 639, N4 604, N3 1,579, N2 1,679, N1 2,951. 122 set phrases (気を付ける, ごめんください) are not single words and are left out.
   - **Long words.** A long word that is neither on a list nor in Anki counts as known when all its short-unit parts are known (冒険者 with 冒険 and 者). With this, JLPT N5–N1 cover 75–89% of running words in five test novels, and Kaishi 1.5k adds 2–3 points. Waller's list lacks a few basic words such as 顔.
   - **Imported lists.** Japanese word lists are read with Sudachi, so 分かる, わかる and わかった all mark 分かる.
   - **Anki.** Ticked fields are analysed with Sudachi too, with furigana readings (会[あ]う) removed.
   - **Saved settings.** Japanese settings are saved to `anki-ja.json` and `known-ja.json`.
   - **CLI.** `--lang ja` for `--anki` without a file. `--level N` marks N5 down to N`N` (`--level 3` is N5–N3).
 - **Kaishi 1.5k toggle.** The Japanese known-words window has a **Kaishi 1.5k deck** checkbox that marks every word of the [Kaishi 1.5k](https://github.com/donkuri/Kaishi) Anki deck as known. This is for decks studied outside the collection hanstat reads; if the deck is in that collection, tick it in the Anki window instead, so that only the cards you have learned count.
-  - **The list.** It holds the Word field of the 1,500 cards of release v2.4.3, keyed by Sudachi like the JLPT list (1,393 words). A set phrase such as お願いします marks each of its words.
+  - **The list.** It holds the Word field of the 1,500 cards of release v2.4.3, keyed by Sudachi like the JLPT list (1,396 words). A set phrase such as お願いします marks each of its words.
   - **Saving.** The choice is saved in `known-ja.json` as `kaishi`.
   - **CLI.** `--kaishi` marks the words for one run; `--known` includes the saved choice.
 

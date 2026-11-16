@@ -789,8 +789,10 @@ impl App {
         self.anki.busy = if self.language == Language::Korean && !hanstat::models::KIWI.is_cached()
         {
             "Downloading Kiwi (126 MB, first Korean use only), then classifying Anki notes…"
-        } else if self.language == Language::Japanese && !hanstat::models::SUDACHI.is_cached() {
-            "Downloading SudachiDict (77 MB, first Japanese use only), then classifying Anki notes…"
+        } else if self.language == Language::Japanese
+            && !hanstat::models::sudachi_local().is_cached()
+        {
+            "Downloading SudachiDict (137 MB, first Japanese use only), then classifying Anki notes…"
         } else {
             "Classifying Anki notes…"
         };
@@ -3083,7 +3085,7 @@ impl App {
                     &hanstat::models::LTP,
                     &hanstat::models::CKIP,
                     &hanstat::models::KIWI,
-                    &hanstat::models::SUDACHI,
+                    hanstat::models::sudachi_local(),
                 ] {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(format!(
@@ -3136,7 +3138,7 @@ const KOREAN_METHOD: &[&str] = &[
 const JAPANESE_METHOD: &[&str] = &[
     "Language: a book is Japanese when its kana are at least a tenth as many as its kanji (a Chinese book has at most a few kana). The badge at the top right shows the mode; Anki decks and fields, word lists, marked words and the user dictionary are kept separately for each language.",
     "Characters are kanji (Script=Han letters), counted exactly as in Chinese books; kana are letters. Words, lengths and reading time are in words.",
-    "Words come from Sudachi, a Japanese morphological analyser, with SudachiDict core in its long-unit mode C: compounds a dictionary lists whole stay whole (事務所, 一生懸命, 冒険者). Each word is counted by Sudachi's normalized form, which merges inflections and spellings (わかった, 分かる → 分かる; かわいく → 可愛い; ウソ → うそ), and shown as the book usually spells it. Two different words the book spells alike are told apart by their normalized form: いる (要る).",
+    "Words come from Sudachi, a Japanese morphological analyser, with SudachiDict full in its long-unit mode C: compounds a dictionary lists whole stay whole (事務所, 一生懸命, 冒険者). Each word is counted by Sudachi's normalized form, which merges inflections and spellings (わかった, 分かる → 分かる; かわいく → 可愛い; ウソ → うそ), and shown as the book usually spells it. Two different words the book spells alike are told apart by their normalized form: いる (要る).",
     "Particles, auxiliaries (た, ます, ない…), punctuation, numbers in digits and Latin words are not Japanese words. Numerals in kanji keep their spelling (二十四).",
     "Before analysis, dialogue noise that Sudachi misreads is removed: an emphatic small っ at the end of a word (ですっ」), stretched vowels and long marks after two or more kana (ますぅ, まーす), and stutters (い、いいんですか; こ、これ). Short interjections such as はぁ, えー and えーと are kept. On five novels this changed Sudachi's reading in a few hundred places, mostly for the better (49 of 81 judged by hand; 6 worse, all stretched interjections like あはー).",
     "Sudachi was chosen over UniDic analysers (Lindera, Vibrato) after a comparison on five novels: it keeps character names whole (UniDic splits most invented names) and gives learner-sized words; on other words the two were about even. Words in the user dictionary are added to Sudachi as proper nouns and are always kept whole.",

@@ -1,8 +1,8 @@
 # Kaishi 1.5k (https://github.com/donkuri/Kaishi), release v2.4.3: the Word field of its 1,500 cards, in deck order.
 # The repository publishes no licence; only the headwords are used here, not the deck's sentences, translations, audio or images.
-# key<TAB>headword. The key is SudachiDict core 20261015's normalized form (mode C) of the headword, as hanstat keys a book's words.
+# key<TAB>headword. The key is SudachiDict full 20261015's normalized form (mode C) of the headword, as hanstat keys a book's words.
 # A card Sudachi splits into an affix and one word is keyed by that word; a set phrase (お願いします) by each of its content words.
-# Each key once (1,500 cards give 1,393 keys).
+# Each key once (1,500 cards give 1,396 keys).
 私	私
 貴方	あなた
 さん	さん
@@ -500,6 +500,7 @@
 感情	感情
 周り	周り
 方法	方法
+もう一度	もう一度
 遅い	遅い
 会話	会話
 合う	合う
@@ -524,6 +525,7 @@
 立ち上がる	立ち上がる
 思い	思い
 以前	以前
+もう少し	もう少し
 襲う	襲う
 見付かる	見つかる
 急ぐ	急ぐ
@@ -1079,6 +1081,7 @@
 馬	馬
 覆う	覆う
 趣味	趣味
+何となく	何となく
 価値	価値
 見守る	見守る
 安全	安全

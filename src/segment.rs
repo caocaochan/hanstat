@@ -63,7 +63,7 @@ pub fn model_for(kind: SegmenterKind) -> Option<&'static models::Model> {
         SegmenterKind::Ckip => Some(&models::CKIP),
         SegmenterKind::Jieba => None,
         SegmenterKind::Kiwi => Some(&models::KIWI),
-        SegmenterKind::Sudachi => Some(&models::SUDACHI),
+        SegmenterKind::Sudachi => Some(models::sudachi()),
     }
 }
 
@@ -112,7 +112,7 @@ impl SegmenterKind {
                 "Kiwi Korean morphological analyser (CoNg model). Counts words as dictionary forms (먹었어요 → 먹다); used for every Korean book."
             }
             Self::Sudachi => {
-                "Sudachi Japanese morphological analyser (SudachiDict core, long units). Counts words in dictionary form, merging spellings (わかった, 分かる → 分かる); used for every Japanese book."
+                "Sudachi Japanese morphological analyser (SudachiDict full, long units). Counts words in dictionary form, merging spellings (わかった, 分かる → 分かる); used for every Japanese book."
             }
         }
     }

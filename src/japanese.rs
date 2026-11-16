@@ -1,7 +1,7 @@
 //! Japanese analysis with Sudachi (sudachi.rs, Apache-2.0) and SudachiDict
-//! core (Apache-2.0), split mode C.
+//! full (Apache-2.0), split mode C.
 //!
-//! The dictionary is downloaded on first use ([`crate::models::SUDACHI`]), so
+//! The dictionary is downloaded on first use ([`crate::models::sudachi`]), so
 //! the Chinese and Korean modes never load it.
 //!
 //! A word is keyed by Sudachi's normalized form, which merges spellings and
@@ -43,10 +43,12 @@ pub struct Word {
 /// Sudachi rejects input over 49,149 bytes; paragraphs are cut well below that.
 const MAX_CHUNK: usize = 16 * 1024;
 
-/// Connection ids and cost of SudachiDict core's 名詞,固有名詞,一般 entries
-/// (as ディズニーランド), used for user-dictionary words.
-const PROPER_NOUN_ID: i16 = 4785;
+/// Cost of user-dictionary words (as the dictionary's own ディズニーランド).
 const USER_WORD_COST: i16 = 4000;
+
+/// Proper nouns the dictionary lists as 名詞,固有名詞,一般, whose connection
+/// ids user words take (the ids differ between dictionary versions).
+const PROPER_NOUN_PROBES: [&str; 3] = ["ディズニーランド", "ポケモン", "東京タワー"];
 
 /// A loaded dictionary. Read-only; analysed from several threads at once.
 pub struct Analyzer {
@@ -54,15 +56,19 @@ pub struct Analyzer {
 }
 
 impl Analyzer {
-    /// Load `system_core.dic` from `dir`, with `user_words` added as proper
+    /// Load `system_full.dic` from `dir`, with `user_words` added as proper
     /// nouns so they are kept whole.
     pub fn build(dir: &Path, user_words: &[String]) -> Result<Analyzer, String> {
-        let dic = dir.join("system_core.dic");
+        let dic = dir.join("system_full.dic");
         let cfg = Config::new(None, None, Some(dic.clone()))
             .map_err(|e| format!("Sudachi configuration: {e}"))?;
         let system = JapaneseDictionary::from_cfg(&cfg)
             .map_err(|e| format!("Cannot load the Sudachi dictionary {}: {e}", dic.display()))?;
-        let csv = user_csv(user_words);
+        let csv = match proper_noun_ids(&system) {
+            Some(ids) => user_csv(user_words, ids),
+            // Without them a user word would not connect: keep the system dictionary.
+            None => String::new(),
+        };
         if csv.is_empty() {
             return Ok(Analyzer { dict: system });
         }
@@ -297,9 +303,27 @@ pub fn filter(p: &str) -> String {
         .collect()
 }
 
+/// The (left, right) connection ids of a 名詞,固有名詞,一般 word in `dict`.
+fn proper_noun_ids(dict: &JapaneseDictionary) -> Option<(i16, i16)> {
+    let mut tok = StatefulTokenizer::new(dict, Mode::C);
+    let mut ml = MorphemeList::empty(dict);
+    PROPER_NOUN_PROBES.iter().find_map(|w| {
+        tok.reset().push_str(w);
+        tok.do_tokenize().ok()?;
+        ml.collect_results(&mut tok).ok()?;
+        let m = (ml.len() == 1).then(|| ml.get(0))?;
+        let pos = m.part_of_speech();
+        if m.is_oov() || pos[0] != "名詞" || pos[1] != "固有名詞" || pos[2] != "一般" {
+            return None;
+        }
+        let (l, r, _) = dict.lexicon().get_word_param(m.word_id());
+        Some((l, r))
+    })
+}
+
 /// v0 lexicon rows for the user words Sudachi can take: Japanese, no spaces,
 /// commas or quotes. Each is a proper noun with the dictionary's own ids.
-fn user_csv(user_words: &[String]) -> String {
+fn user_csv(user_words: &[String], (left, right): (i16, i16)) -> String {
     let mut seen = std::collections::HashSet::new();
     let mut s = String::new();
     for w in user_words {
@@ -313,7 +337,7 @@ fn user_csv(user_words: &[String]) -> String {
             continue;
         }
         s.push_str(&format!(
-            "{w},{PROPER_NOUN_ID},{PROPER_NOUN_ID},{USER_WORD_COST},{w},名詞,固有名詞,一般,*,*,*,*,{w},*,A,*,*,*,*\n"
+            "{w},{left},{right},{USER_WORD_COST},{w},名詞,固有名詞,一般,*,*,*,*,{w},*,A,*,*,*,*\n"
         ));
     }
     s
@@ -330,10 +354,27 @@ pub fn shared(user_words: &[String]) -> Result<Arc<Analyzer>, String> {
         return Ok(a.clone());
     }
     *g = None;
-    let dir = models::SUDACHI.ensure(&|_, _| {})?;
-    let a = Arc::new(Analyzer::build(&dir, user_words)?);
+    let a = Arc::new(load(user_words)?);
     *g = Some((user_words.to_vec(), a.clone()));
     Ok(a)
+}
+
+/// The newest SudachiDict ([`models::sudachi`]); if it can't be downloaded or
+/// loaded (a newer dictionary format, say), the tested [`models::SUDACHI`].
+fn load(user_words: &[String]) -> Result<Analyzer, String> {
+    let latest = models::sudachi();
+    let first = latest
+        .ensure(&|_, _| {})
+        .and_then(|dir| Analyzer::build(&dir, user_words));
+    match first {
+        Err(e) if !std::ptr::eq(latest, &models::SUDACHI) => {
+            let dir = models::SUDACHI
+                .ensure(&|_, _| {})
+                .map_err(|e2| format!("{e}\n{e2}"))?;
+            Analyzer::build(&dir, user_words).map_err(|e2| format!("{e}\n{e2}"))
+        }
+        r => r,
+    }
 }
 
 /// The keys of the words in each of `texts` (word-list entries), using the
@@ -422,13 +463,16 @@ mod tests {
 
     #[test]
     fn user_words_csv() {
-        let csv = user_csv(&[
-            "ぬるま湯ぬい".into(),
-            "a b".into(),
-            "Hello".into(),
-            "ぬるま湯ぬい".into(),
-        ]);
+        let csv = user_csv(
+            &[
+                "ぬるま湯ぬい".into(),
+                "a b".into(),
+                "Hello".into(),
+                "ぬるま湯ぬい".into(),
+            ],
+            (4785, 4786),
+        );
         assert_eq!(csv.lines().count(), 1);
-        assert!(csv.starts_with("ぬるま湯ぬい,4785,4785,"));
+        assert!(csv.starts_with("ぬるま湯ぬい,4785,4786,"));
     }
 }

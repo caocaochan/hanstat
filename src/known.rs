@@ -620,8 +620,8 @@ mod tests {
     fn jlpt_data() {
         let ja = Language::Japanese;
         let counts: Vec<usize> = JLPT_LEVELS.iter().map(|&b| band_count(ja, b)).collect();
-        assert_eq!(counts, [638, 603, 1578, 1673, 2948]);
-        assert_eq!(JLPT.len(), 7_440);
+        assert_eq!(counts, [639, 604, 1579, 1679, 2951]);
+        assert_eq!(JLPT.len(), 7_452);
         let all: HashSet<&str> = JLPT.iter().map(|(_, w)| *w).collect();
         assert_eq!(all.len(), JLPT.len());
         let level = |w: &str| JLPT.iter().find(|(_, x)| *x == w).map(|(b, _)| *b);
@@ -636,7 +636,7 @@ mod tests {
 
     #[test]
     fn kaishi_deck() {
-        assert_eq!(kaishi_count(), 1_393);
+        assert_eq!(kaishi_count(), 1_396);
         let keys: HashSet<&str> = KAISHI.iter().map(|(k, _)| *k).collect();
         assert_eq!(keys.len(), KAISHI.len());
         // First cards of the deck; keys are normalized forms, headwords as the deck writes them.
@@ -652,7 +652,7 @@ mod tests {
         let k = s.apply(None, false).unwrap();
         assert_eq!(k.word("貴方"), Status::Listed);
         assert_eq!(k.word("日本語"), Status::Listed);
-        assert_eq!(k.listed.words, 1_393);
+        assert_eq!(k.listed.words, 1_396);
         // Kanji from the deck's spelling: これ is keyed 此れ, but 此 is not taught.
         assert_eq!(k.char('語'), Status::Listed);
         assert_eq!(k.word("此れ"), Status::Listed);

@@ -13,7 +13,7 @@ Character and word statistics for Chinese and Japanese `.epub` and `.txt` files,
 
 The exe isn't code-signed, so SmartScreen may ask you to confirm the first run. The app updates itself; click the version number in the status bar to check now or turn automatic updates off.
 
-On first start the app downloads the word-segmentation models (LTP 32 MB, CKIP 46 MB) from Hugging Face into `%LOCALAPPDATA%\hanstat\models`. They aren't bundled because their licences differ (see below). The Korean analyser (Kiwi, 126 MB from its GitHub release) is downloaded the first time you open a Korean book, and the Japanese dictionary (SudachiDict core, 77 MB from Works Applications) the first time you open a Japanese book.
+On first start the app downloads the word-segmentation models (LTP 32 MB, CKIP 46 MB) from Hugging Face into `%LOCALAPPDATA%\hanstat\models`. They aren't bundled because their licences differ (see below). The Korean analyser (Kiwi, 126 MB from its GitHub release) is downloaded the first time you open a Korean book, and the Japanese dictionary (SudachiDict full, about 137 MB from its newest GitHub release, checked at most once a day) the first time you open a Japanese book.
 
 ## Korean
 
@@ -49,8 +49,8 @@ Click **📚 HSK & word lists** (Korean: **📚 Levels & word lists**; Japanese:
 
 - **Chinese:** HSK 3.0 levels from the 2025 《HSK 考试大纲》 (11,000 entries, 10,896 distinct words).
 - **Korean:** levels 1–6급 from 국립국어원's 국제 통용 한국어 표준 교육과정 vocabulary (10,635 entries, 9,977 words). TOPIK publishes no word list of its own; this is the list that TOPIK vocabulary lists by level follow. Most 하다/되다 verbs are listed only through their noun, with the affixes -하다 and -되다 taught at 2급. So with 2급 ticked, 말하다 and 생각되다 count as known when 말 and 생각 are in a ticked level. A few words the list teaches as part of a grammar pattern count at that pattern's level: 싶다 (-고 싶다, 1급), 때문 (-기 때문에, 2급), 듯하다 (-는 듯하다, 5급) and similar.
-- **Japanese:** a **Kaishi 1.5k deck** checkbox marks every word of the [Kaishi 1.5k](https://github.com/donkuri/Kaishi) Anki deck as known (1,393 words). It's for when you studied the deck somewhere hanstat doesn't read; if the deck is in your Anki collection, tick it in the Anki window instead, so only the cards you've learned count.
-- **Japanese:** JLPT N5–N1 from Jonathan Waller's lists, the ones jisho.org uses (8,293 entries, 7,440 words). The JLPT has published no word list since 2010, so these are an informed estimate. A long word that isn't on the list itself counts as known when all its parts are: 冒険者 counts once 冒険 and 者 are known. This applies to Anki and word lists too.
+- **Japanese:** a **Kaishi 1.5k deck** checkbox marks every word of the [Kaishi 1.5k](https://github.com/donkuri/Kaishi) Anki deck as known (1,396 words). It's for when you studied the deck somewhere hanstat doesn't read; if the deck is in your Anki collection, tick it in the Anki window instead, so only the cards you've learned count.
+- **Japanese:** JLPT N5–N1 from Jonathan Waller's lists, the ones jisho.org uses (8,293 entries, 7,452 words). The JLPT has published no word list since 2010, so these are an informed estimate. A long word that isn't on the list itself counts as known when all its parts are: 冒険者 counts once 冒険 and 者 are known. This applies to Anki and word lists too.
 
 ## Command line
 

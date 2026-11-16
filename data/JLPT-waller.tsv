@@ -1,10 +1,10 @@
 # JLPT N5–N1 vocabulary: Jonathan Waller's lists (tanos.co.uk, CC BY), with JMdict ids and spelling
 # fixes by stephenmk/yomitan-jlpt-vocab (CC BY-SA 4.0) at commit b062d4e38c4bdd0950ae1d4ec55f04b176182e03.
 # The JLPT publishes no official word list; these are the lists jisho.org uses.
-# level<TAB>key<TAB>headword. The key is SudachiDict core 20261015's normalized form (mode C) of the
+# level<TAB>key<TAB>headword. The key is SudachiDict full 20261015's normalized form (mode C) of the
 # headword (and of the kana for words usually written in kana), as hanstat keys a book's words.
 # An entry Sudachi splits into an affix and one word (お菓子, 五つ) is keyed by that word.
-# Each key once, at its easiest level (5 = N5). 133 set phrases that are not one word are left out.
+# Each key once, at its easiest level (5 = N5). 122 set phrases that are not one word are left out.
 5	会う	会う
 5	青	青
 5	青い	青い
@@ -589,6 +589,7 @@
 5	メートル	メートル
 5	眼鏡	眼鏡
 5	もう	もう
+5	もう一度	もう一度
 5	木曜日	木曜日
 5	持つ	持つ
 5	もっと	もっと
@@ -1078,6 +1079,7 @@
 4	慣れる	慣れる
 4	におい	におい
 4	苦い	苦い
+4	二階建て	二階建て
 4	逃げる	逃げる
 4	日記	日記
 4	入院	入院
@@ -1785,6 +1787,7 @@
 3	好み	好み
 3	好む	好む
 3	小麦	小麦
+3	ごめんなさい	ごめんなさい
 3	小屋	小屋
 3	頃	頃
 3	殺す	殺す
@@ -2975,6 +2978,7 @@
 2	かわり	お代わり
 2	補う	補う
 2	屋外	屋外
+2	おくさん	おくさん
 2	送り仮名	送り仮名
 2	怠る	怠る
 2	押さえる	押える
@@ -3242,6 +3246,7 @@
 2	競馬	競馬
 2	警備	警備
 2	形容詞	形容詞
+2	形容動詞	形容動詞
 2	外科	外科
 2	毛皮	毛皮
 2	激増	激増
@@ -3346,6 +3351,7 @@
 2	こぼれる	零れる
 2	ゴム	ゴム
 2	御免	御免
+2	ごめんください	ごめんください
 2	小指	小指
 2	堪える	こらえる
 2	娯楽	娯楽
@@ -3479,6 +3485,7 @@
 2	締め切る	締め切る
 2	湿る	湿る
 2	ジャーナリスト	ジャーナリスト
+2	社会科学	社会科学
 2	しゃがむ	しゃがむ
 2	蛇口	蛇口
 2	弱点	弱点
@@ -3579,6 +3586,7 @@
 2	寝台	寝台
 2	診断	診断
 2	侵入	侵入
+2	人文科学	人文科学
 2	人命	人命
 2	深夜	深夜
 2	森林	森林
@@ -4263,6 +4271,7 @@
 2	干す	干す
 2	ポスター	ポスター
 2	北極	北極
+2	坊っちゃん	坊っちゃん
 2	掘る	掘る
 2	彫る	彫る
 2	襤褸	ぼろ
@@ -5434,6 +5443,7 @@
 1	ごと	毎
 1	碁盤	碁盤
 1	ごまかす	誤魔化す
+1	御免なさい	御免なさい
 1	佐	佐
 1	再	再
 1	差異	差異
@@ -5680,7 +5690,7 @@
 1	職務	職務
 1	諸君	諸君
 1	所在	所在
-1	しょ	所々
+1	しょしょ	所々
 1	所持	所持
 1	所属	所属
 1	処置	処置
@@ -6462,6 +6472,7 @@
 1	馴れ馴れしい	馴れ馴れしい
 1	難	難
 1	何だかんだ	何だかんだ
+1	何となく	何となく
 1	荷	荷
 1	似通う	似通う
 1	面皰	面皰
@@ -6692,6 +6703,7 @@
 1	日々	日々
 1	悲鳴	悲鳴
 1	百科事典	百科事典
+1	百科辞典	百科辞典
 1	冷やかす	冷やかす
 1	日焼け	日焼け
 1	票	票

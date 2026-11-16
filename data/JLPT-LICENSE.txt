@@ -13,7 +13,7 @@ taken from JMdict (Electronic Dictionary Research and Development Group,
 https://www.edrdg.org/jmdict/j_jmdict.html), licensed under CC BY-SA 4.0.
 
 Changes made for hanstat: each entry is keyed by the normalized form that the
-Sudachi analyser (SudachiDict core 20261015, split mode C) gives its headword
+Sudachi analyser (SudachiDict full 20261015, split mode C) gives its headword
 (and its kana, for words usually written in kana). An entry Sudachi splits into
 an affix and one word (お菓子, 五つ) is keyed by that word. Set phrases that are
 not one word are left out. Each key is kept once, at its easiest level. The
