@@ -4263,8 +4263,7 @@ impl App {
                         RichText::new(value),
                         "against your Library: 50% is its median",
                         Some(&explain),
-                    )
-                    .on_hover_ui(explain);
+                    );
                 }
                 // Korean only: a Japanese book already has four tiles, and the
                 // coverage table below gives the same number.
@@ -4357,8 +4356,7 @@ impl App {
                             "no unknown words".to_owned()
                         },
                         Some(&explain_running),
-                    )
-                    .on_hover_ui(explain_running);
+                    );
                     // Writing style counts as a share of words known (Settings).
                     let counted = rw.percent() - style_off;
                     let d = Difficulty::from_percent(counted);
@@ -4424,8 +4422,7 @@ impl App {
                         RichText::new(d.label()).color(difficulty_color(d)),
                         &sub,
                         Some(&explain),
-                    )
-                    .on_hover_ui(explain);
+                    );
                 });
                 let anki_part = if has_chars {
                     format!(
@@ -5676,7 +5673,7 @@ impl App {
                         .hint_text("🔍 Search")
                         .desired_width(180.0),
                 )
-                .on_hover_text(self.shortcuts.hint(ctx, Action::Filter, LIBRARY_SEARCH_HOVER));
+                .on_hover_text(self.shortcuts.hint(ctx, Action::Filter, "Search the Library (ⓘ: how)"));
                 Self::focus_filter_box(&mut self.focus_filter, ui, &r, &self.library_filter);
                 if (r.has_focus() || r.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     self.library_filter.clear();

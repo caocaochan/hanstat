@@ -24,8 +24,9 @@ fn icon() {
 /// what is applied to the counts afterwards (Anki, known words, discovery,
 /// History, profiles, the reading path, series, the writing-style rating and
 /// the Library's stats and charts), the module list in `lib.rs`, and
-/// downloading (the model's identity is in the key), writing files and the
-/// window's colours. Anything not listed
+/// downloading (the model's identity is in the key), writing files, the
+/// window's colours, the settings file (read only by the windows and the CLI)
+/// and keyboard shortcuts. Anything not listed
 /// here, including a file added later, is part of the fingerprint.
 const NOT_ANALYSIS: &[&str] = &[
     "src/main.rs",
@@ -50,6 +51,8 @@ const NOT_ANALYSIS: &[&str] = &[
     "src/update.rs",
     "src/saver.rs",
     "src/palette.rs",
+    "src/settings.rs",
+    "src/shortcuts.rs",
 ];
 
 /// Bundled data that is not read by the analysis: licences, the
