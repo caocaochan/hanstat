@@ -1,0 +1,95 @@
+# hanstat as a Flatpak, released as hanstat-x86_64-linux.flatpak (see
+# .github/workflows/ci.yml). Built from this checkout:
+#
+#   flatpak-builder --user --install-deps-from=flathub --force-clean \
+#     --install build flatpak/io.github.caocaochan.hanstat.yml
+#
+# Not for Flathub: the build fetches crates over the network (build-args
+# below) instead of vendoring them, which Flathub's offline builders refuse.
+
+app-id: io.github.caocaochan.hanstat
+runtime: org.freedesktop.Platform
+runtime-version: '26.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: hanstat
+
+finish-args:
+  # Window: Wayland, or X11 where there is no Wayland. Files dropped on the
+  # window only arrive under X11 (winit 0.30 has no Wayland drag-and-drop):
+  # `flatpak override --user --nosocket=wayland --socket=x11
+  # io.github.caocaochan.hanstat` trades Wayland for drag-and-drop.
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri
+  # Downloading the segmentation models and SudachiDict on first use.
+  - --share=network
+  # Books are opened through the file chooser portal, but the Library
+  # reopens them by path and dropped files arrive as plain paths.
+  - --filesystem=home:ro
+  # Anki's collection, read from a copy: Anki itself, and Anki's Flatpak
+  # (other apps' ~/.var/app folders are hidden even with home access).
+  - --filesystem=xdg-data/Anki2:ro
+  - --filesystem=~/.var/app/net.ankiweb.Anki/data/Anki2:ro
+
+modules:
+  # Fonts with TrueType or CFF outlines that egui draws correctly, read by
+  # system_fonts() in src/main.rs from /app/share/hanstat/fonts.
+  - name: fonts
+    buildsystem: simple
+    build-commands:
+      - install -Dm644 -t /app/share/hanstat/fonts NotoSansCJKsc-Regular.otf PlangothicP1-Regular.ttf PlangothicP2-Regular.ttf
+      - install -Dm644 -t /app/share/licenses/io.github.caocaochan.hanstat LICENSE-NotoSansCJK.txt LICENSE-Plangothic.txt
+    sources:
+      # Noto Sans CJK SC 2.004: BMP CJK, kana, Hangul (SIL OFL 1.1).
+      - type: file
+        url: https://raw.githubusercontent.com/notofonts/noto-cjk/523d033d6cb47f4a80c58a35753646f5c3608a78/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf
+        sha256: 2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b
+      - type: file
+        url: https://raw.githubusercontent.com/notofonts/noto-cjk/523d033d6cb47f4a80c58a35753646f5c3608a78/LICENSE
+        sha256: 6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2
+        dest-filename: LICENSE-NotoSansCJK.txt
+      # Plangothic 2.9.5795: P1 has CJK Ext B–F, P2 Ext G–H (SIL OFL 1.1).
+      - type: file
+        url: https://github.com/Fitzgerald-Porthmouth-Koenigsegg/Plangothic-Project/releases/download/V2.9.5795/PlangothicP1-Regular.ttf
+        sha256: 550b5d0775b15405946b18f4843df439a51e69508d7e6778d94c1f7a53dc5ad6
+      - type: file
+        url: https://github.com/Fitzgerald-Porthmouth-Koenigsegg/Plangothic-Project/releases/download/V2.9.5795/PlangothicP2-Regular.ttf
+        sha256: 681933370adfe0fc7253f77735275a82fea09fe4f8adba907bdeb46c110daf8f
+      - type: file
+        url: https://raw.githubusercontent.com/Fitzgerald-Porthmouth-Koenigsegg/Plangothic-Project/V2.9.5795/LICENSE-OFL.txt
+        sha256: e564f06d018e7b95bc3594c96a17f1d41865af4038c375e7aa974dd69df38602
+        dest-filename: LICENSE-Plangothic.txt
+
+  - name: hanstat
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      build-args:
+        - --share=network
+      env:
+        CARGO_HOME: /run/build/hanstat/cargo
+    build-commands:
+      - cargo build --release --locked --bins
+      - install -Dm755 -t /app/bin target/release/hanstat target/release/hanstat-cli
+      - install -Dm644 -t /app/share/applications flatpak/io.github.caocaochan.hanstat.desktop
+      - install -Dm644 -t /app/share/metainfo flatpak/io.github.caocaochan.hanstat.metainfo.xml
+      - install -Dm644 assets/icon.png /app/share/icons/hicolor/256x256/apps/io.github.caocaochan.hanstat.png
+      - install -Dm644 -t /app/share/licenses/io.github.caocaochan.hanstat LICENSE-MIT LICENSE-APACHE
+      - install -Dm644 data/OpenCC-LICENSE.txt /app/share/licenses/io.github.caocaochan.hanstat/LICENSE-OpenCC-data.txt
+      - install -Dm644 data/HSK-LICENSE.txt /app/share/licenses/io.github.caocaochan.hanstat/LICENSE-HSK-data.txt
+      - install -Dm644 data/JLPT-LICENSE.txt /app/share/licenses/io.github.caocaochan.hanstat/LICENSE-JLPT-data.txt
+    sources:
+      - type: dir
+        path: ..
+        skip:
+          - target
+          - .models
+          - models
+          - dist
+          - .flatpak-builder
+          - flatpak_app
+          - build
+          - repo

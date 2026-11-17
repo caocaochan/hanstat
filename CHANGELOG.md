@@ -1,5 +1,17 @@
 # Changelog
 
+## [2026.11.17.3] - 2026-11-17
+
+### Added
+- **Linux.** Each release now has `hanstat-x86_64-linux.flatpak`, a Flatpak bundle built in the freedesktop 26.08 SDK (`flatpak/io.github.caocaochan.hanstat.yml`); install it with `flatpak install --user hanstat-x86_64-linux.flatpak`, and Flatpak fetches the runtime from Flathub. It isn't on Flathub.
+  - **Fonts.** No CJK font ships with every distribution, so the Flatpak brings its own: Noto Sans CJK SC (BMP CJK, kana, Hangul) and Plangothic P1 and P2 (Extensions B–F and G–H), all SIL OFL 1.1, about 49 MB. Noto's CFF outlines draw correctly in egui, unlike Apple's (checked on Noto Sans CJK SC 2.004). A build run from Cargo has none and uses the system's fonts through fontconfig.
+  - **Korean.** Kiwi's Linux library (x86-64 and aarch64, built for glibc 2.17) is downloaded with the model, as on Windows and macOS.
+  - **Anki** is found in `~/.local/share/Anki2` (or `$XDG_DATA_HOME/Anki2`), then in Anki's Flatpak (`~/.var/app/net.ankiweb.Anki/data/Anki2`). The Flatpak reads both, read-only.
+  - **Folders.** Settings and the Library go in `~/.local/share/hanstat`, the models and saved analyses in `~/.cache/hanstat` (in the Flatpak, under `~/.var/app/io.github.caocaochan.hanstat`). Windows and macOS are unchanged.
+  - **Updates.** The Flatpak doesn't update itself (its files are read-only); the version menu says to install the newer bundle.
+  - **Drag and drop** works under X11 but not under Wayland, where winit 0.30 doesn't deliver dropped files; the empty window then says to use **Open…** instead. The window has the Wayland app ID `io.github.caocaochan.hanstat`, matching its `.desktop` file.
+- CI tests every push on Linux too and builds the Flatpak; releases include it.
+
 ## [2026.11.17.2] - 2026-11-17
 
 ### Changed

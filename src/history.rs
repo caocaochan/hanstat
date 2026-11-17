@@ -1,6 +1,7 @@
 //! The books analysed before, with their headline statistics, for the
 //! History view. Kept in `%LOCALAPPDATA%\hanstat\history.json` (on macOS
-//! `~/Library/Application Support/hanstat/history.json`).
+//! `~/Library/Application Support/hanstat/history.json`, on Linux
+//! `~/.local/share/hanstat/history.json`; see [`crate::models::app_dir`]).
 //!
 //! A book is identified by the SHA-256 of its file, so a renamed or moved
 //! copy is still the same book; a file changed in place is recognised by its

@@ -1,8 +1,14 @@
 /target
-# Local model copies (the app downloads models to %LOCALAPPDATA%\hanstat\models;
+# Local model copies (the app downloads models to %LOCALAPPDATA%\hanstat\models,
+# on Linux ~/.cache/hanstat/models;
 # CI and local test runs use HANSTAT_MODEL_DIR=.models)
 /models/
 /.models/
 # macos/bundle.sh output
 /dist/
+# flatpak-builder state and output (flatpak/io.github.caocaochan.hanstat.yml)
+/.flatpak-builder/
+/flatpak_app/
+/build/
+/repo/
 *.part

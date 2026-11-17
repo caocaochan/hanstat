@@ -1,7 +1,7 @@
 //! Saved analysis results. Segmenting a book takes seconds (LTP, Kiwi,
 //! Sudachi) to minutes (CKIP); the outcome, the per-section counts of
-//! [`crate::analyze::analyze_book`], is kept in `%LOCALAPPDATA%\hanstat\cache`
-//! (override: `HANSTAT_CACHE_DIR`; off: `HANSTAT_NO_CACHE`) and read back the
+//! [`crate::analyze::analyze_book`], is kept in `cache` in
+//! [`crate::models::cache_dir`] (`%LOCALAPPDATA%\hanstat\cache`; override: `HANSTAT_CACHE_DIR`; off: `HANSTAT_NO_CACHE`) and read back the
 //! next time nothing it depends on has changed.
 //!
 //! An entry is found by the SHA-256 of everything the counts depend on:
@@ -297,7 +297,7 @@ impl Cache {
     pub fn default_dir() -> PathBuf {
         match std::env::var_os("HANSTAT_CACHE_DIR") {
             Some(d) => PathBuf::from(d),
-            None => crate::models::app_dir().join("cache"),
+            None => crate::models::cache_dir().join("cache"),
         }
     }
 

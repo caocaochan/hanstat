@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.caocaochan.hanstat</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <name>hanstat</name>
+  <summary>Character and word statistics for Chinese, Japanese and Korean books</summary>
+  <developer id="io.github.caocaochan">
+    <name>caocaochan</name>
+  </developer>
+  <description>
+    <p>
+      hanstat reads .epub and .txt files in Chinese, Japanese and Korean and counts their characters
+      and words: totals, unique and once-only characters and words, coverage, per-section breakdowns
+      and reading time.
+    </p>
+    <p>
+      It shows how much of a book your Anki cards and vocabulary levels (HSK, TOCFL, JLPT, Korean
+      1–6급) already cover, keeps a Library of the books analysed, and orders them into a reading
+      path that teaches the words each next book needs.
+    </p>
+    <p>
+      The word segmenters (LTP, CKIP, Kiwi, SudachiDict) are downloaded on first use.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.caocaochan.hanstat.desktop</launchable>
+  <url type="homepage">https://github.com/caocaochan/hanstat</url>
+  <url type="bugtracker">https://github.com/caocaochan/hanstat/issues</url>
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/caocaochan/hanstat/main/docs/screenshot.png</image>
+      <caption>The Overview tab for a Chinese novel</caption>
+    </screenshot>
+  </screenshots>
+  <provides>
+    <binary>hanstat</binary>
+    <binary>hanstat-cli</binary>
+  </provides>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <content_rating type="oars-1.1"/>
+</component>

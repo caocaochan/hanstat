@@ -1,8 +1,8 @@
 //! Segmentation models are not bundled (their licences differ from this
 //! project's). They are downloaded on first use from their official Hugging
 //! Face repositories or GitHub releases, pinned to an exact commit or release
-//! and verified by SHA-256, then cached in `%LOCALAPPDATA%\hanstat\models`
-//! (override: `HANSTAT_MODEL_DIR`). SudachiDict is the exception: it follows
+//! and verified by SHA-256, then cached in `models` in [`cache_dir`]
+//! (`%LOCALAPPDATA%\hanstat\models`; override: `HANSTAT_MODEL_DIR`). SudachiDict is the exception: it follows
 //! its newest GitHub release (see [`sudachi`]), verified by the SHA-256 that
 //! GitHub reports for the asset.
 
@@ -147,8 +147,8 @@ const KIWI_MODEL: ModelFile = ModelFile {
 };
 
 /// Kiwi's C library: this platform's release build and the file taken out of
-/// it. Only Windows x64 and macOS arm64 are wired up; elsewhere [`KIWI_LIB`]
-/// is `None` and Korean books can't be analysed.
+/// it. Only Windows x64, macOS arm64 and Linux x86_64/aarch64 are wired up;
+/// elsewhere [`KIWI_LIB`] is `None` and Korean books can't be analysed.
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod kiwi_lib {
     use super::*;
@@ -190,9 +190,56 @@ mod kiwi_lib {
     ];
 }
 
+/// Linux: Kiwi's manylinux2014 builds (glibc 2.17, libstdc++), which load on
+/// any current distribution and in the Flatpak runtime.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod kiwi_lib {
+    use super::*;
+    pub const NAME: Option<&str> = Some("libkiwi.so");
+    pub const FILES: &[ModelFile] = &[
+        ModelFile {
+            name: "kiwi_lnx_x86_64_v0.24.1.tgz",
+            url: kiwi_url!("kiwi_lnx_x86_64_v0.24.1.tgz"),
+            sha256: "534f3b507784ea0f2c26884a13c22f2bfa573f86b6c20b9856feb9050a88f47a",
+            size: 75_394_334,
+            // libkiwi.so and libkiwi.so.0 are symlinks to this file.
+            unpack: Unpack::TarGz(&[Member {
+                path: "lib/libkiwi.so.0.24.1",
+                name: "libkiwi.so",
+                size: 58_594_768,
+            }]),
+        },
+        KIWI_MODEL,
+    ];
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+mod kiwi_lib {
+    use super::*;
+    pub const NAME: Option<&str> = Some("libkiwi.so");
+    pub const FILES: &[ModelFile] = &[
+        ModelFile {
+            name: "kiwi_lnx_aarch64_v0.24.1.tgz",
+            url: kiwi_url!("kiwi_lnx_aarch64_v0.24.1.tgz"),
+            sha256: "ff15838604039130d24e2803ed87c2edc36665f9ff24be8a23b257c2860bc25b",
+            size: 34_868_989,
+            unpack: Unpack::TarGz(&[Member {
+                path: "lib/libkiwi.so.0.24.1",
+                name: "libkiwi.so",
+                size: 25_070_032,
+            }]),
+        },
+        KIWI_MODEL,
+    ];
+}
+
 #[cfg(not(any(
     all(windows, target_arch = "x86_64"),
-    all(target_os = "macos", target_arch = "aarch64")
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 )))]
 mod kiwi_lib {
     use super::*;
@@ -444,18 +491,40 @@ fn leak_sudachi_model(r: &SudachiRelease) -> &'static Model {
     }))
 }
 
-/// hanstat's per-user data folder (`%LOCALAPPDATA%\hanstat`, on macOS
-/// `~/Library/Application Support/hanstat`): models and saved settings.
+/// hanstat's per-user folder for saved settings and the Library
+/// (`%LOCALAPPDATA%\hanstat`, on macOS `~/Library/Application Support/hanstat`,
+/// on Linux `$XDG_DATA_HOME/hanstat`, normally `~/.local/share/hanstat`; in
+/// the Flatpak `~/.var/app/io.github.caocaochan.hanstat/data/hanstat`).
 pub fn app_dir() -> PathBuf {
-    let base = if cfg!(target_os = "macos") {
+    let base = if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
         std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support"))
     } else {
-        std::env::var_os("LOCALAPPDATA")
-            .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        xdg_dir("XDG_DATA_HOME", ".local/share")
     };
     base.unwrap_or_else(std::env::temp_dir).join("hanstat")
+}
+
+/// hanstat's per-user folder for what can be downloaded or made again: the
+/// models and the saved analyses. [`app_dir`] on Windows and macOS; on Linux
+/// `$XDG_CACHE_HOME/hanstat`, normally `~/.cache/hanstat`.
+pub fn cache_dir() -> PathBuf {
+    if cfg!(any(windows, target_os = "macos")) {
+        return app_dir();
+    }
+    xdg_dir("XDG_CACHE_HOME", ".cache")
+        .unwrap_or_else(std::env::temp_dir)
+        .join("hanstat")
+}
+
+/// An XDG base directory: `var` if it holds an absolute path (the spec says
+/// to ignore a relative one), else `~/<fallback>`.
+pub(crate) fn xdg_dir(var: &str, fallback: &str) -> Option<PathBuf> {
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(fallback)))
 }
 
 /// Root cache directory for all models.
@@ -463,7 +532,7 @@ pub fn cache_root() -> PathBuf {
     if let Some(d) = std::env::var_os("HANSTAT_MODEL_DIR") {
         return PathBuf::from(d);
     }
-    app_dir().join("models")
+    cache_dir().join("models")
 }
 
 impl Model {

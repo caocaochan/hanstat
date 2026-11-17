@@ -1,6 +1,7 @@
 //! Korean analysis with Kiwi (bab2min/Kiwi, Apache-2.0) through its C API.
 //!
-//! Kiwi's library (`kiwi.dll` on Windows, `libkiwi.dylib` on macOS) and the
+//! Kiwi's library (`kiwi.dll` on Windows, `libkiwi.dylib` on macOS,
+//! `libkiwi.so` on Linux) and the
 //! CoNg base model are downloaded on first use ([`crate::models::KIWI`]) and
 //! the library is loaded at run time, so building hanstat never needs Kiwi and
 //! the Chinese modes never load it.

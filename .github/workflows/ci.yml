@@ -1,10 +1,10 @@
 name: CI
 
-# Every push and pull request is tested on Windows and macOS, and both builds
-# are packaged and kept as workflow artifacts. On a push to main whose
-# Cargo.toml version has no tag yet, the publish job then tags yyyy.mm.dd.n
-# and publishes a release with both packages. Pushes that don't bump the
-# version are tested only.
+# Every push and pull request is tested on Windows, macOS and Linux, and
+# packaged for Windows, macOS and (as a Flatpak bundle) Linux, kept as
+# workflow artifacts. On a push to main whose Cargo.toml version has no tag
+# yet, the publish job then tags yyyy.mm.dd.n and publishes a release with the
+# three packages. Pushes that don't bump the version are tested only.
 
 on:
   push:
@@ -153,9 +153,54 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  linux:
+    name: Linux
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache segmentation models
+        uses: actions/cache@v6
+        with:
+          path: .models
+          key: models-${{ runner.os }}-${{ hashFiles('src/models.rs') }}
+
+      - name: Clippy
+        run: cargo clippy --release --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --release --locked
+
+  # The Linux release: flatpak/io.github.caocaochan.hanstat.yml built in the
+  # freedesktop SDK, as hanstat-x86_64-linux.flatpak (a fixed name, so
+  # .../releases/latest/download/hanstat-x86_64-linux.flatpak is a permanent
+  # link). The bundle names Flathub as the source of its runtime.
+  flatpak:
+    name: Flatpak
+    needs: version
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          manifest-path: flatpak/io.github.caocaochan.hanstat.yml
+          bundle: hanstat-x86_64-linux.flatpak
+          artifact-name: hanstat-x86_64-linux
+
   publish:
     name: Publish release
-    needs: [version, windows, macos]
+    needs: [version, windows, macos, linux, flatpak]
     if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-latest
     permissions:

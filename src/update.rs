@@ -112,8 +112,13 @@ struct ApiAsset {
 /// The release zip's asset name for this platform. It has no version in it,
 /// so `.../releases/latest/download/<this>` is a permanent link. Platforms
 /// without a release of their own never update (see [`disabled_reason`]).
+/// Linux has a Flatpak bundle instead, which Flatpak installs (see
+/// [`FLATPAK_BUNDLE`]); this name is never looked up there.
 #[cfg(not(target_os = "macos"))]
 const ZIP_NAME: &str = "hanstat-x86_64-pc-windows-msvc.zip";
+
+/// The Linux release: a Flatpak bundle, `.../releases/latest/download/<this>`.
+pub const FLATPAK_BUNDLE: &str = "hanstat-x86_64-linux.flatpak";
 #[cfg(target_os = "macos")]
 const ZIP_NAME: &str = "hanstat-aarch64-apple-darwin.zip";
 
@@ -251,6 +256,12 @@ pub fn exe_path() -> Result<&'static Path, String> {
 /// `target` folder, `HANSTAT_NO_UPDATE` set, or on macOS an exe that isn't
 /// inside an `.app` bundle or that macOS runs from a read-only copy.
 pub fn disabled_reason() -> Option<String> {
+    // The Flatpak's files are read-only and belong to Flatpak.
+    if cfg!(target_os = "linux") && std::env::var_os("FLATPAK_ID").is_some() {
+        return Some(format!(
+            "Installed as a Flatpak: updates are off. To update, download {FLATPAK_BUNDLE} from hanstat's GitHub releases page and open it."
+        ));
+    }
     if !HAS_RELEASE {
         return Some(
             "No release for this platform: updates are off. New versions are on hanstat's GitHub releases page."

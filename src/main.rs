@@ -68,6 +68,9 @@ fn main() -> eframe::Result {
             .with_inner_size([1180.0, 800.0])
             .with_min_inner_size([760.0, 520.0])
             .with_drag_and_drop(true)
+            // The Wayland app_id (ignored elsewhere), matching the Flatpak's
+            // .desktop file so the desktop shows its name and icon.
+            .with_app_id("io.github.caocaochan.hanstat")
             // Same image as the exe's icon resource (build.rs, assets/icon.ico).
             .with_icon(
                 eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
@@ -144,7 +147,7 @@ fn install_fonts(ctx: &egui::Context) {
 type SystemFont = (&'static str, &'static str, u32);
 
 /// Windows: the font folder and its CJK fonts.
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 fn system_fonts() -> (PathBuf, &'static [SystemFont]) {
     let dir = std::env::var_os("WINDIR")
         .map(PathBuf::from)
@@ -177,6 +180,39 @@ fn system_fonts() -> (PathBuf, &'static [SystemFont]) {
         ("apple-symbols", "Apple Symbols.ttf", 0),
     ];
     (PathBuf::from("/System/Library/Fonts"), candidates)
+}
+
+/// Linux: no CJK font comes with every distribution, so the Flatpak brings
+/// its own, in `share/hanstat/fonts` beside the exe's `bin` folder
+/// (`HANSTAT_FONT_DIR` overrides it). Noto Sans CJK SC has the BMP's CJK
+/// (Traditional too, in the Simplified forms, as YaHei on Windows), kana and
+/// Hangul; its CFF outlines draw correctly, unlike Apple's. Plangothic P1 has
+/// Ext B–F and P2 Ext G–H, as SimSun-ExtB and -ExtG on Windows. Without them
+/// (a build run from Cargo), CJK goes to eframe's system font provider.
+#[cfg(not(any(windows, target_os = "macos")))]
+fn system_fonts() -> (PathBuf, &'static [SystemFont]) {
+    let dir = std::env::var_os("HANSTAT_FONT_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let exe = std::env::current_exe().ok()?;
+            Some(exe.parent()?.parent()?.join("share/hanstat/fonts"))
+        })
+        .unwrap_or_default();
+    let candidates = &[
+        ("noto-sans-cjk-sc", "NotoSansCJKsc-Regular.otf", 0),
+        ("plangothic-p1", "PlangothicP1-Regular.ttf", 0), // Ext B–F
+        ("plangothic-p2", "PlangothicP2-Regular.ttf", 0), // Ext G–H
+    ];
+    (dir, candidates)
+}
+
+/// Whether files dropped on the window reach hanstat: not under Wayland on
+/// Linux, where winit 0.30 has no file drag-and-drop (X11 has). winit picks
+/// Wayland whenever one of these variables is set.
+fn drop_works() -> bool {
+    cfg!(any(windows, target_os = "macos"))
+        || (std::env::var_os("WAYLAND_DISPLAY").is_none()
+            && std::env::var_os("WAYLAND_SOCKET").is_none())
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Default)]
@@ -1886,8 +1922,10 @@ impl eframe::App for App {
                     }
                 } else if let Some(p) = &self.path {
                     ui.label(p.display().to_string());
-                } else {
+                } else if drop_works() {
                     ui.label("Open or drop an .epub or .txt file.");
+                } else {
+                    ui.label("Open an .epub or .txt file.");
                 }
                 if let Some(f) = &self.models {
                     if !f.finished.load(Ordering::Relaxed) {
@@ -1950,8 +1988,10 @@ impl eframe::App for App {
                     ui.label(
                         RichText::new(if self.job.is_some() || self.batch.is_some() {
                             "Analysing…"
-                        } else {
+                        } else if drop_works() {
                             "Drop .epub or .txt files here, or click Open…"
+                        } else {
+                            "Click Open… to choose .epub or .txt files"
                         })
                         .size(22.0)
                         .weak(),
@@ -3746,9 +3786,13 @@ impl App {
         if self.history.entries.is_empty() {
             ui.centered_and_justified(|ui| {
                 ui.label(
-                    RichText::new("No books analysed yet. Open or drop an .epub or .txt file.")
-                        .size(22.0)
-                        .weak(),
+                    RichText::new(if drop_works() {
+                        "No books analysed yet. Open or drop an .epub or .txt file."
+                    } else {
+                        "No books analysed yet. Open an .epub or .txt file."
+                    })
+                    .size(22.0)
+                    .weak(),
                 );
             });
             return;

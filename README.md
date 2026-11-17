@@ -5,7 +5,7 @@
 
 Character and word statistics for Chinese, Japanese and Korean `.epub` and `.txt` files: totals, unique and once-only characters and words, coverage, per-section breakdowns, reading time, and how much of the book your Anki cards and vocabulary levels already cover.
 
-Runs on Windows and macOS. The Mac app's font handling and self-updating are by [@linlin56](https://github.com/linlin56), from [#1](https://github.com/caocaochan/hanstat/pull/1).
+Runs on Windows, macOS and Linux. The Mac app's font handling and self-updating are by [@linlin56](https://github.com/linlin56), from [#1](https://github.com/caocaochan/hanstat/pull/1).
 
 ![hanstat's Overview tab for a Chinese novel: character and word totals, HSK 1–5 coverage and difficulty, composition, coverage table and word-length distribution](docs/screenshot.png)
 
@@ -28,13 +28,27 @@ The exe isn't code-signed, so SmartScreen may ask you to confirm the first run.
 
 The command-line tool is inside the app, at `hanstat.app/Contents/MacOS/hanstat-cli`. If Terminal refuses to run it, clear the download's quarantine flag once: `xattr -dr com.apple.quarantine /Applications/hanstat.app`.
 
+### Linux
+
+1. Download [`hanstat-x86_64-linux.flatpak`](https://github.com/caocaochan/hanstat/releases/latest/download/hanstat-x86_64-linux.flatpak) (x86-64).
+2. Install it with `flatpak install --user hanstat-x86_64-linux.flatpak`, or open it in your software centre. Flatpak fetches the freedesktop runtime from Flathub if it isn't installed yet.
+3. Start **hanstat** from your applications, or run `flatpak run io.github.caocaochan.hanstat`, and open a file.
+
+The Flatpak brings its own Chinese, Japanese and Korean fonts (Noto Sans CJK SC, and Plangothic for the rarer characters of Extensions B–H), so no CJK fonts need to be installed. It can read your home folder (read-only) and Anki's data, from Anki or Anki's Flatpak.
+
+Under Wayland, files dropped on the window don't reach hanstat; use **📂 Open…**. To drop files, run it under X11 instead: `flatpak override --user --nosocket=wayland --socket=x11 io.github.caocaochan.hanstat`.
+
+The command-line tool is `flatpak run --command=hanstat-cli io.github.caocaochan.hanstat`.
+
+hanstat isn't on Flathub.
+
 ### Updates
 
-The app updates itself; click the version number in the status bar to check now or turn automatic updates off. On macOS this needs `hanstat.app` moved out of the folder it was unzipped in, since macOS runs it from a read-only copy until then. The Mac release 2026.11.16.5 can't update itself; download a newer one once by hand.
+The app updates itself; click the version number in the status bar to check now or turn automatic updates off. On macOS this needs `hanstat.app` moved out of the folder it was unzipped in, since macOS runs it from a read-only copy until then. The Mac release 2026.11.16.5 can't update itself; download a newer one once by hand. On Linux, install the newer `.flatpak` the same way as the first.
 
 ### Data
 
-The analysers are downloaded on first use into `%LOCALAPPDATA%\hanstat\models` (macOS: `~/Library/Application Support/hanstat/models`): the Chinese models (LTP 32 MB, CKIP 46 MB) on first start, Kiwi (about 130 MB) with your first Korean book, and SudachiDict (about 137 MB) with your first Japanese book. Analyses are saved, so reopening a book is instant.
+The analysers are downloaded on first use into `%LOCALAPPDATA%\hanstat\models` (macOS: `~/Library/Application Support/hanstat/models`, Linux: `~/.cache/hanstat/models`, in the Flatpak `~/.var/app/io.github.caocaochan.hanstat/cache/hanstat/models`): the Chinese models (LTP 32 MB, CKIP 46 MB) on first start, Kiwi (about 130 MB, 165 MB on Linux) with your first Korean book, and SudachiDict (about 137 MB) with your first Japanese book. Analyses are saved, so reopening a book is instant. On Linux, the Library and settings are in `~/.local/share/hanstat` (Flatpak: `~/.var/app/io.github.caocaochan.hanstat/data/hanstat`), and the saved analyses with the models in `~/.cache/hanstat`.
 
 ## Languages
 
@@ -60,7 +74,7 @@ Click **📚 HSK & word lists** (Korean: **Levels**, Japanese: **JLPT**) to mark
 
 ## Library
 
-Click **📖 Library** to list every book you've analysed, with its cover: length, unique words, the share of running words you knew, difficulty and reading time. Click a column to sort, or a title to open the book again. Analysing a book again replaces its row; a book is recognised by its file's contents, so a renamed or moved copy is still the same book. The list is kept in `%LOCALAPPDATA%\hanstat\history.json` (macOS: `~/Library/Application Support/hanstat/history.json`), and small copies of the covers in `covers` next to it.
+Click **📖 Library** to list every book you've analysed, with its cover: length, unique words, the share of running words you knew, difficulty and reading time. Click a column to sort, or a title to open the book again. Analysing a book again replaces its row; a book is recognised by its file's contents, so a renamed or moved copy is still the same book. The list is kept in `%LOCALAPPDATA%\hanstat\history.json` (macOS: `~/Library/Application Support/hanstat/history.json`, Linux: `~/.local/share/hanstat/history.json`), and small copies of the covers in `covers` next to it.
 
 ## Reading path
 
@@ -96,8 +110,8 @@ hanstat-cli.exe --plan [--lang zh|ko|ja] [--target 95 | --learn N] [--incidental
 
 `--library` records a book in the Library as the window does, so books can be added from a script. `--plan` prints the reading path of the Library's books against the known words given; `--study-lists DIR` writes each book's study list.
 
-Run `hanstat-cli.exe --help` for all options. On macOS the CLI is `hanstat.app/Contents/MacOS/hanstat-cli`, and the app can be started with a file as `open -a hanstat --args "$PWD/file.epub"` (the path must be absolute).
+Run `hanstat-cli.exe --help` for all options. On macOS the CLI is `hanstat.app/Contents/MacOS/hanstat-cli`, and the app can be started with a file as `open -a hanstat --args "$PWD/file.epub"` (the path must be absolute). In the Linux Flatpak the app is `flatpak run io.github.caocaochan.hanstat [file...]` and the CLI `flatpak run --command=hanstat-cli io.github.caocaochan.hanstat`.
 
 ## Licence
 
-MIT or Apache-2.0, at your option. Bundled data: OpenCC (Apache-2.0); jieba dictionary (MIT); HSK list from the official syllabus via [ofou/hsk](https://github.com/ofou/hsk) (MIT); TOCFL list from [SC-TOP's 華語八千詞表](https://tocfl.edu.tw/tocfl/index.php/exam/download) (free download, no licence stated; only the words are bundled); JLPT list by Jonathan Waller (CC BY) with fixes from [stephenmk/yomitan-jlpt-vocab](https://github.com/stephenmk/yomitan-jlpt-vocab), CC BY-SA 4.0 (see `data/JLPT-LICENSE.txt`); Kaishi 1.5k headwords from [donkuri/Kaishi](https://github.com/donkuri/Kaishi) (no licence published); Korean levels from 국립국어원's [국제 통용 한국어 표준 교육과정 vocabulary list](https://www.korean.go.kr/front/reportData/reportDataView.do?mn_id=45&report_seq=932) (public work, Korean Copyright Act Art. 24-2). Downloaded models: [LTP](https://huggingface.co/LTP/legacy) is free for research and individual use (commercial use needs a licence from HIT-SCIR), [CKIP bert-tiny](https://huggingface.co/ckiplab/bert-tiny-chinese-ws) is GPL-3.0, [Kiwi](https://github.com/bab2min/Kiwi) and [SudachiDict](https://github.com/WorksApplications/SudachiDict) are Apache-2.0.
+MIT or Apache-2.0, at your option. Bundled data: OpenCC (Apache-2.0); jieba dictionary (MIT); HSK list from the official syllabus via [ofou/hsk](https://github.com/ofou/hsk) (MIT); TOCFL list from [SC-TOP's 華語八千詞表](https://tocfl.edu.tw/tocfl/index.php/exam/download) (free download, no licence stated; only the words are bundled); JLPT list by Jonathan Waller (CC BY) with fixes from [stephenmk/yomitan-jlpt-vocab](https://github.com/stephenmk/yomitan-jlpt-vocab), CC BY-SA 4.0 (see `data/JLPT-LICENSE.txt`); Kaishi 1.5k headwords from [donkuri/Kaishi](https://github.com/donkuri/Kaishi) (no licence published); Korean levels from 국립국어원's [국제 통용 한국어 표준 교육과정 vocabulary list](https://www.korean.go.kr/front/reportData/reportDataView.do?mn_id=45&report_seq=932) (public work, Korean Copyright Act Art. 24-2). Downloaded models: [LTP](https://huggingface.co/LTP/legacy) is free for research and individual use (commercial use needs a licence from HIT-SCIR), [CKIP bert-tiny](https://huggingface.co/ckiplab/bert-tiny-chinese-ws) is GPL-3.0, [Kiwi](https://github.com/bab2min/Kiwi) and [SudachiDict](https://github.com/WorksApplications/SudachiDict) are Apache-2.0. Fonts in the Linux Flatpak: [Noto Sans CJK](https://github.com/notofonts/noto-cjk) and [Plangothic](https://github.com/Fitzgerald-Porthmouth-Koenigsegg/Plangothic-Project), both SIL OFL 1.1.

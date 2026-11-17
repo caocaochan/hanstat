@@ -18,7 +18,7 @@
 //!
 //! The user's choice of collection, decks, note types and fields is saved per
 //! language: `%LOCALAPPDATA%\hanstat\anki.json` for Chinese, `anki-ko.json`
-//! for Korean and `anki-ja.json` for Japanese, next to the `models` folder.
+//! for Korean and `anki-ja.json` for Japanese, in [`crate::models::app_dir`].
 
 use crate::chars;
 use crate::lang::Language;
@@ -131,16 +131,40 @@ pub struct Profile {
 }
 
 /// Anki's data folder: `ANKI_BASE` if set (as Anki itself honours), else
-/// `%APPDATA%\Anki2`, on macOS `~/Library/Application Support/Anki2`.
+/// `%APPDATA%\Anki2`, on macOS `~/Library/Application Support/Anki2`, on
+/// Linux the first of [`linux_anki_bases`] that exists.
 pub fn anki_base() -> Option<PathBuf> {
     if let Some(b) = std::env::var_os("ANKI_BASE") {
         return Some(PathBuf::from(b));
     }
-    if cfg!(target_os = "macos") {
+    if cfg!(windows) {
+        std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("Anki2"))
+    } else if cfg!(target_os = "macos") {
         std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support/Anki2"))
     } else {
-        std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("Anki2"))
+        let bases = linux_anki_bases();
+        bases.iter().find(|b| b.is_dir()).or(bases.first()).cloned()
     }
+}
+
+/// Where Anki keeps its data on Linux: `$XDG_DATA_HOME/Anki2` (normally
+/// `~/.local/share/Anki2`), then Anki's Flatpak (`net.ankiweb.Anki`). In
+/// hanstat's own Flatpak `XDG_DATA_HOME` is hanstat's sandbox folder; the
+/// host's is in `HOST_XDG_DATA_HOME` when it was set.
+fn linux_anki_bases() -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let data = if std::env::var_os("FLATPAK_ID").is_some() {
+        std::env::var_os("HOST_XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| home.as_ref().map(|h| h.join(".local/share")))
+    } else {
+        crate::models::xdg_dir("XDG_DATA_HOME", ".local/share")
+    };
+    data.map(|d| d.join("Anki2"))
+        .into_iter()
+        .chain(home.map(|h| h.join(".var/app/net.ankiweb.Anki/data/Anki2")))
+        .collect()
 }
 
 /// Every profile folder that contains a `collection.anki2`.
