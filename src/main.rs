@@ -3718,11 +3718,11 @@ impl App {
             ui.add_space(8.0);
             ui.selectable_value(&mut self.history_tab, HistTab::Books, "Books")
                 .on_hover_text("Every book analysed, with its statistics");
-            ui.selectable_value(&mut self.history_tab, HistTab::Path, "🧭 Reading path")
+            ui.selectable_value(&mut self.history_tab, HistTab::Path, "Reading path")
                 .on_hover_text(
                     "An order to read the books in, where the words you study for one book make the next ones easier",
                 );
-            ui.selectable_value(&mut self.history_tab, HistTab::Stats, "📊 Stats")
+            ui.selectable_value(&mut self.history_tab, HistTab::Stats, "Stats")
                 .on_hover_text("The library as a whole: its size, its vocabulary and how much of it you know");
             ui.add_space(8.0);
             ui.label(

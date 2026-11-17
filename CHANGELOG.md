@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.17.2] - 2026-11-17
+
+### Changed
+- The Library's **Reading path** and **Stats** tabs no longer have icons, matching **Books**.
+
 ## [2026.11.17.1] - 2026-11-17
 
 ### Added

@@ -64,7 +64,7 @@ Click **📖 Library** to list every book you've analysed, with its cover: lengt
 
 ## Reading path
 
-**📖 Library → 🧭 Reading path** puts the analysed books of one language in an order to read them. Before each book you study some of its unknown words, until a share of its running words is known (95% by default) or a fixed number of them. Those words stay known for every book after it, so each book makes the next ones easier. For each book the table shows how much you know now, how much when the path reaches it, the words to study, what reading it next would take instead, and how many of its words the earlier books taught. **💾** saves a book's study list (word, tab, count) to import as a word list once learned, or to make Anki cards from.
+**📖 Library → Reading path** puts the analysed books of one language in an order to read them. Before each book you study some of its unknown words, until a share of its running words is known (95% by default) or a fixed number of them. Those words stay known for every book after it, so each book makes the next ones easier. For each book the table shows how much you know now, how much when the path reaches it, the words to study, what reading it next would take instead, and how many of its words the earlier books taught. **💾** saves a book's study list (word, tab, count) to import as a word list once learned, or to make Anki cards from.
 
 - **Which words.** A book's study words are weighed by how often the books still to come use them too (**Look ahead**, 2 by default), not only by their frequency in this book. On 69 novels from JJWXC, this cut the words studied in all by 20–26% against studying each book's most frequent unknown words, for learners knowing HSK 1–3, 1–5 or 1–9 with targets of 95% and 98%.
 - **Which order.** The longest study list is made as short as it can be, then the words studied in all. Against reading the easiest book first, the order matters less than the choice of words: on the same books (HSK 1–5, 95%) it needs 34,817 words with at most 3,859 before one book, where easiest-first needs 36,801 with at most 5,319.
@@ -77,7 +77,7 @@ Each book's words are kept in `profiles` next to `history.json`, about 100 KB pe
 
 ## Library stats
 
-**📖 Library → 📊 Stats** shows the library as a whole. At the top, every book of every language: books, characters, running words and reading time in all, the longest book, and a row per language with its average book and the share of running words known at each book's last analysis. Below, the books of one language measured against what you know now:
+**📖 Library → Stats** shows the library as a whole. At the top, every book of every language: books, characters, running words and reading time in all, the longest book, and a row per language with its average book and the share of running words known at each book's last analysis. Below, the books of one language measured against what you know now:
 
 - **Distinct words and characters** across all the books, how many words only one book uses and how many every book does, and how many of the most frequent words make up 95% and 98% of the whole library.
 - **Known now**: the share of the library's running words, distinct words and characters you know, and how many books are easy, moderate, challenging, hard or very hard for you.
