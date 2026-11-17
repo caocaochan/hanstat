@@ -677,10 +677,11 @@ impl Tab {
 
 /// What a Library row in a language is computed from besides its book, its
 /// sections and its segmenter ([`App::lang_inputs`]), as two digests:
-/// `analysis` changes the counts (the build, the user dictionary, the known
-/// words given to the segmenter, character folding); `coverage` changes only
-/// what is known of them (the known words, the hapax setting). A row whose
-/// analysis digest is current is updated from its saved word data alone.
+/// `analysis` changes the counts (the build, the user dictionary, the word
+/// lists given to a Chinese segmenter, character folding); `coverage` changes
+/// only what is known of them (the build's coverage code, the known words,
+/// the hapax setting). A row whose analysis digest is current is updated
+/// from its saved word data alone.
 #[derive(Clone, PartialEq, Debug)]
 struct Inputs {
     analysis: String,
@@ -6576,13 +6577,20 @@ impl App {
         for w in user_words {
             text(&mut h, w);
         }
-        let seg = known.settings.segmenter_words();
+        // Word lists join the segmenter's tokens in Chinese only: Kiwi and
+        // Sudachi return dictionary forms, and the analysis drops them.
+        let seg = if lang == Language::Chinese {
+            known.settings.segmenter_words()
+        } else {
+            Vec::new()
+        };
         h.update((seg.len() as u64).to_le_bytes());
         for w in &seg {
             text(&mut h, w);
         }
         let analysis = hex(h);
         let mut h = Sha256::new();
+        text(&mut h, env!("HANSTAT_COVERAGE_FINGERPRINT"));
         h.update([u8::from(self.settings.skip_hapax)]);
         text(&mut h, &knowledge);
         let inputs = Inputs {

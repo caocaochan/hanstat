@@ -25,14 +25,15 @@ fn icon() {
 /// History, profiles, the reading path, series, the writing-style rating and
 /// the Library's stats and charts), the module list in `lib.rs`, and
 /// downloading (the model's identity is in the key), writing files, the
-/// window's colours, the settings file (read only by the windows and the CLI)
-/// and keyboard shortcuts. Anything not listed
+/// window's colours, the settings file (read only by the windows and the CLI),
+/// keyboard shortcuts and the Library's search. Anything not listed
 /// here, including a file added later, is part of the fingerprint.
 const NOT_ANALYSIS: &[&str] = &[
     "src/main.rs",
     "src/lib.rs",
     "src/bin",
     "src/history.rs",
+    "src/history",
     "src/profile.rs",
     "src/plan.rs",
     "src/plan",
@@ -53,6 +54,7 @@ const NOT_ANALYSIS: &[&str] = &[
     "src/palette.rs",
     "src/settings.rs",
     "src/shortcuts.rs",
+    "src/search.rs",
 ];
 
 /// Bundled data that is not read by the analysis: licences, the
@@ -123,44 +125,65 @@ fn analysis_fingerprint() {
     println!("cargo:rustc-env=HANSTAT_ANALYSIS_FINGERPRINT={:016x}", h.0);
 
     // `HANSTAT_LIBRARY_FINGERPRINT`: the analysis plus what turns it into a
-    // Library row (known-word coverage, discovered names, the row and word
-    // data themselves, and the word lists). A Library row recorded by a
-    // build with another one is analysed again in the background.
+    // Library row (the text, discovered names, the row and its word data).
+    // A Library row recorded by a build with another one is analysed again
+    // in the background.
     let mut lib = Fnv::new();
     lib.item(format!("{:016x}", h.0).as_bytes());
-    let mut extra = Vec::new();
-    for p in LIBRARY_SOURCES {
+    hash_files(&mut lib, LIBRARY_SOURCES);
+    println!("cargo:rustc-env=HANSTAT_LIBRARY_FINGERPRINT={:016x}", lib.0);
+
+    // `HANSTAT_COVERAGE_FINGERPRINT`: how a row's known-word shares are
+    // worked out from its word data. A row recorded by a build with another
+    // one is updated from its saved word data, without analysing the book.
+    let mut cov = Fnv::new();
+    hash_files(&mut cov, COVERAGE_SOURCES);
+    println!(
+        "cargo:rustc-env=HANSTAT_COVERAGE_FINGERPRINT={:016x}",
+        cov.0
+    );
+}
+
+/// Sources and data outside the analysis fingerprint that still change a
+/// Library row's counts or word data for the same book and settings.
+///
+/// Not here: the known words (`known.rs`, the vocabulary lists, Anki), which
+/// reach a row as content, the words themselves being hashed with its inputs
+/// (`App::lang_inputs`); and the coverage, in [`COVERAGE_SOURCES`].
+const LIBRARY_SOURCES: &[&str] = &[
+    "src/extract",
+    "src/discover.rs",
+    "data/CEDICT-words.txt",
+    "src/history/row.rs",
+    "src/profile.rs",
+];
+
+/// What turns a row's word data and the known words into its known-word
+/// shares (`BookCoverage::compute`, `history::Known`).
+const COVERAGE_SOURCES: &[&str] = &["src/anki.rs", "src/history/coverage.rs"];
+
+/// Hash these files (directories: every file under them), in name order.
+fn hash_files(h: &mut Fnv, paths: &[&str]) {
+    let mut files = Vec::new();
+    for p in paths {
         let p = Path::new(p);
         if p.is_dir() {
-            walk(p, &mut extra);
+            walk(p, &mut files);
         } else {
-            extra.push(p.to_path_buf());
+            files.push(p.to_path_buf());
         }
     }
-    extra.extend(NOT_ANALYSIS_DATA.iter().map(PathBuf::from));
-    let mut extra: Vec<(String, PathBuf)> = extra
+    let mut files: Vec<(String, PathBuf)> = files
         .into_iter()
         .map(|p| (p.to_string_lossy().replace('\\', "/"), p))
         .collect();
-    extra.sort();
-    for (name, path) in &extra {
+    files.sort();
+    for (name, path) in &files {
         let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{name}: {e}"));
-        lib.item(name.as_bytes());
-        lib.item(&bytes);
+        h.item(name.as_bytes());
+        h.item(&bytes);
     }
-    println!("cargo:rustc-env=HANSTAT_LIBRARY_FINGERPRINT={:016x}", lib.0);
 }
-
-/// Sources outside the analysis fingerprint that still change a Library row
-/// for the same book and settings.
-const LIBRARY_SOURCES: &[&str] = &[
-    "src/extract",
-    "src/anki.rs",
-    "src/known.rs",
-    "src/discover.rs",
-    "src/history.rs",
-    "src/profile.rs",
-];
 
 fn read(path: &str) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"))

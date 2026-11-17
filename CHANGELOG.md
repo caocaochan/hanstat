@@ -1,5 +1,18 @@
 # Changelog
 
+## [2026.11.17.14] - 2026-11-17
+
+### Changed
+- **The Library analyses its books again only when their counts can change.** It used to also do so when:
+  - **a Korean or Japanese word list was imported or changed**: lists only join the segmenter's tokens in Chinese books, so those books' counts never changed;
+  - **a release changed the known-word lists' code or the bundled HSK, TOCFL, Korean, JLPT or Kaishi lists**: which words you know already updates the rows from their saved word data;
+  - **a release changed how the Library is saved or shown**: 2026.11.17.9 analysed every book again for making one date function public;
+  - **a release changed the Library's search**, which also threw away the saved analyses, so books opened slowly once again.
+
+  A release that changes how known-word shares are worked out now updates the rows from their saved word data (milliseconds a book) instead of analysing every book again.
+
+  This release itself analyses the Library once more in the background.
+
 ## [2026.11.17.13] - 2026-11-17
 
 ### Fixed
