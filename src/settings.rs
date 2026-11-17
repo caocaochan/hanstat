@@ -2,6 +2,7 @@
 //! [`crate::models::app_dir`].
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -26,6 +27,9 @@ pub struct Settings {
     pub ja_cpm: f32,
     /// Korean: words per minute (as counted: content words).
     pub wpm: f32,
+    /// Keyboard shortcuts changed from their defaults, by action, as
+    /// `Ctrl+Shift+K` (empty: none). Read by the app's `shortcuts` module.
+    pub shortcuts: BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -37,6 +41,7 @@ impl Default for Settings {
             cpm: 300.0,
             ja_cpm: 300.0,
             wpm: 100.0,
+            shortcuts: BTreeMap::new(),
         }
     }
 }

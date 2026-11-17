@@ -37,11 +37,6 @@ Deciding whether 简言 is a name, or whether to mark a word known, is hard
 without context. The book is in memory (`Arc<Book>`), so finding them is cheap.
 A right-click menu with Copy and a dictionary lookup would fit with it.
 
-### Keyboard shortcuts
-
-Only the Words tab's arrows/A and Esc in the Library search exist. Useful:
-Ctrl+O open, Ctrl+F focus the current tab's filter, Ctrl+1…6 the book's tabs,
-Ctrl+L the Library, Esc to close the floating windows.
 
 ### The same 📖 icon for two things
 

@@ -2,6 +2,10 @@
 
 ## [2026.11.17.12] - 2026-11-17
 
+### Added
+- **Keyboard shortcuts.** **Ctrl+O** opens books, **Ctrl+L** shows or hides the Library, **Ctrl+F** goes to the search box: the Characters or Words tab's filter (from the other tabs, the Words tab's), or the Library's search in the Library or with no book open, with its text selected so that typing replaces it. **Ctrl+1**–**Ctrl+6** show the book's tabs (also from the Library), **Ctrl+Page Down** and **Ctrl+Page Up** the next and previous tab (the Library's while it is shown). **Ctrl+K** opens the Known words window, **Ctrl+Shift+K** Anki, **Ctrl+D** Forced words, **Ctrl+,** Settings, and **Esc** closes the window in front. In the Words tab, **Ctrl+C** copies the selected word. Buttons, tabs and search boxes show their shortcut in their hover text. Keys without Ctrl or Alt (Esc, A) do nothing while you type in a text box: there Esc first leaves the box.
+- **Change the shortcuts** in ⚙ → **Keyboard shortcuts**: click one and press the new keys (Esc keeps the old ones), ✖ for none, ⟲ for the default, or **Reset all**. Keys another action had are taken from it, with a note saying so; keys that move between or through things (Tab, the arrows, Page Up/Down, Home, End, Enter, Space) or edit text (Ctrl+A, Ctrl+Z, Ctrl+Y) are refused. The Words tab's **A** (mark known) can be changed too. Only the shortcuts you change are saved, in `settings.json`, so the others follow new defaults; a new default never takes keys you chose.
+
 ### Fixed
 - **The status bar no longer grows to fill the window.** In 2026.11.17.11 it could slide up over the content when the pointer passed over it, and stay there: its layout could take the window's whole height, so its separators and centred items grew with every redraw. It is one line high again, and takes a second or third line only when what it shows doesn't fit (in a narrow window, while books are analysed).
 

@@ -28,9 +28,11 @@ mod charts;
 mod library_stats;
 mod palette;
 mod read_books;
+mod shortcuts;
 mod style_scale;
 
 use library_stats::StatsState;
+use shortcuts::{Action, Shortcuts};
 use style_scale::StyleScale;
 
 fn main() -> eframe::Result {
@@ -122,6 +124,7 @@ fn main() -> eframe::Result {
             app.library_hide_read = ui.library_hide_read;
             app.char_sort = ui.char_sort;
             app.word_sort = ui.word_sort;
+            app.shortcuts = Shortcuts::from_saved(&app.settings.shortcuts);
             app.models = fetch_models(&cc.egui_ctx);
             app.updater.start(&cc.egui_ctx);
             app.anki_init(&cc.egui_ctx);
@@ -607,6 +610,69 @@ struct App {
     /// [`App::lang_inputs`] by language, with a quick hash of what they were
     /// made from and the known words they were made with.
     inputs_memo: HashMap<Language, (u64, Option<Arc<anki::Knowledge>>, Inputs)>,
+    /// Keyboard shortcuts ([`shortcuts`]), from `settings.shortcuts`.
+    shortcuts: Shortcuts,
+    /// The action whose new keys are being chosen in the Settings window,
+    /// and what came of the last choice (keys refused, or taken from another action).
+    shortcut_capture: Option<Action>,
+    shortcut_note: Option<String>,
+    /// Focus the filter (or the Library's search) when it is next drawn.
+    focus_filter: bool,
+    /// A text box had the keyboard last frame: Esc, which egui has already
+    /// taken it from by now, left the box and closes nothing.
+    typing_before: bool,
+    /// The floating windows open, in the order they were opened.
+    window_stack: Vec<Win>,
+}
+
+/// The floating windows, which the Close-window shortcut closes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Win {
+    Anki,
+    Known,
+    Forced,
+    Settings,
+    Read,
+}
+
+impl Win {
+    const ALL: [Win; 5] = [Win::Anki, Win::Known, Win::Forced, Win::Settings, Win::Read];
+
+    /// Its layer: the id given to its `egui::Window`.
+    fn layer(self) -> egui::LayerId {
+        let id = egui::Id::unique(match self {
+            Win::Anki => "anki-window",
+            Win::Known => "known-window",
+            Win::Forced => "forced-window",
+            Win::Settings => "settings-window",
+            Win::Read => "read_dialog",
+        });
+        egui::LayerId::new(egui::Order::Middle, id)
+    }
+}
+
+/// The book's tabs, in order.
+const TABS: [(Tab, &str); 6] = [
+    (Tab::Overview, "Overview"),
+    (Tab::Characters, "Characters"),
+    (Tab::Words, "Words"),
+    (Tab::Sections, "Sections"),
+    (Tab::Suggestions, "Suggested words"),
+    (Tab::Notes, "Notes & method"),
+];
+
+impl Tab {
+    /// The shortcut that shows it.
+    fn action(self) -> Action {
+        match self {
+            Tab::Overview => Action::Overview,
+            Tab::Characters => Action::Characters,
+            Tab::Words => Action::Words,
+            Tab::Sections => Action::Sections,
+            Tab::Suggestions => Action::Suggestions,
+            Tab::Notes => Action::Notes,
+        }
+    }
 }
 
 /// What a Library row in a language is computed from besides its book, its
@@ -1176,6 +1242,12 @@ impl Default for App {
             auto_fit: true,
             last_inner: None,
             inputs_memo: HashMap::new(),
+            shortcuts: Shortcuts::default(),
+            shortcut_capture: None,
+            shortcut_note: None,
+            focus_filter: false,
+            typing_before: false,
+            window_stack: Vec::new(),
         }
     }
 }
@@ -2419,6 +2491,8 @@ impl App {
                 .small(),
             );
             ui.separator();
+            self.shortcuts_ui(ui);
+            ui.separator();
             ui.strong("Writing style");
             let supported = style::supported();
             let mut on = self.settings.writing_style;
@@ -2755,20 +2829,17 @@ impl eframe::App for App {
         if !dropped.is_empty() {
             self.open_files(dropped, &ctx);
         }
+        self.handle_shortcuts(&ctx);
 
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 if ui
                     .button("📂 Open…")
-                    .on_hover_text("Open a book, or select several: each is analysed and added to the Library, and the last one is shown")
+                    .on_hover_text(self.shortcuts.hint(&ctx, Action::Open, "Open a book, or select several: each is analysed and added to the Library, and the last one is shown"))
                     .clicked()
-                    && let Some(files) = rfd::FileDialog::new()
-                        .add_filter("E-books and text", &["epub", "txt", "text"])
-                        .add_filter("All files", &["*"])
-                        .pick_files()
                 {
-                    self.open_files(files, &ctx);
+                    self.open_dialog(&ctx);
                 }
                 ui.separator();
                 ui.label("Segmenter:");
@@ -2798,7 +2869,7 @@ impl eframe::App for App {
                     };
                     if ui
                         .selectable_label(self.forced_window, format!("📖 {} forced words", self.user_words.len()))
-                        .on_hover_text(hover)
+                        .on_hover_text(self.shortcuts.hint(&ctx, Action::ForcedWords, hover))
                         .clicked()
                     {
                         self.forced_window = !self.forced_window;
@@ -2815,13 +2886,10 @@ impl eframe::App for App {
                 };
                 if ui
                     .selectable_label(self.anki.window, anki_label)
-                    .on_hover_text("Compare the book with your Anki cards (young and mature)")
+                    .on_hover_text(self.shortcuts.hint(&ctx, Action::Anki, "Compare the book with your Anki cards (young and mature)"))
                     .clicked()
                 {
-                    self.anki.window = !self.anki.window;
-                    if self.anki.window && self.anki.col.is_none() && self.anki.rx.is_none() {
-                        self.anki_open_default(&ctx);
-                    }
+                    self.toggle_anki(&ctx);
                 }
 
                 let is_txt = self.book.as_ref().is_some_and(|b| b.format == "TXT");
@@ -2903,7 +2971,7 @@ impl eframe::App for App {
                 };
                 if ui
                     .selectable_label(self.known.window, label)
-                    .on_hover_text(hover)
+                    .on_hover_text(self.shortcuts.hint(&ctx, Action::KnownWords, hover))
                     .clicked()
                 {
                     self.known.window = !self.known.window;
@@ -2915,7 +2983,7 @@ impl eframe::App for App {
                         self.show_history,
                         format!("📖 Library ({})", self.history.entries.len()),
                     )
-                    .on_hover_text("Every book analysed before, with its statistics, and a reading path through them")
+                    .on_hover_text(self.shortcuts.hint(&ctx, Action::Library, "Every book analysed before, with its statistics, and a reading path through them"))
                     .clicked()
                 {
                     self.show_history = !self.show_history;
@@ -2939,7 +3007,7 @@ impl eframe::App for App {
                 self.version_menu(ui, &ctx);
                 if ui
                     .selectable_label(self.settings_window, RichText::new("⚙").weak())
-                    .on_hover_text("Settings")
+                    .on_hover_text(self.shortcuts.hint(&ctx, Action::Settings, "Settings, keyboard shortcuts"))
                     .clicked()
                 {
                     self.settings_window = !self.settings_window;
@@ -3066,31 +3134,19 @@ impl eframe::App for App {
                 });
                 return;
             }
-            // A Korean book has word statistics only; Korean and Japanese
-            // books have no suggested words.
-            let lang = self.report.as_ref().map(|r| r.language);
-            let korean = lang == Some(Language::Korean);
-            let no_suggestions = lang.is_some_and(|l| l != Language::Chinese);
-            let hidden = |t: Tab| {
-                (korean && t == Tab::Characters) || (no_suggestions && t == Tab::Suggestions)
-            };
-            if hidden(self.tab) {
+            if self.tab_hidden(self.tab) {
                 self.tab = Tab::Overview;
             }
             let tab_before = self.tab;
             ui.horizontal(|ui| {
-                for (t, name) in [
-                    (Tab::Overview, "Overview"),
-                    (Tab::Characters, "Characters"),
-                    (Tab::Words, "Words"),
-                    (Tab::Sections, "Sections"),
-                    (Tab::Suggestions, "Suggested words"),
-                    (Tab::Notes, "Notes & method"),
-                ] {
-                    if hidden(t) {
+                for (t, name) in TABS {
+                    if self.tab_hidden(t) {
                         continue;
                     }
-                    ui.selectable_value(&mut self.tab, t, RichText::new(name).size(15.0));
+                    let r = ui.selectable_value(&mut self.tab, t, RichText::new(name).size(15.0));
+                    if let Some(k) = self.shortcuts.text(&ctx, t.action()) {
+                        r.on_hover_text(k);
+                    }
                 }
             });
             // Marking words or importing lists changes how the book is
@@ -3125,6 +3181,312 @@ impl eframe::App for App {
             self.settings_window(&ctx);
         }
         self.read_window(&ctx);
+        // Asked for but not drawn (no filter shown): not kept for later.
+        self.focus_filter = false;
+        self.typing_before = ctx.text_edit_focused();
+    }
+}
+
+impl App {
+    /// Keyboard shortcuts pressed this frame, before anything is drawn; or,
+    /// while new keys are being chosen in the Settings window, those keys.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        let open: Vec<Win> = Win::ALL.into_iter().filter(|&w| self.win_open(w)).collect();
+        self.window_stack.retain(|w| open.contains(w));
+        for w in open {
+            if !self.window_stack.contains(&w) {
+                self.window_stack.push(w);
+            }
+        }
+        if let Some(a) = self.shortcut_capture {
+            if !self.settings_window {
+                self.shortcut_capture = None;
+            } else {
+                match shortcuts::capture(ctx) {
+                    shortcuts::Captured::Waiting => return,
+                    shortcuts::Captured::Cancel => self.shortcut_note = None,
+                    shortcuts::Captured::Refused(why) => {
+                        self.shortcut_note = Some(format!("{why} Choose other keys."));
+                        return;
+                    }
+                    shortcuts::Captured::Keys(k) => {
+                        self.shortcut_note = self.shortcuts.set(a, Some(k)).map(|b| {
+                            format!(
+                                "{} was taken from “{}”, which now has none.",
+                                shortcuts::display(ctx, k),
+                                b.label()
+                            )
+                        });
+                        self.save_shortcuts();
+                    }
+                }
+                self.shortcut_capture = None;
+                return;
+            }
+        }
+        let typing = self.typing_before || ctx.text_edit_focused();
+        let plain_blocked = typing || egui::Popup::is_any_open(ctx);
+        for a in self.shortcuts.pressed(ctx, plain_blocked) {
+            self.run_action(a, ctx);
+        }
+    }
+
+    fn save_shortcuts(&mut self) {
+        self.settings.shortcuts = self.shortcuts.to_saved();
+        if let Err(e) = self.settings.save() {
+            self.set_error("settings", e);
+        }
+    }
+
+    fn run_action(&mut self, a: Action, ctx: &egui::Context) {
+        match a {
+            Action::Open => self.open_dialog(ctx),
+            Action::Library => self.show_history = !self.show_history,
+            Action::Filter => {
+                if self.show_history || self.report.is_none() {
+                    self.show_history = true;
+                    if self.history_tab == HistTab::Stats {
+                        self.history_tab = HistTab::Books;
+                    }
+                } else if !matches!(self.tab, Tab::Characters | Tab::Words) {
+                    self.switch_tab(Tab::Words, ctx);
+                }
+                self.focus_filter = true;
+            }
+            Action::NextTab | Action::PrevTab => {
+                let next = a == Action::NextTab;
+                if self.show_history {
+                    const H: [HistTab; 3] = [HistTab::Books, HistTab::Path, HistTab::Stats];
+                    let i = H.iter().position(|&t| t == self.history_tab).unwrap_or(0);
+                    self.history_tab = H[(i + if next { 1 } else { H.len() - 1 }) % H.len()];
+                } else if self.report.is_some() {
+                    let step = if next { 1 } else { TABS.len() - 1 };
+                    let mut i = TABS.iter().position(|&(t, _)| t == self.tab).unwrap_or(0);
+                    // The Overview is never hidden, so this ends.
+                    loop {
+                        i = (i + step) % TABS.len();
+                        if !self.tab_hidden(TABS[i].0) {
+                            break;
+                        }
+                    }
+                    self.switch_tab(TABS[i].0, ctx);
+                }
+            }
+            Action::KnownWords => self.known.window = !self.known.window,
+            Action::Anki => self.toggle_anki(ctx),
+            Action::ForcedWords => self.forced_window = !self.forced_window,
+            Action::Settings => self.settings_window = !self.settings_window,
+            Action::CloseWindow => self.close_front_window(ctx),
+            // Handled by the Words table.
+            Action::MarkKnown => {}
+            Action::Overview
+            | Action::Characters
+            | Action::Words
+            | Action::Sections
+            | Action::Suggestions
+            | Action::Notes => {
+                if let Some(&(t, _)) = TABS.iter().find(|(t, _)| t.action() == a)
+                    && self.report.is_some()
+                    && !self.tab_hidden(t)
+                {
+                    self.show_history = false;
+                    self.switch_tab(t, ctx);
+                }
+            }
+        }
+    }
+
+    /// Show a book tab. Marking words or importing lists changes how the
+    /// book is segmented; it's redone on returning to the Overview, not per click.
+    fn switch_tab(&mut self, t: Tab, ctx: &egui::Context) {
+        let before = std::mem::replace(&mut self.tab, t);
+        if t == Tab::Overview && before != Tab::Overview && self.known_resegment_due() {
+            self.rerun(ctx, false);
+        }
+    }
+
+    /// A Korean book has word statistics only; Korean and Japanese books have
+    /// no suggested words.
+    fn tab_hidden(&self, t: Tab) -> bool {
+        let lang = self.report.as_ref().map(|r| r.language);
+        (lang == Some(Language::Korean) && t == Tab::Characters)
+            || (lang.is_some_and(|l| l != Language::Chinese) && t == Tab::Suggestions)
+    }
+
+    fn win_open(&self, w: Win) -> bool {
+        match w {
+            Win::Anki => self.anki.window,
+            Win::Known => self.known.window,
+            Win::Forced => self.forced_window,
+            Win::Settings => self.settings_window,
+            Win::Read => self.read_dialog.is_some(),
+        }
+    }
+
+    /// Close the floating window in front: the one egui has on top, or else
+    /// the one opened last.
+    fn close_front_window(&mut self, ctx: &egui::Context) {
+        let top = ctx.top_layer_id();
+        let w = Win::ALL
+            .into_iter()
+            .find(|&w| self.win_open(w) && Some(w.layer()) == top)
+            .or_else(|| self.window_stack.last().copied());
+        match w {
+            Some(Win::Anki) => self.anki.window = false,
+            Some(Win::Known) => self.known.window = false,
+            Some(Win::Forced) => self.forced_window = false,
+            Some(Win::Settings) => self.settings_window = false,
+            Some(Win::Read) => self.read_dialog = None,
+            None => {}
+        }
+    }
+
+    fn toggle_anki(&mut self, ctx: &egui::Context) {
+        self.anki.window = !self.anki.window;
+        if self.anki.window && self.anki.col.is_none() && self.anki.rx.is_none() {
+            self.anki_open_default(ctx);
+        }
+    }
+
+    fn open_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(files) = rfd::FileDialog::new()
+            .add_filter("E-books and text", &["epub", "txt", "text"])
+            .add_filter("All files", &["*"])
+            .pick_files()
+        {
+            self.open_files(files, ctx);
+        }
+    }
+
+    /// Focus a filter box just drawn, if asked to ([`App::focus_filter`]),
+    /// with its text selected so that typing replaces it.
+    fn focus_filter_box(asked: &mut bool, ui: &egui::Ui, r: &egui::Response, text: &str) {
+        if std::mem::take(asked) {
+            r.request_focus();
+            let mut state = egui::TextEdit::load_state(ui.ctx(), r.id).unwrap_or_default();
+            state
+                .cursor
+                .set_char_range(Some(egui::text_selection::CCursorRange::select_all_str(
+                    text,
+                )));
+            egui::TextEdit::store_state(ui.ctx(), r.id, state);
+        }
+    }
+
+    /// The Keyboard shortcuts section of the Settings window.
+    fn shortcuts_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let shown = egui::CollapsingHeader::new("Keyboard shortcuts")
+            .id_salt("shortcuts")
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Click a shortcut, then press the new keys (Esc keeps the old ones). \
+                         Keys without Ctrl or Alt do nothing while you type in a text box.",
+                    )
+                    .weak()
+                    .small(),
+                );
+                // Taller than the rest of the window: it scrolls.
+                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                egui::Grid::new("shortcut-grid")
+                    .num_columns(3)
+                    .spacing([12.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for a in Action::ALL {
+                            let r = ui.label(a.label());
+                            if let Some(h) = a.hover() {
+                                r.on_hover_text(h);
+                            }
+                            let capturing = self.shortcut_capture == Some(a);
+                            let text = if capturing {
+                                RichText::new("Press keys…").italics()
+                            } else {
+                                match self.shortcuts.text(&ctx, a) {
+                                    Some(k) => RichText::new(k),
+                                    None => RichText::new("none").weak(),
+                                }
+                            };
+                            if ui
+                                .add(
+                                    egui::Button::new(text)
+                                        .selected(capturing)
+                                        .min_size(egui::vec2(110.0, 0.0)),
+                                )
+                                .on_hover_text(if capturing {
+                                    "Press the new keys; Esc keeps the old ones"
+                                } else {
+                                    "Change"
+                                })
+                                .clicked()
+                            {
+                                self.shortcut_capture = if capturing { None } else { Some(a) };
+                                self.shortcut_note = None;
+                            }
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(
+                                        self.shortcuts.get(a).is_some(),
+                                        egui::Button::new("✖").small(),
+                                    )
+                                    .on_hover_text("No keys")
+                                    .clicked()
+                                {
+                                    self.shortcuts.set(a, None);
+                                    self.shortcut_capture = None;
+                                    self.shortcut_note = None;
+                                    self.save_shortcuts();
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !self.shortcuts.is_default(a),
+                                        egui::Button::new("⟲").small(),
+                                    )
+                                    .on_hover_text("Back to the default")
+                                    .clicked()
+                                {
+                                    let d = Shortcuts::default().get(a);
+                                    self.shortcut_note = self.shortcuts.set(a, d).map(|b| {
+                                        format!(
+                                            "Its default keys were taken from “{}”, which now has none.",
+                                            b.label()
+                                        )
+                                    });
+                                    self.shortcut_capture = None;
+                                    self.save_shortcuts();
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+                });
+                if let Some(n) = &self.shortcut_note {
+                    ui.colored_label(palette::warn(), n);
+                }
+                let all_default = Action::ALL.into_iter().all(|a| self.shortcuts.is_default(a));
+                if ui
+                    .add_enabled(!all_default, egui::Button::new("Reset all"))
+                    .clicked()
+                {
+                    self.shortcuts = Shortcuts::default();
+                    self.shortcut_capture = None;
+                    self.shortcut_note = None;
+                    self.save_shortcuts();
+                }
+                ui.label(
+                    RichText::new(
+                        "Fixed: in the Words tab, ↑ ↓ Page Up/Down Home End move the selection and Ctrl+C \
+                         copies the selected word; Esc in a text box leaves it (in the Library's search, clears it).",
+                    )
+                    .weak()
+                    .small(),
+                );
+            });
+        // Folded away while waiting for keys: stop waiting.
+        if shown.body_returned.is_none() {
+            self.shortcut_capture = None;
+        }
     }
 }
 
@@ -4363,11 +4725,16 @@ impl App {
             let r = self.report.as_ref().unwrap();
             ui.horizontal(|ui| {
                 ui.label("Filter:");
-                ui.add(
+                let f = ui.add(
                     egui::TextEdit::singleline(&mut self.char_filter)
                         .hint_text("characters to find")
                         .desired_width(200.0),
                 );
+                let f = match self.shortcuts.text(ui.ctx(), Action::Filter) {
+                    Some(k) => f.on_hover_text(k),
+                    None => f,
+                };
+                Self::focus_filter_box(&mut self.focus_filter, ui, &f, &self.char_filter);
                 anki_filter_combo(ui, &mut self.anki_filter, r.anki.is_some());
                 ui.label(format!(
                     "{} unique characters",
@@ -4514,18 +4881,32 @@ impl App {
             let r = self.report.as_ref().unwrap();
             ui.horizontal(|ui| {
                 ui.label("Filter:");
-                ui.add(
+                let f = ui.add(
                     egui::TextEdit::singleline(&mut self.word_filter)
                         .hint_text("substring")
                         .desired_width(200.0),
                 );
+                let f = match self.shortcuts.text(ui.ctx(), Action::Filter) {
+                    Some(k) => f.on_hover_text(k),
+                    None => f,
+                };
+                Self::focus_filter_box(&mut self.focus_filter, ui, &f, &self.word_filter);
                 anki_filter_combo(ui, &mut self.anki_filter, r.anki.is_some());
                 ui.label(format!(
                     "{} unique words",
                     fmt_int(r.word_freq.len() as u64)
                 ));
+                let mark = self.shortcuts.text(ui.ctx(), Action::MarkKnown);
+                let copy = shortcuts::display(
+                    ui.ctx(),
+                    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::C),
+                );
                 ui.label(
-                    RichText::new("↑ ↓ select a word · A marks it known or unmarks it").weak(),
+                    RichText::new(match mark {
+                        Some(m) => format!("↑ ↓ select a word · {m} marks it known or unmarks it · {copy} copies it"),
+                        None => format!("↑ ↓ select a word · {copy} copies it"),
+                    })
+                    .weak(),
                 );
             });
         }
@@ -4561,14 +4942,18 @@ impl App {
         if !ui.ctx().egui_wants_keyboard_input() && !rows.is_empty() {
             let last = rows.len() - 1;
             let page = ((ui.available_height() / ROW_H) as isize - 2).max(1);
-            let (home, end, steps, mark) = ui.input_mut(|i| {
+            let (home, end, steps, copy) = ui.input_mut(|i| {
                 use egui::{Key, Modifiers};
                 let mut n = |key| i.count_and_consume_key(Modifiers::NONE, key) as isize;
                 let steps = n(Key::ArrowDown) - n(Key::ArrowUp)
                     + page * (n(Key::PageDown) - n(Key::PageUp));
                 let (home, end) = (n(Key::Home) > 0, n(Key::End) > 0);
-                (home, end, steps, i.consume_key(Modifiers::NONE, Key::A))
+                // Ctrl+C arrives as a copy event, not a key.
+                let before = i.events.len();
+                i.events.retain(|e| !matches!(e, egui::Event::Copy));
+                (home, end, steps, i.events.len() < before)
             });
+            let mark = self.shortcuts.consume(ui.ctx(), Action::MarkKnown);
             let mut target = pos;
             if home {
                 target = Some(0);
@@ -4607,12 +4992,20 @@ impl App {
                         "Anki"
                     };
                     note = Some(format!(
-                        "{} is known from {from}; A only unmarks words you marked",
-                        r.display(w)
+                        "{} is known from {from}; {} only unmarks words you marked",
+                        r.display(w),
+                        self.shortcuts
+                            .text(ui.ctx(), Action::MarkKnown)
+                            .unwrap_or_default()
                     ));
                 } else {
                     toggle = Some((w.clone(), true));
                 }
+            }
+            if copy && let Some(p) = pos {
+                let w = r.display(word_of(p));
+                ui.ctx().copy_text(w.to_owned());
+                note = Some(format!("Copied {w}"));
             }
         }
         // Clicking a row also selects it (below).
@@ -5283,7 +5676,8 @@ impl App {
                         .hint_text("🔍 Search")
                         .desired_width(180.0),
                 )
-                .on_hover_text(LIBRARY_SEARCH_HOVER);
+                .on_hover_text(self.shortcuts.hint(ctx, Action::Filter, LIBRARY_SEARCH_HOVER));
+                Self::focus_filter_box(&mut self.focus_filter, ui, &r, &self.library_filter);
                 if (r.has_focus() || r.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     self.library_filter.clear();
                 }
