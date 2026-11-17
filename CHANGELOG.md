@@ -1,5 +1,16 @@
 # Changelog
 
+## [2026.11.17.8] - 2026-11-17
+
+### Added
+- **The Library keeps itself up to date.** Each row records what it was computed from: hanstat's analysis, the user dictionary, the known words (Anki and word lists) and the settings for its language. When any of them changes, the rows affected are analysed again in the background, 5 seconds after the last change, so marking a run of words known costs one update. A change while it runs stops it and it starts afresh after the pause. Rows keep their place and their date; a book removed meanwhile is not brought back. The status bar shows the progress; **Stop** holds it until something changes again. Books of a language not used since hanstat started wait until it is, as do all rows while Anki is still being read. On the first start of this version every row is updated once. Marking Chinese words known changes how books are segmented, so each such update segments the Chinese books again: seconds a book with LTP, minutes with CKIP.
+- **⟳ Recalculate library** at the right of the Library's header analyses every book again at once.
+- **Sections are kept per book.** The sections you include are saved with the book's Library row and restored when it is opened again; background updates use them too, with the segmenter the book was last analysed with (both were the defaults before).
+- **Default reading speeds** in ⚙ (Chinese, Japanese, Korean), saved in `settings.json`, for the Library's and Library Stats' reading times and each book's Overview. An Overview's speed can still be changed for that book alone, with **↺** to go back; opening another book starts from the default again.
+
+### Changed
+- The Library's header no longer has a line of explanation under the tabs; their hover text remains.
+
 ## [2026.11.17.7] - 2026-11-17
 
 ### Added

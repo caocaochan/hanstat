@@ -110,7 +110,46 @@ fn analysis_fingerprint() {
     }
     h.item(lines.join("\n").as_bytes());
     println!("cargo:rustc-env=HANSTAT_ANALYSIS_FINGERPRINT={:016x}", h.0);
+
+    // `HANSTAT_LIBRARY_FINGERPRINT`: the analysis plus what turns it into a
+    // Library row (known-word coverage, discovered names, the row and word
+    // data themselves, and the word lists). A Library row recorded by a
+    // build with another one is analysed again in the background.
+    let mut lib = Fnv::new();
+    lib.item(format!("{:016x}", h.0).as_bytes());
+    let mut extra = Vec::new();
+    for p in LIBRARY_SOURCES {
+        let p = Path::new(p);
+        if p.is_dir() {
+            walk(p, &mut extra);
+        } else {
+            extra.push(p.to_path_buf());
+        }
+    }
+    extra.extend(NOT_ANALYSIS_DATA.iter().map(PathBuf::from));
+    let mut extra: Vec<(String, PathBuf)> = extra
+        .into_iter()
+        .map(|p| (p.to_string_lossy().replace('\\', "/"), p))
+        .collect();
+    extra.sort();
+    for (name, path) in &extra {
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{name}: {e}"));
+        lib.item(name.as_bytes());
+        lib.item(&bytes);
+    }
+    println!("cargo:rustc-env=HANSTAT_LIBRARY_FINGERPRINT={:016x}", lib.0);
 }
+
+/// Sources outside the analysis fingerprint that still change a Library row
+/// for the same book and settings.
+const LIBRARY_SOURCES: &[&str] = &[
+    "src/extract",
+    "src/anki.rs",
+    "src/known.rs",
+    "src/discover.rs",
+    "src/history.rs",
+    "src/profile.rs",
+];
 
 fn read(path: &str) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"))

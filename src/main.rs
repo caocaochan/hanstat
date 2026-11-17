@@ -475,12 +475,16 @@ struct App {
     /// out of the list after A (the "Not known" filter).
     word_sel_pos: usize,
     word_sel_refill: bool,
-    /// Reading speed for Chinese (characters per minute).
-    cpm: f32,
-    /// Reading speed for Korean (words per minute, as counted: content words).
-    wpm: f32,
-    /// Reading speed for Japanese (kanji and kana per minute).
-    ja_cpm: f32,
+    /// The open book's reading speed, where it was changed from the default
+    /// in the ⚙ menu (`Settings::cpm` and so on) to try another; reset when
+    /// another book is opened. Chinese: characters per minute.
+    cpm: Option<f32>,
+    /// Korean: words per minute (as counted: content words).
+    wpm: Option<f32>,
+    /// Japanese: kanji and kana per minute.
+    ja_cpm: Option<f32>,
+    /// `settings` changed by a drag still in progress: saved when it ends.
+    settings_unsaved: bool,
     toast: Option<(String, f64)>,
 
     suggestions: Option<Vec<Candidate>>,
@@ -535,7 +539,31 @@ struct App {
     settings: Settings,
     /// Writing-style ratings ([`style`]).
     style: StyleState,
+    /// Keeping the Library's rows up to date in the background.
+    auto: AutoRefresh,
 }
+
+/// Library rows are analysed again in the background when what they were
+/// computed from changes ([`App::auto_refresh`]).
+#[derive(Default)]
+struct AutoRefresh {
+    /// Next time to look (seconds of `egui` time).
+    next_scan: f64,
+    /// Each language's inputs ([`App::lang_inputs`]) as last seen, and when they last changed.
+    seen: HashMap<Language, String>,
+    changed_at: f64,
+    /// Stopped by the user with these inputs: not started again until they change.
+    paused: Option<HashMap<Language, String>>,
+    /// Books that could not be analysed (or are missing), by path, with the
+    /// inputs tried: not tried again until those change.
+    failed: HashMap<PathBuf, String>,
+    /// Digests of the known words, by the `Arc` they were computed for.
+    knowledge: Vec<(Arc<anki::Knowledge>, String)>,
+}
+
+/// Quiet time after the last change before the background update starts,
+/// so a burst of changes (marking word after word known) costs one run.
+const AUTO_REFRESH_DELAY: f64 = 5.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum HistTab {
@@ -628,8 +656,12 @@ struct PlanDone {
 }
 
 /// Books analysed one after another in the background, each recorded in the
-/// History: several opened at once, or books with no word data yet.
+/// History: several opened at once, books with no word data yet, or the
+/// Library's books again.
 struct Batch {
+    mode: BatchMode,
+    /// Each language's inputs ([`App::lang_inputs`]) the books are analysed with.
+    inputs: HashMap<Language, String>,
     rx: Receiver<BatchMsg>,
     done: Arc<AtomicUsize>,
     /// Including `then_open`.
@@ -641,9 +673,31 @@ struct Batch {
     then_open: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BatchMode {
+    /// Files opened together: added to the Library as new.
+    Open,
+    /// Library books, asked for: their rows are replaced where they are.
+    Refresh,
+    /// Library books whose inputs changed ([`App::auto_refresh`]): the same,
+    /// and given way to anything else.
+    Auto,
+}
+
+/// One book for a batch: its label, file, Chinese segmenter, and the sections
+/// to include (`None`: the book's defaults).
+struct BatchItem {
+    label: String,
+    path: PathBuf,
+    kind: SegmenterKind,
+    sections: Option<Vec<bool>>,
+}
+
 enum BatchMsg {
-    Book(Box<history::Entry>),
-    Failed(String),
+    /// With whether its word data changed.
+    Book(Box<history::Entry>, bool),
+    /// Label, file, error.
+    Failed(String, PathBuf, String),
     Finished,
 }
 
@@ -812,9 +866,10 @@ impl Default for App {
             word_sel: None,
             word_sel_pos: 0,
             word_sel_refill: false,
-            cpm: 300.0,
-            wpm: 100.0,
-            ja_cpm: 300.0,
+            cpm: None,
+            wpm: None,
+            ja_cpm: None,
+            settings_unsaved: false,
             toast: None,
             suggestions: None,
             suggest_rx: None,
@@ -846,6 +901,7 @@ impl Default for App {
             batch: None,
             settings: Settings::load(),
             style: StyleState::load(),
+            auto: AutoRefresh::default(),
         }
     }
 }
@@ -1266,7 +1322,11 @@ impl App {
                 .unwrap_or_else(|| file_stem(path)),
             analysed: history::now(),
             stats: history::Stats::from_report(r),
+            sections: Some(r.sections.iter().map(|s| s.included).collect()),
+            inputs: String::new(),
         };
+        let mut entry = entry;
+        entry.inputs = self.lang_inputs(entry.stats.language).unwrap_or_default();
         let touch = std::mem::take(&mut self.history_touch);
         if let Err(e) = self.history.record(entry, touch) {
             self.history_error = Some(e);
@@ -1848,8 +1908,8 @@ impl App {
                     self.error = Some(e);
                 }
                 // The open book now; the reading path and Library statistics
-                // rebuild on their own (their key has the setting). Other
-                // books' Library numbers follow when each is next opened.
+                // rebuild on their own (their key has the setting), and the
+                // other books' rows are updated in the background.
                 self.refresh_anki_coverage();
             }
             ui.label(
@@ -1857,6 +1917,40 @@ impl App {
                     "Words that occur once in a book (many are rare words, typos or segmenter splits you'd guess or skip) \
                      don't count toward the words you know, the difficulty or the reading path, known or not. \
                      The word counts and coverage table still include them.",
+                )
+                .weak()
+                .small(),
+            );
+            ui.separator();
+            ui.label("Reading speed");
+            egui::Grid::new("speeds").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+                let s = &mut self.settings;
+                let mut changed = false;
+                ui.label("Chinese");
+                changed |= ui
+                    .add(egui::DragValue::new(&mut s.cpm).range(50.0..=2000.0).speed(5.0).suffix(" chars/min"))
+                    .on_hover_text("Chinese characters per minute")
+                    .changed();
+                ui.end_row();
+                ui.label("Japanese");
+                changed |= ui
+                    .add(egui::DragValue::new(&mut s.ja_cpm).range(50.0..=2000.0).speed(5.0).suffix(" chars/min"))
+                    .on_hover_text("Kanji and kana per minute")
+                    .changed();
+                ui.end_row();
+                ui.label("Korean");
+                changed |= ui
+                    .add(egui::DragValue::new(&mut s.wpm).range(20.0..=1000.0).speed(2.0).suffix(" words/min"))
+                    .on_hover_text("Words per minute, as counted here: dictionary forms of content words")
+                    .changed();
+                ui.end_row();
+                if changed {
+                    self.settings_unsaved = true;
+                }
+            });
+            ui.label(
+                RichText::new(
+                    "For the reading times in the Library and on each book's Overview, where a book's speed can be changed on its own to try another.",
                 )
                 .weak()
                 .small(),
@@ -2052,12 +2146,22 @@ impl App {
                 Ok(l) => {
                     let same_book = self.book.as_ref().is_some_and(|b| Arc::ptr_eq(b, &l.book));
                     if !same_book || self.included.len() != l.book.sections.len() {
-                        self.included = l
-                            .book
-                            .sections
-                            .iter()
-                            .map(|s| s.default_included())
-                            .collect();
+                        // The sections chosen when the book was last analysed, if any.
+                        let n = l.book.sections.len();
+                        let saved = l.file_id.as_ref().and_then(|id| {
+                            self.history
+                                .entries
+                                .iter()
+                                .find(|e| e.id == *id)
+                                .and_then(|e| e.sections_for(n))
+                                .map(<[bool]>::to_vec)
+                        });
+                        self.included = saved.unwrap_or_else(|| {
+                            l.book.sections.iter().map(|s| s.default_included()).collect()
+                        });
+                    }
+                    if !same_book {
+                        (self.cpm, self.ja_cpm, self.wpm) = (None, None, None);
                     }
                     let lang = l.prep.language;
                     self.cache_usage = self.cache.as_ref().map_or((0, 0), Cache::usage);
@@ -2096,6 +2200,13 @@ impl eframe::App for App {
         self.poll_stats(&ctx);
         self.refresh_stats(&ctx);
         self.poll_batch(&ctx);
+        self.auto_refresh(&ctx);
+        if self.settings_unsaved && !ctx.input(|i| i.pointer.any_down()) {
+            self.settings_unsaved = false;
+            if let Err(e) = self.settings.save() {
+                self.error = Some(e);
+            }
+        }
         self.style_tick(&ctx);
 
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -3375,16 +3486,22 @@ impl App {
                         ui.label("Reading time");
                         ui.horizontal(|ui| {
                             // Japanese reading speed is measured in characters (文字/分), Korean in words.
-                            let mins = if japanese {
-                                (r.han_total + r.kana_total) as f64 / self.ja_cpm as f64
+                            let (speed, default) = if japanese {
+                                (&mut self.ja_cpm, self.settings.ja_cpm)
                             } else {
-                                r.words_total as f64 / self.wpm as f64
+                                (&mut self.wpm, self.settings.wpm)
+                            };
+                            let v = speed.unwrap_or(default) as f64;
+                            let mins = if japanese {
+                                (r.han_total + r.kana_total) as f64 / v
+                            } else {
+                                r.words_total as f64 / v
                             };
                             ui.label(format!("{}h {:02}m at", (mins / 60.0) as u64, (mins % 60.0) as u64));
                             if japanese {
-                                ui.add(egui::DragValue::new(&mut self.ja_cpm).range(50.0..=2000.0).speed(5.0).suffix(" chars/min"));
+                                speed_input(ui, speed, default, 50.0..=2000.0, 5.0, " chars/min");
                             } else {
-                                ui.add(egui::DragValue::new(&mut self.wpm).range(20.0..=1000.0).speed(2.0).suffix(" words/min"));
+                                speed_input(ui, speed, default, 20.0..=1000.0, 2.0, " words/min");
                             }
                         })
                         .response
@@ -3473,9 +3590,9 @@ impl App {
                     ui.end_row();
                     ui.label("Reading time");
                     ui.horizontal(|ui| {
-                        let mins = r.han_total as f64 / self.cpm as f64;
+                        let mins = r.han_total as f64 / self.cpm.unwrap_or(self.settings.cpm) as f64;
                         ui.label(format!("{}h {:02}m at", (mins / 60.0) as u64, (mins % 60.0) as u64));
-                        ui.add(egui::DragValue::new(&mut self.cpm).range(50.0..=2000.0).speed(5.0).suffix(" chars/min"));
+                        speed_input(ui, &mut self.cpm, self.settings.cpm, 50.0..=2000.0, 5.0, " chars/min");
                     });
                     ui.end_row();
                 });
@@ -4324,16 +4441,35 @@ impl App {
                 {
                     self.library_filter.clear();
                 }
-                ui.add_space(8.0);
             }
-            ui.label(
-                RichText::new(match self.history_tab {
-                    HistTab::Books => "Books analysed before, with the statistics from their last analysis. Analysing a book again replaces its row. Click a title to open the book.",
-                    HistTab::Path => "Study some words before each book; they stay known for every book after it. The path orders the books so that the longest study list is as short as it can be, then the fewest words in all.",
-                    HistTab::Stats => "Totals from every book's last analysis, and the vocabulary its books share, measured against what you know now.",
-                })
-                .weak(),
-            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let can = self.history.entries.iter().filter(|e| e.path.is_file()).count();
+                let missing = self.history.entries.len() - can;
+                let mut hover = String::from(
+                    "Analyse every book in the Library again in the background, with the current known words, user dictionary and settings, \
+                     each with the sections and segmenter it was last analysed with. \
+                     Rows are also updated on their own when any of these change; this redoes them all.",
+                );
+                if missing > 0 {
+                    hover.push_str(&format!(
+                        " {missing} {} no longer where {} were and keep their rows.",
+                        if missing == 1 { "book is" } else { "books are" },
+                        if missing == 1 { "it" } else { "they" },
+                    ));
+                }
+                let busy = self.batch.as_ref().is_some_and(|b| b.mode != BatchMode::Auto);
+                let r = ui
+                    .add_enabled(!busy && can > 0, egui::Button::new("⟳ Recalculate library"))
+                    .on_hover_text(hover)
+                    .on_disabled_hover_text(if busy {
+                        "Books are being analysed: wait for them, or stop them in the status bar"
+                    } else {
+                        "No book in the Library is where it was analysed"
+                    });
+                if r.clicked() {
+                    self.recalculate_library(ctx);
+                }
+            });
         });
         if let Some(e) = &self.history_error {
             ui.colored_label(Color32::from_rgb(220, 170, 60), format!("⚠ {e}"));
@@ -4360,7 +4496,8 @@ impl App {
         }
 
         // Reading time at the speeds set on the Overview, as there.
-        let (cpm, ja_cpm, wpm) = (self.cpm as f64, self.ja_cpm as f64, self.wpm as f64);
+        let sp = &self.settings;
+        let (cpm, ja_cpm, wpm) = (sp.cpm as f64, sp.ja_cpm as f64, sp.wpm as f64);
         let minutes = |s: &history::Stats| match s.language {
             Language::Chinese => s.han_total as f64 / cpm,
             Language::Japanese => (s.han_total + s.kana_total) as f64 / ja_cpm,
@@ -4875,28 +5012,192 @@ impl App {
             self.open(last, ctx);
             return;
         }
-        if self.batch.is_some() {
+        if self.batch.as_ref().is_some_and(|b| b.mode != BatchMode::Auto) {
             self.toast = Some((
                 "Still analysing the books opened before: open these once it has finished.".into(),
                 ctx.input(|i| i.time) + 4.0,
             ));
             return;
         }
-        let todo = files.into_iter().map(|p| (file_name(&p), p)).collect();
-        self.start_batch(todo, Some(last), ctx);
+        let todo = files
+            .into_iter()
+            .map(|p| self.batch_item(file_name(&p), p, self.segmenter))
+            .collect();
+        self.start_batch(todo, Some(last), BatchMode::Open, ctx);
     }
 
-    /// Analyse `todo` (label, file) one after another in the background, the
-    /// way opening each does with its default sections, and record each in
-    /// the History with its word data and cover. Then open `then_open`, if
-    /// given and not stopped.
+    /// A book for a batch, with the sections saved for it in the Library.
+    fn batch_item(&self, label: String, path: PathBuf, kind: SegmenterKind) -> BatchItem {
+        let abs = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
+        let sections = self
+            .history
+            .entries
+            .iter()
+            .find(|e| e.path == abs)
+            .and_then(|e| e.sections.clone());
+        BatchItem {
+            label,
+            path,
+            kind,
+            sections,
+        }
+    }
+
+    /// A Library book for a batch, with the segmenter and sections it was
+    /// last analysed with.
+    fn library_item(e: &history::Entry) -> BatchItem {
+        BatchItem {
+            label: e.title.clone(),
+            path: e.path.clone(),
+            kind: segmenter_by_label(&e.stats.segmenter),
+            sections: e.sections.clone(),
+        }
+    }
+
+    /// Analyse every Library book whose file is still there again, so its row
+    /// reflects the current known words, dictionary and settings.
+    fn recalculate_library(&mut self, ctx: &egui::Context) {
+        let todo: Vec<BatchItem> = self
+            .history
+            .entries
+            .iter()
+            .filter(|e| e.path.is_file())
+            .map(Self::library_item)
+            .collect();
+        if todo.is_empty() {
+            return;
+        }
+        self.history_error = None;
+        self.start_batch(todo, None, BatchMode::Refresh, ctx);
+    }
+
+    /// What a Library row in `lang` is computed from besides its book, its
+    /// sections and its segmenter: the build, the user dictionary, the known
+    /// words (for the segmenter and for coverage) and the settings, as a
+    /// digest. `None` while `lang`'s data is not loaded this session or the
+    /// Anki cards are still being read, when a row could not be computed right.
+    fn lang_inputs(&mut self, lang: Language) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        let (user_words, anki, known) = if lang == self.language {
+            (&self.user_words, &self.anki, &self.known)
+        } else {
+            let d = self.stash.get(&lang)?;
+            (&d.user_words, &d.anki, &d.known)
+        };
+        let anki_pending = anki.rx.is_some()
+            || anki.dirty
+            || (anki.settings.enabled && anki.settings.collection.is_some() && anki.knowledge.is_none());
+        if anki_pending {
+            return None;
+        }
+        let knowledge = match &known.merged {
+            None => String::new(),
+            Some(k) => match self.auto.knowledge.iter().find(|(a, _)| Arc::ptr_eq(a, k)) {
+                Some((_, d)) => d.clone(),
+                None => {
+                    let d = knowledge_digest(k);
+                    self.auto.knowledge.push((k.clone(), d.clone()));
+                    // Only the recent ones: the others are no longer in use.
+                    if self.auto.knowledge.len() > 8 {
+                        self.auto.knowledge.remove(0);
+                    }
+                    d
+                }
+            },
+        };
+        let mut h = Sha256::new();
+        let text = |h: &mut Sha256, s: &str| {
+            h.update((s.len() as u64).to_le_bytes());
+            h.update(s.as_bytes());
+        };
+        text(&mut h, env!("HANSTAT_LIBRARY_FINGERPRINT"));
+        text(&mut h, &format!("{lang:?}"));
+        h.update([u8::from(self.settings.skip_hapax)]);
+        h.update((user_words.len() as u64).to_le_bytes());
+        for w in user_words {
+            text(&mut h, w);
+        }
+        let seg = known.settings.segmenter_words();
+        h.update((seg.len() as u64).to_le_bytes());
+        for w in &seg {
+            text(&mut h, w);
+        }
+        text(&mut h, &knowledge);
+        Some(h.finalize()[..12].iter().map(|b| format!("{b:02x}")).collect())
+    }
+
+    /// Analyse again, in the background, the Library books whose rows were
+    /// computed from other inputs ([`Self::lang_inputs`]) than the current
+    /// ones, once these have not changed for [`AUTO_REFRESH_DELAY`]. A change
+    /// while it runs stops it, and it starts afresh after the delay. The open
+    /// book's row is kept up to date by the Overview itself.
+    fn auto_refresh(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        if now < self.auto.next_scan {
+            return;
+        }
+        self.auto.next_scan = now + 1.0;
+        // As start_batch takes them, so the two compare.
+        let mut inputs = HashMap::new();
+        for l in Language::ALL {
+            if let Some(d) = self.lang_inputs(l) {
+                inputs.insert(l, d);
+            }
+        }
+        if inputs != self.auto.seen {
+            self.auto.seen = inputs.clone();
+            self.auto.changed_at = now;
+            self.auto.failed.clear();
+        }
+        if self.batch.as_ref().is_some_and(|b| b.mode == BatchMode::Auto && b.inputs != inputs) {
+            // Outdated: what it has finished stays, the rest waits for the delay.
+            let b = self.batch.take().unwrap();
+            b.cancel.store(true, Ordering::Relaxed);
+        }
+        if self.batch.is_some() || self.job.is_some() || inputs.is_empty() {
+            return;
+        }
+        let wait = self.auto.changed_at + AUTO_REFRESH_DELAY - now;
+        if wait > 0.0 {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait.min(1.0)));
+            return;
+        }
+        if self.auto.paused.as_ref() == Some(&inputs) {
+            return;
+        }
+        self.auto.paused = None;
+        let open = self.book_id.as_deref();
+        let mut todo = Vec::new();
+        for e in &self.history.entries {
+            let Some(d) = inputs.get(&e.stats.language) else { continue };
+            if e.inputs == *d || Some(e.id.as_str()) == open || self.auto.failed.get(&e.path) == Some(d) {
+                continue;
+            }
+            if e.path.is_file() {
+                todo.push(Self::library_item(e));
+            } else {
+                self.auto.failed.insert(e.path.clone(), d.clone());
+            }
+        }
+        if !todo.is_empty() {
+            self.start_batch(todo, None, BatchMode::Auto, ctx);
+        }
+    }
+
+    /// Analyse `todo` one after another in the background, the way opening
+    /// each does, and record each in the History with its word data and
+    /// cover. Then open `then_open`, if given and not stopped. A batch
+    /// already running is stopped after its current book.
     fn start_batch(
         &mut self,
-        todo: Vec<(String, PathBuf)>,
+        todo: Vec<BatchItem>,
         then_open: Option<PathBuf>,
+        mode: BatchMode,
         ctx: &egui::Context,
     ) {
-        let kind = self.segmenter;
+        if let Some(b) = self.batch.take() {
+            b.cancel.store(true, Ordering::Relaxed);
+        }
         // Each language's dictionary, known words for the segmenter, and
         // knowledge for the History's "Known" (languages not used yet: none).
         let mut words: HashMap<Language, Vec<String>> = self
@@ -4919,6 +5220,13 @@ impl App {
         if let Some(k) = &self.known.merged {
             knowledge.insert(self.language, k.clone());
         }
+        let mut inputs = HashMap::new();
+        for l in Language::ALL {
+            if let Some(d) = self.lang_inputs(l) {
+                inputs.insert(l, d);
+            }
+        }
+        let thread_inputs = inputs.clone();
         let cache = self.cache.clone();
         let skip_hapax = self.settings.skip_hapax;
         let history_path = History::path();
@@ -4930,15 +5238,22 @@ impl App {
         let total = todo.len() + usize::from(then_open.is_some());
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            for (label, path) in todo {
+            for item in todo {
                 if c2.load(Ordering::Relaxed) {
                     break;
                 }
+                let BatchItem {
+                    label,
+                    path,
+                    kind,
+                    sections,
+                } = item;
                 *cur2.lock().unwrap() = label.clone();
                 ctx.request_repaint();
                 let res = profile::analyse_file(
                     &path,
                     kind,
+                    sections.as_deref(),
                     &|l| words.get(&l).cloned().unwrap_or_default(),
                     &|l| {
                         known_words
@@ -4970,23 +5285,34 @@ impl App {
                             let _ = history::save_cover(cover, &dest);
                         }
                     }
-                    Profile::from_report(&id, &r, &names)
-                        .save(&profile::path_in(&history_path, &id))?;
-                    Ok(history::Entry {
-                        id,
-                        path: std::path::absolute(&path).unwrap_or_else(|_| path.clone()),
-                        title: r
-                            .title
-                            .clone()
-                            .filter(|t| !t.trim().is_empty())
-                            .unwrap_or_else(|| file_stem(&path)),
-                        analysed: history::now(),
-                        stats: history::Stats::from_report(&r),
-                    })
+                    // Written only when it changed, so the reading path is
+                    // not rebuilt for nothing.
+                    let p = Profile::from_report(&id, &r, &names);
+                    let p_path = profile::path_in(&history_path, &id);
+                    let changed = Profile::load(&p_path).map(|o| o.digest()) != Some(p.digest());
+                    if changed {
+                        p.save(&p_path)?;
+                    }
+                    Ok((
+                        history::Entry {
+                            id,
+                            path: std::path::absolute(&path).unwrap_or_else(|_| path.clone()),
+                            title: r
+                                .title
+                                .clone()
+                                .filter(|t| !t.trim().is_empty())
+                                .unwrap_or_else(|| file_stem(&path)),
+                            analysed: history::now(),
+                            sections: Some(r.sections.iter().map(|s| s.included).collect()),
+                            inputs: thread_inputs.get(&r.language).cloned().unwrap_or_default(),
+                            stats: history::Stats::from_report(&r),
+                        },
+                        changed,
+                    ))
                 });
                 let _ = tx.send(match res {
-                    Ok(e) => BatchMsg::Book(Box::new(e)),
-                    Err(e) => BatchMsg::Failed(format!("{label}: {e}")),
+                    Ok((e, changed)) => BatchMsg::Book(Box::new(e), changed),
+                    Err(e) => BatchMsg::Failed(label, path, e),
                 });
                 d2.fetch_add(1, Ordering::Relaxed);
                 ctx.request_repaint();
@@ -4995,6 +5321,8 @@ impl App {
             ctx.request_repaint();
         });
         self.batch = Some(Batch {
+            mode,
+            inputs,
             rx,
             done,
             total,
@@ -5012,13 +5340,32 @@ impl App {
         let mut finished = false;
         while let Ok(m) = b.rx.try_recv() {
             match m {
-                BatchMsg::Book(e) => {
-                    if let Err(e) = self.history.record(*e, true) {
+                BatchMsg::Book(e, changed) => {
+                    let res = match b.mode {
+                        BatchMode::Open => self.history.record(*e, true),
+                        BatchMode::Refresh | BatchMode::Auto => self.history.refresh(*e),
+                    };
+                    if let Err(e) = res {
                         self.history_error = Some(e);
                     }
-                    self.profiles_version += 1;
+                    if changed {
+                        self.profiles_version += 1;
+                    }
                 }
-                BatchMsg::Failed(m) => b.failed.push(m),
+                BatchMsg::Failed(label, path, e) => {
+                    if b.mode == BatchMode::Auto
+                        && let Some(d) = self
+                            .history
+                            .entries
+                            .iter()
+                            .find(|x| x.path == path)
+                            .and_then(|x| b.inputs.get(&x.stats.language))
+                            .cloned()
+                    {
+                        self.auto.failed.insert(path, d);
+                    }
+                    b.failed.push(format!("{label}: {e}"));
+                }
                 BatchMsg::Finished => finished = true,
             }
         }
@@ -5027,14 +5374,25 @@ impl App {
             return;
         }
         let b = self.batch.take().unwrap();
+        let stopped = b.cancel.load(Ordering::Relaxed);
+        if b.mode == BatchMode::Auto && stopped {
+            // Stopped by the user: not again until something changes.
+            self.auto.paused = Some(b.inputs.clone());
+        }
         if let Some(p) = b.then_open
-            && !b.cancel.load(Ordering::Relaxed)
+            && !stopped
         {
             self.open(p, ctx);
         }
         // After opening, which clears the error line.
         if !b.failed.is_empty() {
-            self.error = Some(format!("Could not analyse {}", b.failed.join("; ")));
+            let what = b.failed.join("; ");
+            match b.mode {
+                BatchMode::Open => self.error = Some(format!("Could not analyse {what}")),
+                BatchMode::Refresh | BatchMode::Auto => {
+                    self.history_error = Some(format!("Could not update {what}"))
+                }
+            }
         }
     }
 
@@ -5043,17 +5401,32 @@ impl App {
         let Some(b) = &self.batch else { return };
         ui.spinner();
         let done = b.done.load(Ordering::Relaxed);
-        ui.label(format!(
-            "Analysing {} of {}: {}",
+        let doing = match b.mode {
+            BatchMode::Open => "Analysing",
+            BatchMode::Refresh => "Recalculating the Library:",
+            BatchMode::Auto => "Updating the Library:",
+        };
+        let r = ui.label(format!(
+            "{doing} {} of {}: {}",
             (done + 1).min(b.total),
             b.total,
             b.current.lock().unwrap()
         ));
+        if b.mode == BatchMode::Auto {
+            r.on_hover_text(
+                "Known words, the user dictionary, a setting or the analysis itself changed since these books were analysed: \
+                 their rows are being updated",
+            );
+        }
         if ui
             .small_button("Stop")
-            .on_hover_text(
-                "Stop after the current book; the books analysed so far stay in the Library",
-            )
+            .on_hover_text(match b.mode {
+                BatchMode::Auto => {
+                    "Stop after the current book; the rows updated so far stay. \
+                     It starts again only when something changes"
+                }
+                _ => "Stop after the current book; the books analysed so far stay in the Library",
+            })
             .clicked()
         {
             b.cancel.store(true, Ordering::Relaxed);
@@ -5623,22 +5996,98 @@ impl App {
             PlanAction::Backfill => {
                 save_settings = false;
                 let have = self.plan_have();
-                let todo: Vec<(String, PathBuf)> = self
+                let todo: Vec<BatchItem> = self
                     .history
                     .entries
                     .iter()
                     .filter(|e| e.stats.language == self.language && !have.contains(&e.id))
                     .filter(|e| e.path.is_file())
-                    .map(|e| (e.title.clone(), e.path.clone()))
+                    .map(Self::library_item)
                     .collect();
                 self.plan.error = None;
-                self.start_batch(todo, None, ctx);
+                self.start_batch(todo, None, BatchMode::Refresh, ctx);
             }
         }
         if save_settings && let Err(e) = self.plan.settings.save() {
             self.plan.error = Some(e);
         }
     }
+}
+
+/// A book's reading speed: `speed` where changed from `default` (the ⚙
+/// menu's), with a button to go back to it.
+fn speed_input(
+    ui: &mut egui::Ui,
+    speed: &mut Option<f32>,
+    default: f32,
+    range: std::ops::RangeInclusive<f32>,
+    step: f64,
+    suffix: &str,
+) {
+    let mut v = speed.unwrap_or(default);
+    if ui
+        .add(egui::DragValue::new(&mut v).range(range).speed(step).suffix(suffix))
+        .on_hover_text("This book only, to try another speed; the default is set in the ⚙ menu")
+        .changed()
+    {
+        *speed = Some(v);
+    }
+    if speed.is_some_and(|s| s != default)
+        && ui
+            .small_button("↺")
+            .on_hover_text(format!("Back to the default, {default:.0}{suffix} (⚙ menu)"))
+            .clicked()
+    {
+        *speed = None;
+    }
+}
+
+/// The segmenter a Library row names (`SegmenterKind::label`); `Auto` if none does.
+fn segmenter_by_label(label: &str) -> SegmenterKind {
+    [
+        SegmenterKind::Ckip,
+        SegmenterKind::Ltp,
+        SegmenterKind::Jieba,
+        SegmenterKind::Kiwi,
+        SegmenterKind::Sudachi,
+    ]
+    .into_iter()
+    .find(|k| k.label() == label)
+    .unwrap_or(SegmenterKind::Auto)
+}
+
+/// A digest of everything [`BookCoverage::compute`] and a Library row read
+/// from the known words.
+fn knowledge_digest(k: &anki::Knowledge) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    let mut words: Vec<(&String, &Status)> = k.words.iter().collect();
+    words.sort_unstable();
+    h.update((words.len() as u64).to_le_bytes());
+    for (w, s) in words {
+        h.update((w.len() as u64).to_le_bytes());
+        h.update(w.as_bytes());
+        h.update(format!("{s:?}").as_bytes());
+        h.update([0]);
+    }
+    let mut chars: Vec<(&char, &Status)> = k.chars.iter().collect();
+    chars.sort_unstable();
+    h.update((chars.len() as u64).to_le_bytes());
+    for (c, s) in chars {
+        h.update(u32::from(*c).to_le_bytes());
+        h.update(format!("{s:?}").as_bytes());
+        h.update([0]);
+    }
+    let mut stems: Vec<&String> = k.hada_stems.iter().collect();
+    stems.sort_unstable();
+    h.update((stems.len() as u64).to_le_bytes());
+    for w in stems {
+        h.update((w.len() as u64).to_le_bytes());
+        h.update(w.as_bytes());
+    }
+    h.update([u8::from(k.fold), u8::from(k.from_anki)]);
+    h.update(k.listed.source.as_bytes());
+    h.finalize()[..12].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Size cover thumbnails are drawn at in the History table (points), and its row height.

@@ -32,6 +32,23 @@ pub struct Entry {
     /// Seconds since the Unix epoch.
     pub analysed: u64,
     pub stats: Stats,
+    /// Which of the book's sections were included, in order; `None` for an
+    /// entry recorded before they were kept (the book's default sections).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sections: Option<Vec<bool>>,
+    /// What else the row was computed from: the build, the user dictionary,
+    /// the known words and the settings for its language (`App::lang_inputs`
+    /// in the window). Empty if unknown. A row whose inputs differ from the
+    /// current ones is analysed again in the background.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub inputs: String,
+}
+
+impl Entry {
+    /// The sections saved for this book, if they fit a book of `n` sections.
+    pub fn sections_for(&self, n: usize) -> Option<&[bool]> {
+        self.sections.as_deref().filter(|s| s.len() == n)
+    }
 }
 
 /// Everything shown for a book; an entry is only rewritten when these change
@@ -186,6 +203,8 @@ impl History {
             && e.stats == entry.stats
             && e.title == entry.title
             && e.path == entry.path
+            && e.sections == entry.sections
+            && e.inputs == entry.inputs
         {
             return Ok(false);
         }
@@ -197,6 +216,40 @@ impl History {
         }
         self.entries.retain(|e| !same(e));
         self.entries.insert(0, entry);
+        self.save().map(|_| true)
+    }
+
+    /// Replace the book's entry with `entry`, a background re-analysis, where
+    /// it is: the entry keeps its place and the time it was analysed. Nothing
+    /// happens if the book is no longer in the list (removed meanwhile).
+    pub fn refresh(&mut self, mut entry: Entry) -> Result<bool, String> {
+        let same = |e: &Entry| e.id == entry.id || same_path(&e.path, &entry.path);
+        let Some(i) = self.entries.iter().position(same) else {
+            return Ok(false);
+        };
+        // Other entries of the same file or path (a book changed in place:
+        // its old contents) go, with their covers and word data.
+        let stale: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|e| same(e) && e.id != entry.id)
+            .map(|e| e.id.clone())
+            .collect();
+        let mut k = 0;
+        self.entries.retain(|e| {
+            k += 1;
+            k - 1 == i || !same(e)
+        });
+        if !self.read_only {
+            for id in &stale {
+                let _ = std::fs::remove_file(self.cover(id));
+                let _ = std::fs::remove_file(self.profile(id));
+            }
+        }
+        // Only the first match is left, so it is still the first.
+        let i = self.entries.iter().position(same).unwrap();
+        entry.analysed = self.entries[i].analysed;
+        self.entries[i] = entry;
         self.save().map(|_| true)
     }
 
@@ -362,6 +415,8 @@ mod tests {
                 words_for_98: 1,
                 known: None,
             },
+            sections: None,
+            inputs: String::new(),
         }
     }
 
@@ -373,6 +428,38 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&d);
         d.join("history.json")
+    }
+
+    #[test]
+    fn refresh_keeps_place_and_date() {
+        let p = temp().with_file_name("refresh.json");
+        let (mut h, _) = History::load_from(p.clone());
+        for (i, id) in ["a", "b", "c"].into_iter().enumerate() {
+            h.record(entry(id, &format!("C:/books/{id}.epub"), 10, i as u64), true)
+                .unwrap();
+        }
+        // Newest first: c, b, a. b is analysed again in the background.
+        let mut e = entry("b", "C:/books/b.epub", 99, 50);
+        e.inputs = "new".into();
+        e.sections = Some(vec![true, false]);
+        assert!(h.refresh(e).unwrap());
+        let got: Vec<(&str, u64, u64)> = h
+            .entries
+            .iter()
+            .map(|e| (e.id.as_str(), e.stats.words_total, e.analysed))
+            .collect();
+        assert_eq!(got, [("c", 10, 2), ("b", 99, 1), ("a", 10, 0)]);
+        assert_eq!(h.entries[1].sections_for(2), Some(&[true, false][..]));
+        assert_eq!(h.entries[1].sections_for(3), None);
+        // The file changed in place: the new contents take the old row's place.
+        assert!(h.refresh(entry("b2", "C:/books/b.epub", 7, 60)).unwrap());
+        let ids: Vec<&str> = h.entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["c", "b2", "a"]);
+        // Removed while it was being analysed: not brought back.
+        h.remove("a").unwrap();
+        assert!(!h.refresh(entry("a", "C:/books/a.epub", 1, 70)).unwrap());
+        assert_eq!(h.entries.len(), 2);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
     #[test]

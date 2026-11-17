@@ -1112,6 +1112,9 @@ fn record_history(
             }),
         analysed: history::now(),
         stats: history::Stats::from_report(r),
+        sections: Some(r.sections.iter().map(|s| s.included).collect()),
+        // Unknown: the window brings the row up to date with its own inputs.
+        inputs: String::new(),
     };
     if let Err(e) = hist.record(entry, true) {
         fail(e);

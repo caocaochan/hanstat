@@ -128,8 +128,9 @@ pub fn path_in(history: &Path, id: &str) -> PathBuf {
         .join(format!("{id}.json.gz"))
 }
 
-/// Analyse a book file the way the window does with default sections, for a
-/// book with no profile yet (or `hanstat-cli --history`). `words` and
+/// Analyse a book file the way the window does, for a Library book analysed
+/// in the background. `included`: the sections to include (the book's
+/// defaults if `None` or not of its length). `words` and
 /// `known` give the user dictionary and the known words passed to the
 /// segmenter for a language. Downloads the segmenter's model if missing.
 pub struct Analysed {
@@ -143,6 +144,7 @@ pub struct Analysed {
 pub fn analyse_file(
     path: &Path,
     kind: crate::segment::SegmenterKind,
+    included: Option<&[bool]>,
     words: &dyn Fn(Language) -> Vec<String>,
     known: &dyn Fn(Language) -> Vec<String>,
     cache: Option<&crate::cache::Cache>,
@@ -159,7 +161,10 @@ pub fn analyse_file(
     }
     let user = words(lang);
     let prep = analyze::analyze_book_cached(&book, kind, &user, &known(lang), cache, &|_, _| {})?;
-    let included: Vec<bool> = book.sections.iter().map(|s| s.default_included()).collect();
+    let included: Vec<bool> = match included {
+        Some(inc) if inc.len() == book.sections.len() => inc.to_vec(),
+        _ => book.sections.iter().map(|s| s.default_included()).collect(),
+    };
     let report = analyze::build_report(&book, &prep, &included);
     let have: std::collections::HashSet<String> = user.iter().cloned().collect();
     let mut names = user;

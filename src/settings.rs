@@ -18,6 +18,14 @@ pub struct Settings {
     /// shares, difficulty and the reading path
     /// ([`crate::anki::BookCoverage::compute`], [`crate::plan::Library::build`]).
     pub skip_hapax: bool,
+    /// Default reading speeds, for the Library and each book's Overview (where
+    /// a book's speed can be changed on its own to try another).
+    /// Chinese: characters per minute.
+    pub cpm: f32,
+    /// Japanese: kanji and kana per minute.
+    pub ja_cpm: f32,
+    /// Korean: words per minute (as counted: content words).
+    pub wpm: f32,
 }
 
 impl Default for Settings {
@@ -26,6 +34,9 @@ impl Default for Settings {
             writing_style: false,
             style_weight: crate::style::DEFAULT_WEIGHT,
             skip_hapax: false,
+            cpm: 300.0,
+            ja_cpm: 300.0,
+            wpm: 100.0,
         }
     }
 }

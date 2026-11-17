@@ -460,6 +460,7 @@ fn book_file_to_profile_to_reading_path() {
         let a = analyse_file(
             &file,
             SegmenterKind::Jieba,
+            None,
             &|_| vec!["温简言".into()],
             &|_| Vec::new(),
             None,

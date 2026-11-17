@@ -424,7 +424,8 @@ impl App {
 
     /// Every book of every language, from the History.
     fn library_totals(&self, ui: &mut egui::Ui) {
-        let speeds = (self.cpm as f64, self.ja_cpm as f64, self.wpm as f64);
+        let sp = &self.settings;
+        let speeds = (sp.cpm as f64, sp.ja_cpm as f64, sp.wpm as f64);
         let mut by_lang: Vec<(Language, LangTotals)> = Language::ALL
             .iter()
             .map(|&l| (l, LangTotals::default()))
