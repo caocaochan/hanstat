@@ -45,9 +45,10 @@ const NOT_ANALYSIS: &[&str] = &[
     "src/update.rs",
 ];
 
-/// Bundled data that is not read by the analysis: licences and the
-/// vocabulary lists of `known.rs`.
+/// Bundled data that is not read by the analysis: licences, the
+/// vocabulary lists of `known.rs` and the general words of `discover.rs`.
 const NOT_ANALYSIS_DATA: &[&str] = &[
+    "data/CEDICT-words.txt",
     "data/HSK30-2025.tsv",
     "data/TOCFL-2024.tsv",
     "data/KO-standard-2020.tsv",

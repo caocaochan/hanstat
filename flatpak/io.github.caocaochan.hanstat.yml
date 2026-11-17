@@ -81,6 +81,7 @@ modules:
       - install -Dm644 data/OpenCC-LICENSE.txt /app/share/licenses/io.github.caocaochan.hanstat/LICENSE-OpenCC-data.txt
       - install -Dm644 data/HSK-LICENSE.txt /app/share/licenses/io.github.caocaochan.hanstat/LICENSE-HSK-data.txt
       - install -Dm644 data/JLPT-LICENSE.txt /app/share/licenses/io.github.caocaochan.hanstat/LICENSE-JLPT-data.txt
+      - install -Dm644 data/CEDICT-LICENSE.txt /app/share/licenses/io.github.caocaochan.hanstat/LICENSE-CEDICT-data.txt
     sources:
       - type: dir
         path: ..

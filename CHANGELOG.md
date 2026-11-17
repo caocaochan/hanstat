@@ -7,9 +7,14 @@
 - **⟳ Recalculate library** at the right of the Library's header analyses every book again at once.
 - **Sections are kept per book.** The sections you include are saved with the book's Library row and restored when it is opened again; background updates use them too, with the segmenter the book was last analysed with (both were the defaults before).
 - **Default reading speeds** in ⚙ (Chinese, Japanese, Korean), saved in `settings.json`, for the Library's and Library Stats' reading times and each book's Overview. An Overview's speed can still be changed for that book alone, with **↺** to go back; opening another book starts from the default again.
+- **Force a word by typing it.** The Suggested words tab, and a new **📖 forced words** window from the status bar (for every language), have a **Force a word** box (several words can be separated by spaces) and the list of forced words, each removable with ✖.
+- **Forced words are saved** between runs, per language, in `dictionary.txt` (`dictionary-ko.txt`, `dictionary-ja.txt`) next to `settings.json`, in the format `hanstat-cli --dict` reads.
 
 ### Changed
 - The Library's header no longer has a line of explanation under the tabs; their hover text remains.
+- **Suggested words finds names the segmenter glues to the next word.** LTP often keeps a name with a rare character together with the word after it (蒋舸没, 蒋舸问, 蒋舸站), and such a name was never suggested: only a split counted as an error. Now a string inside a longer token that is no dictionary word counts as wrong too (the column is now **Wrong**). The main characters of 默读 (骆闻舟) and 天官赐福 (谢怜) were missing for this reason and are now recommended, with about 19 more names in each of three test novels.
+- Suggested words checks CC-CEDICT besides jieba's dictionary for general words, so words like 靠谱, 抛尸, 副市长 are no longer pre-ticked (1–3 fewer non-names per test novel, no name lost).
+- The status bar's **✖** that removed all forced words is gone; **Remove all** is next to the list.
 
 ## [2026.11.17.7] - 2026-11-17
 

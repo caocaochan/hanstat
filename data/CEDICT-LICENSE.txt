@@ -1,0 +1,16 @@
+data/CEDICT-words.txt
+
+Headwords from CC-CEDICT (https://cc-cedict.org/wiki/), release 2026-11-16, as
+distributed by MDBG (https://www.mdbg.net/chinese/dictionary?page=cc-cedict) and
+converted to Yomitan format by https://github.com/MarvNC/cc-cedict-yomitan.
+CC-CEDICT is a continuation of the CEDICT project started by Paul Denisowski
+in 1997. It is licensed under Creative Commons Attribution-ShareAlike 4.0
+International (CC BY-SA 4.0):
+https://creativecommons.org/licenses/by-sa/4.0/legalcode
+
+Changes made for hanstat: only headwords are kept (no readings or
+definitions); only those of two or more Chinese characters with at least one
+entry that is not a proper noun (lowercase pinyin), and not already in jieba's
+dictionary; a Traditional headword only when its Simplified form is not kept.
+Built by examples/cedict_words.rs. The resulting file, data/CEDICT-words.txt,
+is licensed under CC BY-SA 4.0.

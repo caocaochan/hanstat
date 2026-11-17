@@ -455,7 +455,13 @@ struct App {
     /// The Chinese segmenter choice (a Korean book always uses Kiwi, a Japanese one Sudachi).
     segmenter: SegmenterKind,
     encoding: EncodingChoice,
+    /// Forced words of the current language, saved in `dictionary.txt`
+    /// (see [`hanstat::user_dict_path`]).
     user_words: Vec<String>,
+    /// The "Force a word" text box, the Forced words window, and a load/save error.
+    force_input: String,
+    forced_window: bool,
+    dict_error: Option<String>,
 
     book: Option<Arc<Book>>,
     prep: Option<Arc<Prepared>>,
@@ -852,6 +858,9 @@ impl Default for App {
             segmenter: SegmenterKind::Auto,
             encoding: EncodingChoice::Auto,
             user_words: Vec::new(),
+            force_input: String::new(),
+            forced_window: false,
+            dict_error: None,
             book: None,
             prep: None,
             included: Vec::new(),
@@ -955,7 +964,9 @@ impl App {
                 };
                 // First use of a model: download it (pinned + checksummed) with visible progress.
                 let lang = analyze::detect_language(&book);
-                let words = words_by_lang.remove(&lang).unwrap_or_default();
+                let words = words_by_lang
+                    .remove(&lang)
+                    .unwrap_or_else(|| hanstat::load_user_dict(lang).0);
                 let known_words = known_by_lang
                     .remove(&lang)
                     .unwrap_or_else(|| known::Settings::load_for(lang).0.segmenter_words());
@@ -1063,7 +1074,11 @@ impl App {
 
     // ----- Anki -----
 
+    /// Load the current language's saved settings: forced words, Anki, known words.
     fn anki_init(&mut self, ctx: &egui::Context) {
+        let (w, warn) = hanstat::load_user_dict(self.language);
+        self.user_words = w;
+        self.dict_error = warn;
         let (s, warn) = anki::Settings::load_for(self.language);
         self.anki.settings = s;
         self.anki.error = warn;
@@ -1650,8 +1665,103 @@ impl App {
             .collect();
         new.sort();
         words.extend(new);
+        self.set_user_words(words, ctx);
+    }
+
+    /// Replace the forced words, save them, and re-segment the open book.
+    fn set_user_words(&mut self, words: Vec<String>, ctx: &egui::Context) {
+        if words == self.user_words {
+            return;
+        }
         self.user_words = words;
+        self.dict_error = hanstat::save_user_dict(self.language, &self.user_words).err();
         self.rerun(ctx, false);
+    }
+
+    /// Words typed in the "Force a word" box: separated by spaces, commas or
+    /// 、, each needing at least one non-punctuation character.
+    fn parse_force_input(s: &str) -> Vec<String> {
+        s.split(|c: char| c.is_whitespace() || matches!(c, ',' | '，' | '、' | ';' | '；'))
+            .map(str::trim)
+            .filter(|w| w.chars().any(char::is_alphanumeric))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Forced words: add by typing, remove one by one or all. Shared by the
+    /// Suggested words tab and the Forced words window.
+    fn forced_words_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let busy = self.job.is_some();
+        let mut words = self.user_words.clone();
+        ui.horizontal(|ui| {
+            ui.label("Force a word:");
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.force_input)
+                    .hint_text("蒋舸")
+                    .desired_width(160.0),
+            );
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let new = Self::parse_force_input(&self.force_input);
+            let add = ui
+                .add_enabled(!busy && !new.is_empty(), egui::Button::new("Add"))
+                .on_hover_text("Always count it as one word, in every book of this language. Several words can be separated by spaces.")
+                .clicked();
+            if (add || enter) && !busy && !new.is_empty() {
+                for w in new {
+                    if !words.contains(&w) {
+                        words.push(w);
+                    }
+                }
+                self.force_input.clear();
+                if enter {
+                    r.request_focus();
+                }
+            }
+            if !words.is_empty()
+                && ui
+                    .add_enabled(!busy, egui::Button::new("Remove all"))
+                    .on_hover_text("Remove every forced word of this language (also from the saved list)")
+                    .clicked()
+            {
+                words.clear();
+            }
+        });
+        if !self.user_words.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("{} forced:", self.user_words.len()));
+                for w in &self.user_words {
+                    let b = egui::Button::new(format!("{w} ✖")).small();
+                    if ui
+                        .add_enabled(!busy, b)
+                        .on_hover_text("Stop forcing this word")
+                        .clicked()
+                    {
+                        words.retain(|x| x != w);
+                    }
+                }
+            });
+        }
+        if let Some(e) = &self.dict_error {
+            ui.colored_label(Color32::from_rgb(220, 80, 80), e);
+        }
+        self.set_user_words(words, ctx);
+    }
+
+    fn forced_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.forced_window;
+        egui::Window::new("Forced words")
+            .id(egui::Id::unique("forced-window"))
+            .open(&mut open)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    "Each forced word always counts as one word, in every book of this language: use it for a name the \
+                     segmenter splits or glues to its neighbours (蒋舸没, 蒋舸问). Saved between runs.",
+                );
+                ui.add_space(4.0);
+                self.forced_words_ui(ui, ctx);
+            });
+        self.forced_window &= open;
     }
 
     /// Status-bar part of the updater: download progress, then a restart button.
@@ -2257,16 +2367,18 @@ impl eframe::App for App {
                     }
                 }
 
-                if !self.user_words.is_empty() {
+                {
                     let hover = match self.language {
-                        Language::Chinese => "Always segmented as single words. Added from the Suggested words tab.",
-                        Language::Korean => "Kiwi keeps these whole, as proper nouns. Added from the Suggested words tab; kept separately from the Chinese ones.",
-                        Language::Japanese => "Sudachi keeps these whole, as proper nouns. Kept separately from the Chinese and Korean ones.",
+                        Language::Chinese => "Words always segmented as single words, saved between runs. Add them here or from the Suggested words tab.",
+                        Language::Korean => "Kiwi keeps these whole, as proper nouns. Saved between runs, separately from the Chinese ones.",
+                        Language::Japanese => "Sudachi keeps these whole, as proper nouns. Saved between runs, separately from the Chinese and Korean ones.",
                     };
-                    ui.label(format!("📖 {} forced words", self.user_words.len())).on_hover_text(hover);
-                    if ui.small_button("✖").on_hover_text("Remove all forced words").clicked() {
-                        self.user_words.clear();
-                        self.rerun(&ctx, false);
+                    if ui
+                        .selectable_label(self.forced_window, format!("📖 {} forced words", self.user_words.len()))
+                        .on_hover_text(hover)
+                        .clicked()
+                    {
+                        self.forced_window = !self.forced_window;
                     }
                 }
 
@@ -2548,6 +2660,9 @@ impl eframe::App for App {
         }
         if self.known.window {
             self.known_window(&ctx);
+        }
+        if self.forced_window {
+            self.forced_window(&ctx);
         }
     }
 }
@@ -4094,6 +4209,8 @@ impl App {
     }
 
     fn suggestions_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.forced_words_ui(ui, ctx);
+        ui.separator();
         let Some(cands) = &self.suggestions else {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -4103,10 +4220,11 @@ impl App {
         };
         ui.label(
             "Strings that recur in this book, behave like single words (their parts rarely occur apart; many different \
-             characters appear on either side), but are split by the segmenter. These are mostly character names, places \
-             and in-world terms. Pre-ticked = high confidence (unknown to a general dictionary, and either the segmenter already \
-             keeps it whole part of the time or the statistical evidence is very strong). Applying forces the ticked \
-             strings to always count as one word; save them via Export to reuse for the rest of a series.",
+             characters appear on either side), but are split by the segmenter or glued to a neighbour (蒋舸没). These are \
+             mostly character names, places and in-world terms. Pre-ticked = high confidence (unknown to a general dictionary, \
+             and either the segmenter already gets it right part of the time or the statistical evidence is very strong). \
+             Applying forces the ticked strings to always count as one word; forced words are saved and apply to every book. \
+             A word missing here can be typed in above.",
         );
         ui.add_space(4.0);
         let n_sel = self.selected.len();
@@ -4170,7 +4288,7 @@ impl App {
                         "Whether you know the word (Anki, the levels and word lists ticked, or marked with +)",
                     ),
                     ("Occurrences", "Times the string occurs in the included sections"),
-                    ("Split", "Occurrences the segmenter did NOT keep as one word"),
+                    ("Wrong", "Occurrences the segmenter did NOT keep as one word: split apart, or glued to a neighbour (蒋舸没)"),
                     ("Dependency", "Share of the rarer part's occurrences that are inside this string (1.0 = parts never occur apart)"),
                     ("Boundary freedom", "Min of left/right neighbour entropy (nats); high = appears in many contexts"),
                     ("", ""),
@@ -4242,7 +4360,7 @@ impl App {
                             ui.label(RichText::new("recommended").color(Color32::from_rgb(90, 170, 110)));
                         } else if c.in_dictionary {
                             ui.label(RichText::new("general word").weak())
-                                .on_hover_text("In jieba's general dictionary: the split is usually a granularity choice, not an error.");
+                                .on_hover_text("In a general dictionary (jieba's or CC-CEDICT): the split is usually a granularity choice, not an error.");
                         } else if c.split_occurrences() == c.occurrences {
                             ui.label(RichText::new("always split").weak())
                                 .on_hover_text("The segmenter never keeps this whole: often a set phrase or a compound its standard splits.");
@@ -5278,7 +5396,12 @@ impl App {
                     &path,
                     kind,
                     sections.as_deref(),
-                    &|l| words.get(&l).cloned().unwrap_or_default(),
+                    &|l| {
+                        words
+                            .get(&l)
+                            .cloned()
+                            .unwrap_or_else(|| hanstat::load_user_dict(l).0)
+                    },
                     &|l| {
                         known_words
                             .get(&l)

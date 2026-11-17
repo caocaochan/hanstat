@@ -1,5 +1,5 @@
 //! Unsupervised discovery of book-specific words (mainly names) that the
-//! segmenter splits, so the user can force them without having read the book.
+//! segmenter splits or glues to a neighbour, so the user can force them without having read the book.
 //!
 //! Classic "new word discovery" (新词发现) on runs of Chinese characters:
 //! * frequency — the string recurs;
@@ -25,8 +25,9 @@ pub struct Candidate {
     pub word: String,
     /// Occurrences of the string in the text.
     pub occurrences: u32,
-    /// How many of those the segmenter didn't split: no token boundary falls
-    /// inside (the token is this string, or a longer word containing it).
+    /// How many of those the segmenter got right: the token is this string, or
+    /// a longer dictionary word containing it. The rest were split, or glued to
+    /// a neighbour (蒋舸没).
     pub kept_whole: u32,
     pub cohesion: f64,
     /// Min over split points of f(w) / min(f(left), f(right)): the share of the rarer
@@ -34,7 +35,7 @@ pub struct Candidate {
     pub dependency: f64,
     pub left_entropy: f64,
     pub right_entropy: f64,
-    /// Known to jieba's general dictionary (then it's usually a granularity
+    /// Known to a general dictionary, jieba's or CC-CEDICT (then it's usually a granularity
     /// difference, not an unknown name).
     pub in_dictionary: bool,
     /// Pre-selected: high confidence it is a book-specific word.
@@ -87,14 +88,25 @@ fn is_inner_stop(c: char) -> bool {
     is_edge_stop(c) || in_set("一不没上下来去起", c)
 }
 
-/// How many occurrences of each 2..=MAX_N-char string lie inside a single
-/// segmenter token, either as the whole token or within a longer one (什麼 in
-/// 為什麼, 朋友 in 男朋友). Those weren't split: no token boundary falls inside.
-fn within_token_counts(word_freq: &[(String, u32)]) -> FxHashMap<u128, u32> {
+/// How many occurrences of each 2..=MAX_N-char string the segmenter got right:
+/// the string is the whole token, or lies inside a longer token that is a real
+/// word (`is_word`: 什麼 in 為什麼, 朋友 in 男朋友). Inside a longer token that is
+/// no word, the string was glued to its neighbours (蒋舸 in 蒋舸没, 蒋舸问), which
+/// is as wrong as splitting it, so those occurrences aren't counted.
+fn within_token_counts(
+    word_freq: &[(String, u32)],
+    is_word: impl Fn(&str) -> bool,
+) -> FxHashMap<u128, u32> {
     let mut m = FxHashMap::<u128, u32>::default();
     for (w, n) in word_freq {
         let cs: Vec<char> = w.chars().collect();
-        for len in 2..=MAX_N.min(cs.len()) {
+        if (2..=MAX_N).contains(&cs.len()) {
+            *m.entry(key(&cs)).or_default() += n;
+        }
+        if cs.len() <= 2 || !is_word(w) {
+            continue;
+        }
+        for len in 2..=MAX_N.min(cs.len() - 1) {
             for i in 0..=cs.len() - len {
                 *m.entry(key(&cs[i..i + len])).or_default() += n;
             }
@@ -144,6 +156,39 @@ pub fn discover(
     word_freq: &[(String, u32)],
     known: &HashSet<String>,
     opts: &Options,
+) -> Vec<Candidate> {
+    let jieba = jieba_rs::Jieba::new();
+    let cedict = cedict_words();
+    discover_with(book, included, word_freq, known, opts, &|w| {
+        let s = crate::script::fold_t2s(w);
+        jieba.has_word(w) || jieba.has_word(&s) || cedict.contains(w) || cedict.contains(s.as_str())
+    })
+}
+
+/// CC-CEDICT's general-language words that jieba's dictionary lacks (靠谱,
+/// 抛尸, 副市长), from `data/CEDICT-words.txt` (built by examples/cedict_words.rs).
+/// Measured on five novels: jieba plus these drops 1–3 non-names per book from
+/// the recommendations and no name; a dictionary alone, without jieba, would
+/// recommend set phrases (摇摇头, 话音刚落) that dictionaries don't list.
+fn cedict_words() -> &'static HashSet<&'static str> {
+    static SET: std::sync::OnceLock<HashSet<&'static str>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        include_str!("../data/CEDICT-words.txt")
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect()
+    })
+}
+
+/// [`discover`] with another general dictionary: `is_general` says whether a
+/// string (in the book's script) is a word of the general language.
+pub fn discover_with(
+    book: &Book,
+    included: &[bool],
+    word_freq: &[(String, u32)],
+    known: &HashSet<String>,
+    opts: &Options,
+    is_general: &(dyn Fn(&str) -> bool + Sync),
 ) -> Vec<Candidate> {
     if crate::analyze::detect_language(book) != crate::lang::Language::Chinese {
         return Vec::new();
@@ -257,8 +302,7 @@ pub fn discover(
         }
     }
 
-    let tokens = within_token_counts(word_freq);
-    let jieba = jieba_rs::Jieba::new();
+    let tokens = within_token_counts(word_freq, is_general);
     let mut out: Vec<Candidate> = cand
         .into_iter()
         .filter_map(|(k, (coh, dep, l, r))| {
@@ -277,8 +321,7 @@ pub fn discover(
             if split < min || (split as f64) < 0.05 * occurrences as f64 {
                 return None;
             }
-            let in_dictionary =
-                jieba.has_word(&word) || jieba.has_word(&crate::script::fold_t2s(&word));
+            let in_dictionary = is_general(&word);
             // Names: parts rarely occur elsewhere (high dependency), free boundaries,
             // and the model already treats it as one word *some* of the time. Always-split
             // strings are usually set phrases (指了指, 精神一振) or compounds the
@@ -347,11 +390,25 @@ mod tests {
             ("什麼".to_owned(), 5),
             ("什".to_owned(), 1),
         ];
-        let m = within_token_counts(&freq);
+        let m = within_token_counts(&freq, |w| w == "為什麼");
         let get = |s: &str| m.get(&key(&s.chars().collect::<Vec<_>>())).copied();
         assert_eq!(get("什麼"), Some(8));
         assert_eq!(get("為什"), Some(3));
         assert_eq!(get("為什麼"), Some(3));
+    }
+
+    #[test]
+    fn names_glued_to_a_neighbour_are_not_kept_whole() {
+        let freq = [
+            ("蒋舸".to_owned(), 10),
+            ("蒋舸没".to_owned(), 2),
+            ("蒋舸问".to_owned(), 1),
+        ];
+        let m = within_token_counts(&freq, |_| false);
+        let get = |s: &str| m.get(&key(&s.chars().collect::<Vec<_>>())).copied();
+        assert_eq!(get("蒋舸"), Some(10));
+        assert_eq!(get("蒋舸没"), Some(2));
+        assert_eq!(get("舸没"), None);
     }
 
     #[test]

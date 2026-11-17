@@ -12,3 +12,5 @@
 /build/
 /repo/
 *.part
+# Local Yomitan dictionaries (data/CEDICT-words.txt is built from one; see examples/cedict_words.rs)
+/dicts/
