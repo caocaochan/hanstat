@@ -1,5 +1,16 @@
 # Changelog
 
+## [2026.11.17.5] - 2026-11-17
+
+### Added
+- **Library search.** The Library's **Books** and **Reading path** tabs have a search box that filters the books by title and file name. It is fuzzy: a word's letters need only appear in order (`hp` finds Harry Potter, `黑森` finds 黑暗森林), and several words must all match. A word with `*` (any characters) or `?` (one character) must match the whole title or file name, as in Everything: `三体*` finds the titles that start with 三体, `*.txt` the TXT files. Case is ignored and Traditional characters count as Simplified (`三體` finds 三体). Esc or **✖** clears it. The reading path keeps each book's step number while filtered.
+- **Suggested words** have **+** and **−** to mark a word known or unmark it, as in the Words tab, and a **Status** column (Anki, the ticked levels and word lists, or marked). A word marked known is also kept whole by the segmenter from the next analysis.
+- **Writing style: rate again.** **Rate the N books without a rating** in the ⚙ menu starts the rater afresh and tries every Chinese book in the Library without a rating, those that failed included. It replaces turning the setting off and on.
+- **Writing style: log.** The rater writes what it did to `style.log` next to `style.json`, anew each time it starts: the version and platform, whether llama.cpp and the model are downloaded, each download, llama.cpp's command line and load time, each book's sections and Chinese characters, each sample's position, length and five answers, the book's rating and time, and why a book was not rated. When llama.cpp fails to start or stops while rating, the last 80 lines of its own output are copied in (the CPU-only retry used to overwrite the GPU attempt's). **Open the log** in ⚙ opens it.
+
+### Fixed
+- Writing style: an error answer from llama.cpp (HTTP 4xx or 5xx) is reported with its message instead of only its status, and an answer that is not a digit lists the model's most likely tokens. An internal error while rating a book is reported as that book's failure instead of leaving the rater stuck on it.
+
 ## [2026.11.17.4] - 2026-11-17
 
 ### Added

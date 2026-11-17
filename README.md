@@ -58,7 +58,7 @@ The language is detected from the text and shown in the badge at the right of th
 - **Japanese:** kanji and words, with [Sudachi](https://github.com/WorksApplications/sudachi.rs). Words are counted in dictionary form across spellings (わかった and 分かる are both 分かる).
 - **Korean:** words only, with [Kiwi](https://github.com/bab2min/Kiwi), in dictionary form (먹었어요 is 먹다). Particles and endings aren't words.
 
-If a name gets split, apply it from the **Suggested words** tab, or pass a user dictionary with `hanstat-cli --dict`.
+If a name gets split, apply it from the **Suggested words** tab, or pass a user dictionary with `hanstat-cli --dict`. A suggested word you already know can be marked known there with **+**, as in the Words tab.
 
 ## Anki
 
@@ -74,7 +74,7 @@ Click **📚 HSK & word lists** (Korean: **Levels**, Japanese: **JLPT**) to mark
 
 ## Library
 
-Click **📖 Library** to list every book you've analysed, with its cover: length, unique words, the share of running words you knew, difficulty and reading time. Click a column to sort, or a title to open the book again. Analysing a book again replaces its row; a book is recognised by its file's contents, so a renamed or moved copy is still the same book. The list is kept in `%LOCALAPPDATA%\hanstat\history.json` (macOS: `~/Library/Application Support/hanstat/history.json`, Linux: `~/.local/share/hanstat/history.json`), and small copies of the covers in `covers` next to it.
+Click **📖 Library** to list every book you've analysed, with its cover: length, unique words, the share of running words you knew, difficulty and reading time. Click a column to sort, or a title to open the book again. The search box filters the books (and the reading path) by title and file name: letters need only appear in order (`hp` finds Harry Potter), several words must all match, and a word with `*` or `?` must match the whole title or file name (`三体*`, `*.txt`); case is ignored and `三體` finds `三体`. Analysing a book again replaces its row; a book is recognised by its file's contents, so a renamed or moved copy is still the same book. The list is kept in `%LOCALAPPDATA%\hanstat\history.json` (macOS: `~/Library/Application Support/hanstat/history.json`, Linux: `~/.local/share/hanstat/history.json`), and small copies of the covers in `covers` next to it.
 
 ## Reading path
 
@@ -109,7 +109,7 @@ Tick **Rate writing style with a local AI model** in the **⚙** menu (status ba
 - **Difficulty.** It counts toward each book's difficulty: a book rated a point above typical (5.95) counts as **Weight** points less of its running words known (2 by default, set in ⚙), and one below as more. The reading path raises (lowers) that book's target by as much, and Library Stats colours books the same way. The weight is a judgment, not a measurement; 0 shows the rating without counting it.
 - **Checked** on 20 novels: samples of one book agree with each other (ICC 0.84 for the mean of four), the rating repeats between halves of a book even after the share of words known is taken out, and it matched a reader's judgment on the three pairs checked. Chinese books only; Windows x64, Apple Silicon Macs and Linux x86-64.
 
-Ratings are kept in `style.json` next to `history.json`, the settings in `settings.json`.
+Ratings are kept in `style.json` next to `history.json`, the settings in `settings.json`. **Rate the books without a rating** in ⚙ tries again every Chinese book that has none, those that failed included. What the rater did in its last run (downloads, starting llama.cpp, each book's samples and answers, and why a book failed, with the end of llama.cpp's own output) is written to `style.log` next to them, anew each time it starts; **Open the log** in ⚙ opens it.
 
 ## Command line
 

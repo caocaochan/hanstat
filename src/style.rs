@@ -25,11 +25,16 @@
 //! with the first prompt). Books' ratings ran from 5.4 to 6.6. It agreed
 //! with a reader on the three pairs checked, one of which the share known
 //! puts the other way round. Ratings are kept in `style.json` by History id.
+//!
+//! What the rater did (downloads, starting llama.cpp, each book's samples
+//! and answers, and the reason for every failure) goes to `style.log` next
+//! to it, written anew each time a [`Rater`] starts ([`Log`]).
 
 use crate::extract::{Book, EncodingChoice, SectionKind};
 use crate::models::{self, LLAMA_CPP, LLAMA_SERVER, STYLE_LLM};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
@@ -238,6 +243,94 @@ impl Store {
     }
 }
 
+/// What the rater did, to find out why a book was not rated: `style.log`
+/// next to `style.json`, replaced each time a [`Rater`] starts. Each line
+/// starts with the seconds since then. A log that cannot be written is
+/// left out; rating goes on without it.
+#[derive(Clone, Default)]
+pub struct Log(Option<Arc<Mutex<(std::fs::File, Instant)>>>);
+
+impl Log {
+    pub fn path() -> PathBuf {
+        models::app_dir().join("style.log")
+    }
+
+    /// Start the log afresh, with what is used and when.
+    pub fn create() -> Log {
+        let p = Self::path();
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let log = match std::fs::File::create(&p) {
+            Ok(f) => Log(Some(Arc::new(Mutex::new((f, Instant::now()))))),
+            Err(_) => Log(None),
+        };
+        let state = |m: &models::Model| {
+            if m.is_cached() {
+                "downloaded"
+            } else {
+                "not downloaded"
+            }
+        };
+        log.line(format!(
+            "hanstat {} on {}-{}, {} UTC; rating method {}",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            utc(crate::history::now()),
+            method()
+        ));
+        log.line(format!(
+            "llama.cpp {} in {} ({}); model in {} ({})",
+            LLAMA_CPP.id,
+            LLAMA_CPP.dir().display(),
+            state(&LLAMA_CPP),
+            STYLE_LLM.dir().display(),
+            state(&STYLE_LLM),
+        ));
+        log
+    }
+
+    /// Add `msg`; its later lines are indented under the first.
+    pub fn line(&self, msg: impl AsRef<str>) {
+        let Some(f) = &self.0 else { return };
+        let mut g = f.lock().unwrap_or_else(|e| e.into_inner());
+        let t = g.1.elapsed().as_secs_f64();
+        let text = msg.as_ref().trim_end().replace('\n', "\n           ");
+        let _ = writeln!(g.0, "[{t:8.1}] {text}");
+    }
+}
+
+/// `secs` since the Unix epoch as `YYYY-MM-DD hh:mm:ss`.
+fn utc(secs: u64) -> String {
+    // Howard Hinnant's civil_from_days.
+    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + (m <= 2) as i64;
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
+        rem / 3600,
+        rem / 60 % 60,
+        rem % 60
+    )
+}
+
+/// At most the last `n` characters of `s`, for the log.
+fn tail_chars(s: &str, n: usize) -> &str {
+    let k = s.chars().count();
+    match s.char_indices().nth(k.saturating_sub(n)) {
+        Some((i, _)) if k > n => &s[i..],
+        _ => s,
+    }
+}
+
 const SYSTEM: &str = "你是对外汉语阅读分级专家。你只评估文风难度，并且假设读者认识文中的每一个词语、人名和术语；生词多少完全不计入评分。评分范围1到9，2、4、6、8为相邻等级之间的中间值，请充分使用整个量表。
 
 【示例与等级】（示例只为说明文风，读者认识其中所有词语）
@@ -298,9 +391,21 @@ fn expected_digit(resp: &serde_json::Value) -> Result<f32, String> {
         }
     }
     if mass < 0.5 {
+        let tops: Vec<String> = top
+            .iter()
+            .take(5)
+            .map(|t| {
+                format!(
+                    "{:?} {:.0}%",
+                    t["token"].as_str().unwrap_or("?"),
+                    t["logprob"].as_f64().unwrap_or(f64::NEG_INFINITY).exp() * 100.0
+                )
+            })
+            .collect();
         return Err(format!(
-            "the model did not answer with a digit ({:?})",
-            resp["choices"][0]["message"]["content"]
+            "the model did not answer with a digit ({:?}; most likely: {})",
+            resp["choices"][0]["message"]["content"],
+            tops.join(", ")
         ));
     }
     Ok((sum / mass) as f32)
@@ -312,14 +417,17 @@ pub struct Server {
     child: Arc<Mutex<Child>>,
     url: String,
     agent: ureq::Agent,
-    log: PathBuf,
+    /// llama.cpp's own output.
+    server_log: PathBuf,
+    log: Log,
 }
 
 impl Server {
     /// Start the server and wait until the model is loaded. `gpu`: offload
     /// every layer to the GPU (falls back to the CPU without one); otherwise
-    /// the CPU only. Both downloads must be in the cache.
-    pub fn start(gpu: bool) -> Result<Server, String> {
+    /// the CPU only. Both downloads must be in the cache. What happens goes
+    /// to `log`.
+    pub fn start(gpu: bool, log: &Log) -> Result<Server, String> {
         let name = LLAMA_SERVER.ok_or("llama.cpp has no build for this platform")?;
         let exe = LLAMA_CPP.dir().join(name);
         let model = STYLE_LLM.dir().join(STYLE_LLM.files[0].name);
@@ -333,9 +441,9 @@ impl Server {
             .and_then(|l| l.local_addr())
             .map_err(|e| format!("No free local port: {e}"))?
             .port();
-        let log = models::cache_root().join("llama-server.log");
-        let out = std::fs::File::create(&log)
-            .map_err(|e| format!("Cannot create {}: {e}", log.display()))?;
+        let log_path = models::cache_root().join("llama-server.log");
+        let out = std::fs::File::create(&log_path)
+            .map_err(|e| format!("Cannot create {}: {e}", log_path.display()))?;
         let err = out.try_clone().map_err(|e| e.to_string())?;
         let mut cmd = Command::new(&exe);
         cmd.current_dir(LLAMA_CPP.dir())
@@ -358,30 +466,64 @@ impl Server {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
+        log.line(format!(
+            "Starting llama.cpp {}: {cmd:?}",
+            if gpu { "on the GPU" } else { "on the CPU only" }
+        ));
         let child = cmd
             .spawn()
             .map_err(|e| format!("Cannot start {}: {e}", exe.display()))?;
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(600)))
+            // Read the body of an error answer: it says what went wrong.
+            .http_status_as_error(false)
             .build()
             .into();
         let mut s = Server {
             child: Arc::new(Mutex::new(child)),
             url: format!("http://127.0.0.1:{port}"),
             agent,
-            log,
+            server_log: log_path,
+            log: log.clone(),
         };
-        s.wait_ready(Duration::from_secs(600))?;
-        Ok(s)
+        let t = Instant::now();
+        match s.wait_ready(Duration::from_secs(600)) {
+            Ok(()) => {
+                log.line(format!(
+                    "llama.cpp loaded the model in {:.1} s",
+                    t.elapsed().as_secs_f64()
+                ));
+                Ok(s)
+            }
+            Err(e) => {
+                log.line(format!(
+                    "llama.cpp failed: {}\nIts output ({}) ends:\n{}",
+                    e.lines().next().unwrap_or(""),
+                    s.server_log.display(),
+                    s.log_lines(80)
+                ));
+                Err(e)
+            }
+        }
     }
 
     /// The end of the server's log, for error messages.
     fn log_tail(&self) -> String {
-        let text = std::fs::read(&self.log)
+        self.log_lines(6)
+    }
+
+    /// The last `n` lines of the server's log that are not empty.
+    fn log_lines(&self, n: usize) -> String {
+        let text = std::fs::read(&self.server_log)
             .map(|b| String::from_utf8_lossy(&b).into_owned())
             .unwrap_or_default();
         let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-        lines[lines.len().saturating_sub(6)..].join("\n")
+        lines[lines.len().saturating_sub(n)..].join("\n")
+    }
+
+    /// Whether the server's process is still running.
+    fn alive(&self) -> bool {
+        matches!(self.child.lock().unwrap().try_wait(), Ok(None))
     }
 
     fn wait_ready(&mut self, limit: Duration) -> Result<(), String> {
@@ -390,11 +532,12 @@ impl Server {
             if let Ok(Some(st)) = self.child.lock().unwrap().try_wait() {
                 return Err(format!("llama.cpp stopped ({st}):\n{}", self.log_tail()));
             }
+            // 503 while the model loads.
             if self
                 .agent
                 .get(format!("{}/health", self.url))
                 .call()
-                .is_ok()
+                .is_ok_and(|r| r.status().is_success())
             {
                 return Ok(());
             }
@@ -410,32 +553,78 @@ impl Server {
 
     /// One sample's rating, 1 to 9: the mean answer to [`QUESTIONS`].
     pub fn rate(&self, sample: &str) -> Result<f32, String> {
-        let mut sum = 0.0;
-        for q in QUESTIONS {
+        let mut answers = Vec::with_capacity(QUESTIONS.len());
+        for (k, q) in QUESTIONS.iter().enumerate() {
             let body = serde_json::to_vec(&request(sample, q)).unwrap();
-            let text = self
+            let (status, text) = self
                 .agent
                 .post(format!("{}/v1/chat/completions", self.url))
                 .header("Content-Type", "application/json")
                 .send(&body[..])
-                .and_then(|mut r| r.body_mut().read_to_string())
-                .map_err(|e| format!("llama.cpp: {e}"))?;
-            let v: serde_json::Value =
-                serde_json::from_str(&text).map_err(|e| format!("llama.cpp answered {e}"))?;
-            sum += expected_digit(&v)?;
+                .and_then(|mut r| Ok((r.status(), r.body_mut().read_to_string()?)))
+                .map_err(|e| format!("llama.cpp, question {}: {e}", k + 1))?;
+            if !status.is_success() {
+                return Err(format!(
+                    "llama.cpp answered question {} with HTTP {status}: {}",
+                    k + 1,
+                    tail_chars(text.trim(), 2000)
+                ));
+            }
+            let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+                format!(
+                    "llama.cpp's answer to question {} is not JSON ({e}): {}",
+                    k + 1,
+                    tail_chars(&text, 2000)
+                )
+            })?;
+            answers.push(expected_digit(&v).map_err(|e| format!("Question {}: {e}", k + 1))?);
         }
-        Ok(sum / QUESTIONS.len() as f32)
+        let mean = answers.iter().sum::<f32>() / answers.len() as f32;
+        self.log.line(format!(
+            "    answers {} → {mean:.2}",
+            answers
+                .iter()
+                .map(|a| format!("{a:.2}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+        Ok(mean)
     }
 
     /// A book's rating; `Ok(None)` if it is too short to rate.
     pub fn rate_book(&self, book: &Book) -> Result<Option<Rating>, String> {
+        let body: Vec<_> = book
+            .sections
+            .iter()
+            .filter(|s| s.kind == SectionKind::Body)
+            .collect();
+        self.log.line(format!(
+            "  {}: {} sections, {} of them body text with {} paragraphs and {} Chinese characters",
+            book.format,
+            book.sections.len(),
+            body.len(),
+            body.iter().map(|s| s.paragraphs.len()).sum::<usize>(),
+            body.iter()
+                .flat_map(|s| &s.paragraphs)
+                .map(|p| han(p))
+                .sum::<usize>()
+        ));
         let Some(samples) = samples(book) else {
             return Ok(None);
         };
-        let scores = samples
-            .iter()
-            .map(|s| self.rate(s))
-            .collect::<Result<Vec<f32>, String>>()?;
+        let mut scores = Vec::with_capacity(samples.len());
+        for (k, s) in samples.iter().enumerate() {
+            self.log.line(format!(
+                "  sample {} of {} at {:.0}%: {} Chinese characters, {} in all, starting {:?}",
+                k + 1,
+                samples.len(),
+                POSITIONS[k] * 100.0,
+                han(s),
+                s.chars().count(),
+                s.chars().take(20).collect::<String>()
+            ));
+            scores.push(self.rate(s)?);
+        }
         Ok(Some(Rating {
             score: scores.iter().sum::<f32>() / scores.len() as f32,
             samples: scores,
@@ -504,23 +693,28 @@ type Shared = Arc<(Mutex<State>, Condvar)>;
 pub struct Rater {
     shared: Shared,
     thread: Option<std::thread::JoinHandle<()>>,
+    log: Log,
 }
 
 /// How long the server is kept after the last book.
 const IDLE: Duration = Duration::from_secs(60);
 
 impl Rater {
-    /// `notify` is called whenever there is something new to show.
+    /// `notify` is called whenever there is something new to show. Starts
+    /// a new [`Log`].
     pub fn new(notify: impl Fn() + Send + 'static) -> Rater {
         let shared: Shared = Arc::default();
         let s = shared.clone();
+        let log = Log::create();
+        let l = log.clone();
         let thread = std::thread::Builder::new()
             .name("style-rater".into())
-            .spawn(move || run(s, notify))
+            .spawn(move || run(s, notify, l))
             .expect("cannot start a thread");
         Rater {
             shared,
             thread: Some(thread),
+            log,
         }
     }
 
@@ -534,6 +728,12 @@ impl Rater {
             }
             st.queue.remove(i);
         }
+        self.log.line(format!(
+            "Queued {}{} ({})",
+            job.title,
+            if first { ", first: it is open" } else { "" },
+            job.path.display()
+        ));
         if first {
             st.queue.push_front(job);
         } else {
@@ -572,14 +772,22 @@ impl Drop for Rater {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+        self.log
+            .line("Stopped: the app closed, the setting was turned off or rating started again");
     }
 }
 
-fn run(shared: Shared, notify: impl Fn()) {
+fn run(shared: Shared, notify: impl Fn(), log: Log) {
     let (m, cv) = &*shared;
     let set = |p: Phase| {
         m.lock().unwrap().phase = p;
         notify();
+    };
+    let fail = |e: String| {
+        log.line(format!(
+            "Rating stopped: {e}\nNothing more is rated until it is started again from the ⚙ menu."
+        ));
+        set(Phase::Failed(e));
     };
     let mut server: Option<Server> = None;
     loop {
@@ -602,6 +810,10 @@ fn run(shared: Shared, notify: impl Fn()) {
                 if t.timed_out() && st.queue.is_empty() && server.is_some() {
                     st.child = None;
                     drop(st);
+                    log.line(format!(
+                        "Nothing to rate for {} s: stopping llama.cpp",
+                        IDLE.as_secs()
+                    ));
                     server = None;
                     st = m.lock().unwrap();
                 }
@@ -616,6 +828,13 @@ fn run(shared: Shared, notify: impl Fn()) {
                     if model.is_cached() {
                         continue;
                     }
+                    log.line(format!(
+                        "Downloading {} ({:.0} MB) to {}",
+                        model.id,
+                        model.total_size() as f64 / 1e6,
+                        model.dir().display()
+                    ));
+                    let t = Instant::now();
                     let res = model.ensure(&|d, _| {
                         let mut st = m.lock().unwrap();
                         st.phase = Phase::Downloading {
@@ -626,10 +845,11 @@ fn run(shared: Shared, notify: impl Fn()) {
                         notify();
                     });
                     if let Err(e) = res {
-                        set(Phase::Failed(e));
                         m.lock().unwrap().queue.push_front(job.clone());
+                        fail(format!("Cannot download {}: {e}", model.id));
                         break;
                     }
+                    log.line(format!("Downloaded in {:.0} s", t.elapsed().as_secs_f64()));
                     base += model.total_size();
                 }
                 if matches!(m.lock().unwrap().phase, Phase::Failed(_)) {
@@ -637,19 +857,17 @@ fn run(shared: Shared, notify: impl Fn()) {
                 }
             }
             set(Phase::Starting);
-            match Server::start(true).or_else(|gpu| {
-                Server::start(false).map_err(|cpu| format!("{gpu}\n\nOn the CPU only: {cpu}"))
+            match Server::start(true, &log).or_else(|gpu| {
+                log.line("Trying again on the CPU only");
+                Server::start(false, &log).map_err(|cpu| format!("{gpu}\n\nOn the CPU only: {cpu}"))
             }) {
                 Ok(s) => {
                     m.lock().unwrap().child = Some(s.child.clone());
                     server = Some(s);
                 }
                 Err(e) => {
-                    let mut st = m.lock().unwrap();
-                    st.queue.push_front(job);
-                    st.phase = Phase::Failed(e);
-                    drop(st);
-                    notify();
+                    m.lock().unwrap().queue.push_front(job);
+                    fail(e);
                     continue;
                 }
             }
@@ -659,29 +877,63 @@ fn run(shared: Shared, notify: impl Fn()) {
             title: job.title.clone(),
             left,
         });
-        let res = crate::extract::load(&job.path, EncodingChoice::Auto)
-            .and_then(|book| server.as_ref().unwrap().rate_book(&book));
+        log.line(format!("Rating {} ({})", job.title, job.path.display()));
+        let t = Instant::now();
+        let srv = server.as_ref().unwrap();
+        // A panic would leave the rater stuck on this book: report it as its failure.
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::extract::load(&job.path, EncodingChoice::Auto)
+                .map_err(|e| format!("Cannot read the book: {e}"))
+                .and_then(|book| srv.rate_book(&book))
+        }))
+        .unwrap_or_else(|p| {
+            let msg = p
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| p.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            Err(format!("Internal error (panic): {msg}"))
+        });
+        let secs = t.elapsed().as_secs_f64();
+        // A failed request may mean the server died: start a new one next time.
+        let dead = res.is_err() && !srv.alive();
+        if dead {
+            log.line(format!(
+                "llama.cpp is no longer running; its output ({}) ends:\n{}",
+                srv.server_log.display(),
+                srv.log_lines(80)
+            ));
+        }
         let mut st = m.lock().unwrap();
         if st.stop {
             return;
         }
+        if dead {
+            st.child = None;
+            drop(st);
+            server = None;
+            st = m.lock().unwrap();
+        }
         match res {
-            Ok(Some(r)) => st.out.push(Outcome::Rated(job.id, r)),
-            Ok(None) => st.out.push(Outcome::Skipped(
-                job.id,
-                format!("Fewer than {MIN_HAN} Chinese characters in the body text"),
-            )),
+            Ok(Some(r)) => {
+                log.line(format!(
+                    "  rated {:.2} ({}) in {secs:.1} s",
+                    r.score,
+                    r.samples
+                        .iter()
+                        .map(|x| format!("{x:.2}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                st.out.push(Outcome::Rated(job.id, r));
+            }
+            Ok(None) => {
+                let why = format!("Fewer than {MIN_HAN} Chinese characters in the body text");
+                log.line(format!("  not rated: {why}"));
+                st.out.push(Outcome::Skipped(job.id, why));
+            }
             Err(e) => {
-                // A failed request means the server died: start a new one next time.
-                let alive = server
-                    .as_ref()
-                    .is_some_and(|s| matches!(s.child.lock().unwrap().try_wait(), Ok(None)));
-                if !alive {
-                    st.child = None;
-                    drop(st);
-                    server = None;
-                    st = m.lock().unwrap();
-                }
+                log.line(format!("  FAILED after {secs:.1} s: {e}"));
                 st.out.push(Outcome::Skipped(job.id, e));
             }
         }
@@ -763,6 +1015,15 @@ mod tests {
     #[test]
     fn short_books_are_not_rated() {
         assert!(samples(&book(vec!["短".repeat(1500)])).is_none());
+    }
+
+    #[test]
+    fn log_helpers() {
+        assert_eq!(utc(0), "1970-01-01 00:00:00");
+        assert_eq!(utc(951_868_800), "2000-03-01 00:00:00");
+        assert_eq!(utc(1_700_000_000), "2023-11-14 22:13:20");
+        assert_eq!(tail_chars("一二三四", 2), "三四");
+        assert_eq!(tail_chars("ab", 5), "ab");
     }
 
     #[test]

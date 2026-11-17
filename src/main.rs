@@ -13,6 +13,7 @@ use hanstat::lang::Language;
 use hanstat::plan;
 use hanstat::profile::{self, Profile};
 use hanstat::script::Variant;
+use hanstat::search;
 use hanstat::segment::SegmenterKind;
 use hanstat::settings::Settings;
 use hanstat::style;
@@ -510,6 +511,8 @@ struct App {
     /// The History view replaces the book's tabs.
     show_history: bool,
     history_sort: (HistCol, bool),
+    /// The Library's search box (Books and Reading path; [`search`]).
+    library_filter: String,
     /// SHA-256 of the open book's file, and of the book `report` was built
     /// from (they differ between a new book arriving and its report).
     book_id: Option<String>,
@@ -828,6 +831,7 @@ impl Default for App {
             history_error: None,
             show_history: false,
             history_sort: (HistCol::Analysed, true),
+            library_filter: String::new(),
             book_id: None,
             report_id: None,
             history_touch: false,
@@ -1911,9 +1915,55 @@ impl App {
                 ui.label(RichText::new(format!("{} could not be rated.", skipped.len())).weak())
                     .on_hover_text(skipped.join("\n"));
             }
-            if let Some(style::Phase::Failed(e)) = self.style.rater.as_ref().map(|r| r.phase()) {
+            let phase = self.style.rater.as_ref().map(|r| r.phase());
+            let failed = matches!(phase, Some(style::Phase::Failed(_)));
+            if let Some(style::Phase::Failed(e)) = &phase {
                 ui.colored_label(Color32::from_rgb(220, 170, 60), e);
-                ui.label(RichText::new("Turn the setting off and on to try again.").weak());
+            }
+            let unrated = chinese.len() - rated;
+            // Busy: the books without a rating are already waiting their turn.
+            // (Downloading or starting counts too: stopping then would wait for it.)
+            let busy = !failed
+                && self.style.rater.as_ref().is_some_and(|r| {
+                    r.pending() > 0 || !matches!(phase, Some(style::Phase::Idle))
+                });
+            let mut again = false;
+            ui.horizontal(|ui| {
+                again = ui
+                    .add_enabled(
+                        unrated > 0 && !busy,
+                        egui::Button::new(if unrated == 1 {
+                            "Rate the book without a rating".to_owned()
+                        } else {
+                            format!("Rate the {unrated} books without a rating")
+                        }),
+                    )
+                    .on_hover_text(
+                        "Start the rater afresh, with a new log, and try every Chinese book in the Library                          that has no rating yet, those that failed included.",
+                    )
+                    .on_disabled_hover_text(if busy {
+                        "Still rating: the books without a rating are waiting their turn."
+                    } else {
+                        "Every Chinese book in the Library is rated."
+                    })
+                    .clicked();
+                let log = style::Log::path();
+                if log.is_file()
+                    && ui
+                        .button("Open the log")
+                        .on_hover_text(format!(
+                            "What the rater did in its last run, and why a book failed: {}",
+                            log.display()
+                        ))
+                        .clicked()
+                    && let Err(e) = open_with_system(&log)
+                {
+                    self.style.error = Some(e);
+                }
+            });
+            if again {
+                self.style.stop();
+                self.style.error = None;
             }
             if let Some(e) = &self.style.error {
                 ui.colored_label(Color32::from_rgb(220, 170, 60), e);
@@ -2802,6 +2852,33 @@ fn file_name(p: &Path) -> String {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
+/// Open `path` in the program the system uses for it (a text editor for a log).
+fn open_with_system(path: &Path) -> Result<(), String> {
+    let mut cmd = if cfg!(windows) {
+        // Explorer opens a file with its default program (no cmd quoting pitfalls).
+        let mut c = std::process::Command::new("explorer");
+        c.arg(path);
+        c
+    } else if cfg!(target_os = "macos") {
+        let mut c = std::process::Command::new("open");
+        c.arg(path);
+        c
+    } else {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(path);
+        c
+    };
+    cmd.spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Cannot open {}: {e}", path.display()))
+}
+
+/// A Library book matches the search by its title or its file name.
+fn book_matches(q: &search::Query, title: &str, path: &Path) -> bool {
+    let name = path.file_name().map(|n| n.to_string_lossy());
+    q.matches(std::iter::once(title).chain(name.as_deref()))
+}
+
 fn file_stem(p: &Path) -> String {
     p.file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -3688,21 +3765,27 @@ impl App {
         if let Some(m) = note {
             self.toast = Some((m, ui.input(|i| i.time) + 4.0));
         }
-        if let Some((w, on)) = toggle
-            && self.known.settings.set_marked(&w, on)
-        {
-            let shown = self
-                .report
-                .as_ref()
-                .map_or(w.clone(), |r| r.display(&w).to_owned());
-            let msg = if on {
-                format!("Marked {shown} as known")
-            } else {
-                format!("Unmarked {shown}")
-            };
-            self.toast = Some((msg, ui.input(|i| i.time) + 3.0));
-            self.known_changed();
+        if let Some((w, on)) = toggle {
+            self.mark_known(&w, on, ui);
         }
+    }
+
+    /// Mark `w` known (or unmark it) from the Words or Suggested words tab.
+    fn mark_known(&mut self, w: &str, on: bool, ui: &egui::Ui) {
+        if !self.known.settings.set_marked(w, on) {
+            return;
+        }
+        let shown = self
+            .report
+            .as_ref()
+            .map_or(w.to_owned(), |r| r.display(w).to_owned());
+        let msg = if on {
+            format!("Marked {shown} as known")
+        } else {
+            format!("Unmarked {shown}")
+        };
+        self.toast = Some((msg, ui.input(|i| i.time) + 3.0));
+        self.known_changed();
     }
 
     fn sections(&mut self, ui: &mut egui::Ui) {
@@ -3868,12 +3951,18 @@ impl App {
             ));
         });
         let mut toggles: Vec<String> = Vec::new();
+        // (word, mark) from a +/− click, applied after the table.
+        let mut mark: Option<(String, bool)> = None;
+        let known = &self.known.settings;
+        let merged = self.known.merged.as_deref();
         TableBuilder::new(ui)
             // Cells otherwise inherit the top-down layout: text sits at the row top.
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .striped(true)
             .column(Column::exact(28.0))
+            .column(Column::exact(30.0))
             .column(Column::exact(150.0))
+            .column(Column::exact(if merged.is_some() { 100.0 } else { 0.0 }))
             .column(Column::exact(100.0))
             .column(Column::exact(110.0))
             .column(Column::exact(100.0))
@@ -3882,7 +3971,12 @@ impl App {
             .header(24.0, |mut h| {
                 for (t, tip) in [
                     ("", ""),
+                    ("", ""),
                     ("Word", ""),
+                    (
+                        if merged.is_some() { "Status" } else { "" },
+                        "Whether you know the word (Anki, the levels and word lists ticked, or marked with +)",
+                    ),
                     ("Occurrences", "Times the string occurs in the included sections"),
                     ("Split", "Occurrences the segmenter did NOT keep as one word"),
                     ("Dependency", "Share of the rarer part's occurrences that are inside this string (1.0 = parts never occur apart)"),
@@ -3906,8 +4000,34 @@ impl App {
                             toggles.push(c.word.clone());
                         }
                     });
+                    let st = merged.map(|k| k.word(&c.word));
+                    row.col(|ui| {
+                        if known.is_marked(&c.word) {
+                            if ui
+                                .small_button("−")
+                                .on_hover_text("You marked this word known. Click to unmark it.")
+                                .clicked()
+                            {
+                                mark = Some((c.word.clone(), false));
+                            }
+                        } else if !st.is_some_and(Status::is_known)
+                            && ui
+                                .small_button("+")
+                                .on_hover_text(
+                                    "Mark as known (added to your known words, kept between runs).                                      A word marked known is also kept whole by the segmenter, from the next analysis.",
+                                )
+                                .clicked()
+                        {
+                            mark = Some((c.word.clone(), true));
+                        }
+                    });
                     row.col(|ui| {
                         ui.label(RichText::new(&c.word).size(18.0));
+                    });
+                    row.col(|ui| {
+                        if let Some(s) = st {
+                            ui.label(status_text(s));
+                        }
                     });
                     row.col(|ui| {
                         ui.label(fmt_int(c.occurrences as u64));
@@ -3942,6 +4062,9 @@ impl App {
             if !self.selected.remove(&w) {
                 self.selected.insert(w);
             }
+        }
+        if let Some((w, on)) = mark {
+            self.mark_known(&w, on, ui);
         }
         if apply {
             self.apply_selected(ctx);
@@ -4096,6 +4219,9 @@ const METHOD: &[&str] = &[
     "Anki: the collection is copied (with its write-ahead log) to a temporary folder and read from there, so it works while Anki is open and is never modified. A review card is mature at an interval of 21+ days and young below that, or, with \"Mature by FSRS stability\" on, at the chosen stability (cards without FSRS data keep the interval rule); learning and relearning cards are 'learning'. A note takes its best card's status in the selected decks, a word its best note's, and a character the best status of any known word containing it. A ticked field value with sentence punctuation is split into words with the book's segmenter and forced words, so its boundaries agree with the book's. Otherwise each run of Chinese characters is a word; runs longer than 4 characters (idioms, sayings) also count their segmented parts. Book words must match exactly (after optional Traditional→Simplified folding), so the segmenter's word boundaries matter.",
 ];
 
+/// The Library search box's hover text.
+const LIBRARY_SEARCH_HOVER: &str = "Filters by title and file name. Letters need only appear in order (hp finds Harry Potter);      several words must all match. With * (any characters) or ? (one character) a word must match the whole title or      file name: 三体* starts with 三体, *.txt ends with .txt. Case is ignored and 三體 finds 三体. Esc clears it.";
+
 impl App {
     /// Every book analysed before, as recorded when its analysis (or what
     /// counts as known) last changed. A click on a title opens the book.
@@ -4112,6 +4238,23 @@ impl App {
             ui.selectable_value(&mut self.history_tab, HistTab::Stats, "Stats")
                 .on_hover_text("The library as a whole: its size, its vocabulary and how much of it you know");
             ui.add_space(8.0);
+            if self.history_tab != HistTab::Stats {
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.library_filter)
+                        .hint_text("🔍 Search")
+                        .desired_width(180.0),
+                )
+                .on_hover_text(LIBRARY_SEARCH_HOVER);
+                if (r.has_focus() || r.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.library_filter.clear();
+                }
+                if !self.library_filter.is_empty()
+                    && ui.small_button("✖").on_hover_text("Clear the search").clicked()
+                {
+                    self.library_filter.clear();
+                }
+                ui.add_space(8.0);
+            }
             ui.label(
                 RichText::new(match self.history_tab {
                     HistTab::Books => "Books analysed before, with the statistics from their last analysis. Analysing a book again replaces its row. Click a title to open the book.",
@@ -4192,7 +4335,10 @@ impl App {
                 entries[i].stats.variant.as_str(),
             )
         };
-        let mut rows: Vec<usize> = (0..entries.len()).collect();
+        let query = search::Query::new(&self.library_filter);
+        let mut rows: Vec<usize> = (0..entries.len())
+            .filter(|&i| book_matches(&query, &entries[i].title, &entries[i].path))
+            .collect();
         rows.sort_by(|&a, &b| {
             let o = match col {
                 HistCol::Title => entries[a]
@@ -4205,6 +4351,10 @@ impl App {
             if desc { o.reverse() } else { o }
         });
 
+        if rows.is_empty() {
+            ui.label(RichText::new("No book matches the search.").weak());
+            return;
+        }
         let now = history::now();
         let mut open: Option<PathBuf> = None;
         let mut remove: Option<String> = None;
@@ -5089,6 +5239,21 @@ impl App {
         let covers = &mut self.covers;
         let hist = &self.history;
         let n = path.steps.len();
+        let query = search::Query::new(&self.library_filter);
+        // The steps shown: all, or those the search matches (numbered as on the whole path).
+        let shown: Vec<usize> = (0..n)
+            .filter(|&i| {
+                let b = &lib.books[path.steps[i].book];
+                query.is_empty()
+                    || match by_id.get(b.id.as_str()) {
+                        Some(e) => book_matches(&query, &b.title, &e.path),
+                        None => query.matches([b.title.as_str()]),
+                    }
+            })
+            .collect();
+        if shown.is_empty() {
+            ui.label(RichText::new("No book on the path matches the search.").weak());
+        }
         let dash = || RichText::new("–").weak();
         let left_out: Vec<(String, String)> = self
             .plan
@@ -5153,8 +5318,8 @@ impl App {
                 }
             })
             .body(|body| {
-                body.rows(COVER_ROW, n, |mut row| {
-                    let i = row.index();
+                body.rows(COVER_ROW, shown.len(), |mut row| {
+                    let i = shown[row.index()];
                     let s = &path.steps[i];
                     let b = &lib.books[s.book];
                     let e = by_id.get(b.id.as_str());
