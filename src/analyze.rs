@@ -6,6 +6,7 @@ use crate::cache::{Cache, Key};
 use crate::chars::{self, Class, NormStats};
 use crate::extract::{Book, SectionKind};
 use crate::lang::{self, Language};
+use crate::lexicon;
 use crate::script::{self, Variant};
 use crate::segment::{self, Segmenter, SegmenterKind};
 use rayon::prelude::*;
@@ -323,11 +324,52 @@ pub fn analyze_book_cancellable(
     if cancelled() {
         return Err(CANCELLED.to_owned());
     }
+    let mut stats = stats;
+    if language == Language::Chinese {
+        let protected: Vec<String> = words.iter().chain(&known).cloned().collect();
+        let text: Vec<String> = book
+            .sections
+            .par_iter()
+            .flat_map_iter(|s| s.paragraphs.iter())
+            .map(|p| chars::normalize(p, &mut NormStats::default()))
+            .collect();
+        resplit_rare(&mut stats, &protected, &text);
+    }
     if let (Some(cache), Some(key)) = (cache, &key) {
         // Not being able to save only means analysing again next time.
         let _ = cache.put(key, &stats);
     }
     Ok(prepared(stats, false))
+}
+
+/// Split again the tokens the segmenter invented (see [`lexicon::resplit_map`]).
+/// Judged on the whole book, included sections or not, so that ticking a
+/// section never changes how a word is counted.
+fn resplit_rare(stats: &mut [SectionStats], protected: &[String], text: &[String]) {
+    let mut total: HashMap<String, u32> = HashMap::new();
+    for s in stats.iter() {
+        for (w, n) in &s.words {
+            *total.entry(w.clone()).or_default() += n;
+        }
+    }
+    let map = lexicon::resplit_map(&total, protected, text);
+    if map.is_empty() {
+        return;
+    }
+    stats.par_iter_mut().for_each(|s| {
+        let hits: Vec<String> = s
+            .words
+            .keys()
+            .filter(|w| map.contains_key(*w))
+            .cloned()
+            .collect();
+        for w in hits {
+            let n = s.words.remove(&w).unwrap_or_default();
+            for p in &map[&w] {
+                *s.words.entry(p.clone()).or_default() += n;
+            }
+        }
+    });
 }
 
 fn analyze_group(acc: &mut SectionStats, raw: &[String], seg: &Segmenter) {

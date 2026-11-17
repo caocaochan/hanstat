@@ -57,10 +57,10 @@ const NOT_ANALYSIS: &[&str] = &[
     "src/search.rs",
 ];
 
-/// Bundled data that is not read by the analysis: licences, the
-/// vocabulary lists of `known.rs` and the general words of `discover.rs`.
+/// Bundled data that is not read by the analysis: licences and the
+/// vocabulary lists of `known.rs`. (The word lists of `lexicon.rs`, which
+/// word discovery shares, decide which tokens are split again.)
 const NOT_ANALYSIS_DATA: &[&str] = &[
-    "data/CEDICT-words.txt",
     "data/HSK30-2025.tsv",
     "data/TOCFL-2024.tsv",
     "data/KO-standard-2020.tsv",
@@ -153,7 +153,6 @@ fn analysis_fingerprint() {
 const LIBRARY_SOURCES: &[&str] = &[
     "src/extract",
     "src/discover.rs",
-    "data/CEDICT-words.txt",
     "src/history/row.rs",
     "src/profile.rs",
 ];

@@ -1,5 +1,16 @@
 # Changelog
 
+## [2026.11.17.15] - 2026-11-17
+
+### Changed
+- **Chinese books count far fewer non-words.** A segmenter that misplaces a boundary invents a "word" there: 他妈凭什么 became 他/妈凭/什么, 木柯跑 glued a name to a verb, 时此刻 is what was left of 此时此刻. Each occurs once or twice, but together they were about a third of a novel's distinct words. Now a token that no dictionary knows and that the book itself produces fewer than 5 times is split again into dictionary words and the book's own frequent words (its names and terms): 妈凭 → 妈/凭, 木柯跑 → 木柯/跑. On 我在无限游戏里封神 (LTP) the distinct words went from 44,224 to 30,196, and names get back the occurrences that were glued to a neighbour (白柳 18,502 → 19,760). Forced words and known words are never split, and neither is a rare name the text itself gives away: a string that recurs, whose characters occur mostly inside it (衢 of 白衢), and that isn't always next to the same character (三鹦 of 杜三鹦 is).
+- **Suggested words** lists names the segmenter still gets wrong in as few as 1% of their occurrences (5% before). Most names are now counted right without forcing them, as the glued forms (骆闻舟面, 戚容道) are split again; those, up to 99% right, are no longer suggested.
+- **Idioms count as one word.** The segmenters cut idioms apart (若/有所思, 一/头/雾/水) or glued a name to them (白柳若/有所思, 张傀声/嘶力竭); now each of about 60,000 idioms is one word wherever it occurs, in either script: 若有所思 is counted 122 times in that novel instead of 17. A forced word still wins over an idiom.
+
+  The dictionaries are bundled as headword lists only (`data/chengyu.txt`, `data/extra-words.txt`; see `data/Headwords-LICENSE.txt`), built by `examples/headwords.rs`.
+
+  Every book is segmented again once, as the counts changed: seconds a book with LTP, minutes with CKIP.
+
 ## [2026.11.17.14] - 2026-11-17
 
 ### Changed

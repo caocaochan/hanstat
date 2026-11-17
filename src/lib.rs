@@ -11,6 +11,7 @@ pub mod japanese;
 pub mod kiwi;
 pub mod known;
 pub mod lang;
+pub mod lexicon;
 pub mod models;
 pub mod plan;
 pub mod profile;

@@ -179,34 +179,18 @@ pub fn discover_cancellable(
     opts: &Options,
     cancel: &AtomicBool,
 ) -> Option<Vec<Candidate>> {
-    let jieba = jieba();
-    let cedict = cedict_words();
+    // Not `lexicon::is_dictionary_word`: its extra words and idioms would hide
+    // names that are also rare words. Measured on five novels: jieba plus
+    // CC-CEDICT drops 1–3 non-names per book from the recommendations and no
+    // name; a dictionary alone, without jieba, would recommend set phrases
+    // (摇摇头, 话音刚落) that dictionaries don't list.
+    let jieba = crate::lexicon::jieba();
+    let cedict = crate::lexicon::cedict_words();
     let is_general = |w: &str| {
         let s = crate::script::fold_t2s(w);
         jieba.has_word(w) || jieba.has_word(&s) || cedict.contains(w) || cedict.contains(s.as_str())
     };
     discover_impl(book, included, word_freq, known, opts, &is_general, cancel)
-}
-
-/// jieba's dictionary, built once: building it takes a noticeable moment.
-fn jieba() -> &'static jieba_rs::Jieba {
-    static JIEBA: std::sync::OnceLock<jieba_rs::Jieba> = std::sync::OnceLock::new();
-    JIEBA.get_or_init(jieba_rs::Jieba::new)
-}
-
-/// CC-CEDICT's general-language words that jieba's dictionary lacks (靠谱,
-/// 抛尸, 副市长), from `data/CEDICT-words.txt` (built by examples/cedict_words.rs).
-/// Measured on five novels: jieba plus these drops 1–3 non-names per book from
-/// the recommendations and no name; a dictionary alone, without jieba, would
-/// recommend set phrases (摇摇头, 话音刚落) that dictionaries don't list.
-fn cedict_words() -> &'static HashSet<&'static str> {
-    static SET: std::sync::OnceLock<HashSet<&'static str>> = std::sync::OnceLock::new();
-    SET.get_or_init(|| {
-        include_str!("../data/CEDICT-words.txt")
-            .lines()
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .collect()
-    })
 }
 
 /// [`discover`] with another general dictionary: `is_general` says whether a
@@ -378,7 +362,7 @@ fn discover_impl(
             let kept_whole = tokens.get(&k).copied().unwrap_or(0).min(occurrences);
             let split = occurrences - kept_whole;
             // Only worth suggesting if the segmenter splits it a meaningful share of the time.
-            if split < min || (split as f64) < 0.05 * occurrences as f64 {
+            if split < min || (split as f64) < 0.01 * occurrences as f64 {
                 return None;
             }
             let in_dictionary = is_general(&word);
@@ -396,7 +380,7 @@ fn discover_impl(
             let recommended = !in_dictionary
                 && hmin >= 2.0
                 && word.chars().count() <= 4
-                && ((dep >= 0.6 && (0.03..=0.95).contains(&whole_share)) || strong);
+                && ((dep >= 0.6 && (0.03..=0.99).contains(&whole_share)) || strong);
             Some(Candidate {
                 word,
                 occurrences,

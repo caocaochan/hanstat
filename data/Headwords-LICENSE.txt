@@ -1,0 +1,19 @@
+data/chengyu.txt, data/extra-words.txt
+
+Word lists made of dictionary headwords only: no readings, definitions,
+examples or other content of the dictionaries. Every headword is folded to
+Simplified characters with OpenCC's character table. Built by
+examples/headwords.rs from Yomitan conversions of:
+
+- 新华成语大词典 (revision 2026.11.08.2.3.1, https://github.com/caocaochan/chengyu-yomitan)
+- 汉语成语源流大辞典 (revision 2026.11.08.2.3.1, same project)
+- 现代汉语规范词典, 外语教学与研究出版社 (2010) (Yomitan revision 2026.11.16.3)
+- 现代汉语词典, 7th edition, 商务印书馆 (2016) (Yomitan revision 2026.11.16.3)
+- 國語辭典簡編本, 中華民國教育部 (2014) (Yomitan revision 2026.11.16.4)
+
+data/chengyu.txt: headwords of 4 or more Chinese characters of the two idiom
+dictionaries.
+
+data/extra-words.txt: headwords of 2 or more Chinese characters of
+现代汉语规范词典, 现代汉语词典, 國語辭典簡編本 and 新华成语大词典 that are
+neither in jieba's dictionary, data/CEDICT-words.txt nor data/chengyu.txt.

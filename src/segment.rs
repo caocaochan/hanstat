@@ -16,6 +16,9 @@
 //! Known words (word lists, marked words) are applied more gently: a match
 //! only joins tokens the model split, and never cuts through a model token
 //! (see [`Segmenter::with_known`]).
+//! Before both, every idiom (`data/chengyu.txt`, either script) becomes one
+//! token, like a user-dictionary word: models cut idioms apart (若/有所思) and
+//! glue names to them (白柳若/有所思 → 白柳/若有所思).
 
 use crate::ckip::Ckip;
 use crate::japanese;
@@ -357,32 +360,42 @@ impl Segmenter {
     /// (boundaries forced at its edges, removed inside it).
     fn force<'a>(&self, s: &'a str, toks: Vec<&'a str>) -> Vec<&'a str> {
         let Some(ac) = &self.forced else { return toks };
-        let mut it = ac.find_iter(s).peekable();
-        if it.peek().is_none() {
+        make_tokens(s, toks, ac.find_iter(s).map(|m| (m.start(), m.end())))
+    }
+
+    /// Make every idiom one token (see the module docs). Matched leftmost-longest
+    /// on the text folded to Simplified, which keeps the characters in place.
+    fn idioms<'a>(&self, s: &'a str, toks: Vec<&'a str>) -> Vec<&'a str> {
+        if matches!(self.backend, Backend::Kiwi(_) | Backend::Sudachi(_))
+            || s.chars().nth(3).is_none()
+        {
             return toks;
         }
-        let base = s.as_ptr() as usize;
-        let mut cut = vec![false; s.len() + 1];
-        for t in &toks {
-            cut[t.as_ptr() as usize - base] = true;
-        }
-        cut[s.len()] = true;
-        for m in it {
-            cut[m.start() + 1..m.end()]
-                .iter_mut()
-                .for_each(|b| *b = false);
-            cut[m.start()] = true;
-            cut[m.end()] = true;
-        }
-        let mut out = Vec::with_capacity(toks.len());
-        let mut start = 0;
-        for i in 1..=s.len() {
-            if cut[i] {
-                out.push(&s[start..i]);
-                start = i;
-            }
-        }
-        out
+        let folded = script::fold_t2s(s);
+        let same_offsets = folded.len() == s.len()
+            && s.char_indices()
+                .map(|(i, _)| i)
+                .eq(folded.char_indices().map(|(i, _)| i));
+        let spans: Vec<(usize, usize)> = if same_offsets {
+            idiom_matcher()
+                .find_iter(&folded)
+                .map(|m| (m.start(), m.end()))
+                .collect()
+        } else {
+            // A character changed its UTF-8 length when folded: go by character index.
+            let so: Vec<usize> = s.char_indices().map(|(i, _)| i).chain([s.len()]).collect();
+            let fo: Vec<usize> = folded
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain([folded.len()])
+                .collect();
+            let ci = |b: usize| fo.binary_search(&b).ok();
+            idiom_matcher()
+                .find_iter(&folded)
+                .filter_map(|m| Some((so[ci(m.start())?], so[ci(m.end())?])))
+                .collect()
+        };
+        make_tokens(s, toks, spans.into_iter())
     }
 
     /// The model this segmenter loaded, as [`model_identity`] names it. It
@@ -448,12 +461,12 @@ impl Segmenter {
                     } else {
                         c.split_inclusive(|_| true).collect()
                     };
-                    self.force(c, self.merge_known(c, toks))
+                    self.force(c, self.merge_known(c, self.idioms(c, toks)))
                 })
                 .collect(),
             _ => chunks
                 .iter()
-                .map(|c| self.force(c, self.merge_known(c, self.cut_one(c))))
+                .map(|c| self.force(c, self.merge_known(c, self.idioms(c, self.cut_one(c)))))
                 .collect(),
         }
     }
@@ -501,6 +514,51 @@ impl Segmenter {
             s.split_inclusive(|_| true).collect()
         }
     }
+}
+
+/// The idioms of `data/chengyu.txt` (Simplified), built once.
+fn idiom_matcher() -> &'static aho_corasick::AhoCorasick {
+    static AC: OnceLock<aho_corasick::AhoCorasick> = OnceLock::new();
+    AC.get_or_init(|| {
+        aho_corasick::AhoCorasick::builder()
+            .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+            .build(crate::lexicon::chengyu())
+            .expect("idiom list")
+    })
+}
+
+/// `toks` (tiling `s`) with each of `spans` (byte ranges of `s`, in order,
+/// not overlapping) made exactly one token: boundaries forced at its edges,
+/// removed inside it.
+fn make_tokens<'a>(
+    s: &'a str,
+    toks: Vec<&'a str>,
+    spans: impl Iterator<Item = (usize, usize)>,
+) -> Vec<&'a str> {
+    let mut spans = spans.peekable();
+    if spans.peek().is_none() {
+        return toks;
+    }
+    let base = s.as_ptr() as usize;
+    let mut cut = vec![false; s.len() + 1];
+    for t in &toks {
+        cut[t.as_ptr() as usize - base] = true;
+    }
+    cut[s.len()] = true;
+    for (a, b) in spans {
+        cut[a + 1..b].iter_mut().for_each(|c| *c = false);
+        cut[a] = true;
+        cut[b] = true;
+    }
+    let mut out = Vec::with_capacity(toks.len());
+    let mut start = 0;
+    for i in 1..=s.len() {
+        if cut[i] {
+            out.push(&s[start..i]);
+            start = i;
+        }
+    }
+    out
 }
 
 /// True if `toks` are consecutive slices that exactly tile `s`.
@@ -581,6 +639,52 @@ mod tests {
             .unwrap();
         let out = seg.cut_many(&[s]).pop().unwrap();
         assert!(out.contains(&format!("{x}{y}{z}").as_str()), "{out:?}");
+    }
+
+    /// `s` cut into tokens of the given character lengths.
+    fn tokens<'a>(s: &'a str, lens: &[usize]) -> Vec<&'a str> {
+        let offs: Vec<usize> = s.char_indices().map(|(i, _)| i).chain([s.len()]).collect();
+        let mut i = 0;
+        lens.iter()
+            .map(|n| {
+                let t = &s[offs[i]..offs[i + n]];
+                i += n;
+                t
+            })
+            .collect()
+    }
+
+    #[test]
+    fn idioms_become_one_token() {
+        let seg = Segmenter::new(SegmenterKind::Jieba, &[], Variant::Simplified).unwrap();
+        // A name glued to the idiom's first character (LTP: 白柳若/有所思/地/看).
+        let s = "白柳若有所思地看";
+        assert_eq!(
+            seg.idioms(s, tokens(s, &[3, 3, 1, 1])),
+            ["白柳", "若有所思", "地", "看"]
+        );
+        // Traditional text matches the Simplified list; tokens stay slices of the original.
+        let s = "張傀聲嘶力竭地大吼";
+        assert_eq!(
+            seg.idioms(s, tokens(s, &[3, 3, 1, 1, 1])),
+            ["張傀", "聲嘶力竭", "地", "大", "吼"]
+        );
+        // No idiom: unchanged.
+        let s = "他妈凭什么";
+        assert_eq!(seg.idioms(s, tokens(s, &[1, 2, 2])), ["他", "妈凭", "什么"]);
+    }
+
+    #[test]
+    fn user_words_override_idioms() {
+        let s = "白柳若有所思地看";
+        let seg = Segmenter::new(
+            SegmenterKind::Jieba,
+            &["柳若".to_owned()],
+            Variant::Simplified,
+        )
+        .unwrap();
+        let out = seg.cut_many(&[s]).pop().unwrap();
+        assert!(out.contains(&"柳若"), "{out:?}");
     }
 
     #[test]
