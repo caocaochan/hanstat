@@ -1,5 +1,18 @@
 # Changelog
 
+## [2026.11.17.16] - 2026-11-17
+
+### Added
+- **Save the Library as an image.** 💾 Export → **Library as image (PNG)…** draws one long picture, 1920 pixels wide: the whole library at a glance (books, characters, words, reading time, books read, the longest book), then each language with its size, vocabulary and how much of it you know, its books by difficulty, the vocabulary coverage and length-against-difficulty charts, and a card for every book with its cover, script, difficulty, read mark and figures. The Export menu is there with no book open too, for this.
+- **Save a book's Overview as an image.** **🖼 Save as image…** at the top right of the Overview (or 💾 Export → **Book as image (PNG)…**) draws the book's cover and title, its difficulty on a scale of the bands, the text's figures, what you know of it, its coverage curve and the words needed for each share of the text.
+
+  Both follow the window's light or dark theme and are saved in the background. Book titles are set in LXGW WenKai, bundled with hanstat (SIL Open Font License; see `LICENSE-LXGWWenKai-font.txt`).
+- **What's new.** The first start of a newer version shows the release notes since the version you had, once. Clicking the version number at the bottom right now has **Changelog**, every release's notes.
+
+  This release only records the version you have: its notes show from the next update on.
+
+  Nothing is analysed again.
+
 ## [2026.11.17.15] - 2026-11-17
 
 ### Changed

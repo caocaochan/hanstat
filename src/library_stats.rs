@@ -51,21 +51,21 @@ pub(crate) fn fmt_time(mins: f64) -> String {
 }
 
 /// A book's length in the unit its language is measured in.
-fn length(s: &history::Stats) -> u64 {
+pub(crate) fn length(s: &history::Stats) -> u64 {
     match s.language {
         Language::Korean => s.words_total,
         _ => s.han_total,
     }
 }
 
-fn unit(lang: Language) -> &'static str {
+pub(crate) fn unit(lang: Language) -> &'static str {
     match lang {
         Language::Korean => "words",
         _ => "characters",
     }
 }
 
-fn pct(a: usize, b: usize) -> f64 {
+pub(crate) fn pct(a: usize, b: usize) -> f64 {
     if b == 0 {
         0.0
     } else {
@@ -192,13 +192,13 @@ pub(crate) struct Counted {
     format: u32,
     language: Language,
     /// Traditional and Simplified spellings were one word.
-    fold: bool,
+    pub(crate) fold: bool,
     /// History ids of the books counted, in the order of `words.book_known`.
-    ids: Vec<String>,
+    pub(crate) ids: Vec<String>,
     /// What counted as known ("Anki + HSK 1–5"); `None`: nothing.
-    source: Option<String>,
-    words: plan::stats::LibStats,
-    chars: plan::stats::CharStats,
+    pub(crate) source: Option<String>,
+    pub(crate) words: plan::stats::LibStats,
+    pub(crate) chars: plan::stats::CharStats,
 }
 
 impl Counted {
@@ -237,7 +237,7 @@ pub(crate) struct Done {
 /// until a newer one is ready.
 #[derive(Default)]
 pub(crate) struct StatsState {
-    shown: HashMap<Language, Counted>,
+    pub(crate) shown: HashMap<Language, Counted>,
     /// The library and the known words (`Arc` address; 0: none) of the
     /// running job, or of the last count.
     inputs: Option<(LibKey, usize)>,

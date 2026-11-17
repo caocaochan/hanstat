@@ -23,7 +23,7 @@ fn icon() {
 /// before the text exists (`extract`: the text itself is in the cache key),
 /// what is applied to the counts afterwards (Anki, known words, discovery,
 /// History, profiles, the reading path, series, the writing-style rating and
-/// the Library's stats and charts), the module list in `lib.rs`, and
+/// the Library's stats and charts, the image exports), the module list in `lib.rs`, and
 /// downloading (the model's identity is in the key), writing files, the
 /// window's colours, the settings file (read only by the windows and the CLI),
 /// keyboard shortcuts and the Library's search. Anything not listed
@@ -40,6 +40,8 @@ const NOT_ANALYSIS: &[&str] = &[
     "src/series.rs",
     "src/charts.rs",
     "src/library_stats.rs",
+    "src/png_report.rs",
+    "src/raster.rs",
     "src/read_books.rs",
     "src/style.rs",
     "src/style_scale.rs",
@@ -55,6 +57,7 @@ const NOT_ANALYSIS: &[&str] = &[
     "src/settings.rs",
     "src/shortcuts.rs",
     "src/search.rs",
+    "src/whats_new.rs",
 ];
 
 /// Bundled data that is not read by the analysis: licences and the

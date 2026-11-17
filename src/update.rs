@@ -627,11 +627,17 @@ pub fn clean_up(dir: &Path) {
 pub struct Settings {
     /// Check at startup and install a newer release in the background.
     pub auto_update: bool,
+    /// The version started last (`2026.11.17.15`), for the app's What's new
+    /// window: its release notes show once, on the first start of a newer one.
+    pub last_version: Option<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { auto_update: true }
+        Self {
+            auto_update: true,
+            last_version: None,
+        }
     }
 }
 

@@ -27,9 +27,12 @@ use std::sync::{Arc, Mutex};
 mod charts;
 mod library_stats;
 mod palette;
+mod png_report;
+mod raster;
 mod read_books;
 mod shortcuts;
 mod style_scale;
+mod whats_new;
 
 use library_stats::StatsState;
 use shortcuts::{Action, Shortcuts};
@@ -127,6 +130,7 @@ fn main() -> eframe::Result {
             app.shortcuts = Shortcuts::from_saved(&app.settings.shortcuts);
             app.models = fetch_models(&cc.egui_ctx);
             app.updater.start(&cc.egui_ctx);
+            app.whats_new_at_start();
             app.anki_init(&cc.egui_ctx);
             (app.history, app.history_error) = History::load();
             (app.plan.settings, app.plan.error) = plan::Settings::load();
@@ -521,6 +525,8 @@ struct App {
     /// `settings` changed by a drag still in progress: saved when it ends.
     settings_unsaved: bool,
     toast: Option<(String, f64)>,
+    /// An image export being drawn: its message when done.
+    image_job: Option<Receiver<String>>,
 
     suggestions: Option<Vec<Candidate>>,
     suggest_rx: Option<Receiver<Vec<Candidate>>>,
@@ -623,6 +629,9 @@ struct App {
     typing_before: bool,
     /// The floating windows open, in the order they were opened.
     window_stack: Vec<Win>,
+    /// The release notes since the version used last, on the first start
+    /// of a newer one ([`whats_new`]).
+    whats_new: Option<whats_new::WhatsNew>,
 }
 
 /// The floating windows, which the Close-window shortcut closes.
@@ -633,10 +642,18 @@ enum Win {
     Forced,
     Settings,
     Read,
+    WhatsNew,
 }
 
 impl Win {
-    const ALL: [Win; 5] = [Win::Anki, Win::Known, Win::Forced, Win::Settings, Win::Read];
+    const ALL: [Win; 6] = [
+        Win::Anki,
+        Win::Known,
+        Win::Forced,
+        Win::Settings,
+        Win::Read,
+        Win::WhatsNew,
+    ];
 
     /// Its layer: the id given to its `egui::Window`.
     fn layer(self) -> egui::LayerId {
@@ -646,6 +663,7 @@ impl Win {
             Win::Forced => "forced-window",
             Win::Settings => "settings-window",
             Win::Read => "read_dialog",
+            Win::WhatsNew => whats_new::WINDOW_ID,
         });
         egui::LayerId::new(egui::Order::Middle, id)
     }
@@ -1196,6 +1214,7 @@ impl Default for App {
             ja_cpm: None,
             settings_unsaved: false,
             toast: None,
+            image_job: None,
             suggestions: None,
             suggest_rx: None,
             discover_due: None,
@@ -1249,6 +1268,7 @@ impl Default for App {
             focus_filter: false,
             typing_before: false,
             window_stack: Vec::new(),
+            whats_new: None,
         }
     }
 }
@@ -2287,6 +2307,14 @@ impl App {
                     }
                 }
                 ui.separator();
+                if ui
+                    .button("Changelog")
+                    .on_hover_text("What changed in every release, newest first.")
+                    .clicked()
+                {
+                    self.whats_new = Some(whats_new::WhatsNew::all());
+                    ui.close();
+                }
                 ui.hyperlink_to("Releases on GitHub", update::RELEASES_PAGE);
             },
         );
@@ -2773,6 +2801,7 @@ impl eframe::App for App {
         self.poll_anki(&ctx);
         self.poll_plan(&ctx);
         self.poll_stats(&ctx);
+        self.poll_image(&ctx);
         // Counted only while shown: it reads every book's word data.
         if self.show_history && self.history_tab == HistTab::Stats {
             self.refresh_stats(&ctx);
@@ -2908,11 +2937,25 @@ impl eframe::App for App {
                     }
                 }
 
-                if self.report.is_some() {
+                if self.report.is_some() || !self.history.entries.is_empty() {
                     ui.separator();
+                    let mut image = None;
                     ui.menu_button("💾 Export", |ui| {
+                        let busy = self.image_busy();
+                        let library_button = |ui: &mut egui::Ui| {
+                            ui.add_enabled(!busy, egui::Button::new("Library as image (PNG)…"))
+                                .on_hover_text("One long picture of the Library: its totals, each language's vocabulary and every book")
+                                .on_disabled_hover_text("An image is being saved")
+                                .clicked()
+                        };
+                        let Some(r) = self.report.as_ref() else {
+                            if library_button(ui) {
+                                image = Some(png_report::ImageExport::Library);
+                                ui.close();
+                            }
+                            return;
+                        };
                         let stem = self.path.as_deref().map(file_stem).unwrap_or_else(|| "hanstat".into());
-                        let r = self.report.as_ref().unwrap();
                         let mut msg = None;
                         // A Korean book has no character statistics; a Japanese one counts kanji.
                         let chinese = r.language != Language::Korean;
@@ -2943,6 +2986,20 @@ impl eframe::App for App {
                             msg = save(&format!("{stem}-dictionary.txt"), "txt", self.user_words.join("\n") + "\n");
                         }
                         ui.separator();
+                        if ui
+                            .add_enabled(!busy, egui::Button::new("Book as image (PNG)…"))
+                            .on_hover_text("A picture of this book's Overview: its cover, figures, difficulty and most frequent unknown words")
+                            .on_disabled_hover_text("An image is being saved")
+                            .clicked()
+                        {
+                            image = Some(png_report::ImageExport::Book);
+                            ui.close();
+                        }
+                        if !self.history.entries.is_empty() && library_button(ui) {
+                            image = Some(png_report::ImageExport::Library);
+                            ui.close();
+                        }
+                        ui.separator();
                         if chinese && ui.button("Copy unique characters").clicked() {
                             ctx.copy_text(r.char_freq.iter().map(|x| x.0).collect());
                             msg = Some(format!("Copied {} characters", r.char_freq.len()));
@@ -2956,6 +3013,9 @@ impl eframe::App for App {
                             ui.close();
                         }
                     });
+                    if let Some(what) = image {
+                        self.export_image(&ctx, what);
+                    }
                 }
 
                 ui.separator();
@@ -3182,6 +3242,11 @@ impl eframe::App for App {
             self.settings_window(&ctx);
         }
         self.read_window(&ctx);
+        if let Some(w) = &self.whats_new
+            && !whats_new::window(&ctx, w)
+        {
+            self.whats_new = None;
+        }
         // Asked for but not drawn (no filter shown): not kept for later.
         self.focus_filter = false;
         self.typing_before = ctx.text_edit_focused();
@@ -3189,6 +3254,29 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// At startup: open the What's new window if this version is newer than
+    /// the one started last, and record this one.
+    fn whats_new_at_start(&mut self) {
+        let current = update::current_version();
+        let recorded = self.updater.settings.last_version.clone();
+        let (sections, record) =
+            whats_new::at_start(whats_new::CHANGELOG, recorded.as_deref(), current);
+        if record {
+            self.updater.settings.last_version = Some(update::format_version(current));
+            if let Err(e) = self.updater.settings.save() {
+                self.set_error("update", e);
+            }
+        }
+        if let Some(since) = recorded.as_deref().and_then(update::parse_version)
+            && !sections.is_empty()
+        {
+            self.whats_new = Some(whats_new::WhatsNew {
+                since: Some(since),
+                sections,
+            });
+        }
+    }
+
     /// Keyboard shortcuts pressed this frame, before anything is drawn; or,
     /// while new keys are being chosen in the Settings window, those keys.
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
@@ -3321,6 +3409,7 @@ impl App {
             Win::Forced => self.forced_window,
             Win::Settings => self.settings_window,
             Win::Read => self.read_dialog.is_some(),
+            Win::WhatsNew => self.whats_new.is_some(),
         }
     }
 
@@ -3338,6 +3427,7 @@ impl App {
             Some(Win::Forced) => self.forced_window = false,
             Some(Win::Settings) => self.settings_window = false,
             Some(Win::Read) => self.read_dialog = None,
+            Some(Win::WhatsNew) => self.whats_new = None,
             None => {}
         }
     }
@@ -4199,10 +4289,25 @@ impl App {
             .as_deref()
             .map_or(0.0, |id| self.style_offset(id));
         let skip_hapax = self.settings.skip_hapax;
+        let image_busy = self.image_busy();
+        let mut save_image = false;
         let out = egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            if let Some(t) = &r.title {
-                ui.heading(t);
-            }
+            // The title, wrapped clear of the image button at the right.
+            ui.horizontal_top(|ui| {
+                let w = (ui.available_width() - 160.0).max(120.0);
+                ui.allocate_ui(egui::vec2(w, 0.0), |ui| {
+                    if let Some(t) = &r.title {
+                        ui.heading(t);
+                    }
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                    save_image = ui
+                        .add_enabled(!image_busy, egui::Button::new("🖼 Save as image…"))
+                        .on_hover_text("Save this Overview as a picture (PNG): the cover, figures, difficulty and the most frequent unknown words")
+                        .on_disabled_hover_text("An image is being saved")
+                        .clicked();
+                });
+            });
             let (included, sections) = (self.included.iter().filter(|x| **x).count(), self.included.len());
             ui.label(if chinese {
                 format!(
@@ -4651,6 +4756,9 @@ impl App {
             });
         });
         let ctx = ui.ctx().clone();
+        if save_image {
+            self.export_image(&ctx, png_report::ImageExport::Book);
+        }
         let now = ctx.input(|i| i.time);
         if std::mem::take(&mut self.fit_pending) {
             self.fit_until = now + 3.0;
