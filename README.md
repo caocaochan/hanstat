@@ -75,10 +75,21 @@ Click **📖 Library** to list every book you've analysed, with its cover: lengt
 
 Each book's words are kept in `profiles` next to `history.json`, about 100 KB per novel, and deleted with its Library row. The settings are in `plan.json`.
 
+## Library stats
+
+**📖 Library → 📊 Stats** shows the library as a whole. At the top, every book of every language: books, characters, running words and reading time in all, the longest book, and a row per language with its average book and the share of running words known at each book's last analysis. Below, the books of one language measured against what you know now:
+
+- **Distinct words and characters** across all the books, how many words only one book uses and how many every book does, and how many of the most frequent words make up 95% and 98% of the whole library.
+- **Known now**: the share of the library's running words, distinct words and characters you know, and how many books are easy, moderate, challenging, hard or very hard for you.
+- **Charts**: book lengths coloured by difficulty, length against the share known, the library's vocabulary coverage curve, and how many books each word appears in. Hover a bar or point for the book or the numbers.
+- **Unknown words in the most books**: the 100 words you don't know (names left out) that the most books use, the ones that make the whole library easier. **+** marks one known, as in the Words tab (− unmarks it); it leaves the list, and the figures update, a moment later.
+
+The vocabulary is counted in the background while hanstat runs, whichever view is open, whenever the books, their word data or your known words change, and saved in `library-stats.json` next to `history.json` (`-ko`, `-ja` for the other languages). The tab opens straight away with the last count, which stays on screen (with a spinner) until the new one is ready. It is counted from the books' word data, so books analysed by an earlier version are left out until they're analysed again (from the Reading path tab).
+
 ## Command line
 
 ```
-hanstat.exe [file...] [--tab overview|characters|words|sections|suggestions|notes|library|path]
+hanstat.exe [file...] [--tab overview|characters|words|sections|suggestions|notes|library|path|stats]
 hanstat-cli.exe file.epub [--ltp|--ckip|--jieba] [--dict names.txt] [--auto-dict] [--json] [--chars-csv f] [--words-csv f] [--anki] [--level N] [--tocfl N] [--known-list words.txt] [--lang zh|ko|ja] [--library]
 hanstat-cli.exe --plan [--lang zh|ko|ja] [--target 95 | --learn N] [--incidental M] [--lookahead X] [--objective peak|total] [--width W] [--study-lists DIR] [--json] [--anki] [--known] [--level N] ...
 ```

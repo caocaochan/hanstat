@@ -21,12 +21,18 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
 
+mod charts;
+mod library_stats;
+
+use library_stats::StatsState;
+
 fn main() -> eframe::Result {
-    // hanstat [file...] [--tab overview|characters|words|sections|notes|library|path]
+    // hanstat [file...] [--tab overview|characters|words|sections|notes|library|path|stats]
     // Several files are analysed one after another and the last is shown.
     let mut paths = Vec::new();
     let mut tab = Tab::Overview;
-    // --tab library / path: start in the Library view, on its books or the reading path
+    // --tab library / path / stats: start in the Library view, on its books, the reading
+    // path or its statistics
     // (`history`, its name before, still works).
     let mut history_tab = None;
     let mut args = std::env::args().skip(1);
@@ -44,6 +50,10 @@ fn main() -> eframe::Result {
                 }
                 Some("path") => {
                     history_tab = Some(HistTab::Path);
+                    Tab::Overview
+                }
+                Some("stats") => {
+                    history_tab = Some(HistTab::Stats);
                     Tab::Overview
                 }
                 _ => Tab::Overview,
@@ -470,9 +480,10 @@ struct App {
     covers: HashMap<String, Option<egui::TextureHandle>>,
     /// The next recording is a fresh analysis: save it even if nothing changed.
     history_touch: bool,
-    /// The History view shows the books, or the reading path.
+    /// The History view shows the books, the reading path or the library's statistics.
     history_tab: HistTab,
     plan: PlanState,
+    stats: StatsState,
     /// What the open book's profile was last written from (id, hash), so
     /// that it is written again only when its words or names change.
     profile_written: Option<(String, u64)>,
@@ -486,6 +497,7 @@ enum HistTab {
     #[default]
     Books,
     Path,
+    Stats,
 }
 
 /// The reading path ([`plan`]) of the History's books in the current language.
@@ -745,6 +757,7 @@ impl Default for App {
             covers: HashMap::new(),
             history_tab: HistTab::Books,
             plan: PlanState::default(),
+            stats: StatsState::load(),
             profile_written: None,
             profiles_version: 0,
             batch: None,
@@ -1664,6 +1677,8 @@ impl eframe::App for App {
         self.poll_suggestions(&ctx);
         self.poll_anki(&ctx);
         self.poll_plan(&ctx);
+        self.poll_stats(&ctx);
+        self.refresh_stats(&ctx);
         self.poll_batch(&ctx);
 
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -3698,7 +3713,7 @@ impl App {
     /// Every book analysed before, as recorded when its analysis (or what
     /// counts as known) last changed. A click on a title opens the book.
     fn history_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.heading("Library");
             ui.add_space(8.0);
             ui.selectable_value(&mut self.history_tab, HistTab::Books, "Books")
@@ -3707,11 +3722,14 @@ impl App {
                 .on_hover_text(
                     "An order to read the books in, where the words you study for one book make the next ones easier",
                 );
+            ui.selectable_value(&mut self.history_tab, HistTab::Stats, "📊 Stats")
+                .on_hover_text("The library as a whole: its size, its vocabulary and how much of it you know");
             ui.add_space(8.0);
             ui.label(
                 RichText::new(match self.history_tab {
                     HistTab::Books => "Books analysed before, with the statistics from their last analysis. Analysing a book again replaces its row. Click a title to open the book.",
                     HistTab::Path => "Study some words before each book; they stay known for every book after it. The path orders the books so that the longest study list is as short as it can be, then the fewest words in all.",
+                    HistTab::Stats => "Totals from every book's last analysis, and the vocabulary its books share, measured against what you know now.",
                 })
                 .weak(),
             );
@@ -3720,9 +3738,10 @@ impl App {
             ui.colored_label(Color32::from_rgb(220, 170, 60), format!("⚠ {e}"));
         }
         ui.separator();
-        if self.history_tab == HistTab::Path {
-            self.plan_view(ui, ctx);
-            return;
+        match self.history_tab {
+            HistTab::Path => return self.plan_view(ui, ctx),
+            HistTab::Stats => return self.stats_view(ui, ctx),
+            HistTab::Books => {}
         }
         if self.history.entries.is_empty() {
             ui.centered_and_justified(|ui| {
@@ -4005,6 +4024,21 @@ impl App {
 }
 
 impl App {
+    /// The library of the current language's books `have` (with a profile),
+    /// folded as the known words need.
+    fn lib_key(&self, have: Vec<String>) -> LibKey {
+        LibKey {
+            lang: self.language,
+            fold: plan::Library::fold_for(
+                self.known.merged.as_deref(),
+                self.language,
+                self.anki.settings.match_across_scripts,
+            ),
+            ids: have,
+            version: self.profiles_version,
+        }
+    }
+
     /// History ids of the current language's books that have a profile.
     fn plan_have(&mut self) -> Vec<String> {
         let key = (
@@ -4431,19 +4465,11 @@ impl App {
             .filter(|e| e.stats.language == lang && !have.contains(&e.id))
             .map(|e| (e.title.clone(), e.path.clone()))
             .collect();
+        let lib = self.lib_key(have.clone());
         let st = &self.plan.settings;
         let k = self.known.merged.clone();
         let inputs = PlanInputs {
-            lib: LibKey {
-                lang,
-                fold: plan::Library::fold_for(
-                    k.as_deref(),
-                    lang,
-                    self.anki.settings.match_across_scripts,
-                ),
-                ids: have.clone(),
-                version: self.profiles_version,
-            },
+            lib,
             knowledge: k.as_ref().map_or(0, |k| Arc::as_ptr(k) as usize),
             params: st.params(),
             books: have

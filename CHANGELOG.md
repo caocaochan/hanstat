@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.17.1] - 2026-11-17
+
+### Added
+- **Library stats.** The Library has a new **📊 Stats** tab beside the reading path. It totals every book of every language from its last analysis (books, characters and kana, running words, reading time at the Overview's speeds, the longest book, and a row per language with its average book and length-weighted share known), then measures the current language's books against what is known now: distinct words and characters across the library, words used by one book and by all, the most frequent words making up 95% and 98% of it, the shares of running words, distinct words and characters known, and the books per difficulty. Charts show book lengths coloured by difficulty, length against the share known, the library's coverage curve and how many books each word appears in, with hover details, and a table lists the 100 unknown words (not names) found in the most books, each with **+** to mark it known as in the Words tab. The vocabulary is counted in the background from the books' word data while the app runs, whatever view is open, each time the books, their word data or the known words change (about 0.5 s for 64 novels, once Anki and the word lists have loaded), and saved in `library-stats.json` (`-ko`, `-ja`), so the tab opens at once with the last count and keeps it on screen until the new one is ready. The library built is shared with the reading path. `hanstat --tab stats` opens it.
+
 ## [2026.11.17.0] - 2026-11-17
 
 ### Changed

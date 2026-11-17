@@ -51,6 +51,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+pub mod stats;
+
 /// How much to study before each book.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Study {
