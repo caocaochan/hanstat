@@ -1068,7 +1068,7 @@ impl App {
 
     fn rebuild_report(&mut self) {
         if let (Some(b), Some(p)) = (&self.book, &self.prep) {
-            let r = analyze::build_report(b, p, &self.included);
+            let r = analyze::build_report(b, p, &self.included, self.fold_chars());
             self.char_cum = cumulative(r.char_freq.iter().map(|x| x.1), r.han_total);
             self.word_cum = cumulative(r.word_freq.iter().map(|x| x.1), r.words_total);
             // Word discovery depends on the included sections and the segmenter's output.
@@ -1228,7 +1228,34 @@ impl App {
             self.anki.error = Some(e);
         }
         self.anki_rebuild(ctx);
-        self.refresh_anki_coverage();
+        // "Match Traditional ↔ Simplified" also decides how the book's
+        // characters are counted.
+        if self
+            .report
+            .as_ref()
+            .is_some_and(|r| r.language == Language::Chinese && r.chars_folded != self.fold_chars())
+        {
+            self.rebuild_report();
+        } else {
+            self.refresh_anki_coverage();
+        }
+    }
+
+    /// Count the Traditional and Simplified forms of a Chinese character as
+    /// one: the Chinese "Match Traditional ↔ Simplified" option.
+    fn fold_chars(&self) -> bool {
+        if self.language == Language::Chinese {
+            self.anki.settings.match_across_scripts
+        } else {
+            self.stash.get(&Language::Chinese).map_or_else(
+                || {
+                    anki::Settings::load_for(Language::Chinese)
+                        .0
+                        .match_across_scripts
+                },
+                |d| d.anki.settings.match_across_scripts,
+            )
+        }
     }
 
     fn poll_anki(&mut self, ctx: &egui::Context) {
@@ -3847,13 +3874,17 @@ impl App {
         });
         let status = r.anki.as_ref().map(|c| &c.char_status);
         let af = self.anki_filter;
+        // Folded counts list a character once, as the book writes it: 说
+        // finds 說 there.
+        let fold = |c: char| anki::fold_char(c, r.chars_folded);
         let f: Vec<char> = self
             .char_filter
             .chars()
             .filter(|c| !c.is_whitespace())
+            .map(fold)
             .collect();
         let rows: Vec<usize> = (0..r.char_freq.len())
-            .filter(|&i| f.is_empty() || f.contains(&r.char_freq[i].0))
+            .filter(|&i| f.is_empty() || f.contains(&fold(r.char_freq[i].0)))
             .filter(|&i| status.is_none_or(|s| af.matches(s[i])))
             .collect();
         let total = r.han_total.max(1) as f64;
@@ -5512,6 +5543,7 @@ impl App {
         let thread_inputs = inputs.clone();
         let cache = self.cache.clone();
         let skip_hapax = self.settings.skip_hapax;
+        let fold_chars = self.fold_chars();
         let history_path = History::path();
         let (tx, rx) = channel();
         let done = Arc::new(AtomicUsize::new(0));
@@ -5550,6 +5582,7 @@ impl App {
                             .unwrap_or_else(|| known::Settings::load_for(l).0.segmenter_words())
                     },
                     cache.as_ref(),
+                    fold_chars,
                 )
                 .and_then(|a| {
                     let id = a

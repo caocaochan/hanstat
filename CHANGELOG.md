@@ -1,5 +1,16 @@
 # Changelog
 
+## [2026.11.17.10] - 2026-11-17
+
+### Changed
+- **Traditional and Simplified characters count as one.** With **Match Traditional ↔ Simplified** on (the default), 說 and 说 are one character wherever characters are counted, as words already were. Before, a Library with books in both scripts counted every such pair twice, in the characters known and in the total, so **Characters known** and **Distinct characters** in Library Stats were too high. A book's Overview, Characters tab and sections count the same way: a book that mixes scripts no longer has two of a character, and pairs such as 髮/發 (both 发) are one. Each character is still listed as the book writes it, the more frequent form where it uses both, and the Characters tab's filter finds it in either script (说 finds 說). Turning the option off counts characters as written again. Words in a book are still counted as written.
+- **Traditional books are rated for writing style in Simplified.** The model's examples and its typical rating are Simplified, and it rated Traditional text lower as it was than converted: by 0.19 on 16 Taiwanese editions (61 of 64 samples rose), while Simplified novels converted to Traditional did not move. A Traditional book's samples are now converted character by character before rating; text that mixes scripts is left as it is. Every book is rated again once.
+
+### Fixed
+- **llama.cpp no longer outlives hanstat.** If hanstat was closed while the model loaded, crashed or was ended from Task Manager, `llama-server` kept running and holding GPU memory (three left over held 7 GB of a 12 GB card and slowed the next rating run fifteenfold). On Windows it now runs in a job that ends with hanstat, on Linux it is killed when hanstat ends, and closing hanstat while the model loads stops it at once. macOS still relies on hanstat closing normally.
+
+On the first start of this version every Library row is analysed again once.
+
 ## [2026.11.17.9] - 2026-11-17
 
 ### Added

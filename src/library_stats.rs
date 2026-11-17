@@ -183,7 +183,7 @@ const WIDESPREAD: usize = 100;
 type Toggle = (String, String, bool);
 
 /// Layout of the saved stats; others are ignored and counted again.
-const FORMAT: u32 = 2;
+const FORMAT: u32 = 3;
 
 /// One language's vocabulary stats as last counted. Saved in
 /// `library-stats.json` (`-ko`, `-ja`) so the tab is filled at start,
@@ -332,7 +332,7 @@ impl App {
                 .filter(|(_, p)| p.language == key.lang)
                 .collect();
             let profiles: Vec<Profile> = books.iter().map(|(_, p)| p.clone()).collect();
-            let chars = plan::stats::char_stats(&profiles, k.as_deref());
+            let chars = plan::stats::char_stats(&profiles, k.as_deref(), key.fold);
             drop(profiles);
             let lib = cached.unwrap_or_else(|| {
                 Arc::new(plan::Library::build(
@@ -681,6 +681,8 @@ impl App {
                     )
                     .hover(if lang == Language::Japanese {
                         "Kanji in the books' words, each word as its book usually writes it"
+                    } else if r.fold {
+                        "Characters of the books' words; Traditional and Simplified forms are one character, as for your known words"
                     } else {
                         "Characters of the books' words, as written"
                     }),
@@ -1081,7 +1083,7 @@ mod tests {
             ids: Vec::new(),
             source: Some("Anki".into()),
             words: lib.stats(&lib.known(None), WIDESPREAD),
-            chars: plan::stats::char_stats(&[], None),
+            chars: plan::stats::char_stats(&[], None, false),
         };
         let back: Counted = serde_json::from_slice(&serde_json::to_vec(&c).unwrap()).unwrap();
         assert_eq!(back.language, Language::Japanese);

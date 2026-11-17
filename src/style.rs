@@ -26,12 +26,17 @@
 //! with a reader on the three pairs checked, one of which the share known
 //! puts the other way round. Ratings are kept in `style.json` by History id.
 //!
+//! Traditional books are rated in Simplified ([`in_simplified`]): the
+//! examples and the typical rating are Simplified, and the model rated
+//! Traditional text lower as it was than converted.
+//!
 //! What the rater did (downloads, starting llama.cpp, each book's samples
 //! and answers, and the reason for every failure) goes to `style.log` next
 //! to it, written anew each time a [`Rater`] starts ([`Log`]).
 
 use crate::extract::{Book, EncodingChoice, SectionKind};
 use crate::models::{self, LLAMA_CPP, LLAMA_SERVER, STYLE_LLM};
+use crate::script::{self, Variant};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
@@ -41,8 +46,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// Bumped whenever the samples, prompt or model change, so that older
-/// ratings are made again.
-pub const VERSION: u32 = 1;
+/// ratings are made again. 2: Traditional samples converted to Simplified.
+pub const VERSION: u32 = 2;
 /// Where the samples are taken, as shares of the body text.
 pub const POSITIONS: [f64; 4] = [0.30, 0.45, 0.60, 0.75];
 /// Chinese characters in each sample (from whole paragraphs, so a little more).
@@ -152,6 +157,30 @@ pub fn samples(book: &Book) -> Option<Vec<String>> {
             })
             .collect(),
     )
+}
+
+/// `samples` as the model rates them: in Simplified, converted character by
+/// character ([`script::fold_t2s`]) if they are Traditional, and whether
+/// they were. Mixed text is left as it is: converting would also change
+/// Simplified words that use a "Traditional" character (著名 → 着名).
+///
+/// The prompt's examples and [`TYPICAL`] are Simplified, and the model
+/// rated Traditional text lower as it was than converted: by 0.19 on 16
+/// Taiwanese editions (95% interval 0.17 to 0.21; 61 of 64 samples rose),
+/// while 10 Simplified novels converted to Traditional did not move
+/// (+0.03, −0.02 to +0.09). Measured 2026-11-17 with `examples/style_script_eval.rs`.
+pub fn in_simplified(samples: Vec<String>) -> (Vec<String>, bool) {
+    let t = &*script::TABLES;
+    let (mut trad, mut simp) = (0u64, 0u64);
+    for c in samples.iter().flat_map(|s| s.chars()) {
+        trad += t.trad_only.contains(&c) as u64;
+        simp += t.simp_only.contains(&c) as u64;
+    }
+    if script::classify(trad, simp) == Variant::Traditional {
+        (samples.iter().map(|s| script::fold_t2s(s)).collect(), true)
+    } else {
+        (samples, false)
+    }
 }
 
 /// One book's rating.
@@ -529,6 +558,17 @@ impl Server {
     /// (on a GPU mode without a GPU, llama.cpp uses the CPU). Both downloads
     /// must be in the cache. What happens goes to `log`.
     pub fn start(mode: Mode, log: &Log) -> Result<Server, String> {
+        Self::start_with(mode, log, |_| {})
+    }
+
+    /// [`Server::start`], handing the process to `spawned` as soon as it
+    /// exists, so that it can be killed while the model loads. The process
+    /// dies with hanstat even if hanstat is killed ([`crate::child_guard`]).
+    pub fn start_with(
+        mode: Mode,
+        log: &Log,
+        spawned: impl FnOnce(&Arc<Mutex<Child>>),
+    ) -> Result<Server, String> {
         let name = LLAMA_SERVER.ok_or("llama.cpp has no build for this platform")?;
         let exe = LLAMA_CPP.dir().join(name);
         let model = STYLE_LLM.dir().join(STYLE_LLM.files[0].name);
@@ -571,8 +611,7 @@ impl Server {
             cmd.env("GGML_VK_DISABLE_COOPMAT", "1");
         }
         log.line(format!("Starting llama.cpp {}: {cmd:?}", mode.describe()));
-        let child = cmd
-            .spawn()
+        let child = crate::child_guard::spawn(&mut cmd, |w| log.line(w))
             .map_err(|e| format!("Cannot start {}: {e}", exe.display()))?;
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(600)))
@@ -580,8 +619,10 @@ impl Server {
             .http_status_as_error(false)
             .build()
             .into();
+        let child = Arc::new(Mutex::new(child));
+        spawned(&child);
         let mut s = Server {
-            child: Arc::new(Mutex::new(child)),
+            child,
             url: format!("http://127.0.0.1:{port}"),
             agent,
             server_log: log_path,
@@ -726,6 +767,11 @@ impl Server {
         let Some(samples) = samples(book) else {
             return Ok(None);
         };
+        let (samples, converted) = in_simplified(samples);
+        if converted {
+            self.log
+                .line("  Traditional: rated converted to Simplified, character by character");
+        }
         let mut scores = Vec::with_capacity(samples.len());
         for (k, s) in samples.iter().enumerate() {
             self.log.line(format!(
@@ -985,23 +1031,34 @@ fn run(shared: Shared, notify: impl Fn(), log: Log) {
             }
             set(Phase::Starting);
             let mode = m.lock().unwrap().mode;
+            // Known to the rater from the moment it exists, so that dropping
+            // the rater (the app closing) kills it while the model loads
+            // instead of waiting for it to load and rate a book.
+            let spawned = |c: &Arc<Mutex<Child>>| {
+                let mut st = m.lock().unwrap();
+                if st.stop {
+                    let _ = c.lock().unwrap().kill();
+                }
+                st.child = Some(c.clone());
+            };
             // A GPU that cannot even load the model: the CPU then (for this run only).
-            let started = Server::start(mode, &log).or_else(|gpu| {
-                if mode == Mode::Cpu {
+            let started = Server::start_with(mode, &log, spawned).or_else(|gpu| {
+                if mode == Mode::Cpu || m.lock().unwrap().stop {
                     return Err(gpu);
                 }
                 log.line("Trying again on the CPU only");
-                let s = Server::start(Mode::Cpu, &log)
+                let s = Server::start_with(Mode::Cpu, &log, spawned)
                     .map_err(|cpu| format!("{gpu}\n\nOn the CPU only: {cpu}"))?;
                 m.lock().unwrap().mode = Mode::Cpu;
                 Ok(s)
             });
+            if m.lock().unwrap().stop {
+                return;
+            }
             match started {
-                Ok(s) => {
-                    m.lock().unwrap().child = Some(s.child.clone());
-                    server = Some(s);
-                }
+                Ok(s) => server = Some(s),
                 Err(e) => {
+                    m.lock().unwrap().child = None;
                     m.lock().unwrap().queue.push_front(job);
                     fail(e);
                     continue;
@@ -1183,6 +1240,17 @@ mod tests {
     #[test]
     fn short_books_are_not_rated() {
         assert!(samples(&book(vec!["短".repeat(1500)])).is_none());
+    }
+
+    #[test]
+    fn traditional_is_rated_in_simplified() {
+        let trad = vec!["他們說這個問題還沒有解決，於是轉身離開了。".repeat(3)];
+        let (out, converted) = in_simplified(trad);
+        assert!(converted);
+        assert!(out[0].starts_with("他们说这个问题还没有解决，于是转身离开了。"));
+        // Simplified, with 著 used as Simplified uses it: left alone.
+        let simp = vec!["这位著名作家说，他们还没有解决这个问题。".repeat(3)];
+        assert_eq!(in_simplified(simp.clone()), (simp, false));
     }
 
     #[test]

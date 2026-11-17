@@ -1066,7 +1066,8 @@ pub fn fold(s: &str, on: bool) -> String {
     s.chars().map(|c| t.get(&c).copied().unwrap_or(c)).collect()
 }
 
-fn fold_char(c: char, on: bool) -> char {
+/// [`fold`] for one character.
+pub fn fold_char(c: char, on: bool) -> char {
     if on {
         script::TABLES.t2s.get(&c).copied().unwrap_or(c)
     } else {

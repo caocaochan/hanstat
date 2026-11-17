@@ -936,7 +936,11 @@ fn main() {
         .collect();
     let mut words = words;
     let book_segmenter = prep.segmenter_kind;
-    let mut r = analyze::build_report(&book, &prep, &included);
+    let fold = match &anki_col {
+        Some((_, s)) => s.match_across_scripts,
+        None => anki::Settings::load_for(lang).0.match_across_scripts,
+    };
+    let mut r = analyze::build_report(&book, &prep, &included, fold);
     if auto_dict {
         let known: std::collections::HashSet<String> = words.iter().cloned().collect();
         let found = hanstat::discover::discover(
@@ -960,7 +964,7 @@ fn main() {
         let t_analysis = std::time::Instant::now();
         let prep = analyse(&words);
         analysis = (analysis.0 + t_analysis.elapsed(), analysis.1 && prep.cached);
-        r = analyze::build_report(&book, &prep, &included);
+        r = analyze::build_report(&book, &prep, &included, fold);
     }
     let anki_k = anki_col.as_ref().map(|loaded| {
         anki_knowledge(
@@ -968,10 +972,6 @@ fn main() {
             &anki::SegConfig::for_language(lang, kind, Some(book_segmenter), &words),
         )
     });
-    let fold = match &anki_col {
-        Some((_, s)) => s.match_across_scripts,
-        None => anki::Settings::load_for(lang).0.match_across_scripts,
-    };
     let known_k = match &known_lists {
         Some(l) => l.apply(anki_k.as_ref(), fold),
         None => anki_k,

@@ -2212,7 +2212,7 @@ dependencies = [
 
 [[package]]
 name = "hanstat"
-version = "2026.1117.9"
+version = "2026.1117.10"
 dependencies = [
  "aho-corasick",
  "candle-core",
@@ -2226,6 +2226,7 @@ dependencies = [
  "flate2",
  "image",
  "jieba-rs",
+ "libc",
  "libloading 0.9.1",
  "ltp",
  "memmap2",
@@ -2247,6 +2248,7 @@ dependencies = [
  "unicode-script",
  "unicode-segmentation",
  "ureq",
+ "windows-sys 0.61.2",
  "winresource",
  "zip",
 ]

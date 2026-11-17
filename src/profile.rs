@@ -132,7 +132,8 @@ pub fn path_in(history: &Path, id: &str) -> PathBuf {
 /// in the background. `included`: the sections to include (the book's
 /// defaults if `None` or not of its length). `words` and
 /// `known` give the user dictionary and the known words passed to the
-/// segmenter for a language. Downloads the segmenter's model if missing.
+/// segmenter for a language. `fold_chars`: see [`analyze::build_report`].
+/// Downloads the segmenter's model if missing.
 pub struct Analysed {
     pub book: crate::extract::Book,
     pub report: Report,
@@ -148,6 +149,7 @@ pub fn analyse_file(
     words: &dyn Fn(Language) -> Vec<String>,
     known: &dyn Fn(Language) -> Vec<String>,
     cache: Option<&crate::cache::Cache>,
+    fold_chars: bool,
 ) -> Result<Analysed, String> {
     use crate::{analyze, discover, extract};
     let book = extract::load(path, extract::EncodingChoice::Auto)?;
@@ -165,7 +167,7 @@ pub fn analyse_file(
         Some(inc) if inc.len() == book.sections.len() => inc.to_vec(),
         _ => book.sections.iter().map(|s| s.default_included()).collect(),
     };
-    let report = analyze::build_report(&book, &prep, &included);
+    let report = analyze::build_report(&book, &prep, &included, fold_chars);
     let have: std::collections::HashSet<String> = user.iter().cloned().collect();
     let mut names = user;
     names.extend(

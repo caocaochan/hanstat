@@ -141,13 +141,15 @@ impl Library {
 }
 
 /// Characters of the books' words, each spelled as its book usually spells
-/// it (Japanese keys are normalised forms), counted as written.
-pub fn char_stats(profiles: &[Profile], k: Option<&Knowledge>) -> CharStats {
+/// it (Japanese keys are normalised forms). With `fold`, Traditional
+/// characters count as their Simplified form (說 and 说 are one), as the
+/// library's words do.
+pub fn char_stats(profiles: &[Profile], k: Option<&Knowledge>, fold: bool) -> CharStats {
     let mut counts: FxHashMap<char, u64> = FxHashMap::default();
     for p in profiles {
         for (w, n) in &p.words {
             for c in p.shown(w).chars().filter(|&c| crate::chars::is_han(c)) {
-                *counts.entry(c).or_default() += *n as u64;
+                *counts.entry(crate::anki::fold_char(c, fold)).or_default() += *n as u64;
             }
         }
     }
@@ -248,10 +250,37 @@ mod tests {
         assert_eq!((s.known_words, s.known_running), (0, 0.0));
 
         let profiles: Vec<Profile> = books.into_iter().map(|b| b.1).collect();
-        let c = char_stats(&profiles, None);
+        let c = char_stats(&profiles, None, false);
         assert_eq!(c.total, 600);
         assert_eq!(c.unique, 8); // 我们今天小明苹果
         assert_eq!(c.known, 0);
+    }
+
+    /// A Traditional and a Simplified book with the same words have the
+    /// same characters under folding, and a character known in one script
+    /// is counted once.
+    #[test]
+    fn chars_fold_across_scripts() {
+        let (_, simp) = profile("s", &[("我们", 5), ("说话", 3)], &[]);
+        let (_, mut trad) = profile("t", &[("我們", 5), ("說話", 3)], &[]);
+        trad.variant = "Traditional".into();
+        let both = [simp.clone(), trad];
+        let k = crate::known::Settings {
+            marked: vec!["说".into()],
+            language: Language::Chinese,
+            ..Default::default()
+        }
+        .apply(None, true)
+        .unwrap();
+        let folded = char_stats(&both, Some(&k), true);
+        assert_eq!((folded.unique, folded.known, folded.total), (4, 1, 32));
+        assert_eq!(
+            folded.unique,
+            char_stats(std::slice::from_ref(&simp), None, true).unique
+        );
+        let apart = char_stats(&both, Some(&k), false);
+        // 我们说话 and 們說話.
+        assert_eq!((apart.unique, apart.total), (7, 32));
     }
 
     /// A listed word, marked known as the Words tab does, is known at the

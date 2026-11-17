@@ -116,7 +116,7 @@ fn epub_adversarial() {
 
     let prep = analyze_book(&book, SegmenterKind::Jieba, &[], &[], &|_, _| {}).unwrap();
     let inc: Vec<bool> = book.sections.iter().map(|s| s.default_included()).collect();
-    let r = build_report(&book, &prep, &inc);
+    let r = build_report(&book, &prep, &inc, false);
     assert_eq!(r.han_total, 20);
     assert_eq!(r.han_unique, 18);
     assert_eq!(r.private_use, 1);
@@ -139,9 +139,32 @@ fn epub_adversarial() {
     assert!(r.notes.iter().any(|n| n.contains("not in the spine")));
 
     // Including the nav doc adds its 3 characters but no new distinct ones.
-    let r2 = build_report(&book, &prep, &[true, true, true]);
+    let r2 = build_report(&book, &prep, &[true, true, true], false);
     assert_eq!(r2.han_total, 23);
     assert_eq!(r2.han_unique, 18);
+}
+
+/// Folded, a book that mixes scripts counts 說 and 说 as one character,
+/// shown as the book more often writes it; unfolded, as two.
+#[test]
+fn chars_fold_across_scripts() {
+    let text = "第一章\n他說話。他說了。我说。\n";
+    let book = extract::txt::load(text.as_bytes(), EncodingChoice::Auto);
+    let prep = analyze_book(&book, SegmenterKind::Jieba, &[], &[], &|_, _| {}).unwrap();
+    let inc = vec![true; book.sections.len()];
+    let apart = build_report(&book, &prep, &inc, false);
+    let folded = build_report(&book, &prep, &inc, true);
+    assert!(folded.chars_folded && !apart.chars_folded);
+    assert_eq!(apart.han_total, folded.han_total);
+    assert_eq!(apart.han_unique, folded.han_unique + 1); // 說 and 说
+    let count =
+        |r: &hanstat::analyze::Report, c: char| r.char_freq.iter().find(|x| x.0 == c).map(|x| x.1);
+    assert_eq!(count(&folded, '說'), Some(3));
+    assert_eq!(count(&folded, '说'), None);
+    let rows = |r: &hanstat::analyze::Report| -> usize {
+        r.sections.iter().filter_map(|s| s.new_han).sum()
+    };
+    assert_eq!(rows(&folded), folded.han_unique);
 }
 
 #[test]
@@ -151,7 +174,7 @@ fn traditional_segmentation_keeps_original_chars() {
     let book = extract::txt::load(text.as_bytes(), EncodingChoice::Auto);
     for kind in SegmenterKind::ALL {
         let prep = analyze_book(&book, kind, &[], &[], &|_, _| {}).unwrap();
-        let r = build_report(&book, &prep, &vec![true; book.sections.len()]);
+        let r = build_report(&book, &prep, &vec![true; book.sections.len()], false);
         assert_eq!(r.variant, hanstat::script::Variant::Traditional);
         let words: Vec<&str> = r.word_freq.iter().map(|(w, _)| w.as_str()).collect();
         for w in ["我們", "學習", "漢字", "問題"] {
@@ -196,7 +219,7 @@ fn discovers_invented_name() {
     let book = extract::txt::load(text.as_bytes(), EncodingChoice::Auto);
     let prep = analyze_book(&book, SegmenterKind::Ltp, &[], &[], &|_, _| {}).unwrap();
     let inc = vec![true; book.sections.len()];
-    let r = build_report(&book, &prep, &inc);
+    let r = build_report(&book, &prep, &inc, false);
     let found = hanstat::discover::discover(
         &book,
         &inc,
@@ -238,7 +261,7 @@ fn korean_book_counts_dictionary_forms_only() {
     .unwrap();
     assert_eq!(prep.language, Language::Korean);
     assert_eq!(prep.segmenter_kind, SegmenterKind::Kiwi);
-    let r = build_report(&book, &prep, &vec![true; book.sections.len()]);
+    let r = build_report(&book, &prep, &vec![true; book.sections.len()], false);
     let words: Vec<&str> = r.word_freq.iter().map(|(w, _)| w.as_str()).collect();
     for w in [
         "걷다",
@@ -288,7 +311,7 @@ fn japanese_book_counts_normalized_words_and_kanji() {
     .unwrap();
     assert_eq!(prep.language, Language::Japanese);
     assert_eq!(prep.segmenter_kind, SegmenterKind::Sudachi);
-    let r = build_report(&book, &prep, &vec![true; book.sections.len()]);
+    let r = build_report(&book, &prep, &vec![true; book.sections.len()], false);
     let count = |w: &str| r.word_freq.iter().find(|(x, _)| x == w).map(|x| x.1);
     // わかった and 分かっ are one word, keyed by the normalized form and shown
     // as the book spells it most (a tie goes to the first in sort order).
@@ -363,7 +386,7 @@ fn japanese_long_units_across_many_paragraphs() {
     }
     let book = extract::txt::load(text.as_bytes(), EncodingChoice::Auto);
     let prep = analyze_book(&book, SegmenterKind::Auto, &[], &[], &|_, _| {}).unwrap();
-    let r = build_report(&book, &prep, &vec![true; book.sections.len()]);
+    let r = build_report(&book, &prep, &vec![true; book.sections.len()], false);
     let count = |w: &str| r.word_freq.iter().find(|(x, _)| x == w).map(|x| x.1);
     assert_eq!(count("冒険者"), Some(400), "{:?}", r.word_freq);
     assert_eq!(count("事務所"), Some(400));
@@ -379,7 +402,7 @@ fn user_dictionary_merges_names() {
     let book = extract::txt::load(text.as_bytes(), EncodingChoice::Auto);
     for kind in SegmenterKind::ALL {
         let prep = analyze_book(&book, kind, &["温简言".into()], &[], &|_, _| {}).unwrap();
-        let r = build_report(&book, &prep, &[true]);
+        let r = build_report(&book, &prep, &[true], false);
         let n = r.word_freq.iter().find(|(w, _)| w == "温简言").map(|x| x.1);
         assert_eq!(n, Some(2), "{kind:?}: {:?}", r.word_freq);
     }
@@ -399,7 +422,7 @@ fn analysis_cache_gives_the_same_counts() {
         analyze_book_cached(book, SegmenterKind::Jieba, words, known, cache, &|_, _| {}).unwrap()
     };
     let inc: Vec<bool> = book.sections.iter().map(|_| true).collect();
-    let json = |p| serde_json::to_string(&build_report(&book, p, &inc)).unwrap();
+    let json = |p| serde_json::to_string(&build_report(&book, p, &inc, false)).unwrap();
 
     let plain = run(&book, &[], &[], None);
     let first = run(&book, &[], &[], Some(&cache));
@@ -464,6 +487,7 @@ fn book_file_to_profile_to_reading_path() {
             &|_| vec!["温简言".into()],
             &|_| Vec::new(),
             None,
+            true,
         )
         .unwrap();
         let id = a.file_id.unwrap();

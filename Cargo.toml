@@ -1,6 +1,6 @@
 [package]
 name = "hanstat"
-version = "2026.1117.9"
+version = "2026.1117.10"
 edition = "2024"
 description = "Accurate character/word statistics for Chinese, Japanese and Korean EPUB and TXT files"
 license = "MIT OR Apache-2.0"
@@ -53,6 +53,13 @@ unicode-script = "0.5.9"
 unicode-segmentation = "1.13.3"
 ureq = "3.5.2"
 zip = { version = "9.5.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+# child_guard.rs: llama.cpp dies with hanstat.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.191"
 
 [build-dependencies]
 winresource = "0.1.34"

@@ -2,6 +2,7 @@ pub mod analyze;
 pub mod anki;
 pub mod cache;
 pub mod chars;
+pub mod child_guard;
 pub mod ckip;
 pub mod discover;
 pub mod extract;

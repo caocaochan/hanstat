@@ -499,6 +499,9 @@ pub struct Report {
     pub segmenter: SegmenterKind,
     pub variant: Variant,
     pub folded_for_segmentation: bool,
+    /// The Traditional and Simplified forms of a character were counted as
+    /// one (`char_freq` shows each as the book most often writes it).
+    pub chars_folded: bool,
     pub user_words: usize,
     /// Known words given to the segmenter to join split words.
     pub known_words: usize,
@@ -632,7 +635,29 @@ fn sorted_freq<K: Ord + Clone>(m: &HashMap<K, u32>) -> Vec<(K, u32)> {
     v
 }
 
-pub fn build_report(book: &Book, prep: &Prepared, included: &[bool]) -> Report {
+/// Character counts with the Traditional and Simplified forms of a
+/// character as one ([`crate::anki::fold_char`]), each shown as the book
+/// most often writes it.
+fn folded_freq(han: &HashMap<char, u32>) -> Vec<(char, u32)> {
+    // Folded character → (count, shown as, its count).
+    let mut groups: HashMap<char, (u32, char, u32)> = HashMap::new();
+    for (&c, &n) in han {
+        let g = groups
+            .entry(crate::anki::fold_char(c, true))
+            .or_insert((0, c, 0));
+        g.0 += n;
+        if n > g.2 || (n == g.2 && c < g.1) {
+            (g.1, g.2) = (c, n);
+        }
+    }
+    sorted_freq(&groups.into_values().map(|(n, c, _)| (c, n)).collect())
+}
+
+/// `fold`: count the Traditional and Simplified forms of a character as one
+/// (Chinese only; the "Match Traditional ↔ Simplified" option), as known
+/// words and the Library do. Words are counted as written either way.
+pub fn build_report(book: &Book, prep: &Prepared, included: &[bool], fold: bool) -> Report {
+    let fold = fold && prep.language == Language::Chinese;
     let mut total = SectionStats::default();
     let mut seen_c: std::collections::HashSet<char> = Default::default();
     let mut seen_w: std::collections::HashSet<&str> = Default::default();
@@ -640,8 +665,13 @@ pub fn build_report(book: &Book, prep: &Prepared, included: &[bool]) -> Report {
     for (i, (sec, st)) in book.sections.iter().zip(&prep.stats).enumerate() {
         let inc = included[i];
         let (mut new_han, mut new_words) = (None, None);
+        let han: std::collections::HashSet<char> = st
+            .han
+            .keys()
+            .map(|&c| crate::anki::fold_char(c, fold))
+            .collect();
         if inc {
-            new_han = Some(st.han.keys().filter(|c| seen_c.insert(**c)).count());
+            new_han = Some(han.iter().filter(|c| seen_c.insert(**c)).count());
             new_words = Some(
                 st.words
                     .keys()
@@ -654,7 +684,7 @@ pub fn build_report(book: &Book, prep: &Prepared, included: &[bool]) -> Report {
             kind: sec.kind,
             included: inc,
             han: st.class_counts[0],
-            unique_han: st.han.len(),
+            unique_han: han.len(),
             new_han,
             words: st.words.values().map(|&v| v as u64).sum(),
             unique_words: st.words.len(),
@@ -665,7 +695,11 @@ pub fn build_report(book: &Book, prep: &Prepared, included: &[bool]) -> Report {
         total.add_ref(st);
     }
 
-    let char_freq = sorted_freq(&total.han);
+    let char_freq = if fold {
+        folded_freq(&total.han)
+    } else {
+        sorted_freq(&total.han)
+    };
     let word_freq = sorted_freq(&total.words);
     let foreign_freq = sorted_freq(&total.foreign_words);
     let c = &total.class_counts;
@@ -738,6 +772,7 @@ pub fn build_report(book: &Book, prep: &Prepared, included: &[bool]) -> Report {
         segmenter: prep.segmenter_kind,
         variant: prep.variant,
         folded_for_segmentation: prep.folding_note.is_some(),
+        chars_folded: fold,
         user_words: prep.user_words,
         known_words: prep.known_words.len(),
         han_total,
