@@ -224,7 +224,7 @@ mod tests {
             profile("b", &[("我们", 50), ("明天", 30), ("今天", 20)], &[]),
             profile("c", &[("我们", 40), ("明天", 40), ("苹果", 20)], &[]),
         ];
-        let lib = Library::build(Language::Chinese, false, books.clone());
+        let lib = Library::build(Language::Chinese, false, false, books.clone());
         let s = lib.stats(&lib.known(None), 10);
         assert_eq!(s.vocab, 5);
         assert_eq!(s.running, 300);
@@ -261,7 +261,7 @@ mod tests {
     fn widespread_words_mark_as_counted() {
         let (t, mut trad) = profile("t", &[("我們", 9), ("今天", 3)], &[]);
         trad.variant = "Traditional".into();
-        let lib = Library::build(Language::Chinese, true, vec![(t, trad)]);
+        let lib = Library::build(Language::Chinese, true, false, vec![(t, trad)]);
         let s = lib.stats(&lib.known(None), 10);
         let w = &s.widespread[0];
         assert_eq!((w.word.as_str(), w.shown.as_str()), ("我們", "我們"));
@@ -278,7 +278,7 @@ mod tests {
         let (j, mut ja) = profile("j", &[("為る", 9)], &[]);
         ja.language = Language::Japanese;
         ja.display = HashMap::from([("為る".into(), "する".into())]);
-        let lib = Library::build(Language::Japanese, false, vec![(j, ja)]);
+        let lib = Library::build(Language::Japanese, false, false, vec![(j, ja)]);
         let w = &lib.stats(&lib.known(None), 10).widespread[0];
         assert_eq!((w.word.as_str(), w.shown.as_str()), ("為る", "する"));
     }

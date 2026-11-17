@@ -596,6 +596,8 @@ impl StyleState {
 struct LibKey {
     lang: Language,
     fold: bool,
+    /// [`Settings::skip_hapax`].
+    skip_hapax: bool,
     ids: Vec<String>,
     version: u64,
 }
@@ -1209,12 +1211,19 @@ impl App {
                 .filter(|c| c.recommended)
                 .map(|c| c.word.clone()),
         );
+        let skip_hapax = self.settings.skip_hapax;
         let Some(r) = &mut self.report else { return };
         let had = r.anki.is_some();
-        r.anki =
-            self.known.merged.as_ref().map(|k| {
-                BookCoverage::compute(k, &r.char_freq, &r.word_freq, &names, &r.word_parts)
-            });
+        r.anki = self.known.merged.as_ref().map(|k| {
+            BookCoverage::compute(
+                k,
+                &r.char_freq,
+                &r.word_freq,
+                &names,
+                &r.word_parts,
+                skip_hapax,
+            )
+        });
         if r.anki.is_none() {
             self.anki_filter = AnkiFilter::All;
         } else if !had {
@@ -1828,6 +1837,31 @@ impl App {
     fn settings_menu(&mut self, ui: &mut egui::Ui) {
         ui.menu_button(RichText::new("⚙").weak(), |ui| {
             ui.set_max_width(380.0);
+            if ui
+                .checkbox(
+                    &mut self.settings.skip_hapax,
+                    "Leave out words that occur only once",
+                )
+                .changed()
+            {
+                if let Err(e) = self.settings.save() {
+                    self.error = Some(e);
+                }
+                // The open book now; the reading path and Library statistics
+                // rebuild on their own (their key has the setting). Other
+                // books' Library numbers follow when each is next opened.
+                self.refresh_anki_coverage();
+            }
+            ui.label(
+                RichText::new(
+                    "Words that occur once in a book (many are rare words, typos or segmenter splits you'd guess or skip) \
+                     don't count toward the words you know, the difficulty or the reading path, known or not. \
+                     The word counts and coverage table still include them.",
+                )
+                .weak()
+                .small(),
+            );
+            ui.separator();
             let supported = style::supported();
             let mut on = self.settings.writing_style;
             ui.add_enabled(
@@ -3037,6 +3071,7 @@ impl App {
             .report_id
             .as_deref()
             .map_or(0.0, |id| self.style_offset(id));
+        let skip_hapax = self.settings.skip_hapax;
         let out = egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             if let Some(t) = &r.title {
                 ui.heading(t);
@@ -3076,7 +3111,16 @@ impl App {
                     }
                     big_stat(ui, &format!("{lang_name} words (total)"), r.words_total, &format!("analyser: {}", r.segmenter.label()));
                 }
-                big_stat(ui, "Unique words", r.words_unique as u64, &format!("{} occur only once", fmt_int(r.words_hapax as u64)));
+                big_stat(
+                    ui,
+                    "Unique words",
+                    r.words_unique as u64,
+                    &format!(
+                        "{} occur only once{}",
+                        fmt_int(r.words_hapax as u64),
+                        if skip_hapax { " · left out (⚙)" } else { "" }
+                    ),
+                );
                 if let Some((value, hover)) = &style_info
                     && r.anki.is_none()
                 {
@@ -3134,6 +3178,14 @@ impl App {
                     }
                     let rw = &c.running_words;
                     let unknown = rw.not_known();
+                    let hapax_note = if c.hapax_left_out > 0 {
+                        format!(
+                            "{} words that occur only once are left out of these numbers, known or not (⚙).\n\n",
+                            fmt_int(c.hapax_left_out)
+                        )
+                    } else {
+                        String::new()
+                    };
                     stat_tile(
                         ui,
                         "Running words you know",
@@ -3144,7 +3196,7 @@ impl App {
                             "no unknown words".to_owned()
                         },
                     )
-                    .on_hover_text(if chinese {
+                    .on_hover_text(hapax_note + &if chinese {
                         format!(
                             "Every occurrence counts, so frequent words weigh more. {} of {} word occurrences are known; {} occurrences of names (your user dictionary and the recommended Suggested words) are left out. \
                              Of the running characters, {:.1}% are known.",
@@ -4652,6 +4704,7 @@ impl App {
                 self.language,
                 self.anki.settings.match_across_scripts,
             ),
+            skip_hapax: self.settings.skip_hapax,
             ids: have,
             version: self.profiles_version,
         }
@@ -4726,7 +4779,12 @@ impl App {
                     .into_iter()
                     .filter_map(|(t, p)| Profile::load(&p).map(|p| (t, p)))
                     .collect();
-                Arc::new(plan::Library::build(key.lang, key.fold, books))
+                Arc::new(plan::Library::build(
+                    key.lang,
+                    key.fold,
+                    key.skip_hapax,
+                    books,
+                ))
             });
             // Writing style: a copy only when the offsets changed.
             let mut lib = lib;
@@ -4862,6 +4920,7 @@ impl App {
             knowledge.insert(self.language, k.clone());
         }
         let cache = self.cache.clone();
+        let skip_hapax = self.settings.skip_hapax;
         let history_path = History::path();
         let (tx, rx) = channel();
         let done = Arc::new(AtomicUsize::new(0));
@@ -4902,6 +4961,7 @@ impl App {
                             &r.word_freq,
                             &names,
                             &r.word_parts,
+                            skip_hapax,
                         ));
                     }
                     if let Some(cover) = &a.book.cover {

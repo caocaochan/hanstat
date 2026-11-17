@@ -441,7 +441,12 @@ fn run_plan(a: &PlanArgs, lang: Language, k: Option<&Knowledge>, fold: bool, jso
         lookahead: a.lookahead,
     };
     let t = std::time::Instant::now();
-    let lib = plan::Library::build(lang, fold, books);
+    let lib = plan::Library::build(
+        lang,
+        fold,
+        hanstat::settings::Settings::load().skip_hapax,
+        books,
+    );
     let k0 = lib.known(k);
     let all: Vec<usize> = (0..lib.books.len()).collect();
     let width = a
@@ -998,6 +1003,7 @@ fn main() {
             &r.word_freq,
             names,
             &r.word_parts,
+            hanstat::settings::Settings::load().skip_hapax,
         ));
     }
     if add_history {

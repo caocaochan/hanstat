@@ -381,8 +381,14 @@ struct State {
 
 impl Library {
     /// `books`: (title, profile) of one language. `fold` must be the
-    /// knowledge's (see [`Library::fold_for`]).
-    pub fn build(language: Language, fold: bool, books: Vec<(String, Profile)>) -> Library {
+    /// knowledge's (see [`Library::fold_for`]). `skip_hapax`: leave out a
+    /// book's words that occur only once in it, as the Overview does.
+    pub fn build(
+        language: Language,
+        fold: bool,
+        skip_hapax: bool,
+        books: Vec<(String, Profile)>,
+    ) -> Library {
         let mut ids: FxHashMap<String, u32> = FxHashMap::default();
         let mut vocab: Vec<String> = Vec::new();
         let mut intern = |w: &str| -> (u32, bool) {
@@ -411,7 +417,8 @@ impl Library {
             let mut counts: FxHashMap<u32, (u32, bool)> = FxHashMap::default();
             let mut spell: FxHashMap<u32, String> = FxHashMap::default();
             let mut parts: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-            for (w, n) in &p.words {
+            // Before folding, so the same words go as on the Overview.
+            for (w, n) in p.words.iter().filter(|(_, n)| !skip_hapax || *n > 1) {
                 let (id, unfolded) = intern(w);
                 let is_name = ac.as_ref().is_some_and(|a| a.is_match(w.as_str()));
                 let e = counts.entry(id).or_insert((0, false));
@@ -969,6 +976,7 @@ mod tests {
         let lib = Library::build(
             Language::Chinese,
             false,
+            false,
             vec![profile("a", &[("甲", 50), ("乙", 30), ("丙", 20)], &[])],
         );
         let k0 = lib.known(None);
@@ -990,6 +998,7 @@ mod tests {
         let words = [("甲", 50), ("乙", 30), ("丙", 20)];
         let mut lib = Library::build(
             Language::Chinese,
+            false,
             false,
             vec![profile("a", &words, &[]), profile("b", &words, &[])],
         );
@@ -1017,6 +1026,7 @@ mod tests {
         let lib = Library::build(
             Language::Chinese,
             false,
+            false,
             vec![profile(
                 "a",
                 &[("张三", 60), ("说", 30), ("走", 10)],
@@ -1038,10 +1048,29 @@ mod tests {
     }
 
     #[test]
+    fn hapax_left_out_when_asked() {
+        let books = || vec![profile("a", &[("说", 8), ("走", 1), ("跑", 1)], &[])];
+        let all = Library::build(Language::Chinese, false, false, books());
+        assert_eq!(
+            (all.books[0].unique_words(), all.books[0].running_words()),
+            (3, 10)
+        );
+        let lib = Library::build(Language::Chinese, false, true, books());
+        assert_eq!(
+            (lib.books[0].unique_words(), lib.books[0].running_words()),
+            (1, 8)
+        );
+        let k0 = lib.known(None);
+        let p = lib.evaluate(&k0, &params(Study::Target(100.0), 0.0), &[0]);
+        assert_eq!(lib.study_list(0, &p.steps[0].study), [("说".into(), 8)]);
+    }
+
+    #[test]
     fn folding_merges_traditional_and_simplified() {
         let lib = Library::build(
             Language::Chinese,
             true,
+            false,
             vec![
                 profile("s", &[("说话", 10)], &[]),
                 profile("t", &[("說話", 10)], &[]),
@@ -1062,7 +1091,7 @@ mod tests {
         let a = profile("a", &[("一", 40), ("二", 30), ("三", 30)], &[]);
         let b = profile("b", &[("一", 25), ("二", 25), ("四", 25), ("五", 25)], &[]);
         let c = profile("c", &[("四", 40), ("五", 30), ("六", 30)], &[]);
-        let lib = Library::build(Language::Chinese, false, vec![a, b, c]);
+        let lib = Library::build(Language::Chinese, false, false, vec![a, b, c]);
         let k0 = lib.known(None);
         let pr = params(Study::Target(70.0), 0.0);
         let best = lib
@@ -1079,7 +1108,7 @@ mod tests {
     fn lookahead_prefers_words_needed_later() {
         let a = profile("a", &[("甲", 11), ("乙", 10), ("丙", 1)], &[]);
         let b = profile("b", &[("乙", 50), ("丁", 50)], &[]);
-        let lib = Library::build(Language::Chinese, false, vec![a, b]);
+        let lib = Library::build(Language::Chinese, false, false, vec![a, b]);
         let k0 = lib.known(None);
         let p = lib.evaluate(&k0, &params(Study::Fixed(1), 0.0), &[0, 1]);
         assert_eq!(lib.word(p.steps[0].study[0]), "甲");
@@ -1092,7 +1121,7 @@ mod tests {
     fn incidental_learning() {
         let a = profile("a", &[("甲", 20), ("乙", 3)], &[]);
         let b = profile("b", &[("甲", 1), ("乙", 1)], &[]);
-        let lib = Library::build(Language::Chinese, false, vec![a, b]);
+        let lib = Library::build(Language::Chinese, false, false, vec![a, b]);
         let k0 = lib.known(None);
         let mut pr = params(Study::Fixed(0), 0.0);
         pr.incidental = Some(10);
@@ -1137,7 +1166,7 @@ mod tests {
             titled("SCI谜案集 （第四部）", &[("一", 60), ("八", 40)]),
             titled("SCI謎案集(第3部)", &[("一", 40), ("九", 30), ("十", 30)]),
         ];
-        let lib = Library::build(Language::Chinese, false, books);
+        let lib = Library::build(Language::Chinese, false, false, books);
         let series: Vec<Option<Vec<u32>>> = lib
             .books
             .iter()
@@ -1219,7 +1248,7 @@ mod tests {
                     titled(t, &v)
                 })
                 .collect();
-            let lib = Library::build(Language::Chinese, false, books);
+            let lib = Library::build(Language::Chinese, false, false, books);
             assert!(lib.precedes(0, 5) && lib.precedes(5, 2) && lib.precedes(1, 4));
             assert!(lib.books[3].series.is_none());
             let k0 = lib.known(None);
@@ -1327,7 +1356,7 @@ mod tests {
                     profile(["p", "q", "r", "s", "t", "u"][b as usize], &v, &[])
                 })
                 .collect();
-            let lib = Library::build(Language::Chinese, false, books);
+            let lib = Library::build(Language::Chinese, false, false, books);
             let k0 = lib.known(None);
             let idx: Vec<usize> = (0..6).collect();
             for (study, objective) in [

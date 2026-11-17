@@ -332,8 +332,14 @@ impl App {
             let profiles: Vec<Profile> = books.iter().map(|(_, p)| p.clone()).collect();
             let chars = plan::stats::char_stats(&profiles, k.as_deref());
             drop(profiles);
-            let lib =
-                cached.unwrap_or_else(|| Arc::new(plan::Library::build(key.lang, key.fold, books)));
+            let lib = cached.unwrap_or_else(|| {
+                Arc::new(plan::Library::build(
+                    key.lang,
+                    key.fold,
+                    key.skip_hapax,
+                    books,
+                ))
+            });
             let words = lib.stats(&lib.known(k.as_deref()), WIDESPREAD);
             let counted = Counted {
                 format: FORMAT,
@@ -1045,7 +1051,7 @@ mod tests {
     /// A saved count reads back, including an empty library's (no NaN).
     #[test]
     fn counted_round_trips() {
-        let lib = plan::Library::build(Language::Japanese, false, Vec::new());
+        let lib = plan::Library::build(Language::Japanese, false, false, Vec::new());
         let c = Counted {
             format: FORMAT,
             language: Language::Japanese,

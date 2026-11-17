@@ -14,6 +14,10 @@ pub struct Settings {
     /// Percentage points of running words known that one point of writing
     /// style counts for ([`crate::style::target_offset`]).
     pub style_weight: f32,
+    /// Leave words that occur only once in a book out of its known-word
+    /// shares, difficulty and the reading path
+    /// ([`crate::anki::BookCoverage::compute`], [`crate::plan::Library::build`]).
+    pub skip_hapax: bool,
 }
 
 impl Default for Settings {
@@ -21,6 +25,7 @@ impl Default for Settings {
         Settings {
             writing_style: false,
             style_weight: crate::style::DEFAULT_WEIGHT,
+            skip_hapax: false,
         }
     }
 }

@@ -1315,6 +1315,9 @@ pub struct BookCoverage {
     pub running_words: KnownCount,
     /// Word occurrences left out of `running_words` as names.
     pub name_tokens: u64,
+    /// Distinct words left out of `unique_words` and `running_words` for
+    /// occurring only once (0 unless `skip_hapax`).
+    pub hapax_left_out: u64,
     /// Chinese character occurrences in the running text that are known.
     pub running_chars: KnownCount,
     /// From `running_words`.
@@ -1337,13 +1340,18 @@ impl BookCoverage {
     /// `parts` (Japanese, `Report::word_parts`): a long unit that is not known
     /// itself (冒険者) counts as known when all its short-unit parts (冒険, 者)
     /// are, with the weakest of their statuses.
+    ///
+    /// `skip_hapax`: words that occur only once are left out of the unique
+    /// and running words (known or not), and of the top unknown words.
     pub fn compute(
         k: &Knowledge,
         char_freq: &[(char, u32)],
         word_freq: &[(String, u32)],
         names: &HashSet<String>,
         parts: &HashMap<String, Vec<String>>,
+        skip_hapax: bool,
     ) -> Self {
+        let counted = |n: u32| !skip_hapax || n > 1;
         let word_status: Vec<Status> = word_freq
             .iter()
             .map(|(w, _)| {
@@ -1362,10 +1370,22 @@ impl BookCoverage {
             known: v.iter().filter(|s| s.is_known()).count() as u64,
             total: v.len() as u64,
         };
+        let unique_words =
+            word_freq
+                .iter()
+                .zip(&word_status)
+                .fold(KnownCount::default(), |mut c, ((_, n), s)| {
+                    if counted(*n) {
+                        c.total += 1;
+                        c.known += u64::from(s.is_known());
+                    }
+                    c
+                });
+        let hapax_left_out = word_freq.len() as u64 - unique_words.total;
         let top_unknown_words = word_freq
             .iter()
             .zip(&word_status)
-            .filter(|(_, s)| !s.is_known())
+            .filter(|((_, n), s)| counted(*n) && !s.is_known())
             .take(100)
             .map(|(w, _)| w.clone())
             .collect();
@@ -1378,6 +1398,9 @@ impl BookCoverage {
         let mut name_tokens = 0;
         let mut running_words = KnownCount::default();
         for ((w, n), s) in word_freq.iter().zip(&word_status) {
+            if !counted(*n) {
+                continue;
+            }
             let n = *n as u64;
             if !s.is_known() && names.iter().any(|name| w.contains(name)) {
                 name_tokens += n;
@@ -1392,10 +1415,11 @@ impl BookCoverage {
             anki: k.summary.clone(),
             from_anki: k.from_anki,
             listed: k.listed.clone(),
-            unique_words: count(&word_status),
+            unique_words,
             unique_chars: count(&char_status),
             running_words,
             name_tokens,
+            hapax_left_out,
             running_chars: char_freq.iter().zip(&char_status).fold(
                 KnownCount::default(),
                 |mut c, ((_, n), s)| {
@@ -1498,7 +1522,7 @@ mod tests {
         ];
         let char_freq = vec![('我', 50), ('看', 30), ('顾', 15), ('飞', 15)];
         let names: HashSet<String> = ["顾飞".to_string(), "飞".to_string()].into();
-        let c = BookCoverage::compute(&k, &char_freq, &word_freq, &names, &HashMap::new());
+        let c = BookCoverage::compute(&k, &char_freq, &word_freq, &names, &HashMap::new(), false);
         // 顾飞 and 顾飞说 are names; the one-character "name" 飞 is ignored.
         assert_eq!(c.name_tokens, 15);
         assert_eq!((c.running_words.known, c.running_words.total), (80, 85));
@@ -1506,6 +1530,45 @@ mod tests {
         assert_eq!(c.difficulty, Difficulty::Challenging);
         assert_eq!((c.running_chars.known, c.running_chars.total), (80, 110));
         assert_eq!((c.unique_words.known, c.unique_words.total), (2, 5));
+        assert_eq!(c.hapax_left_out, 0);
+    }
+
+    #[test]
+    fn running_coverage_skips_hapax() {
+        let k = Knowledge {
+            words: [
+                ("我".to_string(), Status::Mature),
+                ("一".to_string(), Status::Mature),
+            ]
+            .into(),
+            chars: HashMap::new(),
+            fold: false,
+            summary: KnowledgeSummary::default(),
+            from_anki: true,
+            listed: ListedSummary::default(),
+            hada_stems: HashSet::new(),
+        };
+        let word_freq = vec![
+            ("我".to_string(), 90),
+            ("看".to_string(), 8),
+            ("一".to_string(), 1),
+            ("滑板".to_string(), 1),
+        ];
+        let off =
+            BookCoverage::compute(&k, &[], &word_freq, &HashSet::new(), &HashMap::new(), false);
+        assert_eq!(
+            (off.running_words.known, off.running_words.total),
+            (91, 100)
+        );
+        assert_eq!((off.unique_words.known, off.unique_words.total), (2, 4));
+        // Known (一) and unknown (滑板) words that occur once both go.
+        let on = BookCoverage::compute(&k, &[], &word_freq, &HashSet::new(), &HashMap::new(), true);
+        assert_eq!((on.running_words.known, on.running_words.total), (90, 98));
+        assert_eq!((on.unique_words.known, on.unique_words.total), (1, 2));
+        assert_eq!(on.hapax_left_out, 2);
+        assert_eq!(on.top_unknown_words, [("看".to_string(), 8)]);
+        // Statuses stay parallel to the word list.
+        assert_eq!(on.word_status.len(), 4);
     }
 
     #[test]

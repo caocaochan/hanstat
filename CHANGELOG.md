@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.17.7] - 2026-11-17
+
+### Added
+- **Leave out words that occur only once** (⚙). A book's words that occur only once (known or not) no longer count toward the unique and running words you know, the difficulty, the top unknown words, the reading path or Library Stats. Off by default, kept in `settings.json`, and used by `hanstat-cli` too. The Overview's **Unique words** tile says when they are left out, and the running-words tile's hover says how many. Word counts and the coverage table still include them; a Library entry's numbers follow when the book is next opened.
+
 ## [2026.11.17.6] - 2026-11-17
 
 ### Fixed

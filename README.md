@@ -64,6 +64,8 @@ If a name gets split, apply it from the **Suggested words** tab, or pass a user 
 
 Click **🃏 Anki**, tick your decks and the fields that hold the word (sentence fields work too), and hanstat shows which of the book's characters and words you already know, what share of the running text that covers, and a difficulty rating. Young and mature cards count as known; with FSRS you can judge maturity by stability instead of interval. Your collection is only read from a copy, never modified.
 
+Tick **Leave out words that occur only once** in the **⚙** menu to keep a book's once-only words (often rare words, typos or segmenter splits you'd guess or skip) out of the words you know, the difficulty, the reading path and Library Stats, known or not. The word counts and coverage table still include them, and Library entries follow when each book is next opened.
+
 ## Vocabulary levels and word lists
 
 Click **📚 HSK & word lists** (Korean: **Levels**, Japanese: **JLPT**) to mark words known without Anki: tick vocabulary levels, import `.txt` word lists (one word per line), or click **+** next to a word in the **Words** tab (or select it with ↑/↓ and press **A**; **A** again unmarks it).

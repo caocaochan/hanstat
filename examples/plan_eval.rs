@@ -67,7 +67,7 @@ fn main() {
         }
         let k = s.apply(None, true);
         let fold = Library::fold_for(k.as_ref(), lang, true);
-        let lib = Library::build(lang, fold, books.clone());
+        let lib = Library::build(lang, fold, false, books.clone());
         let k0 = lib.known(k.as_ref());
         let all: Vec<usize> = (0..lib.books.len()).collect();
         let width = plan::width_for(&lib, &all, plan::SEARCH_BUDGET);

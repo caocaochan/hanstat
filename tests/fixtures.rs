@@ -339,6 +339,7 @@ fn japanese_book_counts_normalized_words_and_kanji() {
         &r.word_freq,
         &Default::default(),
         &r.word_parts,
+        false,
     );
     let status = |w: &str| {
         let i = r.word_freq.iter().position(|(x, _)| x == w).unwrap();
@@ -471,7 +472,7 @@ fn book_file_to_profile_to_reading_path() {
         p.save(&path).unwrap();
         books.push((name.to_owned(), Profile::load(&path).unwrap()));
     }
-    let lib = Library::build(hanstat::lang::Language::Chinese, true, books);
+    let lib = Library::build(hanstat::lang::Language::Chinese, true, false, books);
     let k0 = lib.known(None);
     let p = lib.evaluate(
         &k0,
