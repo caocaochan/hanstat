@@ -13,10 +13,8 @@
 
   This release itself analyses the Library once more in the background.
 
-## [2026.11.17.13] - 2026-11-17
-
 ### Fixed
-- **2026.11.17.12 analysed every Library book again for nothing.** Its settings and keyboard-shortcut code counted as part of the analysis, so the Library's rows (and the saved analyses) looked out of date although every count was the same. They no longer count. This release still analyses the Library once more in the background, for the last time for such a change; **Stop** in the status bar on 2026.11.17.12's run saves one of the two.
+- **2026.11.17.12 analysed every Library book again for nothing.** Its settings and keyboard-shortcut code counted as part of the analysis, so the Library's rows (and the saved analyses) looked out of date although every count was the same. They no longer count.
 - **ⓘ explains, hovering doesn't repeat it.** The Overview's **Running words you know**, **Difficulty for you** and **Writing style** tiles showed their whole explanation on hover as well as on ⓘ; now only ⓘ does. The Library's search box likewise shows a short hint, with the explanation on its ⓘ.
 
 ## [2026.11.17.12] - 2026-11-17
