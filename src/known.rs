@@ -379,7 +379,7 @@ impl Settings {
     }
 
     fn load_from(p: &Path) -> (Settings, Option<String>) {
-        match std::fs::read(p) {
+        match crate::saver::read(p) {
             Err(_) => (Settings::default(), None),
             Ok(b) => match serde_json::from_slice(&b) {
                 Ok(s) => (s, None),
@@ -391,18 +391,9 @@ impl Settings {
         }
     }
 
-    /// Written to a temporary file and renamed, so a crash never leaves half a file.
+    /// Through [`crate::saver`]: in the window, written in the background.
     fn save_to(&self, p: &Path) -> Result<(), String> {
-        let dir = p.parent().unwrap();
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
-        let tmp = p.with_extension(format!("json.{}.tmp", std::process::id()));
-        std::fs::write(&tmp, serde_json::to_string_pretty(self).unwrap())
-            .map_err(|e| format!("Cannot write {}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, p).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            format!("Cannot write {}: {e}", p.display())
-        })
+        crate::saver::write(p, serde_json::to_vec_pretty(self).unwrap())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -620,7 +611,7 @@ impl Settings {
             .iter()
             .flat_map(|l| l.words.iter().map(String::as_str))
             .collect();
-        for (w, keys) in listed.iter().zip(crate::japanese::keys_each(&listed)) {
+        for (w, keys) in listed.iter().zip(japanese_keys(&listed)) {
             out.extend(keys.into_iter().map(|k| (k, w.to_string())));
         }
         out.extend(self.marked.iter().map(|w| (w.clone(), w.clone())));
@@ -633,6 +624,35 @@ impl Settings {
         }
         out
     }
+}
+
+/// [`crate::japanese::keys_each`], remembered: the known words are merged
+/// again whenever any of them change, and analysing every entry of the
+/// imported lists each time would take long. Only entries not seen before
+/// are analysed.
+fn japanese_keys(texts: &[&str]) -> Vec<Vec<String>> {
+    static MEMO: std::sync::Mutex<Option<HashMap<String, Vec<String>>>> =
+        std::sync::Mutex::new(None);
+    let mut memo = MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    let memo = memo.get_or_insert_with(HashMap::new);
+    let mut new: Vec<&str> = texts
+        .iter()
+        .copied()
+        .filter(|t| !memo.contains_key(*t))
+        .collect();
+    new.sort_unstable();
+    new.dedup();
+    // Without Sudachi each entry stands for itself, and isn't remembered so.
+    let Some(keyed) = crate::japanese::analysed_keys_each(&new) else {
+        return texts
+            .iter()
+            .map(|t| memo.get(*t).cloned().unwrap_or_else(|| vec![t.to_string()]))
+            .collect();
+    };
+    for (t, keys) in new.iter().zip(keyed) {
+        memo.insert(t.to_string(), keys);
+    }
+    texts.iter().map(|t| memo[*t].clone()).collect()
 }
 
 /// Read a Chinese word list (see [`read_word_list_in`]).

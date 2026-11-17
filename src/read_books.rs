@@ -9,7 +9,7 @@
 
 use crate::library_stats::{Tile, fmt_time, reading_minutes, tile_grid};
 use crate::{AnkiState, App, fmt_int};
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
 use hanstat::anki::Knowledge;
 use hanstat::history;
 use hanstat::known::{self, ReadBook};
@@ -17,9 +17,6 @@ use hanstat::lang::Language;
 use hanstat::profile::Profile;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-
-/// The green of a book marked read.
-pub(crate) const READ_GREEN: Color32 = Color32::from_rgb(90, 170, 90);
 
 /// New words listed in the dialog, most frequent first.
 const SHOW_NEW: usize = 80;
@@ -242,7 +239,7 @@ impl App {
                     fmt_int(new.len() as u64),
                 ));
                 if let Some(n) = &d.note {
-                    ui.colored_label(Color32::from_rgb(220, 170, 60), format!("⚠ {n}"));
+                    ui.colored_label(crate::palette::warn(), format!("⚠ {n}"));
                 }
                 if !new.is_empty() {
                     ui.add_space(4.0);

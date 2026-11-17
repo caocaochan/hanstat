@@ -16,7 +16,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 
-const ACCENT: Color32 = Color32::from_rgb(90, 150, 220);
 const CHART_HEIGHT: f32 = 230.0;
 
 /// Totals of one language's books, from their History entries.
@@ -616,7 +615,7 @@ impl App {
             }
         });
         if let Some(e) = &self.stats.error {
-            ui.colored_label(Color32::from_rgb(220, 170, 60), format!("⚠ {e}"));
+            ui.colored_label(crate::palette::warn(), format!("⚠ {e}"));
         }
         if entries.is_empty() {
             ui.label(RichText::new("No books in this language yet.").weak());
@@ -826,7 +825,7 @@ impl App {
                         ));
                         difficulty_color(d)
                     }
-                    None => ACCENT,
+                    None => crate::palette::accent(),
                 };
                 Bar {
                     value: len as f64,
@@ -926,7 +925,7 @@ impl App {
                     &w.coverage,
                     &marks,
                     level,
-                    ACCENT,
+                    crate::palette::accent(),
                     "words",
                     CHART_HEIGHT,
                 )
@@ -943,7 +942,7 @@ fn spread_chart(ui: &mut egui::Ui, r: &Counted) {
         .iter()
         .map(|(label, lo, hi, count)| Bar {
             value: *count as f64,
-            color: ACCENT,
+            color: crate::palette::accent(),
             hover: format!(
                 "{} words ({:.1}%) are in {} of the {n} books",
                 fmt_int(*count as u64),

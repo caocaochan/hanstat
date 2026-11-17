@@ -1,5 +1,33 @@
 # Changelog
 
+## [2026.11.17.11] - 2026-11-17
+
+### Changed
+- **Known words update the Library in seconds.** A Library row now records apart what changes a book's counts (hanstat's analysis, the user dictionary, the word lists given to the segmenter, Match Traditional ↔ Simplified) and what only changes how much of them you know (the known words, **Leave out words that occur only once**). When only the second changed, as after marking words known or a book read, the row is computed again from the book's saved word data, which now also hold its character counts, instead of opening, reading and searching the book for names again. Measured on a Library of 81 novels: about 16 ms a book on one core, against 0.4–1 s a book on all of them before. A book whose file has moved is updated too.
+- **Less work while you click.**
+  - The known words (Anki plus levels, lists, marked words and read books) are put together again only when one of them changes; before, also on every ticked section and whenever word discovery finished, and each time the Library's rows, its statistics and the reading path were worked out again for nothing. Japanese word-list entries are read with Sudachi once per session instead of every time.
+  - **Library → Stats** are counted only while that tab is open.
+  - The Library, the books' word data and the known words are saved in the background, a moment after the last change (marking word after word known writes them once), instead of while the window is drawn. Whether each Library book's file is still there is checked in the background every 5 seconds instead of at every frame, so a book on a sleeping drive or a network share no longer stalls the window.
+  - Ticking sections looks for suggested words once, 300 ms after the last tick, and stops a search already running; jieba's dictionary is loaded once.
+  - The Characters and Words tables filter and sort only when the filter, the sort or the book change, not at every frame.
+- **Opening another book stops the analysis still running**, instead of letting it finish unseen. **Changing the segmenter or a TXT's encoding while a book is analysed** analyses it again with the new choice; before, the new choice was shown but the book was analysed with the old one.
+- **Settings window.** **⚙** in the status bar opens a window with the settings (Counting, Reading speed, Writing style) instead of a menu that closed at a click elsewhere.
+- **The window remembers** its size and place, the tab, the Library's tab, sort and **Hide read**, and the Characters and Words tables' sorts (in `window.ron` next to `settings.json`). It grows to fit the Overview only until it has a size of its own: on the first start, and until you resize it.
+- **Colours on the light theme.** Status, difficulty, warning and error colours were made for the dark theme and had a contrast of about 2:1 on the light one (Young 1.9, Moderate 1.8, warnings 2.0). On the light theme they now have darker versions with a contrast of at least 4.5:1; the dark theme is unchanged.
+- **ⓘ explains.** The Overview's **Running words you know**, **Difficulty for you** and **Writing style** tiles, the Library's search and the Suggested words' columns have an **ⓘ** that shows their explanation when clicked; before, it was only in a tooltip.
+- **The status bar** shows the open book's file name (the full path on hover) and takes a second line when what it shows doesn't fit on one.
+- **Releases are numbered with two digits per day**: 2026.11.18.00, .01, … GitHub lists a day's releases by tag name as text, which put 2026.11.17.10 between .2 and .1. Earlier versions update to them as usual.
+
+### Added
+- **Sortable Characters and Words tables.** Click **Rank**, **Char** or **Status** (Characters) or **Rank**, **Word**, **Status** or **Length** (Words) to sort; again to reverse. Ties stay in frequency order. The **Word** column can be dragged wider, and long words are cut off at its edge instead of running into the next column.
+- **Undo removing a book.** ✖ in the Library takes the book out at once, and **↩ Undo** in the status bar puts it back for 10 seconds; only then are its cover and word data deleted. The ✖ is set a little apart from **✔**.
+- **Errors can be dismissed.** Each error above the content has a **✖**, and a new error replaces only an earlier one of the same kind (a failed save no longer hides a failed analysis). The Library's warning line has a ✖ too.
+
+### Fixed
+- The hover texts of the Library's search box and of **Rate the books without a rating** had runs of spaces in the middle.
+
+On the first start of this version every Library row is analysed again once, so that its word data hold the character counts, and each book is segmented once more (the analysis code changed): seconds a book with LTP, minutes with CKIP. After that, changes to the known words take the fast way.
+
 ## [2026.11.17.10] - 2026-11-17
 
 ### Changed

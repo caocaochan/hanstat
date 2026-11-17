@@ -953,7 +953,7 @@ fn run(shared: Shared, notify: impl Fn(), log: Log) {
     };
     let fail = |e: String| {
         log.line(format!(
-            "Rating stopped: {e}\nNothing more is rated until it is started again from the ⚙ menu."
+            "Rating stopped: {e}\nNothing more is rated until it is started again in Settings (⚙)."
         ));
         set(Phase::Failed(e));
     };

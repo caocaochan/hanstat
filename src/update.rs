@@ -27,12 +27,15 @@ const OLD_SUFFIX: &str = "hanstat-old";
 const NEW_SUFFIX: &str = "hanstat-new";
 const USER_AGENT: &str = concat!("hanstat/", env!("CARGO_PKG_VERSION"));
 
-/// Releases are versioned `yyyy.mm.dd.n` (n counts releases on that day from
-/// 0), tagged without a `v`. Older releases (up to v0.7.1) were `v0.x.y`, read as `(0, x, y, 0)`,
-/// so they sort before every dated one.
+/// Releases are versioned `yyyy.mm.dd.nn` (nn counts releases on that day
+/// from 00), tagged without a `v`. The count has two digits so that GitHub's
+/// release list, which orders a day's releases by tag name as text, puts .10
+/// after .09; releases up to 2026.11.17.10 have one digit (.0–.10), which
+/// parses the same. Older releases (up to v0.7.1) were `v0.x.y`, read as
+/// `(0, x, y, 0)`, so they sort before every dated one.
 pub type Version = (u64, u64, u64, u64);
 
-/// `2026.11.15.0`, or a legacy `0.8.0` / `v0.8.0`; anything else
+/// `2026.11.18.00` (or an older `2026.11.15.0`), or a legacy `0.8.0` / `v0.8.0`; anything else
 /// (pre-release suffixes included) is `None`.
 pub fn parse_version(s: &str) -> Option<Version> {
     let parts: Vec<u64> = s
@@ -49,7 +52,7 @@ pub fn parse_version(s: &str) -> Option<Version> {
 }
 
 /// Cargo needs a SemVer version without leading zeros, so Cargo.toml holds
-/// `yyyy.Mdd.n` (2026.1115.0 for 2026.11.15.0, 2027.105.2 for 2027.01.05.2).
+/// `yyyy.Mdd.n` (2026.1115.0 for 2026.11.15.00, 2027.105.2 for 2027.01.05.02).
 fn from_cargo(s: &str) -> Option<Version> {
     let mut it = s.split('.').map(|p| p.parse::<u64>().ok());
     let (y, md, n) = (it.next()??, it.next()??, it.next()??);
@@ -64,16 +67,16 @@ pub fn current_version() -> Version {
     from_cargo(env!("CARGO_PKG_VERSION")).expect("Cargo.toml version is yyyy.Mdd.n")
 }
 
-/// `2026.11.15.0` (legacy versions as `0.8.0`).
+/// `2026.11.15.00` (legacy versions as `0.8.0`).
 pub fn format_version((a, b, c, n): Version) -> String {
     if a == 0 {
         format!("{a}.{b}.{c}")
     } else {
-        format!("{a}.{b:02}.{c:02}.{n}")
+        format!("{a}.{b:02}.{c:02}.{n:02}")
     }
 }
 
-/// This build's version as released, e.g. `2026.11.15.0`.
+/// This build's version as released, e.g. `2026.11.15.00`.
 pub fn version_string() -> String {
     format_version(current_version())
 }
@@ -674,11 +677,16 @@ mod tests {
         assert!(parse_version("2026.11.15.1") > parse_version("2026.11.15.0"));
         assert!(parse_version("2026.11.16.0") > parse_version("2026.11.15.9"));
         assert!(parse_version("2027.01.01.0") > parse_version("2026.12.31.3"));
+        // Two-digit counts, and against the one-digit ones before them.
+        assert_eq!(parse_version("2026.11.18.05"), Some((2026, 11, 18, 5)));
+        assert!(parse_version("2026.11.17.11") > parse_version("2026.11.17.9"));
+        assert!(parse_version("2026.11.18.00") > parse_version("2026.11.17.10"));
 
         assert_eq!(from_cargo("2026.1115.0"), Some((2026, 11, 15, 0)));
         assert_eq!(from_cargo("2027.105.2"), Some((2027, 1, 5, 2)));
         assert_eq!(from_cargo("0.8.0"), None);
-        assert_eq!(format_version((2027, 1, 5, 2)), "2027.01.05.2");
+        assert_eq!(format_version((2027, 1, 5, 2)), "2027.01.05.02");
+        assert_eq!(format_version((2026, 11, 17, 11)), "2026.11.17.11");
         assert_eq!(format_version((0, 8, 0, 0)), "0.8.0");
         // The release tag (made by CI from Cargo.toml) round-trips.
         assert_eq!(parse_version(&version_string()), Some(current_version()));

@@ -11,7 +11,6 @@ use crate::analyze::Report;
 use crate::lang::Language;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 /// Layout of a profile; one of another layout is treated as missing.
@@ -41,6 +40,12 @@ pub struct Profile {
     /// Japanese: how the book spells a word key, where it differs (為る → する).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub display: HashMap<String, String>,
+    /// Character (kanji) counts over the included sections, as
+    /// `Report::char_freq`: with them a Library row's coverage is computed
+    /// again from the profile alone when only the known words change.
+    /// `None` in a profile written before they were kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chars: Option<Vec<(char, u32)>>,
 }
 
 impl Profile {
@@ -64,6 +69,7 @@ impl Profile {
             names,
             parts: r.word_parts.clone(),
             display: r.word_display.clone(),
+            chars: Some(r.char_freq.clone()),
         }
     }
 
@@ -83,6 +89,7 @@ impl Profile {
         let mut display: Vec<_> = self.display.iter().collect();
         display.sort_unstable();
         display.hash(&mut h);
+        self.chars.hash(&mut h);
         h.finish()
     }
 
@@ -91,32 +98,21 @@ impl Profile {
         self.display.get(w).map_or(w, String::as_str)
     }
 
-    /// Write gzip-compressed JSON under a temporary name, then rename.
+    /// Gzip-compressed JSON, through [`crate::saver`] (in the window,
+    /// written in the background).
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        let dir = path.parent().unwrap();
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
-        let tmp = path.with_extension(format!("gz.{}.tmp", std::process::id()));
-        let write = || -> std::io::Result<()> {
-            let f = std::fs::File::create(&tmp)?;
-            let mut gz =
-                flate2::write::GzEncoder::new(BufWriter::new(f), flate2::Compression::new(6));
-            serde_json::to_writer(&mut gz, self)?;
-            gz.finish()?.flush()
-        };
-        write()
-            .and_then(|_| std::fs::rename(&tmp, path))
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&tmp);
-                format!("Cannot write {}: {e}", path.display())
-            })
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
+        serde_json::to_writer(&mut gz, self)
+            .map_err(std::io::Error::other)
+            .and_then(|_| gz.finish())
+            .map_err(|e| format!("Cannot write {}: {e}", path.display()))
+            .and_then(|bytes| crate::saver::write(path, bytes))
     }
 
     /// `None` if missing, unreadable or of another layout.
     pub fn load(path: &Path) -> Option<Profile> {
-        let f = std::fs::File::open(path).ok()?;
-        let p: Profile =
-            serde_json::from_reader(BufReader::new(flate2::read::GzDecoder::new(f))).ok()?;
+        let bytes = crate::saver::read(path).ok()?;
+        let p: Profile = serde_json::from_reader(flate2::read::GzDecoder::new(&bytes[..])).ok()?;
         (p.format == FORMAT).then_some(p)
     }
 }
@@ -208,6 +204,7 @@ mod tests {
             names: vec!["アリス".into()],
             parts: HashMap::from([("冒険者".into(), vec!["冒険".into(), "者".into()])]),
             display: HashMap::from([("為る".into(), "する".into())]),
+            chars: Some(vec![('冒', 3), ('険', 3)]),
         };
         let path = path_in(&dir.join("history.json"), &p.id);
         p.save(&path).unwrap();

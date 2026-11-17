@@ -348,7 +348,7 @@ pub fn coverage_curve(
     }
     if let Some((v, label)) = &level {
         let y = c.y(*v, 0.0, 100.0);
-        let gold = Color32::from_rgb(220, 170, 60);
+        let gold = crate::palette::warn();
         c.painter.hline(c.plot.x_range(), y, Stroke::new(1.5, gold));
         c.painter.text(
             pos2(c.plot.left() + 6.0, y - 2.0),

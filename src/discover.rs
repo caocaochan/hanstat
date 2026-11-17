@@ -16,6 +16,7 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde::Serialize;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const MAX_N: usize = 6;
 const EDGE: u32 = 0;
@@ -157,12 +158,40 @@ pub fn discover(
     known: &HashSet<String>,
     opts: &Options,
 ) -> Vec<Candidate> {
-    let jieba = jieba_rs::Jieba::new();
+    discover_cancellable(
+        book,
+        included,
+        word_freq,
+        known,
+        opts,
+        &AtomicBool::new(false),
+    )
+    .unwrap_or_default()
+}
+
+/// [`discover`] that gives up, returning `None`, once `cancel` is set (the
+/// window starts it again when the included sections change).
+pub fn discover_cancellable(
+    book: &Book,
+    included: &[bool],
+    word_freq: &[(String, u32)],
+    known: &HashSet<String>,
+    opts: &Options,
+    cancel: &AtomicBool,
+) -> Option<Vec<Candidate>> {
+    let jieba = jieba();
     let cedict = cedict_words();
-    discover_with(book, included, word_freq, known, opts, &|w| {
+    let is_general = |w: &str| {
         let s = crate::script::fold_t2s(w);
         jieba.has_word(w) || jieba.has_word(&s) || cedict.contains(w) || cedict.contains(s.as_str())
-    })
+    };
+    discover_impl(book, included, word_freq, known, opts, &is_general, cancel)
+}
+
+/// jieba's dictionary, built once: building it takes a noticeable moment.
+fn jieba() -> &'static jieba_rs::Jieba {
+    static JIEBA: std::sync::OnceLock<jieba_rs::Jieba> = std::sync::OnceLock::new();
+    JIEBA.get_or_init(jieba_rs::Jieba::new)
 }
 
 /// CC-CEDICT's general-language words that jieba's dictionary lacks (靠谱,
@@ -190,8 +219,30 @@ pub fn discover_with(
     opts: &Options,
     is_general: &(dyn Fn(&str) -> bool + Sync),
 ) -> Vec<Candidate> {
+    discover_impl(
+        book,
+        included,
+        word_freq,
+        known,
+        opts,
+        is_general,
+        &AtomicBool::new(false),
+    )
+    .unwrap_or_default()
+}
+
+fn discover_impl(
+    book: &Book,
+    included: &[bool],
+    word_freq: &[(String, u32)],
+    known: &HashSet<String>,
+    opts: &Options,
+    is_general: &(dyn Fn(&str) -> bool + Sync),
+    cancel: &AtomicBool,
+) -> Option<Vec<Candidate>> {
+    let cancelled = || cancel.load(Ordering::Relaxed);
     if crate::analyze::detect_language(book) != crate::lang::Language::Chinese {
-        return Vec::new();
+        return Some(Vec::new());
     }
     // Han-only runs of the normalised text.
     let runs: Vec<Vec<char>> = book
@@ -225,6 +276,9 @@ pub fn discover_with(
     // (n-1)-prefix and (n-1)-suffix are.
     let mut freq: Vec<FxHashMap<u128, u32>> = vec![FxHashMap::default(); MAX_N + 1];
     for n in 1..=MAX_N {
+        if cancelled() {
+            return None;
+        }
         let prev = if n > 1 { Some(&freq[n - 1]) } else { None };
         let counts = runs
             .par_chunks(512)
@@ -284,6 +338,9 @@ pub fn discover_with(
         }
     }
 
+    if cancelled() {
+        return None;
+    }
     // Neighbour distributions for surviving candidates.
     for r in &runs {
         for n in 2..=MAX_N.min(r.len()) {
@@ -302,6 +359,9 @@ pub fn discover_with(
         }
     }
 
+    if cancelled() {
+        return None;
+    }
     let tokens = within_token_counts(word_freq, is_general);
     let mut out: Vec<Candidate> = cand
         .into_iter()
@@ -371,7 +431,7 @@ pub fn discover_with(
             }
         })
     });
-    out
+    Some(out)
 }
 
 #[cfg(test)]

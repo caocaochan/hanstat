@@ -215,6 +215,7 @@ mod tests {
                 names: names.iter().map(|s| s.to_string()).collect(),
                 parts: HashMap::new(),
                 display: HashMap::new(),
+                chars: None,
             },
         )
     }

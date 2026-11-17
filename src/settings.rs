@@ -1,4 +1,4 @@
-//! Settings that apply everywhere, from the ⚙ menu: `settings.json` in
+//! Settings that apply everywhere, from the Settings window (⚙): `settings.json` in
 //! [`crate::models::app_dir`].
 
 use serde::{Deserialize, Serialize};

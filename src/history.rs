@@ -92,25 +92,28 @@ impl Known {
     pub fn difficulty(&self) -> Difficulty {
         Difficulty::from_percent(self.running_words)
     }
+
+    /// What a row shows of a book's coverage by the known words.
+    pub fn from_coverage(c: &crate::anki::BookCoverage) -> Known {
+        let lists = &c.listed.source;
+        Known {
+            source: match (c.from_anki, lists.is_empty()) {
+                (true, true) => "Anki".to_owned(),
+                (true, false) => format!("Anki + {lists}"),
+                (false, _) => lists.clone(),
+            },
+            running_words: c.running_words.percent(),
+            unique_words: c.unique_words.percent(),
+            unique_chars: c.unique_chars.percent(),
+            unknown_words: c.unique_words.not_known(),
+        }
+    }
 }
 
 impl Stats {
     /// From the report the Overview shows.
     pub fn from_report(r: &Report) -> Stats {
-        let known = r.anki.as_ref().map(|c| {
-            let lists = &c.listed.source;
-            Known {
-                source: match (c.from_anki, lists.is_empty()) {
-                    (true, true) => "Anki".to_owned(),
-                    (true, false) => format!("Anki + {lists}"),
-                    (false, _) => lists.clone(),
-                },
-                running_words: c.running_words.percent(),
-                unique_words: c.unique_words.percent(),
-                unique_chars: c.unique_chars.percent(),
-                unknown_words: c.unique_words.not_known(),
-            }
-        });
+        let known = r.anki.as_ref().map(Known::from_coverage);
         Stats {
             format: r.format.to_owned(),
             language: r.language,
@@ -164,7 +167,7 @@ impl History {
             path,
             read_only: false,
         };
-        let warn = match std::fs::read(&h.path) {
+        let warn = match crate::saver::read(&h.path) {
             Err(_) => None,
             Ok(b) => match serde_json::from_slice::<File>(&b) {
                 Ok(f) if f.format <= FORMAT => {
@@ -273,26 +276,55 @@ impl History {
         crate::profile::path_in(&self.path, id)
     }
 
-    /// Written to a temporary file and renamed, so a crash never leaves half a file.
+    /// Through [`crate::saver`]: in the window, written in the background.
     fn save(&self) -> Result<(), String> {
         if self.read_only {
             return Ok(());
         }
-        let p = &self.path;
-        let dir = p.parent().unwrap();
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
-        let file = File {
+        #[derive(Serialize)]
+        struct FileRef<'a> {
+            format: u32,
+            books: &'a [Entry],
+        }
+        let file = FileRef {
             format: FORMAT,
-            books: self.entries.clone(),
+            books: &self.entries,
         };
-        let tmp = p.with_extension(format!("json.{}.tmp", std::process::id()));
-        std::fs::write(&tmp, serde_json::to_string_pretty(&file).unwrap())
-            .map_err(|e| format!("Cannot write {}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, p).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            format!("Cannot write {}: {e}", p.display())
-        })
+        crate::saver::write(&self.path, serde_json::to_vec_pretty(&file).unwrap())
+    }
+
+    /// Take book `id` out of the list without deleting its cover and word
+    /// data, so that [`Self::restore`] can put it back: its place and entry.
+    pub fn take(&mut self, id: &str) -> Result<Option<(usize, Entry)>, String> {
+        let Some(i) = self.entries.iter().position(|e| e.id == id) else {
+            return Ok(None);
+        };
+        let e = self.entries.remove(i);
+        self.save().map(|_| Some((i, e)))
+    }
+
+    /// Put back an entry [`Self::take`] took, unless the book has been
+    /// recorded again meanwhile.
+    pub fn restore(&mut self, i: usize, e: Entry) -> Result<(), String> {
+        if self
+            .entries
+            .iter()
+            .any(|x| x.id == e.id || same_path(&x.path, &e.path))
+        {
+            return Ok(());
+        }
+        self.entries.insert(i.min(self.entries.len()), e);
+        self.save()
+    }
+
+    /// Delete the cover and word data of a book taken out with
+    /// [`Self::take`], unless it is in the list again.
+    pub fn forget(&self, id: &str) {
+        if self.read_only || self.entries.iter().any(|e| e.id == id) {
+            return;
+        }
+        let _ = std::fs::remove_file(self.cover(id));
+        let _ = std::fs::remove_file(self.profile(id));
     }
 }
 

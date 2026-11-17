@@ -14,6 +14,7 @@ pub mod lang;
 pub mod models;
 pub mod plan;
 pub mod profile;
+pub mod saver;
 pub mod script;
 pub mod search;
 pub mod segment;

@@ -204,6 +204,26 @@ pub fn analyze_book_cached(
     cache: Option<&Cache>,
     progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Result<Prepared, String> {
+    let never = std::sync::atomic::AtomicBool::new(false);
+    analyze_book_cancellable(book, kind, user_words, known_words, cache, progress, &never)
+}
+
+/// The error [`analyze_book_cancellable`] returns once cancelled.
+pub const CANCELLED: &str = "Analysis cancelled";
+
+/// [`analyze_book_cached`] that stops, with the error [`CANCELLED`], soon
+/// after `cancel` is set (another book was opened meanwhile). Nothing is
+/// saved in the cache then.
+pub fn analyze_book_cancellable(
+    book: &Book,
+    kind: SegmenterKind,
+    user_words: &[String],
+    known_words: &[String],
+    cache: Option<&Cache>,
+    progress: &(dyn Fn(usize, usize) + Sync),
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Prepared, String> {
+    let cancelled = || cancel.load(std::sync::atomic::Ordering::Relaxed);
     let language = detect_language(book);
     let (tr, si) = detect_variant(book);
     let variant = match language {
@@ -260,6 +280,9 @@ pub fn analyze_book_cached(
         }
         key = Some(k);
     }
+    if cancelled() {
+        return Err(CANCELLED.to_owned());
+    }
     let seg = Segmenter::new(resolved, &words, variant)?.with_known(&known)?;
     // Sudachi falls back to its tested dictionary when the newest can't be loaded.
     if let Some(e) = &expected {
@@ -281,6 +304,9 @@ pub fn analyze_book_cached(
             s.paragraphs
                 .par_chunks(GROUP)
                 .fold(SectionStats::default, |mut acc, group| {
+                    if cancelled() {
+                        return acc;
+                    }
                     match language {
                         Language::Chinese => analyze_group(&mut acc, group, &seg),
                         Language::Korean => analyze_group_korean(&mut acc, group, &seg),
@@ -294,6 +320,9 @@ pub fn analyze_book_cached(
                 .reduce(SectionStats::default, SectionStats::merge)
         })
         .collect::<Vec<SectionStats>>();
+    if cancelled() {
+        return Err(CANCELLED.to_owned());
+    }
     if let (Some(cache), Some(key)) = (cache, &key) {
         // Not being able to save only means analysing again next time.
         let _ = cache.put(key, &stats);

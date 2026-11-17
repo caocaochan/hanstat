@@ -517,3 +517,56 @@ fn book_file_to_profile_to_reading_path() {
     assert_eq!(p.steps[1].reached, 100.0);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A Library row whose counts are current is updated from its saved word
+/// data alone when only the known words change: that must give the row the
+/// full report gives.
+#[test]
+fn profile_alone_gives_the_rows_coverage() {
+    use hanstat::anki::{BookCoverage, Knowledge};
+    use hanstat::history::Known;
+    use hanstat::profile::Profile;
+    use std::collections::HashSet;
+    let text = "第一章\n他說話。他說了。我们学习汉字，这个问题很难。林原说话很认真。林原来了。\n";
+    let book = extract::txt::load(text.as_bytes(), EncodingChoice::Auto);
+    let prep = analyze_book(&book, SegmenterKind::Jieba, &[], &[], &|_, _| {}).unwrap();
+    let inc = vec![true; book.sections.len()];
+    let names: HashSet<String> = ["林原".to_owned()].into();
+    for fold in [false, true] {
+        let r = build_report(&book, &prep, &inc, fold);
+        let mut k = Knowledge::empty(fold);
+        k.add_listed(
+            r.word_freq.iter().step_by(2).map(|(w, _)| w.as_str()),
+            "test".into(),
+        );
+        for skip_hapax in [false, true] {
+            let from_report = BookCoverage::compute(
+                &k,
+                &r.char_freq,
+                &r.word_freq,
+                &names,
+                &r.word_parts,
+                skip_hapax,
+            );
+            let dir =
+                std::env::temp_dir().join(format!("hanstat-cov-{}-{fold}", std::process::id()));
+            let path = dir.join("p.json.gz");
+            Profile::from_report("id", &r, &names).save(&path).unwrap();
+            let p = Profile::load(&path).unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            let p_names: HashSet<String> = p.names.iter().cloned().collect();
+            let from_profile = BookCoverage::compute(
+                &k,
+                p.chars.as_ref().unwrap(),
+                &p.words,
+                &p_names,
+                &p.parts,
+                skip_hapax,
+            );
+            assert_eq!(
+                Known::from_coverage(&from_report),
+                Known::from_coverage(&from_profile)
+            );
+        }
+    }
+}

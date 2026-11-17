@@ -392,17 +392,21 @@ fn load(user_words: &[String]) -> Result<Analyzer, String> {
 /// The keys of the words in each of `texts` (word-list entries), using the
 /// latest analyser; each text as it is if Sudachi can't be loaded.
 pub fn keys_each(texts: &[&str]) -> Vec<Vec<String>> {
+    analysed_keys_each(texts).unwrap_or_else(|| texts.iter().map(|t| vec![t.to_string()]).collect())
+}
+
+/// [`keys_each`], or `None` if Sudachi can't be loaded.
+pub fn analysed_keys_each(texts: &[&str]) -> Option<Vec<Vec<String>>> {
     if texts.is_empty() {
-        return Vec::new();
+        return Some(Vec::new());
     }
-    match shared_any() {
-        Some(a) => a
+    Some(
+        shared_any()?
             .words_many(texts)
             .into_iter()
             .map(|v| v.into_iter().map(|w| w.key).collect())
             .collect(),
-        None => texts.iter().map(|t| vec![t.to_string()]).collect(),
-    }
+    )
 }
 
 static CURRENT: Mutex<Option<(Vec<String>, Arc<Analyzer>)>> = Mutex::new(None);
