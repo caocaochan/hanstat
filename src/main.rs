@@ -2157,7 +2157,11 @@ impl App {
                                 .map(<[bool]>::to_vec)
                         });
                         self.included = saved.unwrap_or_else(|| {
-                            l.book.sections.iter().map(|s| s.default_included()).collect()
+                            l.book
+                                .sections
+                                .iter()
+                                .map(|s| s.default_included())
+                                .collect()
                         });
                     }
                     if !same_book {
@@ -5012,7 +5016,11 @@ impl App {
             self.open(last, ctx);
             return;
         }
-        if self.batch.as_ref().is_some_and(|b| b.mode != BatchMode::Auto) {
+        if self
+            .batch
+            .as_ref()
+            .is_some_and(|b| b.mode != BatchMode::Auto)
+        {
             self.toast = Some((
                 "Still analysing the books opened before: open these once it has finished.".into(),
                 ctx.input(|i| i.time) + 4.0,
@@ -5086,7 +5094,9 @@ impl App {
         };
         let anki_pending = anki.rx.is_some()
             || anki.dirty
-            || (anki.settings.enabled && anki.settings.collection.is_some() && anki.knowledge.is_none());
+            || (anki.settings.enabled
+                && anki.settings.collection.is_some()
+                && anki.knowledge.is_none());
         if anki_pending {
             return None;
         }
@@ -5123,7 +5133,12 @@ impl App {
             text(&mut h, w);
         }
         text(&mut h, &knowledge);
-        Some(h.finalize()[..12].iter().map(|b| format!("{b:02x}")).collect())
+        Some(
+            h.finalize()[..12]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+        )
     }
 
     /// Analyse again, in the background, the Library books whose rows were
@@ -5149,7 +5164,11 @@ impl App {
             self.auto.changed_at = now;
             self.auto.failed.clear();
         }
-        if self.batch.as_ref().is_some_and(|b| b.mode == BatchMode::Auto && b.inputs != inputs) {
+        if self
+            .batch
+            .as_ref()
+            .is_some_and(|b| b.mode == BatchMode::Auto && b.inputs != inputs)
+        {
             // Outdated: what it has finished stays, the rest waits for the delay.
             let b = self.batch.take().unwrap();
             b.cancel.store(true, Ordering::Relaxed);
@@ -5169,8 +5188,13 @@ impl App {
         let open = self.book_id.as_deref();
         let mut todo = Vec::new();
         for e in &self.history.entries {
-            let Some(d) = inputs.get(&e.stats.language) else { continue };
-            if e.inputs == *d || Some(e.id.as_str()) == open || self.auto.failed.get(&e.path) == Some(d) {
+            let Some(d) = inputs.get(&e.stats.language) else {
+                continue;
+            };
+            if e.inputs == *d
+                || Some(e.id.as_str()) == open
+                || self.auto.failed.get(&e.path) == Some(d)
+            {
                 continue;
             }
             if e.path.is_file() {
@@ -6026,7 +6050,12 @@ fn speed_input(
 ) {
     let mut v = speed.unwrap_or(default);
     if ui
-        .add(egui::DragValue::new(&mut v).range(range).speed(step).suffix(suffix))
+        .add(
+            egui::DragValue::new(&mut v)
+                .range(range)
+                .speed(step)
+                .suffix(suffix),
+        )
         .on_hover_text("This book only, to try another speed; the default is set in the ⚙ menu")
         .changed()
     {
@@ -6035,7 +6064,9 @@ fn speed_input(
     if speed.is_some_and(|s| s != default)
         && ui
             .small_button("↺")
-            .on_hover_text(format!("Back to the default, {default:.0}{suffix} (⚙ menu)"))
+            .on_hover_text(format!(
+                "Back to the default, {default:.0}{suffix} (⚙ menu)"
+            ))
             .clicked()
     {
         *speed = None;
@@ -6087,7 +6118,10 @@ fn knowledge_digest(k: &anki::Knowledge) -> String {
     }
     h.update([u8::from(k.fold), u8::from(k.from_anki)]);
     h.update(k.listed.source.as_bytes());
-    h.finalize()[..12].iter().map(|b| format!("{b:02x}")).collect()
+    h.finalize()[..12]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Size cover thumbnails are drawn at in the History table (points), and its row height.

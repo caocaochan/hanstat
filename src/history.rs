@@ -435,8 +435,11 @@ mod tests {
         let p = temp().with_file_name("refresh.json");
         let (mut h, _) = History::load_from(p.clone());
         for (i, id) in ["a", "b", "c"].into_iter().enumerate() {
-            h.record(entry(id, &format!("C:/books/{id}.epub"), 10, i as u64), true)
-                .unwrap();
+            h.record(
+                entry(id, &format!("C:/books/{id}.epub"), 10, i as u64),
+                true,
+            )
+            .unwrap();
         }
         // Newest first: c, b, a. b is analysed again in the background.
         let mut e = entry("b", "C:/books/b.epub", 99, 50);
