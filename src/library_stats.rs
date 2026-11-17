@@ -711,8 +711,8 @@ impl App {
             ui.add_space(6.0);
             if source.is_some() && n > 0 {
                 let mut counts = [0usize; 5];
-                for &p in &w.book_known {
-                    counts[Difficulty::from_percent(p) as usize] += 1;
+                for (id, &p) in r.ids.iter().zip(&w.book_known) {
+                    counts[Difficulty::from_percent(p - self.style_offset(id)) as usize] += 1;
                 }
                 let parts: Vec<(usize, Color32, String)> = [
                     Difficulty::Easy,
@@ -789,7 +789,7 @@ impl App {
                 let mut hover = format!("{}\n{} {}", e.title, fmt_int(len), unit(lang));
                 let color = match now {
                     Some(p) => {
-                        let d = Difficulty::from_percent(p);
+                        let d = Difficulty::from_percent(p - self.style_offset(&e.id));
                         hover.push_str(&format!(
                             "\n{p:.1}% of running words known now · {}",
                             d.label()
@@ -827,7 +827,7 @@ impl App {
             .filter_map(|e| {
                 let p = *known_now.get(e.id.as_str())?;
                 let len = length(&e.stats);
-                let d = Difficulty::from_percent(p);
+                let d = Difficulty::from_percent(p - self.style_offset(&e.id));
                 Some(Point {
                     x: len.max(1) as f64,
                     y: p,

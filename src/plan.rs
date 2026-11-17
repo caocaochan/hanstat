@@ -40,6 +40,11 @@
 //! offers a volume once the earlier ones on the path are read, and
 //! easiest-first and orders set by hand are put in series order
 //! ([`Library::in_series_order`]).
+//!
+//! **Writing style.** With ratings on ([`crate::style`]), a book whose prose
+//! is harder than typical gets a higher target (or, under a fixed number,
+//! counts as read at a lower coverage), and an easier one a lower:
+//! [`LibBook::offset`] percentage points.
 
 use crate::anki::Knowledge;
 use crate::lang::Language;
@@ -231,6 +236,10 @@ pub struct LibBook {
     /// volume ([`series::Volume::number`]), if another book of the library
     /// is in that series.
     pub series: Option<(u32, Vec<u32>)>,
+    /// Percentage points added to the target for this book (taken off its
+    /// reading coverage under a fixed number), from its writing style
+    /// ([`crate::style::target_offset`]); 0 by default.
+    pub offset: f64,
 }
 
 impl LibBook {
@@ -288,6 +297,8 @@ pub struct Step {
     pub study_now: Option<usize>,
     /// The book's words not known now that the path taught before it.
     pub gained: usize,
+    /// The book's [`LibBook::offset`].
+    pub offset: f64,
     /// Words learned from reading it ([`Params::incidental`]).
     pub by_reading: usize,
 }
@@ -352,7 +363,7 @@ fn order_key(objective: Objective, k: Key) -> Key {
 fn step_cost(study: Study, s: &Step) -> i64 {
     match study {
         Study::Target(_) => s.study.len() as i64,
-        Study::Fixed(_) => -(s.reading * 100.0).round() as i64,
+        Study::Fixed(_) => -((s.reading - s.offset) * 100.0).round() as i64,
     }
 }
 
@@ -430,6 +441,7 @@ impl Library {
                 denom,
                 spell,
                 series: None,
+                offset: 0.0,
             });
         }
         // Series: two or more books whose titles name one, at least one with
@@ -618,7 +630,7 @@ impl Library {
             .map(|(w, _)| w.1 as u64);
         match study {
             Study::Target(t) => {
-                let need = need_tokens(t, known, total);
+                let need = need_tokens((t + b.offset).clamp(0.0, 100.0), known, total);
                 let mut got = 0;
                 let mut n = 0;
                 for c in unknown {
@@ -632,7 +644,7 @@ impl Library {
             }
             Study::Fixed(n) => {
                 let add: u64 = unknown.take(n).sum();
-                (now, -(pct(known + add) * 100.0).round() as i64)
+                (now, -((pct(known + add) - b.offset) * 100.0).round() as i64)
             }
         }
     }
@@ -669,7 +681,7 @@ impl Library {
         let mut add = 0u64;
         match params.study {
             Study::Target(t) => {
-                let need = need_tokens(t, s.known, s.total);
+                let need = need_tokens((t + b.offset).clamp(0.0, 100.0), s.known, s.total);
                 for &(w, n) in &cand {
                     if add >= need {
                         break;
@@ -724,6 +736,7 @@ impl Library {
             study_now,
             gained,
             by_reading,
+            offset: b.offset,
         }
     }
 
@@ -763,12 +776,28 @@ impl Library {
         }
     }
 
-    /// `books` sorted by the share of running words known now, highest
-    /// first, with each series in volume order.
+    /// Set each book's [`LibBook::offset`] by its History id. True if one changed.
+    pub fn set_offsets(&mut self, offset: impl Fn(&str) -> f64) -> bool {
+        let mut changed = false;
+        for b in &mut self.books {
+            let o = offset(&b.id);
+            changed |= o != b.offset;
+            b.offset = o;
+        }
+        changed
+    }
+
+    /// `books` sorted by the share of running words known now (less any
+    /// [`LibBook::offset`]), highest first, with each series in volume order.
     pub fn easiest_now(&self, known0: &Known, books: &[usize]) -> Vec<usize> {
         let mut v: Vec<(usize, f64)> = books
             .iter()
-            .map(|&b| (b, self.cheap(b, known0, Study::Fixed(0)).0))
+            .map(|&b| {
+                (
+                    b,
+                    self.cheap(b, known0, Study::Fixed(0)).0 - self.books[b].offset,
+                )
+            })
             .collect();
         v.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         let v: Vec<usize> = v.into_iter().map(|x| x.0).collect();
@@ -954,6 +983,33 @@ mod tests {
         // Nothing to study once the target is met.
         let p = lib.evaluate(&k0, &params(Study::Target(0.0), 0.0), &[0]);
         assert!(p.steps[0].study.is_empty());
+    }
+
+    #[test]
+    fn style_offset_raises_the_target() {
+        let words = [("甲", 50), ("乙", 30), ("丙", 20)];
+        let mut lib = Library::build(
+            Language::Chinese,
+            false,
+            vec![profile("a", &words, &[]), profile("b", &words, &[])],
+        );
+        assert!(lib.set_offsets(|id| if id == "b" { 5.0 } else { 0.0 }));
+        assert!(!lib.set_offsets(|id| if id == "b" { 5.0 } else { 0.0 }));
+        let k0 = lib.known(None);
+        // 80% takes 甲 and 乙; 85% for b also takes 丙.
+        let p = lib.evaluate(&k0, &params(Study::Target(80.0), 0.0), &[0]);
+        assert_eq!(p.steps[0].study.len(), 2);
+        let p = lib.evaluate(&k0, &params(Study::Target(80.0), 0.0), &[1]);
+        assert_eq!(p.steps[0].study.len(), 3);
+        assert_eq!(p.steps[0].offset, 5.0);
+        // Equal coverage: the easier style comes first.
+        assert_eq!(lib.easiest_now(&k0, &[1, 0]), [0, 1]);
+        // Under a fixed number the offset is taken off the reading coverage.
+        let pr = params(Study::Fixed(1), 0.0);
+        let a = lib.evaluate(&k0, &pr, &[0]);
+        let b = lib.evaluate(&k0, &pr, &[1]);
+        assert_eq!(a.steps[0].reading, b.steps[0].reading);
+        assert!(b.key() > a.key());
     }
 
     #[test]

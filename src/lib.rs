@@ -16,6 +16,8 @@ pub mod profile;
 pub mod script;
 pub mod segment;
 pub mod series;
+pub mod settings;
+pub mod style;
 pub mod update;
 
 /// Read a user dictionary: one word per line; anything after the first

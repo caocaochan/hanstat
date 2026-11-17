@@ -14,6 +14,8 @@ use hanstat::plan;
 use hanstat::profile::{self, Profile};
 use hanstat::script::Variant;
 use hanstat::segment::SegmenterKind;
+use hanstat::settings::Settings;
+use hanstat::style;
 use hanstat::update::{self, Release};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -526,6 +528,10 @@ struct App {
     /// Bumped whenever a profile is written or removed: the reading path reloads.
     profiles_version: u64,
     batch: Option<Batch>,
+    /// The ⚙ menu's settings.
+    settings: Settings,
+    /// Writing-style ratings ([`style`]).
+    style: StyleState,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -551,6 +557,38 @@ struct PlanState {
     job: Option<(Receiver<PlanDone>, Arc<AtomicBool>)>,
 }
 
+/// Writing-style ratings: those made, and the rater while the setting is on.
+#[derive(Default)]
+struct StyleState {
+    store: style::Store,
+    rater: Option<style::Rater>,
+    /// Books queued this session (rated, skipped or waiting): each is asked once.
+    asked: HashSet<String>,
+    /// Why a book was not rated, by History id.
+    skipped: HashMap<String, String>,
+    /// Bumped when a rating arrives.
+    version: u64,
+    error: Option<String>,
+}
+
+impl StyleState {
+    fn load() -> Self {
+        let (store, error) = style::Store::load();
+        StyleState {
+            store,
+            error,
+            ..Default::default()
+        }
+    }
+
+    /// Stop rating (the server too) and forget what was asked this session.
+    fn stop(&mut self) {
+        self.rater = None;
+        self.asked.clear();
+        self.skipped.clear();
+    }
+}
+
 #[derive(Clone, PartialEq)]
 struct LibKey {
     lang: Language,
@@ -568,6 +606,8 @@ struct PlanInputs {
     /// The books on the path, by History id.
     books: Vec<String>,
     manual: Option<Vec<String>>,
+    /// Target offsets from writing style, by History id (none: 0).
+    offsets: Vec<(String, f64)>,
 }
 
 struct PlanDone {
@@ -624,6 +664,7 @@ enum HistCol {
     Words,
     Time,
     Analysed,
+    Style,
 }
 
 enum AnkiMsg {
@@ -797,6 +838,8 @@ impl Default for App {
             profile_written: None,
             profiles_version: 0,
             batch: None,
+            settings: Settings::load(),
+            style: StyleState::load(),
         }
     }
 }
@@ -1644,6 +1687,240 @@ impl App {
         );
     }
 
+    /// Whether writing-style ratings are on (and can run here).
+    fn style_on(&self) -> bool {
+        self.settings.writing_style && style::supported()
+    }
+
+    /// Percentage points a book's writing style takes off its share of
+    /// running words known for its difficulty, and adds to its target in the
+    /// reading path; 0 while ratings are off or the book isn't rated.
+    fn style_offset(&self, id: &str) -> f64 {
+        if !self.style_on() {
+            return 0.0;
+        }
+        self.style.store.get(id).map_or(0.0, |r| {
+            style::target_offset(r.score, self.settings.style_weight)
+        })
+    }
+
+    /// While ratings are on: start the rater, keep what it rated, and queue
+    /// the Chinese books without a rating, the open one first.
+    fn style_tick(&mut self, ctx: &egui::Context) {
+        if !self.style_on() {
+            return;
+        }
+        let st = &mut self.style;
+        let rater = st.rater.get_or_insert_with(|| {
+            let c = ctx.clone();
+            style::Rater::new(move || c.request_repaint())
+        });
+        let mut changed = false;
+        for o in rater.take() {
+            match o {
+                style::Outcome::Rated(id, r) => {
+                    st.skipped.remove(&id);
+                    st.store.insert(id, r);
+                    changed = true;
+                }
+                style::Outcome::Skipped(id, why) => {
+                    st.skipped.insert(id, why);
+                }
+            }
+        }
+        if changed {
+            st.version += 1;
+            st.error = st.store.save().err();
+        }
+        if let (Some(id), Some(r), Some(path)) = (&self.report_id, &self.report, &self.path)
+            && r.language == Language::Chinese
+            && st.store.get(id).is_none()
+            && st.asked.insert(id.clone())
+        {
+            let title = r
+                .title
+                .clone()
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| file_stem(path));
+            rater.push(
+                style::Job {
+                    id: id.clone(),
+                    path: path.clone(),
+                    title,
+                },
+                true,
+            );
+        }
+        for e in &self.history.entries {
+            if e.stats.language != Language::Chinese
+                || st.store.get(&e.id).is_some()
+                || !st.asked.insert(e.id.clone())
+            {
+                continue;
+            }
+            if e.path.is_file() {
+                rater.push(
+                    style::Job {
+                        id: e.id.clone(),
+                        path: e.path.clone(),
+                        title: e.title.clone(),
+                    },
+                    false,
+                );
+            } else {
+                st.skipped
+                    .insert(e.id.clone(), "The file is no longer where it was.".into());
+            }
+        }
+    }
+
+    /// What the writing-style rater is doing, in the status bar.
+    fn style_status(&self, ui: &mut egui::Ui) {
+        let Some(r) = self.style.rater.as_ref().filter(|_| self.style_on()) else {
+            return;
+        };
+        match r.phase() {
+            style::Phase::Idle => {}
+            style::Phase::Downloading { done, total } => {
+                ui.separator();
+                ui.spinner();
+                ui.label(format!(
+                    "Downloading the writing-style model ({:.0} of {:.0} MB, first use only)",
+                    done as f64 / 1e6,
+                    total as f64 / 1e6
+                ));
+                ui.add(
+                    egui::ProgressBar::new(done as f32 / total.max(1) as f32)
+                        .desired_width(160.0)
+                        .show_percentage(),
+                );
+            }
+            style::Phase::Starting => {
+                ui.separator();
+                ui.spinner();
+                ui.label("Loading the writing-style model…");
+            }
+            style::Phase::Rating { title, left } => {
+                ui.separator();
+                ui.spinner();
+                ui.label(if left > 0 {
+                    format!("Rating the writing style of {title} ({left} more to go)")
+                } else {
+                    format!("Rating the writing style of {title}")
+                });
+            }
+            style::Phase::Failed(e) => {
+                ui.separator();
+                ui.colored_label(
+                    Color32::from_rgb(220, 170, 60),
+                    "⚠ Writing-style rating failed",
+                )
+                .on_hover_text(e);
+            }
+        }
+    }
+
+    /// The ⚙ menu at the right of the status bar, beside the version.
+    fn settings_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button(RichText::new("⚙").weak(), |ui| {
+            ui.set_max_width(380.0);
+            let supported = style::supported();
+            let mut on = self.settings.writing_style;
+            ui.add_enabled(
+                supported,
+                egui::Checkbox::new(&mut on, "Rate writing style with a local AI model"),
+            )
+            .on_disabled_hover_text(
+                "llama.cpp, which runs the model, has no build for this platform (only Windows x64, macOS on Apple silicon and Linux x86-64).",
+            );
+            if on != self.settings.writing_style {
+                self.settings.writing_style = on;
+                if let Err(e) = self.settings.save() {
+                    self.error = Some(e);
+                }
+                if !on {
+                    self.style.stop();
+                }
+            }
+            ui.label(
+                RichText::new(
+                    "Chinese books only. Rates how hard a book's prose is to read when you know its words \
+                     (sentence structure, written and classical register, rhetoric and description, what you must infer) \
+                     from four samples, from 1 (plain, spoken) to 9 (near classical Chinese); most novels are 5.0 to 6.6. \
+                     It counts toward each book's difficulty, with the words you know, and toward the reading path.",
+                )
+                .weak()
+                .small(),
+            );
+            let dl = style::download_size();
+            if dl > 0 {
+                ui.label(
+                    RichText::new(format!(
+                        "First use downloads llama.cpp and the Qwen3.5-4B model ({:.1} GB). They run on this computer, \
+                         on the GPU if it has one (about 5 seconds a book), otherwise on the CPU (much longer); the books never leave it.",
+                        dl as f64 / 1e9
+                    ))
+                    .weak()
+                    .small(),
+                );
+            }
+            if !self.style_on() {
+                return;
+            }
+            let hover = format!(
+                "A book rated one point above typical ({:.2}) counts as this many points less of its running words known, \
+                 for its difficulty and in the reading path (whose target rises by as much); one rated below typical, as more. \
+                 0 shows the rating without counting it. Not measured: {} is a judgment.",
+                style::TYPICAL,
+                style::DEFAULT_WEIGHT
+            );
+            ui.horizontal(|ui| {
+                ui.label("Weight").on_hover_text(&hover);
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut self.settings.style_weight)
+                            .range(0.0..=10.0)
+                            .speed(0.05)
+                            .max_decimals(1)
+                            .suffix(" % known per point"),
+                    )
+                    .on_hover_text(&hover)
+                    .changed()
+                    && let Err(e) = self.settings.save()
+                {
+                    self.error = Some(e);
+                }
+            });
+            ui.separator();
+            let chinese: Vec<&history::Entry> = self
+                .history
+                .entries
+                .iter()
+                .filter(|e| e.stats.language == Language::Chinese)
+                .collect();
+            let rated = chinese.iter().filter(|e| self.style.store.get(&e.id).is_some()).count();
+            ui.label(format!(
+                "{rated} of the {} Chinese books in the Library are rated.",
+                chinese.len()
+            ));
+            let skipped: Vec<String> = chinese
+                .iter()
+                .filter_map(|e| self.style.skipped.get(&e.id).map(|w| format!("{}: {w}", e.title)))
+                .collect();
+            if !skipped.is_empty() {
+                ui.label(RichText::new(format!("{} could not be rated.", skipped.len())).weak())
+                    .on_hover_text(skipped.join("\n"));
+            }
+            if let Some(style::Phase::Failed(e)) = self.style.rater.as_ref().map(|r| r.phase()) {
+                ui.colored_label(Color32::from_rgb(220, 170, 60), e);
+                ui.label(RichText::new("Turn the setting off and on to try again.").weak());
+            }
+            if let Some(e) = &self.style.error {
+                ui.colored_label(Color32::from_rgb(220, 170, 60), e);
+            }
+        });
+    }
+
     /// Start the (now updated) exe on the same file and tab, then close.
     fn restart(&mut self, ctx: &egui::Context) {
         let exe = match update::exe_path() {
@@ -1716,6 +1993,7 @@ impl eframe::App for App {
         self.poll_stats(&ctx);
         self.refresh_stats(&ctx);
         self.poll_batch(&ctx);
+        self.style_tick(&ctx);
 
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
@@ -1958,10 +2236,12 @@ impl eframe::App for App {
                         }
                     }
                 }
+                self.style_status(ui);
                 self.update_status(ui, &ctx);
                 let now = ui.input(|i| i.time);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     self.version_menu(ui, &ctx);
+                    self.settings_menu(ui);
                     if let Some((m, until)) = &self.toast {
                         if now < *until {
                             ui.label(RichText::new(m).strong());
@@ -2594,6 +2874,9 @@ fn stat_tile(ui: &mut egui::Ui, title: &str, value: RichText, sub: &str) -> egui
         .response
 }
 
+/// The Overview's explanation of the writing-style rating.
+const STYLE_HOVER: &str = "How hard the prose is to read when you know its words: sentence structure, written and classical register, rhetoric and description, what you must infer. Rated by a local AI model (Qwen3.5-4B) from four samples of 3,000 characters, from 1 (plain, spoken) to 9 (near classical Chinese); most novels are 5.0 to 6.6. It counts toward the difficulty with the weight set in ⚙, where it can be turned off.";
+
 fn difficulty_color(d: Difficulty) -> Color32 {
     match d {
         Difficulty::Easy => Color32::from_rgb(90, 190, 110),
@@ -2630,6 +2913,34 @@ impl App {
         let japanese = r.language == Language::Japanese;
         let has_chars = chinese || japanese;
         let lang_name = r.language.name();
+        // Writing style, while ratings are on: (rating, hover). Shown in the
+        // difficulty tile, which it counts toward; a tile of its own when
+        // nothing is marked known.
+        let style_info: Option<(String, String)> = (chinese && self.style_on()).then(|| {
+            let id = self.report_id.as_deref().unwrap_or("");
+            match self.style.store.get(id) {
+                Some(s) => (
+                    format!("{:.2} · {}", s.score, s.label()),
+                    format!(
+                        "Writing style {:.2} (typical {:.2}); samples at 30, 45, 60 and 75% of the text: {}",
+                        s.score,
+                        style::TYPICAL,
+                        s.samples.iter().map(|x| format!("{x:.2}")).collect::<Vec<_>>().join(", ")
+                    ),
+                ),
+                None => match self.style.skipped.get(id) {
+                    Some(why) => ("not rated".into(), why.clone()),
+                    None => (
+                        "being rated…".into(),
+                        "The local model rates this book in the background.".into(),
+                    ),
+                },
+            }
+        });
+        let style_off = self
+            .report_id
+            .as_deref()
+            .map_or(0.0, |id| self.style_offset(id));
         let out = egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             if let Some(t) = &r.title {
                 ui.heading(t);
@@ -2670,6 +2981,19 @@ impl App {
                     big_stat(ui, &format!("{lang_name} words (total)"), r.words_total, &format!("analyser: {}", r.segmenter.label()));
                 }
                 big_stat(ui, "Unique words", r.words_unique as u64, &format!("{} occur only once", fmt_int(r.words_hapax as u64)));
+                if let Some((value, hover)) = &style_info
+                    && r.anki.is_none()
+                {
+                    // On a row of its own: the tiles don't wrap.
+                    ui.end_row();
+                    stat_tile(
+                        ui,
+                        "Writing style",
+                        RichText::new(value),
+                        "1 plain – 9 near classical",
+                    )
+                    .on_hover_text(format!("{hover}\n\n{STYLE_HOVER}"));
+                }
                 // Korean only: a Japanese book already has four tiles, and the
                 // coverage table below gives the same number.
                 if !has_chars {
@@ -2750,14 +3074,37 @@ impl App {
                             fmt_int(c.name_tokens)
                         )
                     });
-                    let d = c.difficulty;
+                    // Writing style counts as a share of words known (⚙).
+                    let counted = rw.percent() - style_off;
+                    let d = Difficulty::from_percent(counted);
+                    let styled = style_off.abs() >= 0.05;
+                    let mut sub = d.description().to_owned();
+                    if let Some((value, _)) = &style_info {
+                        sub.push_str(&format!("\nWriting style {value}"));
+                        if styled {
+                            sub.push_str(&format!(" · counts as {counted:.1}% known"));
+                        }
+                    }
                     stat_tile(
                         ui,
                         "Difficulty for you",
                         RichText::new(d.label()).color(difficulty_color(d)),
-                        d.description(),
+                        &sub,
                     )
                     .on_hover_ui(|ui| {
+                        if let Some((_, hover)) = &style_info {
+                            ui.label(hover);
+                            if styled {
+                                ui.label(format!(
+                                    "{:.1}% of running words known, {} {:.1} points for the writing style (weight in ⚙): counts as {counted:.1}%.",
+                                    rw.percent(),
+                                    if style_off > 0.0 { "less" } else { "plus" },
+                                    style_off.abs()
+                                ));
+                            }
+                            ui.label(RichText::new(STYLE_HOVER).weak().small());
+                            ui.separator();
+                        }
                         ui.label("From the share of running words you know:");
                         egui::Grid::new("difficulty-bands").spacing([16.0, 2.0]).show(ui, |ui| {
                             let mut upper = None;
@@ -3806,6 +4153,19 @@ impl App {
             Language::Korean => s.words_total as f64 / wpm,
         };
         let (col, desc) = self.history_sort;
+        let style_on = self.style_on();
+        let style_scores: HashMap<&str, f32> = if style_on {
+            self.style.store.current()
+        } else {
+            HashMap::new()
+        };
+        let style_skipped = &self.style.skipped;
+        let style_off: HashMap<&str, f64> = self
+            .history
+            .entries
+            .iter()
+            .map(|e| (e.id.as_str(), self.style_offset(&e.id)))
+            .collect();
         let hist = &self.history;
         let entries = &hist.entries;
         let covers = &mut self.covers;
@@ -3819,6 +4179,10 @@ impl App {
                 HistCol::Known => s.known.as_ref().map_or(-1.0, |k| k.running_words),
                 HistCol::Time => minutes(s),
                 HistCol::Analysed => entries[i].analysed as f64,
+                // Books not rated sort below every rating.
+                HistCol::Style => style_scores
+                    .get(entries[i].id.as_str())
+                    .map_or(-1.0, |&x| x as f64),
                 HistCol::Title | HistCol::Language => 0.0,
             }
         };
@@ -3851,7 +4215,8 @@ impl App {
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .striped(true)
             .column(
-                Column::initial(320.0)
+                // Narrower while the writing-style column is shown, so the row still fits.
+                Column::initial(if style_on { 220.0 } else { 320.0 })
                     .at_least(140.0)
                     .resizable(true)
                     .clip(true),
@@ -3860,11 +4225,12 @@ impl App {
             .columns(Column::exact(100.0), 3)
             .column(Column::exact(80.0))
             .column(Column::exact(100.0))
+            .columns(Column::exact(130.0), style_on as usize)
             .column(Column::exact(80.0))
             .column(Column::exact(100.0))
             .column(Column::remainder())
             .header(24.0, |mut h| {
-                let heads: [(Option<HistCol>, &str, &str); 10] = [
+                let mut heads: Vec<(Option<HistCol>, &str, &str)> = vec![
                     (Some(HistCol::Title), "Book", "The book's title, or its file name"),
                     (Some(HistCol::Language), "Language", "Language, and script for Chinese"),
                     (
@@ -3879,11 +4245,21 @@ impl App {
                         "Known",
                         "Running words you knew (Anki cards and the levels and word lists marked known) at the last analysis; names are left out",
                     ),
-                    (None, "Difficulty", "From the share of running words known, as on the Overview"),
+                    (None, "Difficulty", "From the share of running words known (and the writing style, while rated), as on the Overview"),
                     (Some(HistCol::Time), "Reading", "Reading time at the speeds set on the Overview"),
                     (Some(HistCol::Analysed), "Analysed", "When the book was last analysed"),
                     (None, "", ""),
                 ];
+                if style_on {
+                    heads.insert(
+                        7,
+                        (
+                            Some(HistCol::Style),
+                            "Writing style",
+                            "How hard the prose is when you know its words, rated by a local AI model (⚙): 1 plain – 9 near classical Chinese; most novels 5.4–6.6. Chinese books only",
+                        ),
+                    );
+                }
                 for (c, t, hover) in heads {
                     h.col(|ui| {
                         let Some(c) = c else {
@@ -4012,9 +4388,21 @@ impl App {
                                     .on_hover_text(format!("Known from {}", k.source));
                             });
                             row.col(|ui| {
-                                let d = k.difficulty();
-                                ui.label(RichText::new(d.label()).color(difficulty_color(d)))
-                                    .on_hover_text(d.description());
+                                let off = style_off.get(e.id.as_str()).copied().unwrap_or(0.0);
+                                let counted = k.running_words - off;
+                                let d = Difficulty::from_percent(counted);
+                                let t = ui.label(RichText::new(d.label()).color(difficulty_color(d)));
+                                if off.abs() >= 0.05 {
+                                    t.on_hover_text(format!(
+                                        "{}\n{:.1}% known, {} {:.1} points for its writing style: counts as {counted:.1}%",
+                                        d.description(),
+                                        k.running_words,
+                                        if off > 0.0 { "less" } else { "plus" },
+                                        off.abs()
+                                    ));
+                                } else {
+                                    t.on_hover_text(d.description());
+                                }
                             });
                         }
                         None => {
@@ -4027,6 +4415,23 @@ impl App {
                                 ui.label(dash());
                             });
                         }
+                    }
+                    if style_on {
+                        row.col(|ui| match style_scores.get(e.id.as_str()) {
+                            Some(&x) => {
+                                ui.label(format!("{x:.2} · {}", style::label(x)));
+                            }
+                            None if s.language == Language::Chinese => {
+                                ui.label(dash()).on_hover_text(
+                                    style_skipped
+                                        .get(&e.id)
+                                        .map_or("Not rated yet", String::as_str),
+                                );
+                            }
+                            None => {
+                                ui.label(dash()).on_hover_text("Chinese books only");
+                            }
+                        });
                     }
                     row.col(|ui| {
                         let mins = minutes(s);
@@ -4154,6 +4559,17 @@ impl App {
                     .collect();
                 Arc::new(plan::Library::build(key.lang, key.fold, books))
             });
+            // Writing style: a copy only when the offsets changed.
+            let mut lib = lib;
+            let off: HashMap<&str, f64> = inputs
+                .offsets
+                .iter()
+                .map(|(id, o)| (id.as_str(), *o))
+                .collect();
+            let want = |id: &str| off.get(id).copied().unwrap_or(0.0);
+            if lib.books.iter().any(|b| b.offset != want(&b.id)) {
+                Arc::make_mut(&mut lib).set_offsets(want);
+            }
             let index: HashMap<&str, usize> = lib
                 .books
                 .iter()
@@ -4421,6 +4837,7 @@ impl App {
         let fixed_lang = self.prep.is_some() || self.job.is_some();
         let mut pick_lang = None;
         let mut changed = false;
+        let style_on = self.style_on() && lang == Language::Chinese;
         let st = &mut self.plan.settings;
         ui.horizontal_wrapped(|ui| {
             if fixed_lang {
@@ -4511,6 +4928,14 @@ impl App {
             .collect();
         let lib = self.lib_key(have.clone());
         let st = &self.plan.settings;
+        let offsets: Vec<(String, f64)> = if style_on {
+            have.iter()
+                .map(|id| (id.clone(), self.style_offset(id)))
+                .filter(|(_, o)| *o != 0.0)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let k = self.known.merged.clone();
         let inputs = PlanInputs {
             lib,
@@ -4522,6 +4947,7 @@ impl App {
                 .cloned()
                 .collect(),
             manual: st.manual_order(lang).cloned(),
+            offsets,
         };
         if self.plan.inputs.as_ref() != Some(&inputs) {
             self.start_plan(inputs, ctx);
@@ -4655,6 +5081,11 @@ impl App {
 
         let by_id: HashMap<&str, &history::Entry> =
             entries.iter().map(|e| (e.id.as_str(), *e)).collect();
+        let style_scores: HashMap<&str, f32> = if style_on {
+            self.style.store.current()
+        } else {
+            HashMap::new()
+        };
         let covers = &mut self.covers;
         let hist = &self.history;
         let n = path.steps.len();
@@ -4679,15 +5110,17 @@ impl App {
             .max_scroll_height(table_h)
             .column(Column::exact(88.0))
             .column(
-                Column::initial(300.0)
+                // Narrower while the writing-style column is shown, so the row still fits.
+                Column::initial(if style_on { 200.0 } else { 300.0 })
                     .at_least(140.0)
                     .resizable(true)
                     .clip(true),
             )
+            .columns(Column::exact(130.0), style_on as usize)
             .columns(Column::exact(96.0), 6)
             .column(Column::remainder())
             .header(24.0, |mut h| {
-                let heads: [(&str, &str); 9] = [
+                let mut heads: Vec<(&str, &str)> = vec![
                     ("#", "Reading order. ⏶⏷ set your own order; the planner's is shown alongside"),
                     ("Book", "Click a title to open the book"),
                     ("Known now", "Running words you know now (names left out)"),
@@ -4704,6 +5137,15 @@ impl App {
                     ("While reading", "Running words known while reading it, after studying"),
                     ("", ""),
                 ];
+                if style_on {
+                    heads.insert(
+                        2,
+                        (
+                            "Writing style",
+                            "How hard the prose is when you know its words (⚙); a book above typical gets a higher target, one below a lower",
+                        ),
+                    );
+                }
                 for (t, hover) in heads {
                     h.col(|ui| {
                         ui.strong(t).on_hover_text(hover);
@@ -4780,6 +5222,30 @@ impl App {
                             }
                         }
                     });
+                    if style_on {
+                        row.col(|ui| match style_scores.get(b.id.as_str()) {
+                            Some(&x) => {
+                                let t = ui.label(format!("{x:.2} · {}", style::label(x)));
+                                if s.offset.abs() >= 0.05 {
+                                    t.on_hover_text(match path.params.study {
+                                        plan::Study::Target(target) => format!(
+                                            "Target {:.1}% ({:+.1} points for its writing style)",
+                                            (target + s.offset).clamp(0.0, 100.0),
+                                            s.offset
+                                        ),
+                                        plan::Study::Fixed(_) => format!(
+                                            "Counts as read at {:.1}% ({:+.1} points for its writing style)",
+                                            s.reading - s.offset,
+                                            -s.offset
+                                        ),
+                                    });
+                                }
+                            }
+                            None => {
+                                ui.label(dash()).on_hover_text("Not rated yet");
+                            }
+                        });
+                    }
                     row.col(|ui| {
                         ui.label(format!("{:.1}%", s.now));
                     });
@@ -4812,7 +5278,8 @@ impl App {
                         }
                     });
                     row.col(|ui| {
-                        let d = Difficulty::from_percent(s.reading);
+                        // Coloured by the difficulty, writing style included.
+                        let d = Difficulty::from_percent(s.reading - s.offset);
                         ui.label(RichText::new(format!("{:.1}%", s.reading)).color(difficulty_color(d)))
                             .on_hover_text(format!("{}: {}", d.label(), d.description()));
                     });

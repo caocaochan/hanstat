@@ -1,5 +1,16 @@
 # Changelog
 
+## [2026.11.17.4] - 2026-11-17
+
+### Added
+- **Writing style.** A new **⚙** menu in the status bar, beside the version, has a permanent setting, **Rate writing style with a local AI model** (off by default, saved in `settings.json`). It rates how hard a Chinese book's prose is to read when you know its words: sentence structure, written and classical register, rhetoric and description, what you must infer. Two books with the same share of words known can read very differently.
+  - **How.** Qwen3.5-4B (Q4_K_M, Apache-2.0) runs through llama.cpp's server (b12464, MIT), started in the background on a local port: the Vulkan build on Windows x64 and Linux x86-64 (any GPU with a Vulkan driver, else the CPU), the Metal build on Apple Silicon. It rates four samples of 3,000 characters at 30, 45, 60 and 75% of the body text, asking five questions of each (overall, syntax, register, rhetoric, narrative) against five example passages for levels 1, 3, 5, 7 and 9, with the instruction to assume every word is known; each answer counts as the expected value of the digit from the model's probabilities. Samples are not chapters, which run from 600 to 40,000 characters depending on the book, and a paragraph that is a whole chapter is cut to fit.
+  - **Downloads.** llama.cpp (38 MB) and the model (2.7 GB) are downloaded on first use, pinned and checked by SHA-256, into the model folder. Nothing leaves the computer.
+  - **Speed.** About 5 seconds a book on an RTX 5070; the 70 Chinese novels of a test library took 6 minutes. The Library's Chinese books are rated in the background, the open one first, and the server is stopped after a minute with nothing to rate (freeing the GPU's memory) and when hanstat closes.
+  - **Shown** with two decimals and a word (plain, typical, literary, very literary) in the Overview's **Difficulty** tile, in a **Writing style** column of the Library (sortable) and of the reading path, and saved in `style.json` next to `history.json`.
+  - **Difficulty** combines it with the words you know: a book rated a point above typical (5.95) counts as **Weight** points less of its running words known (2 by default, set in ⚙; a judgment, not a measurement), one below as more. The Overview, the Library and Library Stats band books by it, and the reading path raises (lowers) each book's target by as much (under a fixed number of words, its reading coverage counts that much lower). Weight 0 shows the rating without counting it.
+  - **Checked** on 20 novels: the agreement between samples of one book (ICC) is 0.57 for one sample and 0.84 for the mean of four; the rating correlates −0.54 with the share of words known, and what it adds beyond that repeats between halves of a book's samples (r = 0.62). A first prompt (one question, "ignore vocabulary", only odd levels described) mostly restated the share known (0.13 beyond it). It matched a reader's judgment on the three pairs checked.
+
 ## [2026.11.17.3] - 2026-11-17
 
 ### Added

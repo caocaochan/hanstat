@@ -261,6 +261,185 @@ pub const KIWI: Model = Model {
     files: kiwi_lib::FILES,
 };
 
+macro_rules! llama_url {
+    ($f:literal) => {
+        concat!(
+            "https://github.com/ggml-org/llama.cpp/releases/download/b12464/",
+            $f
+        )
+    };
+}
+
+/// llama.cpp's server from its b12464 release: the one program the writing-
+/// style rating runs (see `crate::style`), with the libraries it loads. On
+/// Windows and Linux the Vulkan build, which uses any GPU with a Vulkan
+/// driver (NVIDIA, AMD, Intel) and falls back to the CPU, choosing the CPU
+/// library built for the processor (`ggml-cpu-*`); on macOS the Metal build.
+/// macOS and Linux load the libraries by their versioned names
+/// (`@rpath/libllama.1.dylib`, `libllama.so.1`, the archive's symlinks), so
+/// each is saved under that name. Only Windows x64, macOS arm64 and Linux
+/// x86_64 are wired up; elsewhere [`LLAMA_SERVER`] is `None`.
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod llama_bin {
+    use super::*;
+    macro_rules! m {
+        ($($f:literal = $size:literal),* $(,)?) => {
+            &[$(Member { path: $f, name: $f, size: $size }),*]
+        };
+    }
+    pub const SERVER: Option<&str> = Some("llama-server.exe");
+    pub const FILES: &[ModelFile] = &[ModelFile {
+        name: "llama-b12464-bin-win-vulkan-x64.zip",
+        url: llama_url!("llama-b12464-bin-win-vulkan-x64.zip"),
+        sha256: "839455639ced0f6ad50e971d37c89050e0e8b952c12e1c62a78823940fb93073",
+        size: 38_354_249,
+        unpack: Unpack::Zip(m![
+            "llama-server.exe" = 9_728,
+            "llama-server-impl.dll" = 10_356_224,
+            "llama-common.dll" = 8_592_384,
+            "llama.dll" = 3_910_144,
+            "mtmd.dll" = 2_576_384,
+            "ggml.dll" = 78_848,
+            "ggml-base.dll" = 832_000,
+            "ggml-vulkan.dll" = 42_398_720,
+            "ggml-rpc.dll" = 234_496,
+            "libomp.dll" = 768_000,
+            "ggml-cpu-x64.dll" = 932_352,
+            "ggml-cpu-sse42.dll" = 939_520,
+            "ggml-cpu-sandybridge.dll" = 1_316_352,
+            "ggml-cpu-ivybridge.dll" = 1_348_096,
+            "ggml-cpu-piledriver.dll" = 1_341_440,
+            "ggml-cpu-haswell.dll" = 1_466_880,
+            "ggml-cpu-skylakex.dll" = 1_688_064,
+            "ggml-cpu-cannonlake.dll" = 1_695_232,
+            "ggml-cpu-cascadelake.dll" = 1_668_096,
+            "ggml-cpu-icelake.dll" = 1_674_752,
+            "ggml-cpu-cooperlake.dll" = 1_677_824,
+            "ggml-cpu-alderlake.dll" = 1_461_760,
+            "ggml-cpu-zen4.dll" = 1_683_968,
+            "ggml-cpu-sapphirerapids.dll" = 1_954_304,
+            "LICENSE-LLVM-OpenMP" = 19_741,
+        ]),
+    }];
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod llama_bin {
+    use super::*;
+    macro_rules! m {
+        ($($f:literal => $name:literal = $size:literal),* $(,)?) => {
+            &[$(Member { path: concat!("llama-b12464/", $f), name: $name, size: $size }),*]
+        };
+    }
+    pub const SERVER: Option<&str> = Some("llama-server");
+    pub const FILES: &[ModelFile] = &[ModelFile {
+        name: "llama-b12464-bin-macos-arm64.tar.gz",
+        url: llama_url!("llama-b12464-bin-macos-arm64.tar.gz"),
+        sha256: "95cb3cf68c5534bebe598c4f95576fcca28444627de2373293512759e3ffa925",
+        size: 17_065_398,
+        unpack: Unpack::TarGz(m![
+            "llama-server" => "llama-server" = 49_984,
+            "libllama-server-impl.dylib" => "libllama-server-impl.dylib" = 10_032_264,
+            "libllama-common.1.0.0.dylib" => "libllama-common.1.dylib" = 8_224_456,
+            "libllama.1.0.0.dylib" => "libllama.1.dylib" = 3_852_064,
+            "libmtmd.1.0.0.dylib" => "libmtmd.1.dylib" = 1_948_896,
+            "libggml.1.0.0.dylib" => "libggml.1.dylib" = 60_016,
+            "libggml-base.1.0.0.dylib" => "libggml-base.1.dylib" = 770_760,
+            "libggml-cpu.1.0.0.dylib" => "libggml-cpu.1.dylib" = 959_168,
+            "libggml-metal.1.0.0.dylib" => "libggml-metal.1.dylib" = 5_688_296,
+            "libggml-blas.1.0.0.dylib" => "libggml-blas.1.dylib" = 58_776,
+            "libggml-rpc.1.0.0.dylib" => "libggml-rpc.1.dylib" = 243_488,
+            "LICENSE" => "LICENSE" = 1_078,
+        ]),
+    }];
+}
+
+/// Needs the system's `libgomp.so.1` (GCC's OpenMP runtime) and, for the
+/// GPU, `libvulkan.so.1`; without a Vulkan driver it runs on the CPU.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod llama_bin {
+    use super::*;
+    macro_rules! m {
+        ($($f:literal => $name:literal = $size:literal),* $(,)?) => {
+            &[$(Member { path: concat!("llama-b12464/", $f), name: $name, size: $size }),*]
+        };
+    }
+    pub const SERVER: Option<&str> = Some("llama-server");
+    pub const FILES: &[ModelFile] = &[ModelFile {
+        name: "llama-b12464-bin-ubuntu-vulkan-x64.tar.gz",
+        url: llama_url!("llama-b12464-bin-ubuntu-vulkan-x64.tar.gz"),
+        sha256: "78fb7eefb8f022e0f181083e7f868917efc184b38cd9282ffc450c950bbae018",
+        size: 36_478_662,
+        unpack: Unpack::TarGz(m![
+            "llama-server" => "llama-server" = 30_840,
+            "libllama-server-impl.so" => "libllama-server-impl.so" = 8_519_704,
+            "libllama-common.so.1.0.0" => "libllama-common.so.1" = 7_000_480,
+            "libllama.so.1.0.0" => "libllama.so.1" = 5_540_136,
+            "libmtmd.so.1.0.0" => "libmtmd.so.1" = 2_671_864,
+            "libggml.so.1.0.0" => "libggml.so.1" = 51_040,
+            "libggml-base.so.1.0.0" => "libggml-base.so.1" = 937_456,
+            "libggml-vulkan.so" => "libggml-vulkan.so" = 41_594_816,
+            "libggml-rpc.so" => "libggml-rpc.so" = 328_712,
+            "libggml-cpu-x64.so" => "libggml-cpu-x64.so" = 976_392,
+            "libggml-cpu-sse42.so" => "libggml-cpu-sse42.so" = 976_272,
+            "libggml-cpu-sandybridge.so" => "libggml-cpu-sandybridge.so" = 1_364_536,
+            "libggml-cpu-ivybridge.so" => "libggml-cpu-ivybridge.so" = 1_399_368,
+            "libggml-cpu-piledriver.so" => "libggml-cpu-piledriver.so" = 1_395_272,
+            "libggml-cpu-haswell.so" => "libggml-cpu-haswell.so" = 1_459_656,
+            "libggml-cpu-skylakex.so" => "libggml-cpu-skylakex.so" = 1_618_576,
+            "libggml-cpu-cannonlake.so" => "libggml-cpu-cannonlake.so" = 1_618_576,
+            "libggml-cpu-cascadelake.so" => "libggml-cpu-cascadelake.so" = 1_634_664,
+            "libggml-cpu-icelake.so" => "libggml-cpu-icelake.so" = 1_634_664,
+            "libggml-cpu-cooperlake.so" => "libggml-cpu-cooperlake.so" = 1_634_736,
+            "libggml-cpu-alderlake.so" => "libggml-cpu-alderlake.so" = 1_455_560,
+            "libggml-cpu-zen4.so" => "libggml-cpu-zen4.so" = 1_634_736,
+            "libggml-cpu-sapphirerapids.so" => "libggml-cpu-sapphirerapids.so" = 1_901_032,
+            "LICENSE" => "LICENSE" = 1_078,
+        ]),
+    }];
+}
+
+#[cfg(not(any(
+    all(windows, target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "linux", target_arch = "x86_64")
+)))]
+mod llama_bin {
+    use super::*;
+    pub const SERVER: Option<&str> = None;
+    pub const FILES: &[ModelFile] = &[];
+}
+
+/// File name of llama.cpp's server in [`LLAMA_CPP`]'s folder; `None` on
+/// platforms without a build of it.
+pub const LLAMA_SERVER: Option<&str> = llama_bin::SERVER;
+
+/// llama.cpp's server, which runs [`STYLE_LLM`] for the writing-style rating.
+pub const LLAMA_CPP: Model = Model {
+    id: "llama.cpp-b12464",
+    title: "llama.cpp b12464 server (ggml-org)",
+    licence: "MIT (LLVM OpenMP on Windows: Apache-2.0 with LLVM exception)",
+    homepage: "https://github.com/ggml-org/llama.cpp",
+    files: llama_bin::FILES,
+};
+
+/// The language model that rates writing style: Qwen3.5-4B, 4-bit (Q4_K_M)
+/// GGUF as converted by Unsloth (Qwen publishes no GGUF of it), pinned to a
+/// commit of that repository.
+pub const STYLE_LLM: Model = Model {
+    id: "qwen3.5-4b-q4km",
+    title: "Qwen3.5-4B, Q4_K_M (Alibaba Qwen; GGUF by Unsloth)",
+    licence: "Apache-2.0",
+    homepage: "https://huggingface.co/Qwen/Qwen3.5-4B",
+    files: &[ModelFile {
+        name: "Qwen3.5-4B-Q4_K_M.gguf",
+        url: "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf",
+        sha256: "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
+        size: 2_740_937_888,
+        unpack: Unpack::Keep,
+    }],
+};
+
 /// SudachiDict full 20261015 from its GitHub release, the dictionary of the
 /// Sudachi Japanese analyser (see `crate::japanese`). Full rather than core:
 /// it adds proper nouns and set phrases, so more names and nicknames stay
