@@ -1907,6 +1907,25 @@ impl App {
                 "{rated} of the {} Chinese books in the Library are rated.",
                 chinese.len()
             ));
+            if let Some(mode) = self
+                .style
+                .rater
+                .as_ref()
+                .map(|r| r.mode())
+                .filter(|&m| m != style::Mode::Gpu)
+            {
+                ui.label(
+                    RichText::new(format!(
+                        "llama.cpp runs {}: it crashed with faster settings on this computer.",
+                        mode.describe()
+                    ))
+                    .weak(),
+                )
+                .on_hover_text(
+                    "Kept until llama.cpp is updated. The log has the crash. \
+                     Seen with AMD's Vulkan driver on an RX 7600 XT.",
+                );
+            }
             let skipped: Vec<String> = chinese
                 .iter()
                 .filter_map(|e| self.style.skipped.get(&e.id).map(|w| format!("{}: {w}", e.title)))

@@ -422,12 +422,113 @@ pub struct Server {
     log: Log,
 }
 
+/// How llama.cpp is run, fastest first. Each is tried after llama.cpp
+/// crashed while rating with the one before: on an RX 7600 XT (Windows,
+/// Adrenalin 32.0.32015.7029, 2026-11-17) the Vulkan build crashed with an
+/// access violation on the first prompt unless cooperative matrices or
+/// flash attention were off, while every setting worked on an RTX 5070.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Mode {
+    #[default]
+    Gpu,
+    /// `GGML_VK_DISABLE_COOPMAT=1`.
+    GpuNoCoopmat,
+    /// Both off: `GGML_VK_DISABLE_COOPMAT=1` and `-fa off`.
+    GpuNoFlashAttn,
+    Cpu,
+}
+
+impl Mode {
+    /// The one to try after a crash with this one.
+    pub fn next(self) -> Option<Mode> {
+        match self {
+            Mode::Gpu => Some(Mode::GpuNoCoopmat),
+            Mode::GpuNoCoopmat => Some(Mode::GpuNoFlashAttn),
+            Mode::GpuNoFlashAttn => Some(Mode::Cpu),
+            Mode::Cpu => None,
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Mode::Gpu => "on the GPU",
+            Mode::GpuNoCoopmat => "on the GPU without cooperative matrices",
+            Mode::GpuNoFlashAttn => "on the GPU without cooperative matrices or flash attention",
+            Mode::Cpu => "on the CPU only",
+        }
+    }
+
+    /// `style-llama.json` next to `style.json`: the mode that last worked
+    /// with this build of llama.cpp (a new build starts again from the GPU).
+    fn path() -> PathBuf {
+        models::app_dir().join("style-llama.json")
+    }
+
+    pub fn load() -> Mode {
+        #[derive(Deserialize)]
+        struct Saved {
+            llama: String,
+            mode: Mode,
+        }
+        std::fs::read(Self::path())
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Saved>(&b).ok())
+            .filter(|s| s.llama == LLAMA_CPP.id)
+            .map_or(Mode::Gpu, |s| s.mode)
+    }
+
+    fn save(self) -> Result<(), String> {
+        let json = serde_json::json!({"llama": LLAMA_CPP.id, "mode": self});
+        std::fs::write(Self::path(), serde_json::to_vec_pretty(&json).unwrap())
+            .map_err(|e| format!("Cannot save {}: {e}", Self::path().display()))
+    }
+}
+
+/// llama.cpp's own list of the devices it can use, for the log.
+pub fn list_devices() -> String {
+    let Some(name) = LLAMA_SERVER else {
+        return String::new();
+    };
+    let mut cmd = Command::new(LLAMA_CPP.dir().join(name));
+    cmd.current_dir(LLAMA_CPP.dir())
+        .arg("--list-devices")
+        .stdin(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    match cmd.output() {
+        Ok(o) => {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+            lines.join("\n")
+        }
+        Err(e) => format!("llama.cpp --list-devices: {e}"),
+    }
+}
+
+/// How a process ended, with Windows' NTSTATUS in hex (0xC0000005 is an
+/// access violation).
+fn describe_exit(st: std::process::ExitStatus) -> String {
+    match st.code() {
+        #[cfg(windows)]
+        Some(c) => format!("exit code {:#010X}", c as u32),
+        #[cfg(not(windows))]
+        Some(c) => format!("exit code {c}"),
+        None => st.to_string(),
+    }
+}
+
 impl Server {
-    /// Start the server and wait until the model is loaded. `gpu`: offload
-    /// every layer to the GPU (falls back to the CPU without one); otherwise
-    /// the CPU only. Both downloads must be in the cache. What happens goes
-    /// to `log`.
-    pub fn start(gpu: bool, log: &Log) -> Result<Server, String> {
+    /// Start the server and wait until the model is loaded, run as `mode`
+    /// (on a GPU mode without a GPU, llama.cpp uses the CPU). Both downloads
+    /// must be in the cache. What happens goes to `log`.
+    pub fn start(mode: Mode, log: &Log) -> Result<Server, String> {
         let name = LLAMA_SERVER.ok_or("llama.cpp has no build for this platform")?;
         let exe = LLAMA_CPP.dir().join(name);
         let model = STYLE_LLM.dir().join(STYLE_LLM.files[0].name);
@@ -452,10 +553,10 @@ impl Server {
             .args(["--host", "127.0.0.1", "--port", &port.to_string()])
             // A sample is about 2,600 tokens and the instructions 600.
             .args(["--ctx-size", "8192", "--parallel", "1", "--no-ui"])
-            .args(if gpu {
-                &["--n-gpu-layers", "99"][..]
-            } else {
-                &["--n-gpu-layers", "0", "--device", "none"][..]
+            .args(match mode {
+                Mode::Gpu | Mode::GpuNoCoopmat => &["--n-gpu-layers", "99"][..],
+                Mode::GpuNoFlashAttn => &["--n-gpu-layers", "99", "--flash-attn", "off"][..],
+                Mode::Cpu => &["--n-gpu-layers", "0", "--device", "none"][..],
             })
             .stdin(Stdio::null())
             .stdout(out)
@@ -466,10 +567,10 @@ impl Server {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
-        log.line(format!(
-            "Starting llama.cpp {}: {cmd:?}",
-            if gpu { "on the GPU" } else { "on the CPU only" }
-        ));
+        if matches!(mode, Mode::GpuNoCoopmat | Mode::GpuNoFlashAttn) {
+            cmd.env("GGML_VK_DISABLE_COOPMAT", "1");
+        }
+        log.line(format!("Starting llama.cpp {}: {cmd:?}", mode.describe()));
         let child = cmd
             .spawn()
             .map_err(|e| format!("Cannot start {}: {e}", exe.display()))?;
@@ -521,9 +622,22 @@ impl Server {
         lines[lines.len().saturating_sub(n)..].join("\n")
     }
 
-    /// Whether the server's process is still running.
-    fn alive(&self) -> bool {
-        matches!(self.child.lock().unwrap().try_wait(), Ok(None))
+    /// How the server's process ended, if it does within `limit`. A crash
+    /// closes the connection before the process is gone, so a failed
+    /// request waits a moment before deciding the server is still alive.
+    fn exited_within(&self, limit: Duration) -> Option<String> {
+        let t = Instant::now();
+        loop {
+            match self.child.lock().unwrap().try_wait() {
+                Ok(Some(st)) => return Some(describe_exit(st)),
+                Err(e) => return Some(e.to_string()),
+                Ok(None) => {}
+            }
+            if t.elapsed() >= limit {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     fn wait_ready(&mut self, limit: Duration) -> Result<(), String> {
@@ -669,8 +783,8 @@ pub enum Phase {
     Starting,
     /// Rating `title`; `left` books are waiting after it.
     Rating { title: String, left: usize },
-    /// The server could not be started; nothing is rated until the setting
-    /// is turned off and on again.
+    /// The server could not be started, or crashed with every [`Mode`];
+    /// nothing is rated until the rater is started again.
     Failed(String),
 }
 
@@ -683,6 +797,8 @@ struct State {
     /// The running server's process, so that dropping the rater stops it
     /// even in the middle of a request.
     child: Option<Arc<Mutex<Child>>>,
+    /// How llama.cpp is run ([`Mode::load`] at the start).
+    mode: Mode,
 }
 
 type Shared = Arc<(Mutex<State>, Condvar)>;
@@ -704,6 +820,7 @@ impl Rater {
     /// a new [`Log`].
     pub fn new(notify: impl Fn() + Send + 'static) -> Rater {
         let shared: Shared = Arc::default();
+        shared.0.lock().unwrap().mode = Mode::load();
         let s = shared.clone();
         let log = Log::create();
         let l = log.clone();
@@ -744,6 +861,11 @@ impl Rater {
 
     pub fn phase(&self) -> Phase {
         self.shared.0.lock().unwrap().phase.clone()
+    }
+
+    /// How llama.cpp is run now.
+    pub fn mode(&self) -> Mode {
+        self.shared.0.lock().unwrap().mode
     }
 
     /// Books waiting, including the one being rated.
@@ -790,6 +912,7 @@ fn run(shared: Shared, notify: impl Fn(), log: Log) {
         set(Phase::Failed(e));
     };
     let mut server: Option<Server> = None;
+    let mut listed = false;
     loop {
         // The next job, or stop the server after `IDLE` without one.
         let job = {
@@ -856,11 +979,24 @@ fn run(shared: Shared, notify: impl Fn(), log: Log) {
                     continue;
                 }
             }
+            if !listed {
+                listed = true;
+                log.line(format!("llama.cpp --list-devices:\n{}", list_devices()));
+            }
             set(Phase::Starting);
-            match Server::start(true, &log).or_else(|gpu| {
+            let mode = m.lock().unwrap().mode;
+            // A GPU that cannot even load the model: the CPU then (for this run only).
+            let started = Server::start(mode, &log).or_else(|gpu| {
+                if mode == Mode::Cpu {
+                    return Err(gpu);
+                }
                 log.line("Trying again on the CPU only");
-                Server::start(false, &log).map_err(|cpu| format!("{gpu}\n\nOn the CPU only: {cpu}"))
-            }) {
+                let s = Server::start(Mode::Cpu, &log)
+                    .map_err(|cpu| format!("{gpu}\n\nOn the CPU only: {cpu}"))?;
+                m.lock().unwrap().mode = Mode::Cpu;
+                Ok(s)
+            });
+            match started {
                 Ok(s) => {
                     m.lock().unwrap().child = Some(s.child.clone());
                     server = Some(s);
@@ -895,11 +1031,15 @@ fn run(shared: Shared, notify: impl Fn(), log: Log) {
             Err(format!("Internal error (panic): {msg}"))
         });
         let secs = t.elapsed().as_secs_f64();
-        // A failed request may mean the server died: start a new one next time.
-        let dead = res.is_err() && !srv.alive();
-        if dead {
+        // A failed request may mean llama.cpp crashed: not the book's fault.
+        let exit = if res.is_err() {
+            srv.exited_within(Duration::from_secs(3))
+        } else {
+            None
+        };
+        if let Some(how) = &exit {
             log.line(format!(
-                "llama.cpp is no longer running; its output ({}) ends:\n{}",
+                "llama.cpp stopped ({how}) while rating; its output ({}) ends:\n{}",
                 srv.server_log.display(),
                 srv.log_lines(80)
             ));
@@ -908,11 +1048,39 @@ fn run(shared: Shared, notify: impl Fn(), log: Log) {
         if st.stop {
             return;
         }
-        if dead {
+        if let Some(how) = exit {
             st.child = None;
             drop(st);
             server = None;
             st = m.lock().unwrap();
+            // The book again, with llama.cpp run more safely, unless it
+            // crashed every way.
+            st.queue.push_front(job);
+            let was = st.mode;
+            match was.next() {
+                Some(next) => {
+                    st.mode = next;
+                    st.phase = Phase::Idle;
+                    drop(st);
+                    log.line(format!(
+                        "  llama.cpp crashed {}: trying the book again {}",
+                        was.describe(),
+                        next.describe()
+                    ));
+                    if let Err(e) = next.save() {
+                        log.line(e);
+                    }
+                    notify();
+                }
+                None => {
+                    drop(st);
+                    fail(format!(
+                        "llama.cpp crashed ({how}) with every setting tried, on the GPU and on the CPU. \
+                         Its output is in the log."
+                    ));
+                }
+            }
+            continue;
         }
         match res {
             Ok(Some(r)) => {

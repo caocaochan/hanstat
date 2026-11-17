@@ -1,5 +1,14 @@
 # Changelog
 
+## [2026.11.17.6] - 2026-11-17
+
+### Fixed
+- **Writing style on AMD GPUs.** On an RX 7600 XT (Windows, Adrenalin 32.0.32015.7029) llama.cpp's Vulkan build crashed with an access violation (0xC0000005) on the first sample of every book, and every book in the Library was marked as not rated within minutes. It works there with cooperative matrices off (`GGML_VK_DISABLE_COOPMAT=1`) or with flash attention off. Now, when llama.cpp crashes while rating, the book is rated again with llama.cpp run more safely: on the GPU without cooperative matrices, then also without flash attention, then on the CPU only; only if it crashes on the CPU too does rating stop, with the error in ⚙. The setting that worked is kept in `style-llama.json` next to `style.json`, so later starts don't crash first, until a new llama.cpp build is downloaded. ⚙ says when a slower setting is in use.
+- Writing style: a book that failed because llama.cpp stopped is no longer blamed for it. A crash closes the connection before the process is gone, so the next book used to fail too (connection refused) before llama.cpp was restarted; hanstat now waits up to 3 s for the process to exit.
+
+### Added
+- `style.log` lists llama.cpp's devices (`--list-devices`) once per run and gives llama.cpp's exit code when it stops while rating (0xC0000005 is an access violation).
+
 ## [2026.11.17.5] - 2026-11-17
 
 ### Added
