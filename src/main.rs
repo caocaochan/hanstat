@@ -2931,7 +2931,11 @@ impl eframe::App for App {
         egui::Panel::bottom("status").show(ui, |ui| {
             // The version, ⚙ and messages at the right; the rest fills the
             // space left of them, on more lines when it doesn't fit on one.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Both start as one row's height: a layout given the panel's whole
+            // height lets separators and centred items fill it, and the panel,
+            // sized to its contents, grows with every frame.
+            let row = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+            ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.version_menu(ui, &ctx);
                 if ui
                     .selectable_label(self.settings_window, RichText::new("⚙").weak())
@@ -2959,9 +2963,8 @@ impl eframe::App for App {
                 if undo {
                     self.undo_removal();
                 }
-                ui.with_layout(
-                    egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
-                    |ui| {
+                // The space left of them, in that row (not the panel's height).
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true), |ui| {
                 if self.batch.is_some() {
                     self.batch_status(ui);
                     ui.separator();
@@ -3023,8 +3026,7 @@ impl eframe::App for App {
                 }
                 self.style_status(ui);
                 self.update_status(ui, &ctx);
-                    },
-                );
+                });
             });
         });
 

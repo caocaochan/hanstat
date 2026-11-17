@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.17.12] - 2026-11-17
+
+### Fixed
+- **The status bar no longer grows to fill the window.** In 2026.11.17.11 it could slide up over the content when the pointer passed over it, and stay there: its layout could take the window's whole height, so its separators and centred items grew with every redraw. It is one line high again, and takes a second or third line only when what it shows doesn't fit (in a narrow window, while books are analysed).
+
 ## [2026.11.17.11] - 2026-11-17
 
 ### Changed
