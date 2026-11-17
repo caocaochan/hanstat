@@ -377,7 +377,7 @@ pub fn date_time(t: u64) -> String {
 }
 
 /// UTC calendar date of a Unix time (Hinnant's days-to-civil).
-fn date(t: u64) -> String {
+pub fn date(t: u64) -> String {
     let z = (t / 86_400) as i64 + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;

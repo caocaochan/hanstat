@@ -120,6 +120,11 @@ pub struct Settings {
     pub incidental_on: bool,
     pub incidental: u32,
     pub lookahead: f32,
+    /// Marking a book read: the share of its words occurring at least
+    /// `read_min_count` times that count as known
+    /// ([`crate::known::read_selection`]), as last chosen.
+    pub read_percent: u8,
+    pub read_min_count: u32,
     /// History ids of the books left out of the path.
     pub left_out: Vec<String>,
     /// Reading orders set by hand (History ids), by language name; a
@@ -136,6 +141,8 @@ impl Default for Settings {
             incidental_on: false,
             incidental: 10,
             lookahead: DEFAULT_LOOKAHEAD,
+            read_percent: 90,
+            read_min_count: 10,
             left_out: Vec::new(),
             manual: HashMap::new(),
         }

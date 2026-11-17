@@ -896,7 +896,7 @@ fn main() {
     let lang = analyze::detect_language(&book);
     let anki_col = open_anki(lang);
     let known_lists = ka.resolve(lang);
-    // Word lists and marked words also join words the segmenter split.
+    // Imported word lists also join words the segmenter split.
     let seg_known: Vec<String> = known_lists
         .as_ref()
         .map(|k| k.segmenter_words())

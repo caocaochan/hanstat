@@ -26,8 +26,11 @@ use std::sync::{Arc, Mutex};
 
 mod charts;
 mod library_stats;
+mod read_books;
+mod style_scale;
 
 use library_stats::StatsState;
+use style_scale::StyleScale;
 
 fn main() -> eframe::Result {
     // hanstat [file...] [--tab overview|characters|words|sections|notes|library|path|stats]
@@ -547,6 +550,14 @@ struct App {
     style: StyleState,
     /// Keeping the Library's rows up to date in the background.
     auto: AutoRefresh,
+    /// The Mark read window, while open.
+    read_dialog: Option<read_books::ReadDialog>,
+    /// Known words of the Library's languages that are neither in use nor
+    /// set aside, read from their files for their books' read marks
+    /// ([`App::load_read_marks`]).
+    known_disk: HashMap<Language, known::Settings>,
+    /// The Library's Books tab leaves out the books marked read.
+    library_hide_read: bool,
 }
 
 /// Library rows are analysed again in the background when what they were
@@ -713,6 +724,7 @@ enum PlanAction {
     Move(usize, isize),
     LeaveOut(String),
     Include(String),
+    MarkRead(String),
     SaveList(usize),
     Optimise,
     Backfill,
@@ -730,6 +742,8 @@ enum HistCol {
     Time,
     Analysed,
     Style,
+    Read,
+    Difficulty,
 }
 
 enum AnkiMsg {
@@ -911,6 +925,9 @@ impl Default for App {
             settings: Settings::load(),
             style: StyleState::load(),
             auto: AutoRefresh::default(),
+            read_dialog: None,
+            known_disk: HashMap::new(),
+            library_hide_read: false,
         }
     }
 }
@@ -943,8 +960,8 @@ impl App {
             .map(|(l, d)| (*l, d.user_words.clone()))
             .collect();
         words_by_lang.insert(self.language, self.user_words.clone());
-        // Word lists and marked words join words the segmenter split; a
-        // language whose settings aren't loaded yet is read from disk.
+        // Imported word lists join words the segmenter split; a language
+        // whose settings aren't loaded yet is read from disk.
         let mut known_by_lang: HashMap<Language, Vec<String>> = self
             .stash
             .iter()
@@ -1082,6 +1099,8 @@ impl App {
         let (s, warn) = anki::Settings::load_for(self.language);
         self.anki.settings = s;
         self.anki.error = warn;
+        // Read from its file (again): any read marks changed there are in it.
+        self.known_disk.remove(&self.language);
         let (k, warn) = known::Settings::load_for(self.language);
         self.known.settings = k;
         self.known.error = warn;
@@ -1255,23 +1274,8 @@ impl App {
     }
 
     fn refresh_anki_coverage(&mut self) {
-        // Anki (if on) plus the levels and word lists marked known.
-        let base = self
-            .anki
-            .knowledge
-            .as_deref()
-            .filter(|_| self.anki.settings.enabled);
-        self.known.merged = if self.known.settings.is_empty() {
-            self.anki
-                .knowledge
-                .clone()
-                .filter(|_| self.anki.settings.enabled)
-        } else {
-            self.known
-                .settings
-                .apply(base, self.anki.settings.match_across_scripts)
-                .map(Arc::new)
-        };
+        // Anki (if on) plus the levels, word lists and books marked known.
+        self.known.merged = read_books::merged_knowledge(&self.anki, &self.known.settings);
         // Names don't count against the difficulty: the user dictionary plus
         // the recommended Suggested words (once discovery has finished).
         let mut names: HashSet<String> = self.user_words.iter().cloned().collect();
@@ -2088,7 +2092,7 @@ impl App {
                 RichText::new(
                     "Chinese books only. Rates how hard a book's prose is to read when you know its words \
                      (sentence structure, written and classical register, rhetoric and description, what you must infer) \
-                     from four samples, from 1 (plain, spoken) to 9 (near classical Chinese); most novels are 5.0 to 6.6. \
+                     from four samples, shown as a percentage of the rated books in your Library (50% is their median) and a word: plain, typical, literary or very literary. \
                      It counts toward each book's difficulty, with the words you know, and toward the reading path.",
                 )
                 .weak()
@@ -2110,8 +2114,10 @@ impl App {
                 return;
             }
             let hover = format!(
-                "A book rated one point above typical ({:.2}) counts as this many points less of its running words known, \
-                 for its difficulty and in the reading path (whose target rises by as much); one rated below typical, as more. \
+                "The weight works on the model's own rating (1 plain – 9 near classical Chinese, shown when you hover a book's \
+                 Difficulty tile), not on the percentage, which only compares the books of your Library. A book rated a point \
+                 above typical ({:.2}) counts as this many points less of its running words known, for its difficulty and in the \
+                 reading path (whose target rises by as much); one rated below typical, as more. \
                  0 shows the rating without counting it. Not measured: {} is a judgment.",
                 style::TYPICAL,
                 style::DEFAULT_WEIGHT
@@ -2124,7 +2130,7 @@ impl App {
                             .range(0.0..=10.0)
                             .speed(0.05)
                             .max_decimals(1)
-                            .suffix(" % known per point"),
+                            .suffix(" % known per point of the model's rating"),
                     )
                     .on_hover_text(&hover)
                     .changed()
@@ -2664,6 +2670,7 @@ impl eframe::App for App {
         if self.forced_window {
             self.forced_window(&ctx);
         }
+        self.read_window(&ctx);
     }
 }
 
@@ -2974,6 +2981,42 @@ impl App {
                         changed |= k.settings.set_marked(&w, false);
                     }
                 }
+
+                ui.separator();
+                ui.strong(format!("Books read ({})", fmt_int(k.settings.read.len() as u64)));
+                if k.settings.read.is_empty() {
+                    ui.label(
+                        RichText::new("Mark a book read with ✔ in the Library to count its most frequent words as known.")
+                            .weak(),
+                    );
+                } else {
+                    let mut unread = None;
+                    egui::ScrollArea::vertical()
+                        .id_salt("known-read")
+                        .max_height(100.0)
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                for b in k.settings.read.iter().rev() {
+                                    if ui
+                                        .small_button(format!("{} ✖", b.title))
+                                        .on_hover_text(format!(
+                                            "{} words ({}% of those read {}+ times), marked read {}. Click to unmark it and take them back.",
+                                            fmt_int(b.words.len() as u64),
+                                            b.percent,
+                                            b.min_count,
+                                            history::date(b.read)
+                                        ))
+                                        .clicked()
+                                    {
+                                        unread = Some(b.id.clone());
+                                    }
+                                }
+                            });
+                        });
+                    if let Some(id) = unread {
+                        changed |= k.settings.unset_read(&id);
+                    }
+                }
                 if let Some(e) = &k.error {
                     ui.colored_label(Color32::from_rgb(220, 80, 80), format!("⚠ {e}"));
                 }
@@ -3055,8 +3098,8 @@ impl App {
         self.refresh_anki_coverage();
     }
 
-    /// True if the open Chinese book was segmented with other word lists or
-    /// marked words than the current ones.
+    /// True if the open Chinese book was segmented with other imported word
+    /// lists than the current ones.
     fn known_resegment_due(&self) -> bool {
         self.job.is_none()
             && self.prep.as_ref().is_some_and(|p| {
@@ -3235,7 +3278,22 @@ fn stat_tile(ui: &mut egui::Ui, title: &str, value: RichText, sub: &str) -> egui
 }
 
 /// The Overview's explanation of the writing-style rating.
-const STYLE_HOVER: &str = "How hard the prose is to read when you know its words: sentence structure, written and classical register, rhetoric and description, what you must infer. Rated by a local AI model (Qwen3.5-4B) from four samples of 3,000 characters, from 1 (plain, spoken) to 9 (near classical Chinese); most novels are 5.0 to 6.6. It counts toward the difficulty with the weight set in ⚙, where it can be turned off.";
+const STYLE_HOVER: &str = "How hard the prose is to read when you know its words: sentence structure, written and classical register, rhetoric and description, what you must infer. Rated by a local AI model (Qwen3.5-4B) from four samples of 3,000 characters. The percentage compares it with the rated books in your Library: 50% is their median, and 9 in 10 of them fall between 5% and 95%. The word after it (plain, typical, literary, very literary) is the model's own judgment, the same for everyone. It counts toward the difficulty with the weight set in ⚙, where it can be turned off.";
+
+impl App {
+    /// The writing-style scale fitted to the rated Chinese books of the
+    /// Library ([`style_scale`]).
+    fn style_scale(&self) -> StyleScale {
+        let rated = self.style.store.current();
+        StyleScale::fit(
+            self.history
+                .entries
+                .iter()
+                .filter(|e| e.stats.language == Language::Chinese)
+                .filter_map(|e| rated.get(e.id.as_str()).copied()),
+        )
+    }
+}
 
 fn difficulty_color(d: Difficulty) -> Color32 {
     match d {
@@ -3278,11 +3336,16 @@ impl App {
         // nothing is marked known.
         let style_info: Option<(String, String)> = (chinese && self.style_on()).then(|| {
             let id = self.report_id.as_deref().unwrap_or("");
+            let scale = self.style_scale();
             match self.style.store.get(id) {
                 Some(s) => (
-                    format!("{:.2} · {}", s.score, s.label()),
+                    format!("{} · {}", scale.pct(s.score), s.label()),
                     format!(
-                        "Writing style {:.2} (typical {:.2}); samples at 30, 45, 60 and 75% of the text: {}",
+                        "Writing style {} against the {} rated books of your Library (50% is their median). \
+                         The model's own rating: {:.2} on its scale of 1–9 (typical {:.2}); \
+                         samples at 30, 45, 60 and 75% of the text: {}",
+                        scale.pct(s.score),
+                        scale.books,
                         s.score,
                         style::TYPICAL,
                         s.samples.iter().map(|x| format!("{x:.2}")).collect::<Vec<_>>().join(", ")
@@ -3360,7 +3423,7 @@ impl App {
                         ui,
                         "Writing style",
                         RichText::new(value),
-                        "1 plain – 9 near classical",
+                        "against your Library: 50% is its median",
                     )
                     .on_hover_text(format!("{hover}\n\n{STYLE_HOVER}"));
                 }
@@ -4324,7 +4387,7 @@ impl App {
                             && ui
                                 .small_button("+")
                                 .on_hover_text(
-                                    "Mark as known (added to your known words, kept between runs).                                      A word marked known is also kept whole by the segmenter, from the next analysis.",
+                                    "Mark as known (added to your known words, kept between runs). To keep a name whole, apply it instead.",
                                 )
                                 .clicked()
                         {
@@ -4400,7 +4463,7 @@ impl App {
                 }
                 if r.known_words > 0 {
                     ui.label(format!(
-                        "• Known words (word lists and marked words): {} used to join words the segmenter split, never cutting through one of its words. Changes apply on returning to the Overview.",
+                        "• Imported word lists: {} words used to join words the segmenter split, never cutting through one of its words. Changes apply on returning to the Overview.",
                         fmt_int(r.known_words as u64)
                     ));
                 }
@@ -4536,6 +4599,7 @@ impl App {
     /// Every book analysed before, as recorded when its analysis (or what
     /// counts as known) last changed. A click on a title opens the book.
     fn history_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.load_read_marks();
         ui.horizontal_wrapped(|ui| {
             ui.heading("Library");
             ui.add_space(8.0);
@@ -4562,6 +4626,14 @@ impl App {
                     && ui.small_button("✖").on_hover_text("Clear the search").clicked()
                 {
                     self.library_filter.clear();
+                }
+                if self.history_tab == HistTab::Books
+                    && Language::ALL
+                        .into_iter()
+                        .any(|l| self.known_of(l).is_some_and(|k| !k.read.is_empty()))
+                {
+                    ui.checkbox(&mut self.library_hide_read, "Hide read")
+                        .on_hover_text("Leave out the books marked read");
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4632,6 +4704,7 @@ impl App {
         } else {
             HashMap::new()
         };
+        let style_scale = self.style_scale();
         let style_skipped = &self.style.skipped;
         let style_off: HashMap<&str, f64> = self
             .history
@@ -4639,6 +4712,8 @@ impl App {
             .iter()
             .map(|e| (e.id.as_str(), self.style_offset(&e.id)))
             .collect();
+        let read_at = self.read_dates();
+        let hide_read = self.library_hide_read;
         let hist = &self.history;
         let entries = &hist.entries;
         let covers = &mut self.covers;
@@ -4650,8 +4725,20 @@ impl App {
                 HistCol::Unique => s.words_unique as f64,
                 // Books with nothing known sort below every percentage.
                 HistCol::Known => s.known.as_ref().map_or(-1.0, |k| k.running_words),
+                // Harder first when descending: the share known as counted for
+                // the difficulty (writing style included), the lower the harder.
+                // Books with nothing known sort below every book with a difficulty.
+                HistCol::Difficulty => s.known.as_ref().map_or(-1.0, |k| {
+                    let off = style_off
+                        .get(entries[i].id.as_str())
+                        .copied()
+                        .unwrap_or(0.0);
+                    100.0 - (k.running_words - off)
+                }),
                 HistCol::Time => minutes(s),
                 HistCol::Analysed => entries[i].analysed as f64,
+                // Books not read sort below every date.
+                HistCol::Read => read_at.get(&entries[i].id).map_or(-1.0, |&t| t as f64),
                 // Books not rated sort below every rating.
                 HistCol::Style => style_scores
                     .get(entries[i].id.as_str())
@@ -4668,6 +4755,7 @@ impl App {
         let query = search::Query::new(&self.library_filter);
         let mut rows: Vec<usize> = (0..entries.len())
             .filter(|&i| book_matches(&query, &entries[i].title, &entries[i].path))
+            .filter(|&i| !hide_read || !read_at.contains_key(&entries[i].id))
             .collect();
         rows.sort_by(|&a, &b| {
             let o = match col {
@@ -4682,12 +4770,20 @@ impl App {
         });
 
         if rows.is_empty() {
-            ui.label(RichText::new("No book matches the search.").weak());
+            ui.label(
+                RichText::new(if hide_read && self.library_filter.is_empty() {
+                    "Every book is marked read."
+                } else {
+                    "No book matches the search."
+                })
+                .weak(),
+            );
             return;
         }
         let now = history::now();
         let mut open: Option<PathBuf> = None;
         let mut remove: Option<String> = None;
+        let mut mark_read: Option<String> = None;
         let mut sort = None;
         let dash = || RichText::new("–").weak();
         TableBuilder::new(ui)
@@ -4696,7 +4792,7 @@ impl App {
             .striped(true)
             .column(
                 // Narrower while the writing-style column is shown, so the row still fits.
-                Column::initial(if style_on { 220.0 } else { 320.0 })
+                Column::initial(if style_on { 140.0 } else { 300.0 })
                     .at_least(140.0)
                     .resizable(true)
                     .clip(true),
@@ -4707,7 +4803,8 @@ impl App {
             .column(Column::exact(100.0))
             .columns(Column::exact(130.0), style_on as usize)
             .column(Column::exact(80.0))
-            .column(Column::exact(100.0))
+            .column(Column::exact(92.0))
+            .column(Column::exact(36.0))
             .column(Column::remainder())
             .header(24.0, |mut h| {
                 let mut heads: Vec<(Option<HistCol>, &str, &str)> = vec![
@@ -4725,9 +4822,14 @@ impl App {
                         "Known",
                         "Running words you knew (Anki cards and the levels and word lists marked known) at the last analysis; names are left out",
                     ),
-                    (None, "Difficulty", "From the share of running words known (and the writing style, while rated), as on the Overview"),
+                    (Some(HistCol::Difficulty), "Difficulty", "From the share of running words known (and the writing style, while rated), as on the Overview"),
                     (Some(HistCol::Time), "Reading", "Reading time at the speeds set on the Overview"),
                     (Some(HistCol::Analysed), "Analysed", "When the book was last analysed"),
+                    (
+                        Some(HistCol::Read),
+                        "Read",
+                        "Mark a book read to count its most frequent words as known and take it off the reading path",
+                    ),
                     (None, "", ""),
                 ];
                 if style_on {
@@ -4736,7 +4838,7 @@ impl App {
                         (
                             Some(HistCol::Style),
                             "Writing style",
-                            "How hard the prose is when you know its words, rated by a local AI model (⚙): 1 plain – 9 near classical Chinese; most novels 5.4–6.6. Chinese books only",
+                            "How hard the prose is when you know its words, rated by a local AI model (⚙). The percentage compares it with the Library's rated books (50% is their median); the word is the model's own judgment. Chinese books only",
                         ),
                     );
                 }
@@ -4751,12 +4853,21 @@ impl App {
                             (true, true) => " ⏷",
                             (true, false) => " ⏶",
                         };
-                        if ui
+                        // Underlined under the pointer, with a hand: it can be clicked.
+                        let r = ui
                             .add(
                                 egui::Label::new(RichText::new(format!("{t}{arrow}")).strong())
                                     .sense(egui::Sense::click()),
                             )
-                            .on_hover_text(hover)
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if r.hovered() {
+                            let y = r.rect.bottom() - 1.0;
+                            let stroke = egui::Stroke::new(1.0, ui.visuals().strong_text_color());
+                            ui.painter().hline(r.rect.x_range(), y, stroke);
+                        }
+                        if r.on_hover_text(format!("{hover}
+
+Click to sort; again to reverse."))
                             .clicked()
                         {
                             // Numbers and dates start largest first, text A–Z.
@@ -4899,7 +5010,8 @@ impl App {
                     if style_on {
                         row.col(|ui| match style_scores.get(e.id.as_str()) {
                             Some(&x) => {
-                                ui.label(format!("{x:.2} · {}", style::label(x)));
+                                ui.label(format!("{} · {}", style_scale.pct(x), style::label(x)))
+                                    .on_hover_text(style_scale.hover(x));
                             }
                             None if s.language == Language::Chinese => {
                                 ui.label(dash()).on_hover_text(
@@ -4925,6 +5037,32 @@ impl App {
                         ui.label(history::age(e.analysed, now))
                             .on_hover_text(history::date_time(e.analysed));
                     });
+                    row.col(|ui| match read_at.get(&e.id) {
+                        Some(&t) => {
+                            if ui
+                                .button(RichText::new("✔").strong().color(read_books::READ_GREEN))
+                                .on_hover_text(format!(
+                                    "Marked read {} ({}). Click to change how many of its words count as known, or to unmark it.",
+                                    history::age(t, now),
+                                    history::date_time(t)
+                                ))
+                                .clicked()
+                            {
+                                mark_read = Some(e.id.clone());
+                            }
+                        }
+                        None => {
+                            let has_words = hist.profile(&e.id).is_file();
+                            if ui
+                                .add_enabled(has_words, egui::Button::new(RichText::new("✔").weak()))
+                                .on_hover_text("Mark read: count its most frequent words as known and take it off the reading path")
+                                .on_disabled_hover_text("No word data yet: open the book, or ⟳ Recalculate library")
+                                .clicked()
+                            {
+                                mark_read = Some(e.id.clone());
+                            }
+                        }
+                    });
                     row.col(|ui| {
                         if ui
                             .small_button("✖")
@@ -4938,6 +5076,9 @@ impl App {
             });
         if let Some(s) = sort {
             self.history_sort = s;
+        }
+        if let Some(id) = mark_read {
+            self.open_read_dialog(&id);
         }
         if let Some(id) = remove {
             self.covers.remove(&id);
@@ -5690,9 +5831,12 @@ impl App {
             lib,
             knowledge: k.as_ref().map_or(0, |k| Arc::as_ptr(k) as usize),
             params: st.params(),
+            // Books marked read are done with.
             books: have
                 .iter()
-                .filter(|id| !st.left_out.contains(id))
+                .filter(|id| {
+                    !st.left_out.contains(id) && self.known.settings.read_book(id).is_none()
+                })
                 .cloned()
                 .collect(),
             manual: st.manual_order(lang).cloned(),
@@ -5835,6 +5979,7 @@ impl App {
         } else {
             HashMap::new()
         };
+        let style_scale = self.style_scale();
         let covers = &mut self.covers;
         let hist = &self.history;
         let n = path.steps.len();
@@ -5865,8 +6010,20 @@ impl App {
                     .map(|e| (id.clone(), e.title.clone()))
             })
             .collect();
-        let table_h =
-            (ui.available_height() - if left_out.is_empty() { 0.0 } else { 72.0 }).max(120.0);
+        let read_here = self
+            .known
+            .settings
+            .read
+            .iter()
+            .filter(|b| by_id.contains_key(b.id.as_str()))
+            .count();
+        let table_h = (ui.available_height()
+            - if left_out.is_empty() && read_here == 0 {
+                0.0
+            } else {
+                72.0
+            })
+        .max(120.0);
         TableBuilder::new(ui)
             .id_salt("plan_table")
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
@@ -5989,9 +6146,11 @@ impl App {
                     if style_on {
                         row.col(|ui| match style_scores.get(b.id.as_str()) {
                             Some(&x) => {
-                                let t = ui.label(format!("{x:.2} · {}", style::label(x)));
+                                let t = ui.label(format!("{} · {}", style_scale.pct(x), style::label(x)));
+                                let mut hover = style_scale.hover(x);
                                 if s.offset.abs() >= 0.05 {
-                                    t.on_hover_text(match path.params.study {
+                                    hover.push_str("\n\n");
+                                    hover.push_str(&match path.params.study {
                                         plan::Study::Target(target) => format!(
                                             "Target {:.1}% ({:+.1} points for its writing style)",
                                             (target + s.offset).clamp(0.0, 100.0),
@@ -6004,6 +6163,7 @@ impl App {
                                         ),
                                     });
                                 }
+                                t.on_hover_text(hover);
                             }
                             None => {
                                 ui.label(dash()).on_hover_text("Not rated yet");
@@ -6056,8 +6216,15 @@ impl App {
                             act = Some(PlanAction::SaveList(i));
                         }
                         if ui
+                            .small_button("✔")
+                            .on_hover_text("Mark it read: its most frequent words count as known, and it leaves the path")
+                            .clicked()
+                        {
+                            act = Some(PlanAction::MarkRead(b.id.clone()));
+                        }
+                        if ui
                             .small_button("✖")
-                            .on_hover_text("Leave it out of the path (read, or not to be read)")
+                            .on_hover_text("Leave it out of the path without marking it read")
                             .clicked()
                         {
                             act = Some(PlanAction::LeaveOut(b.id.clone()));
@@ -6065,9 +6232,23 @@ impl App {
                     });
                 });
             });
-        if !left_out.is_empty() {
+        if !left_out.is_empty() || read_here > 0 {
             ui.separator();
             ui.horizontal_wrapped(|ui| {
+                if read_here > 0 {
+                    ui.label(
+                        RichText::new(format!(
+                            "{read_here} {} marked read {} not on the path.",
+                            if read_here == 1 { "book" } else { "books" },
+                            if read_here == 1 { "is" } else { "are" },
+                        ))
+                        .weak(),
+                    )
+                    .on_hover_text("Unmark one with its ✔ in the Library's Books tab");
+                }
+                if left_out.is_empty() {
+                    return;
+                }
                 ui.label(RichText::new(format!("Left out ({}):", left_out.len())).weak());
                 for (id, title) in &left_out {
                     if ui
@@ -6111,6 +6292,10 @@ impl App {
                 }
             }
             PlanAction::Include(id) => st.left_out.retain(|x| *x != id),
+            PlanAction::MarkRead(id) => {
+                save_settings = false;
+                self.open_read_dialog(&id);
+            }
             PlanAction::Optimise => {
                 st.manual.remove(&lang);
             }

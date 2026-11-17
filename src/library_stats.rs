@@ -30,9 +30,11 @@ struct LangTotals {
     /// Running words of the books with a known share, and the known ones among them.
     known_of: f64,
     known: f64,
+    /// Books marked read.
+    read: usize,
 }
 
-fn reading_minutes(s: &history::Stats, (cpm, ja_cpm, wpm): (f64, f64, f64)) -> f64 {
+pub(crate) fn reading_minutes(s: &history::Stats, (cpm, ja_cpm, wpm): (f64, f64, f64)) -> f64 {
     match s.language {
         Language::Chinese => s.han_total as f64 / cpm,
         Language::Japanese => (s.han_total + s.kana_total) as f64 / ja_cpm,
@@ -40,7 +42,7 @@ fn reading_minutes(s: &history::Stats, (cpm, ja_cpm, wpm): (f64, f64, f64)) -> f
     }
 }
 
-fn fmt_time(mins: f64) -> String {
+pub(crate) fn fmt_time(mins: f64) -> String {
     let h = (mins / 60.0) as u64;
     if h >= 100 {
         format!("{} h", fmt_int(h))
@@ -73,7 +75,7 @@ fn pct(a: usize, b: usize) -> f64 {
 }
 
 /// A figure in a box: a title, a large value and a line under it.
-struct Tile {
+pub(crate) struct Tile {
     title: &'static str,
     value: RichText,
     sub: String,
@@ -81,7 +83,7 @@ struct Tile {
 }
 
 impl Tile {
-    fn new(title: &'static str, value: RichText, sub: String) -> Tile {
+    pub(crate) fn new(title: &'static str, value: RichText, sub: String) -> Tile {
         Tile {
             title,
             value,
@@ -90,7 +92,7 @@ impl Tile {
         }
     }
 
-    fn hover(mut self, text: &str) -> Tile {
+    pub(crate) fn hover(mut self, text: &str) -> Tile {
         self.hover = Some(text.to_owned());
         self
     }
@@ -100,7 +102,7 @@ impl Tile {
 /// wide. A frame's size is only known once it is drawn, so a wrapping
 /// layout can't move one to the next row: it runs off the right instead.
 /// Text that doesn't fit is cut with "…" and shown whole on hover.
-fn tile_grid(ui: &mut egui::Ui, tiles: Vec<Tile>) {
+pub(crate) fn tile_grid(ui: &mut egui::Ui, tiles: Vec<Tile>) {
     const TILE_MIN: f32 = 210.0;
     const GAP: f32 = 8.0;
     const MARGIN: f32 = 12.0;
@@ -448,6 +450,18 @@ impl App {
             }
         }
         by_lang.retain(|(_, t)| t.books > 0);
+        for (l, t) in &mut by_lang {
+            let ids: std::collections::HashSet<&str> = self
+                .known_of(*l)
+                .map(|k| k.read.iter().map(|b| b.id.as_str()).collect())
+                .unwrap_or_default();
+            t.read = self
+                .history
+                .entries
+                .iter()
+                .filter(|e| e.stats.language == *l && ids.contains(e.id.as_str()))
+                .count();
+        }
         let sum = |f: &dyn Fn(&LangTotals) -> u64| by_lang.iter().map(|(_, t)| f(t)).sum::<u64>();
         let books = self.history.entries.len();
         let minutes: f64 = by_lang.iter().map(|(_, t)| t.minutes).sum();
@@ -507,6 +521,7 @@ impl App {
                 for h in [
                     ("Language", ""),
                     ("Books", ""),
+                    ("Read", "Books marked read"),
                     ("Characters", "Chinese characters, or kanji"),
                     ("Kana", "Japanese books"),
                     ("Words", "Running words"),
@@ -525,6 +540,11 @@ impl App {
                     let (badge, color) = mode_badge(*l, None);
                     ui.label(RichText::new(badge).color(color).strong());
                     ui.label(fmt_int(t.books as u64));
+                    if t.read > 0 {
+                        ui.label(fmt_int(t.read as u64));
+                    } else {
+                        ui.label(dash());
+                    }
                     if *l == Language::Korean {
                         ui.label(dash());
                     } else {
@@ -769,6 +789,7 @@ impl App {
             charts_left(ui);
             charts_right(ui);
         }
+        self.read_section(ui, &entries);
         let mut toggle = None;
         if let Some(r) = res
             && source.is_some()

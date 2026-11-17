@@ -1,5 +1,24 @@
 # Changelog
 
+## [2026.11.17.9] - 2026-11-17
+
+### Added
+- **Mark a book read.** The Library's new **Read** column has a **✔** button for each book: of its words that occur at least N times (10 by default), the most frequent P% (90% by default) count as known. The window shows how many words that is, how many of them you didn't know yet, the most frequent of those, and their share of the book's running words; the last P and N are kept in `plan.json`. A read book's ✔ turns green, with when it was marked on hover; click it to change the share or **Unmark read**. The words are saved as they were with the language's known words (`known.json`, `-ko`, `-ja`), so analysing the book again doesn't change them and unmarking takes back exactly those (a word another source marks known stays known). Names count too, which helps the next volume of a series.
+  - **Not given to the segmenter.** A read book's words don't join pieces the segmenter split. Feeding thousands of a book's tokens back would carry its segmentation errors (LTP's glued names such as 蒋舸没) to other books, and every mark would invalidate the analysis cache of every Chinese book. Marking a book changes only the known words: the Library's rows are recounted from the saved analyses, about a minute for 81 books.
+  - **Reading path.** A read book leaves the path, with a line under it saying how many did. Each step has **✔** to mark it read, beside **✖** (left out without being read).
+  - **Library Stats.** Read books stay in every figure. The per-language table has a **Read** column, and a new **Books read** section shows how many, their characters and reading time, the words they count as known (and how many were new), and each read book.
+  - **Hide read** next to the Library's search box leaves them out of the list. The **📚** window lists the books read, each removable with ✖ (also those no longer in the Library). The known-words label counts them ("HSK 1–5 + 1 book read").
+  - Works for the books of a language not in use too: its known words are changed in its file.
+
+### Changed
+- **The README is short:** what hanstat does, how to install it, a page on using it, the command line, where its data is and the licences, with a new screenshot. The details of every feature are in this changelog.
+- **Writing style is shown as a percentage of your Library**, in the Overview, the Library and the reading path. The model rates on a scale of 1 (plain) to 9 (near classical Chinese), but books use only a narrow band of it (5.1 to 6.6 in a test library of 70 novels), so the ratings all read alike. Now a rating is placed on a logistic curve fitted to the rated Chinese books of the Library: their median shows as 50%, their 5th and 95th percentiles as 5% and 95%, so whatever band a library's books occupy, they spread over the whole range (in the test library, 0.9% to 97%). Nothing is fixed to one library's numbers; one rated book shows as 50%. The percentage moves as books are rated; the word after it (plain, typical, literary, very literary) is the model's own judgment and doesn't. Hovering a rating shows the model's own number, which is what is kept (`style.json` is unchanged) and what counts toward the difficulty, with the **Weight** in ⚙ per point of it as before.
+- **Words marked with + no longer change how books are segmented.** Since 2026.11.17.1 they joined pieces the segmenter split (想/到 → 想到), so each + or − in a Chinese book meant segmenting every Chinese book in the Library again (minutes a book with CKIP). They are the segmenter's own tokens, so joining them elsewhere mostly turned two known tokens into one known word. Now a mark only recounts the books, from the saved analyses. Imported word lists still join split words, as their words come from outside the book (一口气 split as 一/口气 would otherwise never match). To keep a name whole, apply it from Suggested words or type it into **Force a word**, which also splits it off a word it was glued to. If you have words marked with +, the Chinese books are segmented once more after updating.
+
+### Fixed
+- The Library's **Difficulty** column sorts: by the share of running words known as counted for the difficulty (the writing style included, while rated), hardest first, books with nothing known last.
+- The Library's sortable column headings look clickable: they are underlined under the pointer, which turns into a hand, and their hover text says a click sorts and a second reverses.
+
 ## [2026.11.17.8] - 2026-11-17
 
 ### Added

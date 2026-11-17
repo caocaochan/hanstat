@@ -21,6 +21,14 @@
 //! Sudachi's normalized form, as the book's words are, and imported Japanese
 //! lists are run through Sudachi the same way (see [`Settings::apply`]).
 //!
+//! Books marked read in the Library count too: the most frequent of their
+//! words, taken when the book was marked ([`ReadBook`], [`read_selection`]).
+//!
+//! Only imported lists are given to the segmenter, to join words it split
+//! ([`Settings::segmenter_words`]). Words marked with + and the words of books
+//! read are the segmenter's own tokens: joining them elsewhere gains little,
+//! and each change would mean segmenting every Chinese book again.
+//!
 //! The ticked levels and the imported lists (copied in, so the source files
 //! may move) are saved per language: `%LOCALAPPDATA%\hanstat\known.json` for
 //! Chinese, `known-ko.json` for Korean and `known-ja.json` for Japanese.
@@ -283,6 +291,42 @@ pub struct WordList {
     pub words: Vec<String>,
 }
 
+/// A book marked read in the Library: the words it counts as known.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReadBook {
+    /// The History entry's id (the SHA-256 of the book's file).
+    pub id: String,
+    /// The book's title when it was marked, shown once it has left the Library.
+    pub title: String,
+    /// When it was marked read, in seconds since the Unix epoch.
+    pub read: u64,
+    /// The share of the words occurring at least `min_count` times that was
+    /// taken, most frequent first (see [`read_selection`]).
+    pub percent: u8,
+    pub min_count: u32,
+    /// The words taken, as the book's profile keys them, most frequent first.
+    /// Kept as they were, so analysing the book again doesn't change them.
+    pub words: Vec<String>,
+    /// How many of them were not known yet when the book was marked.
+    pub added: usize,
+    /// Japanese: how the book spells a word key, where it differs (為る → する).
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub display: HashMap<String, String>,
+}
+
+/// The words a read book teaches: of its words occurring at least
+/// `min_count` times, the most frequent `percent`% (rounded up). `words` is
+/// most frequent first, as a profile keeps them.
+pub fn read_selection(words: &[(String, u32)], percent: u8, min_count: u32) -> Vec<&(String, u32)> {
+    let mut often: Vec<&(String, u32)> = words.iter().filter(|(_, n)| *n >= min_count).collect();
+    // Stable: words of equal count keep the profile's order.
+    often.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    let take = (often.len() * percent.min(100) as usize).div_ceil(100);
+    often.truncate(take);
+    often
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -299,6 +343,9 @@ pub struct Settings {
     /// Chinese: ticked TOCFL levels (see [`TOCFL_LEVELS`]), alongside the HSK ones.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tocfl: Vec<u8>,
+    /// Books marked read in the Library, in the order they were marked.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub read: Vec<ReadBook>,
     /// Which language's file these settings belong to (not stored in it).
     #[serde(skip)]
     pub language: Language,
@@ -364,6 +411,27 @@ impl Settings {
             && self.marked.is_empty()
             && !self.kaishi_on()
             && self.tocfl_levels().is_empty()
+            && self.read.iter().all(|b| b.words.is_empty())
+    }
+
+    /// The book with History id `id`, if it is marked read.
+    pub fn read_book(&self, id: &str) -> Option<&ReadBook> {
+        self.read.iter().find(|b| b.id == id)
+    }
+
+    /// Mark a book read, replacing an earlier mark of the same book.
+    pub fn set_read(&mut self, b: ReadBook) {
+        match self.read.iter_mut().find(|x| x.id == b.id) {
+            Some(x) => *x = b,
+            None => self.read.push(b),
+        }
+    }
+
+    /// Unmark a book; its words stay known only where something else marks them.
+    pub fn unset_read(&mut self, id: &str) -> bool {
+        let n = self.read.len();
+        self.read.retain(|b| b.id != id);
+        self.read.len() != n
     }
 
     /// The Kaishi 1.5k words are marked known (Japanese only).
@@ -445,6 +513,11 @@ impl Settings {
                     .flat_map(|l| l.words.iter().map(String::as_str)),
             )
             .chain(self.marked.iter().map(String::as_str))
+            .chain(
+                self.read
+                    .iter()
+                    .flat_map(|b| b.words.iter().map(String::as_str)),
+            )
     }
 
     /// Korean words X whose X하다 and X되다 count as known: X is at a level L
@@ -460,14 +533,14 @@ impl Settings {
             .collect()
     }
 
-    /// The words given to the segmenter (imported lists and marked words, not
-    /// the levels), sorted and deduplicated so two sets compare equal.
+    /// The words given to the segmenter: the imported lists' (not the levels,
+    /// the marked words or the words of books read), sorted and deduplicated
+    /// so two sets compare equal.
     pub fn segmenter_words(&self) -> Vec<String> {
         let mut w: Vec<String> = self
             .lists
             .iter()
             .flat_map(|l| l.words.iter())
-            .chain(&self.marked)
             .cloned()
             .collect();
         w.sort_unstable();
@@ -495,6 +568,11 @@ impl Settings {
         }
         if !self.marked.is_empty() {
             parts.push(format!("{} marked", self.marked.len()));
+        }
+        match self.read.len() {
+            0 => {}
+            1 => parts.push("1 book read".to_owned()),
+            n => parts.push(format!("{n} books read")),
         }
         parts.join(" + ")
     }
@@ -546,6 +624,13 @@ impl Settings {
             out.extend(keys.into_iter().map(|k| (k, w.to_string())));
         }
         out.extend(self.marked.iter().map(|w| (w.clone(), w.clone())));
+        for b in &self.read {
+            out.extend(
+                b.words
+                    .iter()
+                    .map(|w| (w.clone(), b.display.get(w).unwrap_or(w).clone())),
+            );
+        }
         out
     }
 }
@@ -952,5 +1037,102 @@ mod tests {
         assert_eq!(m.apply(None, true).unwrap().word("跑步"), Status::Listed);
         assert!(m.set_marked("跑步", false) && m.is_empty());
         assert!(Settings::default().apply(None, true).is_none());
+    }
+
+    fn counts(w: &[(&str, u32)]) -> Vec<(String, u32)> {
+        w.iter().map(|(w, n)| (w.to_string(), *n)).collect()
+    }
+
+    #[test]
+    fn read_selection_takes_the_most_frequent_share() {
+        let w = counts(&[
+            ("的", 50),
+            ("他", 40),
+            ("说", 12),
+            ("走", 10),
+            ("跑", 9),
+            ("飞", 1),
+        ]);
+        let pick = |p, m| -> Vec<&str> {
+            read_selection(&w, p, m)
+                .iter()
+                .map(|(w, _)| w.as_str())
+                .collect()
+        };
+        // 4 words occur 10+ times; 90% of 4 is 3.6, rounded up.
+        assert_eq!(pick(90, 10), ["的", "他", "说", "走"]);
+        assert_eq!(pick(50, 10), ["的", "他"]);
+        assert_eq!(pick(100, 1).len(), 6);
+        // A sliver of one word still takes it; 0% takes none.
+        assert_eq!(pick(1, 10), ["的"]);
+        assert!(pick(0, 10).is_empty());
+        assert!(pick(100, 100).is_empty());
+    }
+
+    #[test]
+    fn read_books_count_as_known_but_not_for_the_segmenter() {
+        let mut s = Settings::default();
+        s.set_marked("顾九思", true);
+        s.set_read(ReadBook {
+            id: "abc".into(),
+            title: "长风渡".into(),
+            words: vec!["我们".into(), "學習".into()],
+            percent: 90,
+            min_count: 10,
+            ..Default::default()
+        });
+        assert!(s.read_book("abc").is_some() && s.read_book("x").is_none());
+        let k = s.apply(None, true).unwrap();
+        assert_eq!(k.word("我们"), Status::Listed);
+        assert_eq!(k.word("学习"), Status::Listed);
+        // Neither marked words nor books read go to the segmenter; lists do.
+        assert!(s.segmenter_words().is_empty());
+        s.add_list(WordList {
+            name: "a.txt".into(),
+            path: "a.txt".into(),
+            words: vec!["学习".into(), "你好".into(), "学习".into()],
+        });
+        assert_eq!(s.segmenter_words(), ["你好", "学习"]);
+        s.lists.clear();
+        assert_eq!(s.label(), "1 marked + 1 book read");
+        // Marking the same book again replaces it.
+        s.set_read(ReadBook {
+            id: "abc".into(),
+            words: vec!["他们".into()],
+            ..Default::default()
+        });
+        assert_eq!(s.read.len(), 1);
+        let k = s.apply(None, true).unwrap();
+        assert!(k.word("他们").is_known() && !k.word("我们").is_known());
+        // Unmarked: its words are no longer known.
+        assert!(s.unset_read("abc") && !s.unset_read("abc"));
+        s.set_marked("顾九思", false);
+        assert!(s.is_empty());
+        // Saved and read back.
+        s.set_read(ReadBook {
+            id: "j".into(),
+            words: vec!["為る".into()],
+            display: HashMap::from([("為る".to_owned(), "する".to_owned())]),
+            ..Default::default()
+        });
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn japanese_read_books_keep_their_spelling() {
+        let mut s = Settings {
+            language: Language::Japanese,
+            ..Default::default()
+        };
+        s.set_read(ReadBook {
+            id: "j".into(),
+            words: vec!["為る".into(), "冒険".into()],
+            display: HashMap::from([("為る".to_owned(), "する".to_owned())]),
+            ..Default::default()
+        });
+        let w = s.japanese_words();
+        assert!(w.contains(&("為る".to_owned(), "する".to_owned())));
+        assert!(w.contains(&("冒険".to_owned(), "冒険".to_owned())));
     }
 }
