@@ -157,7 +157,7 @@ impl History {
                 Ok(f) => {
                     h.read_only = true;
                     Some(format!(
-                        "{} is from a newer hanstat (format {}); history is not saved",
+                        "{} is from a newer hanstat (format {}); the library is not saved",
                         h.path.display(),
                         f.format
                     ))
@@ -165,7 +165,7 @@ impl History {
                 Err(e) => {
                     h.read_only = true;
                     Some(format!(
-                        "Ignoring unreadable {}: {e}; history is not saved",
+                        "Ignoring unreadable {}: {e}; the library is not saved",
                         h.path.display()
                     ))
                 }

@@ -1,7 +1,7 @@
 //! Command-line front-end.
 //!
 //! hanstat-cli <file> [--ckip|--ltp|--jieba] [--dict words.txt] [--json] [--top N]
-//!             [--include-all] [--exclude N,M,..] [--chars-csv out.csv] [--words-csv out.csv] [--suggest N] [--auto-dict] [--history]
+//!             [--include-all] [--exclude N,M,..] [--chars-csv out.csv] [--words-csv out.csv] [--suggest N] [--auto-dict] [--library]
 //! hanstat-cli --plan [--lang zh|ko|ja] [--target P | --learn N] [--incidental M] [--lookahead X] [--width W] [--study-lists DIR] [--json]
 
 use hanstat::analyze::{self, Report};
@@ -401,7 +401,7 @@ impl Default for PlanArgs {
     }
 }
 
-/// Order the books of `lang` in the History into a reading path, against `k`.
+/// Order the books of `lang` in the Library into a reading path, against `k`.
 fn run_plan(a: &PlanArgs, lang: Language, k: Option<&Knowledge>, fold: bool, json: bool) {
     let (hist, warn) = History::load();
     if let Some(w) = warn {
@@ -417,14 +417,14 @@ fn run_plan(a: &PlanArgs, lang: Language, k: Option<&Knowledge>, fold: bool, jso
     }
     for e in &missing {
         eprintln!(
-            "no word data for {} (analysed by an older version); left out: run hanstat-cli \"{}\" --history",
+            "no word data for {} (analysed by an older version); left out: run hanstat-cli \"{}\" --library",
             e.title,
             e.path.display()
         );
     }
     if books.is_empty() {
         eprintln!(
-            "No {} books with word data in the history ({}). Add some with hanstat-cli <file> --history.",
+            "No {} books with word data in the library ({}). Add some with hanstat-cli <file> --library.",
             lang.name(),
             History::path().display()
         );
@@ -738,7 +738,8 @@ fn main() {
             "--auto-dict" => auto_dict = true,
             "--no-cache" => no_cache = true,
             "--suggest" => suggest = Some(args.next().and_then(|s| s.parse().ok()).unwrap_or(40)),
-            "--history" => add_history = true,
+            // `--history`: its name before the History became the Library.
+            "--library" | "--history" => add_history = true,
             "--plan" => pa.on = true,
             "--target" => {
                 pa.on = true;
@@ -781,7 +782,7 @@ fn main() {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: hanstat-cli <file.epub|file.txt> [--ckip|--ltp|--jieba] [--dict words.txt] [--json] [--top N] [--include-all] [--exclude i,j] [--chars-csv f] [--words-csv f] [--suggest N] [--auto-dict] [--no-cache] [--history]\n\
+                    "usage: hanstat-cli <file.epub|file.txt> [--ckip|--ltp|--jieba] [--dict words.txt] [--json] [--top N] [--include-all] [--exclude i,j] [--chars-csv f] [--words-csv f] [--suggest N] [--auto-dict] [--no-cache] [--library]\n\
                      \x20      hanstat-cli --plan [--lang zh|ko|ja] [--target P | --learn N] [--incidental M] [--lookahead X] [--width W] [--study-lists DIR] [--json]\n\
                      \x20      [--anki] [--anki-list] [--anki-collection collection.anki2] [--anki-deck NAME]... [--anki-field \"NOTE TYPE:FIELD\"]... [--anki-mature-stability DAYS] [--anki-save]\n\
                      \x20      [--known] [--level N] [--hsk N] [--tocfl N] [--kaishi] [--known-list words.txt]... [--lang zh|ko|ja]\n\
@@ -803,8 +804,8 @@ fn main() {
                      --anki-mature-stability DAYS counts a review card as mature once its FSRS stability reaches DAYS instead of at an interval of 21+ days (0: interval rule).\n\
                      Without a file, --anki prints the collection summary only, for --lang (default zh).\n\
                      \n\
-                     --history records the book in the History (and its word data for the reading path), as opening it in the window does.\n\
-                     --plan orders the --lang books in the History into a reading path against the known words (--anki, --known, --level, ...):\n\
+                     --library records the book in the Library (and its word data for the reading path), as opening it in the window does.\n\
+                     --plan orders the --lang books in the Library into a reading path against the known words (--anki, --known, --level, ...):\n\
                      \x20 before each book you study its unknown words until --target P% of its running words are known (default 95), or --learn N of them;\n\
                      \x20 they stay known for the books after it. --incidental M also counts words read M+ times in a book as learned.\n\
                      \x20 --lookahead X weighs the books still to come when choosing study words (0: the book's most frequent; default {}).\n\
@@ -842,7 +843,7 @@ fn main() {
         .unwrap_or_default();
     if pa.on {
         if file.is_some() {
-            eprintln!("--plan works on the History: give no file");
+            eprintln!("--plan works on the Library: give no file");
             std::process::exit(2);
         }
         let lang = lang_arg.unwrap_or_default();
@@ -1068,7 +1069,7 @@ fn main() {
     }
 }
 
-/// `--history`: the book's History entry, cover and word data, as the window saves them.
+/// `--library`: the book's Library entry, cover and word data, as the window saves them.
 fn record_history(
     file: &std::path::Path,
     book: &extract::Book,

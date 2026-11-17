@@ -22,11 +22,12 @@ use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
 
 fn main() -> eframe::Result {
-    // hanstat [file...] [--tab overview|characters|words|sections|notes|history|path]
+    // hanstat [file...] [--tab overview|characters|words|sections|notes|library|path]
     // Several files are analysed one after another and the last is shown.
     let mut paths = Vec::new();
     let mut tab = Tab::Overview;
-    // --tab history / path: start in the History view, on its books or the reading path.
+    // --tab library / path: start in the Library view, on its books or the reading path
+    // (`history`, its name before, still works).
     let mut history_tab = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -37,7 +38,7 @@ fn main() -> eframe::Result {
                 Some("sections") => Tab::Sections,
                 Some("notes") => Tab::Notes,
                 Some("suggestions") => Tab::Suggestions,
-                Some("history") => {
+                Some("library" | "history") => {
                     history_tab = Some(HistTab::Books);
                     Tab::Overview
                 }
@@ -1682,7 +1683,7 @@ impl eframe::App for App {
             ui.horizontal_wrapped(|ui| {
                 if ui
                     .button("📂 Open…")
-                    .on_hover_text("Open a book, or select several: each is analysed and added to the History, and the last one is shown")
+                    .on_hover_text("Open a book, or select several: each is analysed and added to the Library, and the last one is shown")
                     .clicked()
                     && let Some(files) = rfd::FileDialog::new()
                         .add_filter("E-books and text", &["epub", "txt", "text"])
@@ -1830,9 +1831,9 @@ impl eframe::App for App {
                 if ui
                     .selectable_label(
                         self.show_history,
-                        format!("🕘 History ({})", self.history.entries.len()),
+                        format!("📖 Library ({})", self.history.entries.len()),
                     )
-                    .on_hover_text("Every book analysed before, with its statistics")
+                    .on_hover_text("Every book analysed before, with its statistics, and a reading path through them")
                     .clicked()
                 {
                     self.show_history = !self.show_history;
@@ -3698,7 +3699,7 @@ impl App {
     /// counts as known) last changed. A click on a title opens the book.
     fn history_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
-            ui.heading("History");
+            ui.heading("Library");
             ui.add_space(8.0);
             ui.selectable_value(&mut self.history_tab, HistTab::Books, "Books")
                 .on_hover_text("Every book analysed, with its statistics");
@@ -3979,7 +3980,7 @@ impl App {
                     row.col(|ui| {
                         if ui
                             .small_button("✖")
-                            .on_hover_text("Remove from the history (the book itself is not touched)")
+                            .on_hover_text("Remove from the library (the book itself is not touched)")
                             .clicked()
                         {
                             remove = Some(e.id.clone());
@@ -4106,6 +4107,9 @@ impl App {
                             o.push(s.book);
                         }
                     }
+                    // A volume added since, or an order saved before series
+                    // were recognised, may be out of series order.
+                    let o = lib.in_series_order(&o);
                     (lib.evaluate(&k0, &params, &o), Some(best))
                 }
                 None => (best, None),
@@ -4325,7 +4329,7 @@ impl App {
         if ui
             .small_button("Stop")
             .on_hover_text(
-                "Stop after the current book; the books analysed so far stay in the History",
+                "Stop after the current book; the books analysed so far stay in the Library",
             )
             .clicked()
         {
@@ -4644,10 +4648,23 @@ impl App {
                     let e = by_id.get(b.id.as_str());
                     row.col(|ui| {
                         ui.label(RichText::new(format!("{}", i + 1)).strong());
-                        if ui.add_enabled(i > 0, egui::Button::new("⏶").small()).on_hover_text("Read earlier").clicked() {
+                        // A series is read in volume order.
+                        let after_volume = i > 0 && lib.precedes(path.steps[i - 1].book, s.book);
+                        let before_volume = i + 1 < n && lib.precedes(s.book, path.steps[i + 1].book);
+                        if ui
+                            .add_enabled(i > 0 && !after_volume, egui::Button::new("⏶").small())
+                            .on_hover_text("Read earlier")
+                            .on_disabled_hover_text(if after_volume { "The book above is an earlier volume of its series" } else { "" })
+                            .clicked()
+                        {
                             act = Some(PlanAction::Move(i, -1));
                         }
-                        if ui.add_enabled(i + 1 < n, egui::Button::new("⏷").small()).on_hover_text("Read later").clicked() {
+                        if ui
+                            .add_enabled(i + 1 < n && !before_volume, egui::Button::new("⏷").small())
+                            .on_hover_text("Read later")
+                            .on_disabled_hover_text(if before_volume { "The book below is a later volume of its series" } else { "" })
+                            .clicked()
+                        {
                             act = Some(PlanAction::Move(i, 1));
                         }
                     });

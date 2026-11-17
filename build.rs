@@ -22,7 +22,7 @@ fn icon() {
 /// text, segmenter, model and word lists: the windows, the CLI, what happens
 /// before the text exists (`extract`: the text itself is in the cache key),
 /// what is applied to the counts afterwards (Anki, known words, discovery,
-/// History, profiles and the reading path), the module list in `lib.rs`, and
+/// History, profiles, the reading path and series), the module list in `lib.rs`, and
 /// downloading (the model's identity is in the key). Anything not listed
 /// here, including a file added later, is part of the fingerprint.
 const NOT_ANALYSIS: &[&str] = &[
@@ -32,6 +32,7 @@ const NOT_ANALYSIS: &[&str] = &[
     "src/history.rs",
     "src/profile.rs",
     "src/plan.rs",
+    "src/series.rs",
     "src/extract",
     "src/anki.rs",
     "src/known.rs",

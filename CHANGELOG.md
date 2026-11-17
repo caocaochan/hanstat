@@ -1,5 +1,13 @@
 # Changelog
 
+## [2026.11.17.0] - 2026-11-17
+
+### Changed
+- **History is now the Library.** The toolbar button is **📖 Library**, and the view's heading, hover texts and messages say Library. `hanstat --tab library` and `hanstat-cli --library` are the new names; `--tab history` and `--history` still work. The files keep their names (`history.json`, `covers`, `profiles`), so nothing is lost.
+
+### Fixed
+- **The reading path keeps a series in order.** It could put a later volume before an earlier one (`SCI谜案集（第二部）` before `（第一部）`) when the later one was easier. Books whose titles name one series are now read in volume order, with other books between them where that helps: the search only offers a volume once the earlier ones on the path are read, and easiest-first and orders set by hand (including ones saved before) are put in series order. Titles are matched after taking out the volume marker, tags such as `[星际]` or `（完结）`, spaces, punctuation and full-width forms, and folding Traditional to Simplified. Markers are recognised at the end, before a subtitle or at the start, bracketed or not: `第二部`, `第3卷`, `二册`, `卷三`, `上`/`中`/`下`, `上册`, `前篇`/`後編`, `续`, `4巻`, `2권`, `제3부`, `상`/`하`, `Vol. 3`, `Volume IV`, `Book Two`, `Part 5`, `#6`, `2.5`, with Arabic, Chinese (`十二`, `一百零五`, `贰`) and Roman numerals (`III`, `Ⅲ`) and ①②; nested ones too (`第一部（下）`). A book of the series with no number counts as the first; extras (番外, 外传, 外伝) come after every volume. Joined to a title without a space or bracket, only unambiguous markers count (`三体2`, `X第二部`, `X上册`), so `天下` or `1984` stay whole. ⏶⏷ no longer move a volume past an earlier or later one of its series.
+
 ## [2026.11.16.9] - 2026-11-16
 
 ### Added
