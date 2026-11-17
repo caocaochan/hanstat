@@ -199,7 +199,9 @@ jobs:
       # any failure as its own step.
       - name: Make the preinstalled runtimes updatable
         run: |
-          dir=$(flatpak --system --installations)
+          # The system installation, where the image installed the runtimes.
+          dir=$(flatpak --installations | head -n 1)
+          echo "Copying $dir into the writable layer"
           cp -a "$dir" "$dir.copy"
           rm -rf "$dir"
           mv "$dir.copy" "$dir"
