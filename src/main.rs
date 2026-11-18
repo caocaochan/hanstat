@@ -3044,7 +3044,7 @@ impl eframe::App for App {
                     (false, _) => format!("📚 Known: {}", self.known.settings.label()),
                 };
                 let hover = match self.language {
-                    Language::Chinese => "Mark HSK 3.0 or TOCFL levels and imported word lists as known, in addition to your Anki cards",
+                    Language::Chinese => "Mark HSK 3.0, HSK 2.0 or TOCFL levels and imported word lists as known, in addition to your Anki cards",
                     Language::Korean => "Mark vocabulary levels 1–6급 and imported Korean word lists as known, in addition to your Anki cards",
                     Language::Japanese => "Mark JLPT levels N5–N1 and imported Japanese word lists as known, in addition to your Anki cards",
                 };
@@ -3739,6 +3739,52 @@ impl App {
                     }
                 });
                 if lang == Language::Chinese {
+                    ui.add_space(6.0);
+                    ui.strong("HSK 2.0 vocabulary");
+                    ui.label(
+                        RichText::new(
+                            "The 2012 word lists (5,000 words): what the HSK tested before the 2025 syllabus, and what the HSK Standard Course textbooks teach. \
+                             Tick each level whose new words you know, alongside or instead of HSK 3.0.",
+                        )
+                        .weak(),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        let mut cum = 0;
+                        for &b in &known::HSK2_LEVELS {
+                            let n = known::hsk2_count(b);
+                            cum += n;
+                            let mut v = k.settings.hsk2_on(b);
+                            if ui
+                                .checkbox(&mut v, format!("HSK {b} ({})", fmt_int(n as u64)))
+                                .on_hover_text(format!(
+                                    "HSK 2.0 level {b}: {} words introduced at this level; {} up to and including it",
+                                    fmt_int(n as u64),
+                                    fmt_int(cum as u64)
+                                ))
+                                .changed()
+                            {
+                                k.settings.set_hsk2(b, v);
+                                changed = true;
+                            }
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("All up to:").weak());
+                        for (i, &b) in known::HSK2_LEVELS.iter().enumerate() {
+                            if ui
+                                .small_button(b.to_string())
+                                .on_hover_text(format!("Tick HSK 2.0 1 to {b} only"))
+                                .clicked()
+                            {
+                                k.settings.hsk2 = known::HSK2_LEVELS[..=i].to_vec();
+                                changed = true;
+                            }
+                        }
+                        if ui.small_button("None").clicked() && !k.settings.hsk2.is_empty() {
+                            k.settings.hsk2.clear();
+                            changed = true;
+                        }
+                    });
                     ui.add_space(6.0);
                     ui.strong("TOCFL vocabulary (華語八千詞表)");
                     ui.label(

@@ -2,8 +2,10 @@
 //!
 //! Chinese: the HSK 3.0 vocabulary of the 2025 《HSK 考试大纲》
 //! (中外语言交流合作中心, in force from July 2026), bundled in
-//! `data/HSK30-2025.tsv`; and, ticked separately, the TOCFL levels of SC-TOP's
-//! 華語八千詞表 (2024-09 edition, Traditional), in `data/TOCFL-2024.tsv`.
+//! `data/HSK30-2025.tsv`; and, ticked separately, the HSK 2.0 levels 1–6 (the
+//! 2012 revision of the new HSK lists, Simplified) in `data/HSK20-2012.tsv`,
+//! and the TOCFL levels of SC-TOP's 華語八千詞表 (2024-09 edition,
+//! Traditional), in `data/TOCFL-2024.tsv`.
 //!
 //! Korean: levels 1급–6급 of 국립국어원's 국제 통용 한국어 표준 교육과정
 //! vocabulary, bundled in `data/KO-standard-2020.tsv`. TOPIK has no official
@@ -42,6 +44,7 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 static HSK_TSV: &str = include_str!("../data/HSK30-2025.tsv");
+static HSK2_TSV: &str = include_str!("../data/HSK20-2012.tsv");
 static TOCFL_TSV: &str = include_str!("../data/TOCFL-2024.tsv");
 static KO_TSV: &str = include_str!("../data/KO-standard-2020.tsv");
 static JLPT_TSV: &str = include_str!("../data/JLPT-waller.tsv");
@@ -66,6 +69,44 @@ pub fn kaishi_count() -> usize {
 
 /// HSK bands: 1–6, and 7 for the shared 7–9 list.
 pub const BANDS: [u8; 7] = [1, 2, 3, 4, 5, 6, 7];
+
+/// HSK 2.0 levels 1–6 (2012 lists).
+pub const HSK2_LEVELS: [u8; 6] = [1, 2, 3, 4, 5, 6];
+
+/// Words introduced at HSK 2.0 `level`.
+pub fn hsk2_words(level: u8) -> impl Iterator<Item = &'static str> {
+    HSK2.iter()
+        .filter(move |(b, _)| *b == level)
+        .map(|(_, w)| *w)
+}
+
+pub fn hsk2_count(level: u8) -> usize {
+    hsk2_words(level).count()
+}
+
+/// "HSK 2.0 1–4", "HSK 2.0 1, 3–4".
+pub fn hsk2_label(levels: &[u8]) -> String {
+    let parts: Vec<String> = runs(levels)
+        .into_iter()
+        .map(|(a, b)| if a == b { a.to_string() } else { format!("{a}–{b}") })
+        .collect();
+    format!("HSK 2.0 {}", parts.join(", "))
+}
+
+/// Sorted, deduplicated `levels` as runs of consecutive numbers (first, last).
+fn runs(levels: &[u8]) -> Vec<(u8, u8)> {
+    let mut b: Vec<u8> = levels.to_vec();
+    b.sort_unstable();
+    b.dedup();
+    let mut out: Vec<(u8, u8)> = Vec::new();
+    for x in b {
+        match out.last_mut() {
+            Some((_, last)) if *last + 1 == x => *last = x,
+            _ => out.push((x, x)),
+        }
+    }
+    out
+}
 
 /// TOCFL word-list levels, easiest first: Novice 1–2 (準備級), then Level 1
 /// (入門級, band A) to Level 5 (流利級, band C). Level 6 (精通級) has no list
@@ -157,6 +198,7 @@ fn parse_levels(tsv: &'static str) -> Vec<(u8, &'static str)> {
 
 /// (band, word), each word once, at the lowest band it is introduced.
 static HSK: LazyLock<Vec<(u8, &'static str)>> = LazyLock::new(|| parse_levels(HSK_TSV));
+static HSK2: LazyLock<Vec<(u8, &'static str)>> = LazyLock::new(|| parse_levels(HSK2_TSV));
 static TOCFL: LazyLock<Vec<(u8, &'static str)>> = LazyLock::new(|| parse_levels(TOCFL_TSV));
 static KO: LazyLock<Vec<(u8, &'static str)>> = LazyLock::new(|| parse_levels(KO_TSV));
 static JLPT: LazyLock<Vec<(u8, &'static str)>> = LazyLock::new(|| parse_levels(JLPT_TSV));
@@ -340,6 +382,9 @@ pub struct Settings {
     /// Japanese: the words of the Kaishi 1.5k Anki deck count as known.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub kaishi: bool,
+    /// Chinese: ticked HSK 2.0 levels (see [`HSK2_LEVELS`]), alongside the HSK 3.0 ones.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hsk2: Vec<u8>,
     /// Chinese: ticked TOCFL levels (see [`TOCFL_LEVELS`]), alongside the HSK ones.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tocfl: Vec<u8>,
@@ -401,6 +446,7 @@ impl Settings {
             && self.lists.iter().all(|l| l.words.is_empty())
             && self.marked.is_empty()
             && !self.kaishi_on()
+            && self.hsk2_levels().is_empty()
             && self.tocfl_levels().is_empty()
             && self.read.iter().all(|b| b.words.is_empty())
     }
@@ -428,6 +474,27 @@ impl Settings {
     /// The Kaishi 1.5k words are marked known (Japanese only).
     pub fn kaishi_on(&self) -> bool {
         self.kaishi && self.language == Language::Japanese
+    }
+
+    /// The ticked HSK 2.0 levels that apply (Chinese only).
+    pub fn hsk2_levels(&self) -> &[u8] {
+        if self.language == Language::Chinese {
+            &self.hsk2
+        } else {
+            &[]
+        }
+    }
+
+    pub fn hsk2_on(&self, level: u8) -> bool {
+        self.hsk2.contains(&level)
+    }
+
+    pub fn set_hsk2(&mut self, level: u8, on: bool) {
+        self.hsk2.retain(|b| *b != level);
+        if on {
+            self.hsk2.push(level);
+            self.hsk2.sort_unstable();
+        }
     }
 
     /// The ticked TOCFL levels that apply (Chinese only).
@@ -492,11 +559,16 @@ impl Settings {
             .iter()
             .filter(|(b, _)| self.levels.contains(b))
             .map(|(_, w)| *w);
+        let hsk2 = HSK2
+            .iter()
+            .filter(|(b, _)| self.hsk2_levels().contains(b))
+            .map(|(_, w)| *w);
         let tocfl = TOCFL
             .iter()
             .filter(|(b, _)| self.tocfl_levels().contains(b))
             .map(|(_, w)| *w);
         levels
+            .chain(hsk2)
             .chain(tocfl)
             .chain(
                 self.lists
@@ -539,12 +611,16 @@ impl Settings {
         w
     }
 
-    /// "HSK 1–3 + 2 word lists + 15 marked", "TOCFL Novice 1–A2", "N5–N4 + Kaishi 1.5k".
+    /// "HSK 1–3 + 2 word lists + 15 marked", "HSK 2.0 1–4", "TOCFL Novice 1–Level 2",
+    /// "N5–N4 + Kaishi 1.5k".
     pub fn label(&self) -> String {
         let n = self.lists.iter().filter(|l| !l.words.is_empty()).count();
         let mut parts = Vec::new();
         if !self.levels.is_empty() {
             parts.push(bands_label(self.language, &self.levels));
+        }
+        if !self.hsk2_levels().is_empty() {
+            parts.push(hsk2_label(self.hsk2_levels()));
         }
         if !self.tocfl_levels().is_empty() {
             parts.push(tocfl_label(self.tocfl_levels()));
@@ -767,6 +843,62 @@ mod tests {
         assert_eq!(level("着急"), Some(5));
         assert_eq!(level("着名"), None);
         assert_eq!(level("借口"), Some(7));
+    }
+
+    #[test]
+    fn hsk2_data_matches_the_list() {
+        // 5,000 entries (150/150/300/600/1300/2500), plus 4 from splitting the
+        // paired entries (虽然……但是……), less 9 homographs kept at their first
+        // level (得 助词 at 2, 得 助动词 at 4).
+        let counts: Vec<usize> = HSK2_LEVELS.iter().map(|&b| hsk2_count(b)).collect();
+        assert_eq!(counts, [150, 151, 297, 598, 1300, 2499]);
+        assert_eq!(HSK2.len(), 4_995);
+        let all: HashSet<&str> = HSK2.iter().map(|(_, w)| *w).collect();
+        assert_eq!(all.len(), HSK2.len());
+        assert!(all.iter().all(|w| w.chars().all(chars::is_han)));
+        let level = |w: &str| HSK2.iter().find(|(_, x)| *x == w).map(|(b, _)| *b);
+        assert_eq!(level("爸爸"), Some(1));
+        assert_eq!(level("得"), Some(2));
+        assert_eq!(level("虽然"), Some(2));
+        assert_eq!(level("但是"), Some(2));
+        assert_eq!(level("只有"), Some(3));
+        // 2012 revision, not the 2010 lists: 饭馆 left level 1, 饭店 came in.
+        assert_eq!(level("饭店"), Some(1));
+        assert_eq!(level("饭馆"), None);
+    }
+
+    #[test]
+    fn hsk2_levels_mark_words() {
+        let mut s = Settings::default();
+        s.set_hsk2(4, true);
+        s.set_hsk2(1, true);
+        s.set_hsk2(2, true);
+        assert_eq!(s.hsk2, [1, 2, 4]);
+        assert_eq!(s.label(), "HSK 2.0 1–2, 4");
+        s.set_band(1, true);
+        s.set_tocfl(1, true);
+        assert_eq!(s.label(), "HSK 1 + HSK 2.0 1–2, 4 + TOCFL Novice 1");
+        s.levels.clear();
+        s.tocfl.clear();
+        // 2.0-only words count; Simplified list words match a Traditional book when folding.
+        assert_eq!(s.apply(None, false).unwrap().word("宾馆"), Status::Listed);
+        let k = s.apply(None, true).unwrap();
+        assert_eq!(k.word("賓館"), Status::Listed);
+        assert!(!k.word("饭馆").is_known());
+        // Saved only when ticked, and only Chinese uses it.
+        let off = serde_json::to_string(&Settings::default()).unwrap();
+        assert!(!off.contains("hsk2"), "{off}");
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.hsk2, [1, 2, 4]);
+        assert!(back.levels.is_empty());
+        let ko = Settings {
+            hsk2: vec![1],
+            language: Language::Korean,
+            ..Default::default()
+        };
+        assert!(ko.is_empty() && ko.label().is_empty());
+        assert_eq!(hsk2_label(&[1, 2, 3, 4, 5, 6]), "HSK 2.0 1–6");
+        assert_eq!(hsk2_label(&[3]), "HSK 2.0 3");
     }
 
     #[test]

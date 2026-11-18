@@ -1,5 +1,15 @@
 # Changelog
 
+## [2026.11.18.06] - 2026-11-18
+
+### Added
+- **HSK 2.0 levels.** In Chinese mode the known-words window has an **HSK 2.0 vocabulary** section between HSK 3.0 and TOCFL: checkboxes for levels 1–6 and an **All up to** row. They can be ticked alongside or instead of HSK 3.0 and TOCFL, and the toolbar shows them as `HSK 2.0 1–4`.
+  - **The list.** The 2012 revision of the HSK word lists (5,000 entries: 150/150/300/600/1,300/2,500 per level), which the HSK tested until the 2025 syllabus and the HSK Standard Course textbooks teach. Taken from hskhsk.com's lists (MIT) and checked against the official 2012 spreadsheet. Paired entries count as their words (虽然……但是…… gives 虽然 and 但是), and a homograph listed twice counts at its first level (得 is level 2, 得 děi level 4). This gives 4,995 words.
+  - **Traditional books.** The list is in Simplified characters; with **Match Traditional ↔ Simplified** on (the default), it matches Traditional books too.
+  - **Measured.** On 黄金台, HSK 2.0 1–6 covers 60.4% of running words, HSK 3.0 1–6 covers 71.6%, and both together cover 73.9% (HSK 2.0 1–4: 51.9%, HSK 3.0 1–4: 61.4%). The 2012 list leaves out frequent single-character words that the 2025 syllabus has (道, 中, 时, 事, 手, 可, 后), and forms such as 他们 and 这么.
+  - **CLI.** `--hsk2 N` marks levels 1 to N. `--known` includes the HSK 2.0 levels ticked in the window.
+  - Saved in `known.json` as `hsk2`. Older versions ignore the key.
+
 ## [2026.11.18.05] - 2026-11-18
 
 ### Fixed

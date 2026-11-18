@@ -21,7 +21,9 @@ struct KnownArgs {
     level: Option<u8>,
     /// `--hsk N`: Chinese only.
     hsk: Option<u8>,
-    /// `--tocfl N`: TOCFL levels 1 to N (Novice 1 to C1), Chinese only.
+    /// `--hsk2 N`: HSK 2.0 levels 1 to N (2012 lists), Chinese only.
+    hsk2: Option<u8>,
+    /// `--tocfl N`: TOCFL levels 1 to N (Novice 1 to Level 5), Chinese only.
     tocfl: Option<u8>,
     lists: Vec<PathBuf>,
     /// `--kaishi`: Japanese only.
@@ -34,6 +36,7 @@ impl KnownArgs {
         if !self.saved
             && self.level.is_none()
             && self.hsk.is_none()
+            && self.hsk2.is_none()
             && self.tocfl.is_none()
             && self.lists.is_empty()
             && !self.kaishi
@@ -57,6 +60,7 @@ impl KnownArgs {
                 k.set_marked(w, true);
             }
             k.kaishi = s.kaishi;
+            k.hsk2 = s.hsk2;
             k.tocfl = s.tocfl;
         }
         if self.kaishi {
@@ -71,6 +75,11 @@ impl KnownArgs {
             (Some(_), lang) => {
                 eprintln!("--hsk ignored: the book is {} (use --level)", lang.name())
             }
+            (None, _) => {}
+        }
+        match (self.hsk2, lang) {
+            (Some(n), Language::Chinese) => (1..=n).for_each(|b| k.set_hsk2(b, true)),
+            (Some(_), lang) => eprintln!("--hsk2 ignored: the book is {}", lang.name()),
             (None, _) => {}
         }
         match (self.tocfl, lang) {
@@ -870,6 +879,16 @@ fn main() {
                 };
                 ka.level = Some(n);
             }
+            "--hsk2" => {
+                let n: u8 = match args.next().and_then(|s| s.parse().ok()) {
+                    Some(n @ 1..=6) => n,
+                    _ => {
+                        eprintln!("--hsk2 expects an HSK 2.0 level from 1 to 6");
+                        std::process::exit(2)
+                    }
+                };
+                ka.hsk2 = Some(n);
+            }
             "--tocfl" => {
                 let n: u8 = match args.next().and_then(|s| s.parse().ok()) {
                     Some(n @ 1..=7) => n,
@@ -987,7 +1006,7 @@ fn main() {
                     "usage: hanstat-cli <file.epub|file.txt> [--ckip|--ltp|--jieba] [--dict words.txt] [--json] [--top N] [--include-all] [--exclude i,j] [--chars-csv f] [--words-csv f] [--suggest N] [--auto-dict] [--no-cache] [--library]\n\
                      \x20      hanstat-cli --plan [--lang zh|ko|ja] [--target P | --learn N] [--incidental M] [--lookahead X] [--width W] [--study-lists DIR] [--json]\n\
                      \x20      [--anki] [--anki-list] [--anki-collection collection.anki2] [--anki-deck NAME]... [--anki-field \"NOTE TYPE:FIELD\"]... [--anki-mature-stability DAYS] [--anki-save]\n\
-                     \x20      [--known] [--level N] [--hsk N] [--tocfl N] [--kaishi] [--known-list words.txt]... [--lang zh|ko|ja]\n\
+                     \x20      [--known] [--level N] [--hsk N] [--hsk2 N] [--tocfl N] [--kaishi] [--known-list words.txt]... [--lang zh|ko|ja]\n\
                      \n\
                      The book's language is detected: Korean books are analysed with Kiwi and have word statistics only;\n\
                      \x20 Japanese books are analysed with Sudachi and have kanji and word statistics (both downloaded on first use).\n\
@@ -997,6 +1016,7 @@ fn main() {
                      --level N marks levels 1 to N known in the book's language: HSK 3.0 (2025 syllabus; 7, 8, 9: all) for Chinese,\n\
                      \x20 1–6급 of 국립국어원's 국제 통용 한국어 표준 교육과정 vocabulary (the list TOPIK levels follow) for Korean,\n\
                      \x20 JLPT N5 down to N`N` for Japanese (Jonathan Waller's lists; --level 3 is N5–N3).\n\
+                     --hsk2 N marks HSK 2.0 levels 1 to N known in Chinese books (the 2012 lists, 5,000 words).\n\
                      --tocfl N marks TOCFL levels 1 to N known in Chinese books (SC-TOP's 華語八千詞表, 2024: 1–2 are Novice 1–2, 3–7 are Level 1–5).\n\
                      --hsk N is --level N for Chinese books only; --kaishi marks the words of the Kaishi 1.5k deck known (Japanese books only);\n\
                      \x20 --known-list adds a word list (one word per line).\n\
