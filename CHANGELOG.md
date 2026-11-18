@@ -1,5 +1,16 @@
 # Changelog
 
+## [2026.11.18.04] - 2026-11-18
+
+### Changed
+- **Choose which dictionaries start collapsed.** A **Collapsed** checkbox beside each dictionary in **Dictionaries**: its entries start closed in the popup (click its bar there to open them), the others open. It used to be the first three open, whichever they were. The list now has column headings.
+- **Resize the popup.** Drag the grip in its corner (the one away from the word). The size is kept when hanstat restarts; **Reset** in **Dictionaries** goes back to the default.
+- **A click on a popup closes the popups opened from it.**
+
+### Fixed
+- **The popup no longer flickers between two words.** With Shift held on a word whose popup sits above it, the popup could switch back and forth between that word and one from an entry scrolled out of sight (the hidden part lay under the pointer). A popup now only looks up what is visibly under the pointer, on that popup.
+- **A popup opened from another is never behind it.** After a click on a popup, the next popup opened from it could show underneath.
+
 ## [2026.11.18.03] - 2026-11-18
 
 ### Added

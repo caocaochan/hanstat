@@ -113,6 +113,7 @@ fn real_dictionaries() {
             id,
             enabled: true,
             check: None,
+            collapsed: false,
         });
     }
     m.save(&root).unwrap();
@@ -225,6 +226,7 @@ fn import_and_look_up() {
             id: id.into(),
             enabled: true,
             check: None,
+            collapsed: false,
         }],
         last_auto_check: 0,
         default_installed: false,

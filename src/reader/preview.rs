@@ -553,6 +553,67 @@ fn dictionary_popup() {
     );
     assert!(late.is_empty(), "shown in the frame that points at them");
     assert!(none.is_empty(), "every Han character is in some dictionary");
+    // A word at the foot of the page: its popup goes above it, and with the
+    // pointer held there it stays one popup on that word (it once looked up
+    // a word of an entry scrolled out of view, under the pointer, and
+    // flickered between the two).
+    let (last_src, last_rect) = *spots.last().unwrap();
+    for i in 0..20 {
+        d.frame_with(
+            &mut r,
+            vec![egui::Event::PointerMoved(last_rect.center())],
+            shift,
+        );
+        assert_eq!(r.dict.levels.len(), 1, "one popup (frame {i})");
+        assert_eq!(
+            r.dict.highlight(r.spine).map(|h| h.0),
+            Some(last_src),
+            "frame {i}"
+        );
+    }
+    let pr = r.dict.levels[0].rect.unwrap();
+    assert!(pr.bottom() <= last_rect.top(), "above its word");
+    // Its top-right grip (away from the word) resizes it: up and right.
+    let grip = pr.right_top() + vec2(-6.0, 6.0);
+    let before = pr.size();
+    let button = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    d.frame(&mut r, vec![egui::Event::PointerMoved(grip)]);
+    d.frame(&mut r, vec![button(grip, true)]);
+    for k in 1..=5 {
+        d.frame(
+            &mut r,
+            vec![egui::Event::PointerMoved(
+                grip + vec2(8.0 * k as f32, -6.0 * k as f32),
+            )],
+        );
+    }
+    d.frame(&mut r, vec![button(grip + vec2(40.0, -30.0), false)]);
+    d.idle(&mut r, 3);
+    let after = r.dict.levels[0].rect.unwrap().size();
+    eprintln!(
+        "resized {before:?} -> {after:?}; saved {:?}",
+        r.settings.popup_size
+    );
+    assert!((after.x - before.x - 40.0).abs() < 2.0, "wider by the drag");
+    assert!(
+        (after.y - before.y - 30.0).abs() < 2.0,
+        "taller by the drag"
+    );
+    assert!(
+        r.settings.popup_size.is_some(),
+        "the size goes in the settings"
+    );
+    assert!(r.dict.is_open(), "resizing keeps the popup");
+    // Reset: the default size again.
+    r.settings.popup_size = None;
+    d.idle(&mut r, 3);
+    let reset = r.dict.levels[0].rect.unwrap().size();
+    assert!((reset - before).length() < 2.0, "{reset:?} {before:?}");
     // Without Shift, moving the pointer changes nothing.
     let before = r.dict.highlight(r.spine);
     d.frame(&mut r, vec![egui::Event::PointerMoved(spots[0].1.center())]);
@@ -596,6 +657,68 @@ fn dictionary_popup() {
         "visible in the frame that asked it"
     );
     d.snap("popup-child");
+    // The child stays above its parent, even after the pointer was on the parent.
+    let cr = r.dict.levels[1].rect.expect("child drawn");
+    let both = cr.intersect(pr);
+    if both.is_positive() {
+        let off_child = [
+            pr.left_top() + vec2(6.0, 6.0),
+            pr.right_bottom() - vec2(30.0, 6.0),
+        ]
+        .into_iter()
+        .find(|p| !cr.contains(*p))
+        .unwrap();
+        d.frame(&mut r, vec![egui::Event::PointerMoved(off_child)]);
+        d.idle(&mut r, 2);
+        let child = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::unique(("reader-dict-popup", 1usize)),
+        );
+        assert_eq!(
+            d.ctx.layer_id_at(both.center()),
+            Some(child),
+            "the child is on top"
+        );
+    }
+    // A click on the parent (off the child) closes the child.
+    let cr = r.dict.levels[1].rect.expect("child drawn");
+    let on_parent = [
+        pr.left_top() + vec2(6.0, 6.0),
+        pr.right_top() + vec2(-6.0, 6.0),
+        pr.left_bottom() + vec2(6.0, -6.0),
+        pr.right_bottom() + vec2(-6.0, -6.0),
+    ]
+    .into_iter()
+    .find(|p| !cr.contains(*p))
+    .expect("some of the parent is not under the child");
+    d.click(&mut r, on_parent);
+    assert_eq!(
+        r.dict.levels.len(),
+        1,
+        "a click on the parent closes the child"
+    );
+    assert_eq!((r.spine, r.page), page, "and doesn't turn the page");
+    // Open again; Esc closes the child only.
+    d.frame_with(&mut r, vec![egui::Event::PointerMoved(child_at)], shift);
+    assert_eq!(r.dict.levels.len(), 2, "the child opens again");
+    // After that click raised the parent, the new child is still on top.
+    d.idle(&mut r, 2);
+    let (pr2, cr2) = (
+        r.dict.levels[0].rect.unwrap(),
+        r.dict.levels[1].rect.unwrap(),
+    );
+    let both = cr2.intersect(pr2);
+    if both.is_positive() {
+        let child = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::unique(("reader-dict-popup", 1usize)),
+        );
+        assert_eq!(
+            d.ctx.layer_id_at(both.center()),
+            Some(child),
+            "a new child is above a clicked parent"
+        );
+    }
     assert!(d.key(&mut r, Key::Escape), "the reader stays open");
     assert_eq!(r.dict.levels.len(), 1, "Esc closes the child only");
     // ↓ scrolls the popup; the page stays.
@@ -751,6 +874,32 @@ fn dictionaries_window() {
     let g = &r.dict.levels[0].result.groups[0];
     assert!(!g.freqs.is_empty(), "with a Danmei rank");
     d.key(&mut r, Key::Escape);
+    // CC-CEDICT set to start collapsed: the popup is told.
+    {
+        let id = r
+            .dicts
+            .listed()
+            .iter()
+            .find(|x| x.1.starts_with("CC-CEDICT"))
+            .unwrap()
+            .0
+            .clone();
+        let settings = r.settings.clone();
+        r.dicts.edit(&r.dict, &settings, |m| {
+            m.dicts.iter_mut().find(|e| e.id == id).unwrap().collapsed = true;
+        });
+        let t = Instant::now();
+        while !r.dict.dicts.iter().any(|d| d.collapsed) {
+            d.frame(&mut r, vec![]);
+            assert!(t.elapsed().as_secs() < 10, "the popup sees the setting");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        r.dicts.open = true;
+        d.idle(&mut r, 3);
+        d.snap("dicts-collapsed");
+        r.dicts.open = false;
+        d.idle(&mut r, 2);
+    }
     // CC-CEDICT off: nothing to look up in.
     let (cedict, danmei) = {
         let l = r.dicts.listed();

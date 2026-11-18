@@ -90,6 +90,8 @@ pub struct DictInfo {
     pub has_terms: bool,
     pub has_freq: bool,
     pub dir: std::path::PathBuf,
+    /// Its entries start collapsed in the popup (the user's choice).
+    pub collapsed: bool,
 }
 
 pub struct Engine {
@@ -129,6 +131,7 @@ impl Engine {
                         has_terms: s.meta.has_terms(),
                         has_freq: s.meta.has_freq(),
                         dir: s.dir.clone(),
+                        collapsed: entry.collapsed,
                     });
                     e.stores.push(s);
                 }

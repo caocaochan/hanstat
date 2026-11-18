@@ -129,6 +129,9 @@ pub struct Entry {
     pub enabled: bool,
     #[serde(default)]
     pub check: Option<Check>,
+    /// Its entries start collapsed in the popup.
+    #[serde(default)]
+    pub collapsed: bool,
 }
 
 /// The last update check of a dictionary.

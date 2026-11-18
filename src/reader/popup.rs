@@ -15,7 +15,7 @@
 use super::layout::Params;
 use super::render::Renderer;
 use super::tree::LinkTarget;
-use eframe::egui::{self, Color32, Pos2, Rect, RichText, Sense, pos2, vec2};
+use eframe::egui::{self, Color32, Pos2, Rect, RichText, Sense, Vec2, pos2, vec2};
 use hanstat::dict::lookup::{DictInfo, Lookup};
 use hanstat::dict::service::{Reply, Service};
 use serde::{Deserialize, Serialize};
@@ -67,10 +67,12 @@ const REST: f64 = 0.15;
 const WAIT: Duration = Duration::from_millis(3);
 /// Popups open at once: the page's and two inside it.
 pub const MAX_LEVELS: usize = 3;
-/// Dictionaries whose glossaries show without a click, per headword.
-const OPEN_DICTS: usize = 3;
 /// The popup's height by default, in lines of its text.
-pub const DEFAULT_LINES: f32 = 16.0;
+const DEFAULT_LINES: f32 = 16.0;
+/// The popup's width by default, in characters of its text.
+const DEFAULT_CHARS: f32 = 30.0;
+/// The corner grip that resizes the popup.
+const GRIP: f32 = 14.0;
 
 /// A popup's frame around its scrolled entries: margins and border.
 const FRAME_V: f32 = 22.0;
@@ -114,6 +116,8 @@ pub struct Level {
     heights: HashMap<(usize, usize), f32>,
     /// Where it was drawn.
     pub rect: Option<Rect>,
+    /// Put above the other popups (once, when it first shows).
+    raised: bool,
 }
 
 pub struct Popup {
@@ -134,8 +138,11 @@ pub struct Popup {
     pub last_layout_ms: f32,
     /// Lines to scroll the top popup by (↑ ↓), taken when it is drawn.
     pub scroll_lines: i32,
-    /// The popup's height, in lines of its text (a setting).
-    pub lines: f32,
+    /// The popup's size (its entries' area: width, height), as dragged by
+    /// its corner; `None`: the default. Kept in the reader's settings.
+    pub size: Option<Vec2>,
+    /// The size was dragged this frame (to save).
+    pub size_changed: bool,
     /// The popups' areas exist in egui (see [`Popup::warm`]).
     warmed: bool,
 }
@@ -241,7 +248,8 @@ impl Popup {
             rest: None,
             last_layout_ms: 0.0,
             scroll_lines: 0,
-            lines: DEFAULT_LINES,
+            size: None,
+            size_changed: false,
             warmed: false,
         }
     }
@@ -316,6 +324,7 @@ impl Popup {
                     bars: HashSet::new(),
                     heights: HashMap::new(),
                     rect: None,
+                    raised: false,
                 });
             }
         }
@@ -408,7 +417,11 @@ impl Popup {
         if let Some(l) = self.levels.last_mut() {
             for (gi, g) in l.result.groups.iter().enumerate() {
                 for pi in 0..g.parts.len() {
-                    if pi >= OPEN_DICTS {
+                    if self
+                        .dicts
+                        .get(g.parts[pi].dict)
+                        .is_some_and(|d| d.collapsed)
+                    {
                         l.bars.insert((gi, pi));
                     }
                 }
@@ -441,7 +454,7 @@ impl Popup {
         }
         self.warmed = true;
         for level in 0..MAX_LEVELS {
-            egui::Area::new(egui::Id::unique(("reader-dict-popup", level)))
+            egui::Area::new(popup_id(level))
                 .order(egui::Order::Foreground)
                 .fade_in(false)
                 .fixed_pos(pos2(-20_000.0, -20_000.0))
@@ -467,7 +480,27 @@ impl Popup {
         self.renderer.images.poll(ctx);
         let screen = ctx.content_rect();
         let size = (params.base * 0.8).max(13.0);
-        let width = (size * 30.0).clamp(280.0, (screen.width() - 24.0).max(200.0));
+        // The entries' area: as dragged, or the default; within the window.
+        let want = self.size.unwrap_or(vec2(
+            size * DEFAULT_CHARS - 24.0,
+            size * 1.35 * DEFAULT_LINES,
+        ));
+        let width = (want.x + 24.0).clamp(240.0, (screen.width() - 24.0).max(200.0));
+        let content_h = want.y.clamp(100.0, (screen.height() * 0.9).max(100.0));
+        self.size_changed = false;
+        // A click on a popup closes the popups opened from it (where the
+        // popups were last frame, as egui finds what the pointer is on).
+        if ctx.input(|i| i.pointer.primary_clicked())
+            && let Some(p) = ctx.input(|i| i.pointer.interact_pos())
+            && let Some(top) = self
+                .levels
+                .iter()
+                .rposition(|l| l.rect.is_some_and(|r| r.contains(p)))
+            && top + 1 < self.levels.len()
+        {
+            self.levels.truncate(top + 1);
+            self.asked = None;
+        }
         let t = std::time::Instant::now();
         let mut level = 0;
         while level < self.levels.len() {
@@ -483,15 +516,26 @@ impl Popup {
             let w = width - (level as f32 * 24.0).min(width * 0.3);
             // A word looked up in this popup: its child popup replaces any
             // above it, and is drawn in this frame (the loop goes on to it).
-            if let Some((text, origin, anchor)) =
-                self.draw_level(ctx, level, anchor, w, size, params, show_freq, key_held)
-            {
+            if let Some((text, origin, anchor)) = self.draw_level(
+                ctx, level, anchor, w, content_h, size, params, show_freq, key_held,
+            ) {
                 let link = matches!(origin, Origin::Link(_));
                 if !self.asked_for(origin) && (link || self.rested(origin, key, now, ctx)) {
                     self.ask(text, origin, Some(anchor));
                 }
             }
             level += 1;
+        }
+        // A popup shows above every other, once, when it first shows: a
+        // child above the parent it came from, even if the parent was raised
+        // by a click (egui raises an area clicked; raising every frame would
+        // keep that order). A click on a parent closes its children, so it
+        // can't come back over them.
+        for (level, l) in self.levels.iter_mut().enumerate() {
+            if !l.raised {
+                ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, popup_id(level)));
+                l.raised = true;
+            }
         }
         self.last_layout_ms = t.elapsed().as_secs_f32() * 1e3;
     }
@@ -504,17 +548,15 @@ impl Popup {
         level: usize,
         anchor: Rect,
         width: f32,
+        content_h: f32,
         size: f32,
         params: &Params,
         show_freq: bool,
         key_held: bool,
     ) -> Option<(String, Origin, Rect)> {
         let screen = ctx.content_rect();
-        // A fixed height (its entries scroll inside): the setting's lines,
-        // within the window.
-        let max_h = (size * 1.35 * self.lines)
-            .min(screen.height() * 0.8)
-            .max(120.0);
+        // A fixed height: its entries scroll inside.
+        let max_h = content_h;
         let below = screen.bottom() - anchor.bottom();
         let above = anchor.top() - screen.top();
         let x = anchor.left().clamp(
@@ -523,7 +565,7 @@ impl Popup {
         );
         let down = below >= max_h + FRAME_V + 14.0 || below >= above;
         let room = if down { below } else { above };
-        let max_h = max_h.min(room - 14.0 - FRAME_V).max(120.0);
+        let max_h = max_h.min(room - 14.0 - FRAME_V).max(100.0);
         // Placed by its top-left corner always: its height is fixed, so its
         // top is known now above the word too; egui would place a
         // bottom-anchored area from last frame's size, a frame off.
@@ -567,12 +609,18 @@ impl Popup {
         let mut toggle_bar = None;
         let mut toggle_details = None;
         let mut heights: Vec<((usize, usize), f32)> = Vec::new();
-        let pointer = ctx.pointer_hover_pos();
+        // The pointer, if this popup is what it is on (not the page under an
+        // entry scrolled out of view, nor a child popup over this one).
+        let layer = egui::LayerId::new(egui::Order::Foreground, popup_id(level));
+        let pointer = ctx
+            .pointer_hover_pos()
+            .filter(|p| ctx.layer_id_at(*p) == Some(layer));
+        let mut resize: Option<Vec2> = None;
         let clicked = ctx.input(|i| i.pointer.primary_clicked());
         let ppp = ctx.pixels_per_point();
         let renderer = &mut self.renderer;
         let lvl = &self.levels[level];
-        let area = egui::Area::new(egui::Id::unique(("reader-dict-popup", level)))
+        let area = egui::Area::new(popup_id(level))
             .order(egui::Order::Foreground)
             .fade_in(false)
             .fixed_pos(pos)
@@ -580,7 +628,7 @@ impl Popup {
             .constrain(true)
             .show(ctx, |ui| {
                 *ui.visuals_mut() = popup_visuals();
-                egui::Frame::new()
+                let frame = egui::Frame::new()
                     .fill(mocha::BASE)
                     .stroke(egui::Stroke::new(1.0, mocha::SURFACE1))
                     .corner_radius(8)
@@ -616,7 +664,9 @@ impl Popup {
                                     let Some(dict) = dicts.get(p.dict) else {
                                         continue;
                                     };
-                                    let open = (pi < OPEN_DICTS) != lvl.bars.contains(&(gi, pi));
+                                    // Open unless the dictionary is set to start
+                                    // collapsed; a click on its bar toggles it.
+                                    let open = !dict.collapsed != lvl.bars.contains(&(gi, pi));
                                     let label = format!(
                                         "{} {}{}",
                                         if open { "▾" } else { "▸" },
@@ -739,7 +789,57 @@ impl Popup {
                             }
                         });
                     });
+                // The grip in the corner away from the word: dragging it
+                // resizes every popup (down and right, or up and right).
+                let r = frame.response.rect;
+                let grip = if down {
+                    Rect::from_min_size(r.right_bottom() - vec2(GRIP, GRIP), vec2(GRIP, GRIP))
+                } else {
+                    Rect::from_min_size(r.right_top() + vec2(-GRIP, 0.0), vec2(GRIP, GRIP))
+                };
+                let g = ui.interact(grip, egui::Id::unique(("dict-grip", level)), Sense::drag());
+                if g.hovered() || g.dragged() {
+                    ui.ctx().set_cursor_icon(if down {
+                        egui::CursorIcon::ResizeNwSe
+                    } else {
+                        egui::CursorIcon::ResizeNeSw
+                    });
+                }
+                if g.dragged() {
+                    let d = g.drag_delta();
+                    resize = Some(vec2(d.x, if down { d.y } else { -d.y }));
+                }
+                let c = if g.hovered() || g.dragged() {
+                    mocha::SUBTEXT1
+                } else {
+                    mocha::SURFACE2
+                };
+                let p = ui.painter();
+                for k in 1..=3 {
+                    let o = k as f32 * 3.5;
+                    let (a, b) = if down {
+                        (
+                            pos2(grip.right() - 2.0, grip.bottom() - 2.0 - o),
+                            pos2(grip.right() - 2.0 - o, grip.bottom() - 2.0),
+                        )
+                    } else {
+                        (
+                            pos2(grip.right() - 2.0, grip.top() + 2.0 + o),
+                            pos2(grip.right() - 2.0 - o, grip.top() + 2.0),
+                        )
+                    };
+                    p.line_segment([a, b], egui::Stroke::new(1.2, c));
+                }
             });
+        if let Some(d) = resize {
+            let cur = vec2(inner_w + (level as f32 * 24.0).min(width * 0.3), max_h);
+            let screen = ctx.content_rect();
+            self.size = Some(vec2(
+                (cur.x + d.x).clamp(216.0, (screen.width() - 48.0).max(216.0)),
+                (cur.y + d.y).clamp(100.0, (screen.height() * 0.9).max(100.0)),
+            ));
+            self.size_changed = true;
+        }
         let l = &mut self.levels[level];
         l.rect = Some(area.response.rect);
         l.heights.extend(heights);
@@ -756,6 +856,11 @@ impl Popup {
         }
         want
     }
+}
+
+/// The egui id of popup `level`'s area.
+fn popup_id(level: usize) -> egui::Id {
+    egui::Id::unique(("reader-dict-popup", level))
 }
 
 /// A height for glossaries not laid out yet: their text at about a third of

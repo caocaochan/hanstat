@@ -82,8 +82,9 @@ struct Settings {
     check_updates: bool,
     /// Install dictionary updates found, without asking.
     auto_install: bool,
-    /// The popup's height, in lines of its text.
-    popup_lines: f32,
+    /// The popup's size as dragged by its corner (width, height of its
+    /// entries' area); `None`: the default.
+    popup_size: Option<[f32; 2]>,
 }
 
 impl Default for Settings {
@@ -102,7 +103,7 @@ impl Default for Settings {
             show_freq: true,
             check_updates: true,
             auto_install: false,
-            popup_lines: popup::DEFAULT_LINES,
+            popup_size: None,
         }
     }
 }
@@ -546,7 +547,7 @@ impl Reader {
         self.images.poll(&ctx);
         let mut open = true;
         self.dict.warm(&ctx);
-        self.dict.lines = self.settings.popup_lines;
+        self.dict.size = self.settings.popup_size.map(|[w, h]| vec2(w, h));
         self.dict.poll();
         self.dict.anchor = None;
         self.dicts.poll(&ctx, &self.dict, &self.settings);
@@ -951,6 +952,11 @@ impl Reader {
                     lookup_key,
                     now,
                 );
+                if self.dict.size_changed {
+                    self.settings.popup_size = self.dict.size.map(|v| [v.x, v.y]);
+                    // Saved once the drag ends (the save waits for the button's release).
+                    self.dirty = true;
+                }
             } else {
                 self.dict.close();
             }

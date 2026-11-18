@@ -154,6 +154,7 @@ pub fn add_to_manifest(root: &Path, id: &str) -> Result<(), String> {
                 id: id.to_owned(),
                 enabled: true,
                 check: None,
+                collapsed: false,
             });
         }
     })

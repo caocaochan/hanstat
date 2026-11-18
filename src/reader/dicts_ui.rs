@@ -331,7 +331,7 @@ impl Manager {
             settings.show_freq,
             settings.check_updates,
             settings.auto_install,
-            settings.popup_lines,
+            settings.popup_size,
         );
         let mut open = self.open;
         let mut action: Option<Action> = None;
@@ -375,11 +375,20 @@ impl Manager {
                 }
                 egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
                     egui::Grid::new("dict-rows")
-                        .num_columns(7)
+                        .num_columns(9)
                         .spacing([10.0, 6.0])
                         .striped(true)
                         .show(ui, |ui| {
                             let n = self.rows.len();
+                            if n > 0 {
+                                let head = |ui: &mut egui::Ui, t: &str| {
+                                    ui.label(RichText::new(t).size(12.0).color(super::theme::BASE1));
+                                };
+                                for t in ["On", "", "Dictionary", "Kind", "Entries", "Size", "Updates", "Collapsed", ""] {
+                                    head(ui, t);
+                                }
+                                ui.end_row();
+                            }
                             for (i, (e, m)) in self.rows.iter().enumerate() {
                                 let mut on = e.enabled;
                                 if ui.checkbox(&mut on, "").on_hover_text("Use in the popup").changed() {
@@ -458,6 +467,18 @@ impl Manager {
                                         ui.label("");
                                     }
                                 }
+                                if m.as_ref().is_some_and(|m| m.has_terms()) {
+                                    let mut c = e.collapsed;
+                                    if ui
+                                        .checkbox(&mut c, "")
+                                        .on_hover_text("Its entries start collapsed in the popup (click its bar there to open them)")
+                                        .changed()
+                                    {
+                                        action = Some(Action::Collapse(e.id.clone(), c));
+                                    }
+                                } else {
+                                    ui.label("");
+                                }
                                 if self.confirm_delete.as_deref() == Some(&e.id) {
                                     ui.horizontal(|ui| {
                                         if ui.button(RichText::new("Delete").color(Color32::from_rgb(0xdc, 0x32, 0x2f))).clicked() {
@@ -534,13 +555,20 @@ impl Manager {
                     ui.label("");
                     ui.checkbox(&mut settings.show_freq, "Show frequency ranks");
                     ui.end_row();
-                    ui.label("Popup height");
-                    ui.add(
-                        egui::Slider::new(&mut settings.popup_lines, 8.0..=40.0)
-                            .step_by(1.0)
-                            .suffix(" lines"),
-                    )
-                    .on_hover_text("Longer entries scroll inside it (also with ↑ ↓)");
+                    ui.label("Popup size");
+                    ui.horizontal(|ui| {
+                        ui.label(match settings.popup_size {
+                            Some([w, h]) => format!("{w:.0} × {h:.0}"),
+                            None => "Default".to_owned(),
+                        })
+                        .on_hover_text("Drag the popup's corner to resize it; longer entries scroll inside it (also with ↑ ↓)");
+                        if ui
+                            .add_enabled(settings.popup_size.is_some(), egui::Button::new("Reset"))
+                            .clicked()
+                        {
+                            settings.popup_size = None;
+                        }
+                    });
                     ui.end_row();
                     ui.label("Updates");
                     ui.vertical(|ui| {
@@ -574,6 +602,11 @@ impl Manager {
                     e.enabled = on;
                 }
             }),
+            Some(Action::Collapse(id, c)) => self.edit(popup, settings, |m| {
+                if let Some(e) = m.dicts.iter_mut().find(|e| e.id == id) {
+                    e.collapsed = c;
+                }
+            }),
             Some(Action::Move(a, b)) => self.edit(popup, settings, |m| {
                 if a < m.dicts.len() && b < m.dicts.len() {
                     m.dicts.swap(a, b);
@@ -593,7 +626,7 @@ impl Manager {
             settings.show_freq,
             settings.check_updates,
             settings.auto_install,
-            settings.popup_lines,
+            settings.popup_size,
         );
         if after.1 != before.1 {
             popup.reload(settings.freq_sort.clone());
@@ -608,6 +641,7 @@ enum Action {
     UpdateAll,
     Update(String),
     Enable(String, bool),
+    Collapse(String, bool),
     Move(usize, usize),
     AskDelete(String),
     KeepIt,
