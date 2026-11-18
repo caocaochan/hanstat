@@ -206,9 +206,21 @@ impl Driver {
 
     /// One frame; `false` once the reader closed.
     fn frame(&mut self, r: &mut Reader, events: Vec<egui::Event>) -> bool {
+        self.frame_with(r, events, egui::Modifiers::NONE)
+    }
+
+    /// A frame with `modifiers` held (egui keeps them from frame to frame).
+    fn frame_with(
+        &mut self,
+        r: &mut Reader,
+        events: Vec<egui::Event>,
+        modifiers: egui::Modifiers,
+    ) -> bool {
+        let mut all = vec![egui::Event::ModifiersChanged(modifiers)];
+        all.extend(events);
         let raw = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, self.size)),
-            events,
+            events: all,
             time: Some(self.time),
             predicted_dt: 1.0 / 60.0,
             ..Default::default()
@@ -413,6 +425,399 @@ fn contents_clicks() {
         "Esc with the menu open keeps the reader"
     );
     assert!(r.probe.toc_item.is_none(), "Esc closes the menu");
+    r.close(&d.ctx);
+}
+
+/// The dictionary popup with real dictionaries (those of `LOCALAPPDATA`'s
+/// hanstat folder: point it at a scratch copy). Shift over a word opens the
+/// popup in the same frame, with the word highlighted; Esc closes it and not
+/// the reader; a click on the page closes it without turning the page; a
+/// page turn closes it. Prints the frame times of 60 lookups.
+#[test]
+#[ignore]
+fn dictionary_popup() {
+    let book = env("READER_EPUB").expect("set READER_EPUB");
+    let mut d = Driver::new();
+    let mut r = d.open(&book);
+    r.spine = env("READER_SPINE")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    r.target = Some(Target::Offset(0));
+    d.ready(&mut r);
+    let t = Instant::now();
+    while !r.dict.has_terms() {
+        d.frame(&mut r, vec![]);
+        assert!(
+            t.elapsed().as_secs() < 30,
+            "no dictionaries in {:?}",
+            hanstat::dict::root()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    eprintln!(
+        "{} dictionaries, scan {} characters",
+        r.dict.dicts.len(),
+        r.dict.scan_len
+    );
+    let l = r.layouts[&r.spine].clone();
+    let ch = r.chapter(r.spine).unwrap();
+    let (idx, off) = r.probe.sides[0];
+    // Han characters of the first page, their boxes on screen.
+    let spots: Vec<(u32, Rect)> = (0..ch.chars.len() as u32)
+        .filter(|&s| hanstat::chars::is_han(ch.chars[s as usize]))
+        .filter_map(|s| {
+            l.char_rects(idx, s..s + 1)
+                .first()
+                .map(|b| (s, b.translate(off)))
+        })
+        .collect();
+    assert!(spots.len() > 60, "a page of text");
+    let shift = egui::Modifiers::SHIFT;
+    let page = (r.spine, r.page);
+    // Lookups: each in the frame that moves the pointer there.
+    let mut frames = Vec::new();
+    let mut micros = Vec::new();
+    let mut layouts = Vec::new();
+    let (mut shown, mut late, mut none, mut covered) = (0, Vec::new(), Vec::new(), 0);
+    for (k, (src, rect)) in spots
+        .iter()
+        .step_by((spots.len() / 60).max(1))
+        .take(60)
+        .enumerate()
+    {
+        // Under the popup the pointer is on the popup, not the page (as in Yomitan).
+        if r.dict.contains(rect.center()) {
+            covered += 1;
+            continue;
+        }
+        let t = Instant::now();
+        d.frame_with(
+            &mut r,
+            vec![egui::Event::PointerMoved(rect.center())],
+            shift,
+        );
+        frames.push(t.elapsed().as_secs_f64() * 1e3);
+        if r.dict.highlight(r.spine).is_some_and(|(hs, _)| hs == *src) {
+            micros.push(r.dict.last_micros);
+            layouts.push(r.dict.last_layout_ms);
+            shown += 1;
+        } else {
+            // Not in this frame: a slow lookup, or nothing found.
+            let mut frames_more = 0;
+            while frames_more < 60 && !r.dict.highlight(r.spine).is_some_and(|(hs, _)| hs == *src) {
+                d.frame_with(&mut r, vec![], shift);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                frames_more += 1;
+            }
+            let c = ch.chars[*src as usize];
+            if r.dict.highlight(r.spine).is_some_and(|(hs, _)| hs == *src) {
+                late.push((c, frames_more, r.dict.last_micros));
+            } else {
+                none.push(c);
+            }
+        }
+        if k == 3 {
+            d.snap("popup");
+        }
+    }
+    eprintln!("late: {late:?}; nothing found: {none:?}; under the popup: {covered}");
+    frames.sort_by(|a, b| a.total_cmp(b));
+    micros.sort();
+    layouts.sort_by(|a, b| a.total_cmp(b));
+    eprintln!(
+        "popup entries built and laid out: median {:.2} ms, max {:.2} ms",
+        layouts[layouts.len() / 2],
+        layouts.last().unwrap()
+    );
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let s = &super::render::STAGES;
+        let n = s[4].load(Relaxed).max(1) as f64;
+        eprintln!(
+            "{} entries built: HTML {:.0} µs, parse {:.0} µs, style {:.0} µs, layout {:.0} µs each",
+            n,
+            s[0].load(Relaxed) as f64 / n,
+            s[1].load(Relaxed) as f64 / n,
+            s[2].load(Relaxed) as f64 / n,
+            s[3].load(Relaxed) as f64 / n
+        );
+    }
+    eprintln!(
+        "{shown}/{} shown in the same frame; frame with lookup and popup: median {:.2} ms, p99 {:.2} ms, max {:.2} ms; lookup thread median {} µs, max {} µs",
+        frames.len(),
+        frames[frames.len() / 2],
+        frames[frames.len() * 99 / 100],
+        frames.last().unwrap(),
+        micros[micros.len() / 2],
+        micros.last().unwrap()
+    );
+    assert!(late.is_empty(), "shown in the frame that points at them");
+    assert!(none.is_empty(), "every Han character is in some dictionary");
+    // Without Shift, moving the pointer changes nothing.
+    let before = r.dict.highlight(r.spine);
+    d.frame(&mut r, vec![egui::Event::PointerMoved(spots[0].1.center())]);
+    assert_eq!(r.dict.highlight(r.spine), before);
+    // A word in the popup, with Shift: a child popup beside it.
+    let pr = r.dict.levels[0].rect.expect("drawn");
+    let mut child_at = None;
+    'find: for y in (0..)
+        .map(|k| pr.top() + 30.0 + k as f32 * 9.0)
+        .take_while(|y| *y < pr.bottom() - 10.0)
+    {
+        for x in (0..)
+            .map(|k| pr.left() + 16.0 + k as f32 * 11.0)
+            .take_while(|x| *x < pr.right() - 16.0)
+        {
+            d.frame_with(&mut r, vec![egui::Event::PointerMoved(pos2(x, y))], shift);
+            if r.dict.levels.len() == 2 {
+                child_at = Some(pos2(x, y));
+                break 'find;
+            }
+        }
+    }
+    let child_at = child_at.expect("a word in the popup opens a child popup");
+    eprintln!(
+        "child popup for {:?} at {child_at:?}",
+        r.dict.levels[1].result.text
+    );
+    // Drawn in the frame that asked it (egui knew its area already).
+    assert!(
+        r.dict.levels[1]
+            .rect
+            .is_some_and(|c| c.is_positive() && c.left() > -1000.0),
+        "drawn"
+    );
+    assert!(
+        d.ctx
+            .memory(|m| m.areas().visible_last_frame(&egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::unique(("reader-dict-popup", 1usize))
+            ))),
+        "visible in the frame that asked it"
+    );
+    d.snap("popup-child");
+    assert!(d.key(&mut r, Key::Escape), "the reader stays open");
+    assert_eq!(r.dict.levels.len(), 1, "Esc closes the child only");
+    // ↓ scrolls the popup; the page stays.
+    assert!(d.key(&mut r, Key::ArrowDown));
+    assert!(r.dict.is_open(), "↓ scrolls the popup");
+    assert_eq!((r.spine, r.page), page, "and doesn't turn the page");
+    // Esc closes the popup, not the reader.
+    assert!(r.dict.is_open());
+    assert!(d.key(&mut r, Key::Escape), "the reader stays open");
+    assert!(!r.dict.is_open(), "Esc closes the popup");
+    // A click on the page closes it without turning the page.
+    d.frame_with(
+        &mut r,
+        vec![egui::Event::PointerMoved(spots[10].1.center())],
+        shift,
+    );
+    assert!(r.dict.is_open());
+    d.click(&mut r, pos2(d.size.x - 60.0, d.size.y - 40.0));
+    assert!(!r.dict.is_open(), "a click closes the popup");
+    assert_eq!((r.spine, r.page), page, "and doesn't turn the page");
+    // A page turn closes it.
+    d.frame_with(
+        &mut r,
+        vec![egui::Event::PointerMoved(spots[20].1.center())],
+        shift,
+    );
+    assert!(r.dict.is_open());
+    d.key(&mut r, Key::ArrowRight);
+    assert!(!r.dict.is_open(), "turning the page closes the popup");
+    assert_ne!((r.spine, r.page), page);
+    r.close(&d.ctx);
+}
+
+/// Popups of words picked by hand, to look at: `READER_WORDS` (comma-
+/// separated) are shown over the first page, all dictionaries open, one PNG
+/// each in `READER_OUT`.
+#[test]
+#[ignore]
+fn popup_words() {
+    let book = env("READER_EPUB").expect("set READER_EPUB");
+    let words = env("READER_WORDS").unwrap_or_else(|| "说话,行,画蛇添足,北京,一".into());
+    let mut d = Driver::new();
+    d.size = vec2(1200.0, 900.0);
+    let mut r = d.open(&book);
+    r.spine = env("READER_SPINE")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    r.target = Some(Target::Offset(0));
+    d.ready(&mut r);
+    while !r.dict.has_terms() {
+        d.frame(&mut r, vec![]);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let l = r.layouts[&r.spine].clone();
+    let ch = r.chapter(r.spine).unwrap();
+    let (idx, off) = r.probe.sides[0];
+    let first = (0..ch.chars.len() as u32)
+        .filter(|&s| hanstat::chars::is_han(ch.chars[s as usize]))
+        .find_map(|s| {
+            l.char_rects(idx, s..s + 1)
+                .first()
+                .map(|b| b.translate(off))
+        })
+        .unwrap();
+    let shift = egui::Modifiers::SHIFT;
+    for (i, w) in words.split(',').enumerate() {
+        d.frame_with(
+            &mut r,
+            vec![egui::Event::PointerMoved(first.center())],
+            shift,
+        );
+        assert!(r.dict.is_open());
+        r.dict.show_word(w);
+        r.dict.open_all();
+        let t = Instant::now();
+        d.frame_with(&mut r, vec![], egui::Modifiers::NONE);
+        eprintln!(
+            "{w}: {} groups, frame {:?}, entries {:.2} ms",
+            r.dict.levels[0].result.groups.len(),
+            t.elapsed(),
+            r.dict.last_layout_ms
+        );
+        d.idle(&mut r, 3);
+        if let Some(n) = env("READER_SCROLL").and_then(|v| v.parse().ok()) {
+            r.dict.scroll_lines = n;
+            // Images arrive decoded a few frames later.
+            for _ in 0..20 {
+                d.frame(&mut r, vec![]);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        d.snap(&format!("word-{i}-{w}"));
+    }
+    r.close(&d.ctx);
+}
+
+/// The Dictionaries window from an empty start (point `LOCALAPPDATA` at an
+/// empty scratch folder; `READER_DICTS` is the folder of zips): CC-CEDICT and
+/// Danmei imported through it, then looked up; CC-CEDICT turned off (no
+/// definitions left), Danmei deleted.
+#[test]
+#[ignore]
+fn dictionaries_window() {
+    let book = env("READER_EPUB").expect("set READER_EPUB");
+    let zips = std::path::PathBuf::from(env("READER_DICTS").expect("set READER_DICTS"));
+    let mut d = Driver::new();
+    let mut r = d.open(&book);
+    r.spine = 5;
+    r.target = Some(Target::Offset(0));
+    d.ready(&mut r);
+    assert!(r.dicts.listed().is_empty(), "an empty start");
+    r.dicts.open = true;
+    d.idle(&mut r, 3);
+    d.snap("dicts-empty");
+    let t = Instant::now();
+    r.dicts
+        .import(vec![zips.join("CC-CEDICT.zip"), zips.join("Danmei.zip")]);
+    while r.dicts.busy() || !r.dict.has_terms() {
+        d.frame(&mut r, vec![]);
+        assert!(t.elapsed().as_secs() < 60, "imports finish");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    eprintln!(
+        "imported in {:?}: {:?}; {:?}",
+        t.elapsed(),
+        r.dicts.listed(),
+        r.dicts.notes()
+    );
+    assert_eq!(r.dicts.listed().len(), 2);
+    d.idle(&mut r, 3);
+    d.snap("dicts-two");
+    r.dicts.open = false;
+    // egui finds what is under the pointer from the last frame's windows.
+    d.idle(&mut r, 2);
+    // Looked up, with the rank.
+    let l = r.layouts[&r.spine].clone();
+    let ch = r.chapter(r.spine).unwrap();
+    let (idx, off) = r.probe.sides[0];
+    let spot = (0..ch.chars.len() as u32)
+        .filter(|&s| hanstat::chars::is_han(ch.chars[s as usize]))
+        .find_map(|s| {
+            l.char_rects(idx, s..s + 1)
+                .first()
+                .map(|b| b.translate(off))
+        })
+        .unwrap();
+    d.frame_with(
+        &mut r,
+        vec![egui::Event::PointerMoved(spot.center())],
+        egui::Modifiers::SHIFT,
+    );
+    assert!(r.dict.is_open(), "found in CC-CEDICT");
+    let g = &r.dict.levels[0].result.groups[0];
+    assert!(!g.freqs.is_empty(), "with a Danmei rank");
+    d.key(&mut r, Key::Escape);
+    // CC-CEDICT off: nothing to look up in.
+    let (cedict, danmei) = {
+        let l = r.dicts.listed();
+        (
+            l.iter()
+                .find(|x| x.1.starts_with("CC-CEDICT"))
+                .unwrap()
+                .0
+                .clone(),
+            l.iter().find(|x| x.1 == "Danmei").unwrap().0.clone(),
+        )
+    };
+    let settings = r.settings.clone();
+    r.dicts.edit(&r.dict, &settings, |m| {
+        m.dicts.iter_mut().find(|e| e.id == cedict).unwrap().enabled = false;
+    });
+    let t = Instant::now();
+    while r.dict.has_terms() {
+        d.frame(&mut r, vec![]);
+        assert!(t.elapsed().as_secs() < 10);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    // Danmei deleted: its folder is gone.
+    r.dicts.delete(&danmei, &mut r.dict, &settings);
+    assert_eq!(r.dicts.listed().len(), 1);
+    assert!(!hanstat::dict::root().join(&danmei).exists());
+    r.dicts.open = true;
+    d.idle(&mut r, 3);
+    d.snap("dicts-after");
+    r.close(&d.ctx);
+}
+
+/// Over the network, from an empty app folder (point `LOCALAPPDATA` at
+/// one): the reader downloads CC-CEDICT by itself; once deleted, it is not
+/// downloaded again.
+#[test]
+#[ignore]
+fn default_dictionary() {
+    let book = env("READER_EPUB").expect("set READER_EPUB");
+    let mut d = Driver::new();
+    let mut r = d.open(&book);
+    d.ready(&mut r);
+    let t = Instant::now();
+    while r.dicts.busy() || !r.dict.has_terms() {
+        d.frame(&mut r, vec![]);
+        assert!(
+            t.elapsed().as_secs() < 120,
+            "downloaded: {:?}",
+            r.dicts.notes()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    eprintln!("installed in {:?}: {:?}", t.elapsed(), r.dicts.notes());
+    let listed = r.dicts.listed();
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].1.starts_with("CC-CEDICT"), "{listed:?}");
+    let settings = r.settings.clone();
+    r.dicts.delete(&listed[0].0, &mut r.dict, &settings);
+    r.close(&d.ctx);
+    // Opened again: nothing downloaded.
+    let mut r = d.open(&book);
+    d.ready(&mut r);
+    d.idle(&mut r, 10);
+    assert!(
+        !r.dicts.busy() && r.dicts.listed().is_empty(),
+        "a deleted default stays deleted"
+    );
     r.close(&d.ctx);
 }
 

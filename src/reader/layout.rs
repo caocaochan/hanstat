@@ -49,6 +49,15 @@ pub enum Item {
     Fill {
         rect: Rect,
         color: Color32,
+        /// Rounded corners.
+        radius: f32,
+    },
+    /// An outline with rounded corners (an inline box's border).
+    Frame {
+        rect: Rect,
+        radius: f32,
+        width: f32,
+        color: Color32,
     },
     Line {
         a: Pos2,
@@ -83,6 +92,32 @@ pub struct Link {
     unit: usize,
 }
 
+/// Where a line's characters are, for finding the one under the pointer.
+/// Its characters are `start..start + len` of [`Hits`]' arrays.
+#[derive(Clone, Copy, Debug)]
+pub struct HitLine {
+    /// The line box.
+    pub top: f32,
+    pub bottom: f32,
+    /// The text's own height in it (a highlight's top and bottom).
+    pub glyph_top: f32,
+    pub glyph_bottom: f32,
+    unit: usize,
+    start: u32,
+    len: u32,
+}
+
+/// The characters of a laid-out chapter: lines in layout order, and for each
+/// character its left edge, advance and index in [`Chapter::chars`]
+/// (increasing through the chapter).
+#[derive(Default)]
+pub struct Hits {
+    pub lines: Vec<HitLine>,
+    x: Vec<f32>,
+    w: Vec<f32>,
+    src: Vec<u32>,
+}
+
 pub struct ChapterLayout {
     pub items: Vec<Item>,
     units: Vec<Unit>,
@@ -91,6 +126,7 @@ pub struct ChapterLayout {
     pub pages: Vec<Page>,
     pub anchors: HashMap<String, usize>,
     pub links: Vec<Link>,
+    pub hits: Hits,
 }
 
 impl ChapterLayout {
@@ -144,6 +180,11 @@ impl ChapterLayout {
     }
 
     /// The page's used height (for centring a lone image).
+    /// The height of the whole flow (a popup entry: one long page).
+    pub fn flow_height(&self) -> f32 {
+        self.units.last().map_or(0.0, |u| u.bottom)
+    }
+
     pub fn page_height(&self, page: usize) -> f32 {
         self.pages.get(page).map_or(0.0, |p| {
             self.units[p.units.end - 1].bottom - self.units[p.units.start].top
@@ -158,6 +199,50 @@ impl ChapterLayout {
             .unwrap_or(0..0);
         self.links.iter().filter(move |l| range.contains(&l.unit))
     }
+
+    /// The lines of `page`, as a range of [`Hits::lines`].
+    fn page_lines(&self, page: usize) -> Range<usize> {
+        let Some(p) = self.pages.get(page) else {
+            return 0..0;
+        };
+        let lines = &self.hits.lines;
+        let a = lines.partition_point(|l| l.unit < p.units.start);
+        let z = lines.partition_point(|l| l.unit < p.units.end);
+        a..z
+    }
+
+    /// The character at `p` (flow coordinates) on `page`: its index in
+    /// [`Chapter::chars`]. Only a point on a character's own box counts.
+    pub fn char_at(&self, page: usize, p: Pos2) -> Option<u32> {
+        let h = &self.hits;
+        let lines = &h.lines[self.page_lines(page)];
+        let i = lines.partition_point(|l| l.bottom <= p.y);
+        let l = lines.get(i).filter(|l| l.top <= p.y)?;
+        let (a, z) = (l.start as usize, (l.start + l.len) as usize);
+        let k = a + h.x[a..z].partition_point(|x| *x <= p.x);
+        let k = k.checked_sub(1).filter(|k| *k >= a)?;
+        (p.x < h.x[k] + h.w[k]).then_some(h.src[k])
+    }
+
+    /// The boxes (flow coordinates) of the characters `src` of
+    /// [`Chapter::chars`] that are on `page`, one per line.
+    pub fn char_rects(&self, page: usize, src: Range<u32>) -> Vec<Rect> {
+        let h = &self.hits;
+        let mut out = Vec::new();
+        for l in &h.lines[self.page_lines(page)] {
+            let (a, z) = (l.start as usize, (l.start + l.len) as usize);
+            let s = &h.src[a..z];
+            let i = a + s.partition_point(|x| *x < src.start);
+            let j = a + s.partition_point(|x| *x < src.end);
+            if i < j {
+                out.push(Rect::from_min_max(
+                    pos2(h.x[i], l.glyph_top),
+                    pos2(h.x[j - 1] + h.w[j - 1], l.glyph_bottom),
+                ));
+            }
+        }
+        out
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -165,6 +250,37 @@ enum AKind {
     Char,
     Image(usize),
     Break,
+    /// An inline box: index into `Flow::boxes`.
+    Box(usize),
+}
+
+#[derive(Clone)]
+enum BoxPiece {
+    Text {
+        galley: Arc<Galley>,
+        x: f32,
+        y: f32,
+    },
+    Image {
+        path: String,
+        x: f32,
+        y: f32,
+        size: Vec2,
+    },
+}
+
+/// An inline box laid out: its content on one line, its padding and border.
+struct InBox {
+    /// Its content, on one baseline: text runs and images, by x from the
+    /// content's left and y from its top.
+    pieces: Vec<BoxPiece>,
+    style: StyleId,
+    /// Outer size (border box).
+    size: Vec2,
+    /// From the border box's top to the content's baseline.
+    base: f32,
+    /// Border and padding before the content: left, top.
+    inset: Vec2,
 }
 
 #[derive(Clone, Copy)]
@@ -178,7 +294,11 @@ struct Atom {
     w: f32,
     /// Space before it (ruby wider than its base).
     lead: f32,
+    /// Index in [`Chapter::chars`]; [`NO_SRC`] for images and breaks.
+    src: u32,
 }
+
+const NO_SRC: u32 = u32::MAX;
 
 struct Flow<'a, 'f> {
     p: &'a Params,
@@ -197,6 +317,9 @@ struct Flow<'a, 'f> {
     pending_anchors: Vec<String>,
     anchors: HashMap<String, usize>,
     struts: HashMap<StyleId, (f32, f32)>,
+    hits: Hits,
+    /// The inline boxes of the paragraph being laid out.
+    boxes: Vec<InBox>,
 }
 
 pub fn layout(
@@ -222,6 +345,8 @@ pub fn layout(
         pending_anchors: Vec::new(),
         anchors: HashMap::new(),
         struts: HashMap::new(),
+        hits: Hits::default(),
+        boxes: Vec::new(),
     };
     f.block(&ch.root, 0.0, p.content_w);
     let last = f.units.len().saturating_sub(1);
@@ -263,6 +388,7 @@ pub fn layout(
         pages,
         anchors: f.anchors,
         links: f.links,
+        hits: f.hits,
     }
 }
 
@@ -385,6 +511,15 @@ impl Flow<'_, '_> {
         if s.hidden {
             return Color32::TRANSPARENT;
         }
+        let c = self.color_opaque(s);
+        if s.opacity < 1.0 {
+            c.gamma_multiply(s.opacity)
+        } else {
+            c
+        }
+    }
+
+    fn color_opaque(&self, s: &Style) -> Color32 {
         match s.color {
             None => self.p.text,
             Some(c) => {
@@ -502,6 +637,7 @@ impl Flow<'_, '_> {
             self.items.push(Item::Fill {
                 rect: Rect::NOTHING,
                 color: Color32::TRANSPARENT,
+                radius: 0.0,
             });
             Some(self.items.len() - 1)
         } else {
@@ -532,7 +668,16 @@ impl Flow<'_, '_> {
         if let Some(slot) = deco_slot {
             let rect = Rect::from_min_max(pos2(left, top), pos2(left + total, bottom));
             if let Some(bg) = s.background.filter(|c| !near_white(*c)) {
-                self.items[slot] = Item::Fill { rect, color: bg };
+                let bg = if s.opacity < 1.0 {
+                    bg.gamma_multiply(s.opacity)
+                } else {
+                    bg
+                };
+                self.items[slot] = Item::Fill {
+                    rect,
+                    color: bg,
+                    radius: s.radius * self.p.base,
+                };
                 self.decos.push((top, bottom, slot));
             }
             for (i, b) in s.border.iter().enumerate() {
@@ -710,6 +855,192 @@ impl Flow<'_, '_> {
         self.push_unit(top, self.y, n - 1..n, false, 0);
     }
 
+    /// Lay out an inline box's content on one line, within `avail`:
+    /// (the box, the margin before it, the margin after it).
+    fn inline_box(&mut self, items: &[Inline], style: StyleId, avail: f32) -> (InBox, f32, f32) {
+        let s = self.ch.styles[style as usize].clone();
+        let base = self.p.base;
+        let pad: Vec<f32> = s
+            .padding
+            .iter()
+            .map(|l| l.px(base, avail).max(0.0))
+            .collect();
+        let bw: Vec<f32> = s
+            .border
+            .iter()
+            .map(|b| {
+                if b.visible() {
+                    (b.width * base).max(0.75)
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let ml = s.margin[3].px(base, avail);
+        let mr = s.margin[1].px(base, avail);
+        // Text runs and images (a dictionary's glyph for a rare character),
+        // nested boxes flattened into them.
+        enum Run<'a> {
+            Text(&'a str, StyleId),
+            Image(&'a Img, StyleId),
+        }
+        fn flatten<'a>(items: &'a [Inline], out: &mut Vec<Run<'a>>) {
+            for it in items {
+                match it {
+                    Inline::Text { text, style, .. } => out.push(Run::Text(text, *style)),
+                    Inline::Image { img, style, .. } => out.push(Run::Image(img, *style)),
+                    Inline::Box { items, .. } => flatten(items, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut runs = Vec::new();
+        flatten(items, &mut runs);
+        if runs.is_empty() {
+            runs.push(Run::Text(" ", style));
+        }
+        // Pieces with their height above and below the baseline.
+        let mut pieces: Vec<(BoxPiece, f32, f32)> = Vec::new();
+        let mut x = 0.0;
+        let mut job = LayoutJob::default();
+        let flush = |job: &mut LayoutJob,
+                     x: &mut f32,
+                     pieces: &mut Vec<(BoxPiece, f32, f32)>,
+                     fonts: &mut FontsView<'_>| {
+            if job.sections.is_empty() {
+                return;
+            }
+            let mut j = std::mem::take(job);
+            j.wrap.max_width = f32::INFINITY;
+            let g = fonts.layout_job(j);
+            let b = baseline(&g);
+            let (w, h) = (g.size().x, g.size().y);
+            pieces.push((
+                BoxPiece::Text {
+                    galley: g,
+                    x: *x,
+                    y: 0.0,
+                },
+                b,
+                h - b,
+            ));
+            *x += w;
+        };
+        for r in &runs {
+            match r {
+                Run::Text(t, st) => {
+                    let f = self.format(&self.ch.styles[*st as usize].clone(), 0.0);
+                    job.append(t, 0.0, f);
+                }
+                Run::Image(img, st) => {
+                    flush(&mut job, &mut x, &mut pieces, self.fonts);
+                    let s = self.ch.styles[*st as usize].clone();
+                    let size = self.image_size(img, &s, avail);
+                    pieces.push((
+                        BoxPiece::Image {
+                            path: img.path.clone(),
+                            x,
+                            y: 0.0,
+                            size,
+                        },
+                        size.y,
+                        0.0,
+                    ));
+                    x += size.x;
+                }
+            }
+        }
+        flush(&mut job, &mut x, &mut pieces, self.fonts);
+        let above = pieces.iter().map(|p| p.1).fold(0.0, f32::max);
+        let below = pieces.iter().map(|p| p.2).fold(0.0, f32::max);
+        let pieces: Vec<BoxPiece> = pieces
+            .into_iter()
+            .map(|(p, a, _)| match p {
+                BoxPiece::Text { galley, x, .. } => BoxPiece::Text {
+                    galley,
+                    x,
+                    y: above - a,
+                },
+                BoxPiece::Image { path, x, size, .. } => BoxPiece::Image {
+                    path,
+                    x,
+                    y: above - size.y,
+                    size,
+                },
+            })
+            .collect();
+        let inset = vec2(bw[3] + pad[3], bw[0] + pad[0]);
+        let size = vec2(
+            (x + inset.x + pad[1] + bw[1]).min(avail.max(1.0)),
+            above + below + inset.y + pad[2] + bw[2],
+        );
+        let b = InBox {
+            base: inset.y + above,
+            pieces,
+            style,
+            size,
+            inset,
+        };
+        (b, ml, mr)
+    }
+
+    /// Draw inline box `k` with its content on the baseline `at.y`, from `at.x`.
+    fn emit_box(&mut self, k: usize, at: Pos2) {
+        let (pieces, style, size, base, inset) = {
+            let b = &self.boxes[k];
+            (b.pieces.clone(), b.style, b.size, b.base, b.inset)
+        };
+        let s = self.ch.styles[style as usize].clone();
+        let rect = Rect::from_min_size(pos2(at.x, at.y - base), size);
+        let radius = (s.radius * self.p.base).min(size.y / 2.0);
+        if let Some(bg) = s.background {
+            let bg = if s.opacity < 1.0 {
+                bg.gamma_multiply(s.opacity)
+            } else {
+                bg
+            };
+            self.items.push(Item::Fill {
+                rect,
+                color: bg,
+                radius,
+            });
+        }
+        if let Some(b) = s.border.iter().find(|b| b.visible()) {
+            let color = b.color.map_or(self.p.rule, |c| {
+                let c = self.color_opaque(&Style {
+                    color: Some(c),
+                    ..Style::default()
+                });
+                if s.opacity < 1.0 {
+                    c.gamma_multiply(s.opacity)
+                } else {
+                    c
+                }
+            });
+            let width = (b.width * self.p.base).max(0.75);
+            self.items.push(Item::Frame {
+                rect: rect.shrink(width / 2.0),
+                radius,
+                width,
+                color,
+            });
+        }
+        let origin = rect.min + inset;
+        for p in pieces {
+            match p {
+                BoxPiece::Text { galley, x, y } => self.items.push(Item::Text {
+                    pos: origin + vec2(x, y),
+                    galley,
+                    faux: None,
+                }),
+                BoxPiece::Image { path, x, y, size } => self.items.push(Item::Image {
+                    rect: Rect::from_min_size(origin + vec2(x, y), size),
+                    path,
+                }),
+            }
+        }
+    }
+
     fn inline(&mut self, items: &[Inline], block_style: StyleId, x0: f32, w: f32, first: bool) {
         let ch = self.ch;
         let bs = ch.styles[block_style as usize].clone();
@@ -720,13 +1051,19 @@ impl Flow<'_, '_> {
         let mut anchors: Vec<(usize, String)> = Vec::new();
         let mut ruby_open: Option<usize> = None;
         let mut widths: HashMap<(char, StyleId), f32> = HashMap::new();
+        self.boxes.clear();
         for it in items {
             match it {
-                Inline::Text { text, style, link } => {
+                Inline::Text {
+                    text,
+                    style,
+                    link,
+                    src,
+                } => {
                     let s = &ch.styles[*style as usize];
                     let fid = FontId::new(self.font_px(s), self.family(s).0);
                     let ls = s.letter_spacing * self.p.base;
-                    for c in text.chars() {
+                    for (k, c) in text.chars().enumerate() {
                         let w = *widths
                             .entry((c, *style))
                             .or_insert_with(|| self.fonts.glyph_width(&fid, c) + ls);
@@ -738,6 +1075,7 @@ impl Flow<'_, '_> {
                             ruby: ruby_open,
                             w,
                             lead: 0.0,
+                            src: src + k as u32,
                         });
                     }
                 }
@@ -753,6 +1091,7 @@ impl Flow<'_, '_> {
                         ruby: ruby_open,
                         w: size.x,
                         lead: 0.0,
+                        src: NO_SRC,
                     });
                 }
                 Inline::Break => atoms.push(Atom {
@@ -763,6 +1102,7 @@ impl Flow<'_, '_> {
                     ruby: None,
                     w: 0.0,
                     lead: 0.0,
+                    src: NO_SRC,
                 }),
                 Inline::Anchor(id) => anchors.push((atoms.len(), id.clone())),
                 Inline::RubyStart { annotation, style } => {
@@ -777,6 +1117,21 @@ impl Flow<'_, '_> {
                     if let Some(r) = ruby_open.take() {
                         rubies[r].2 = atoms.len();
                     }
+                }
+                Inline::Box { items, style, link } => {
+                    let (b, lead, trail) = self.inline_box(items, *style, w);
+                    let outer = b.size.x;
+                    self.boxes.push(b);
+                    atoms.push(Atom {
+                        ch: '\u{FFFC}',
+                        kind: AKind::Box(self.boxes.len() - 1),
+                        style: *style,
+                        link: *link,
+                        ruby: ruby_open,
+                        w: outer + trail,
+                        lead,
+                        src: NO_SRC,
+                    });
                 }
             }
         }
@@ -944,7 +1299,7 @@ impl Flow<'_, '_> {
         let mut i = 0;
         while i < atoms.len() {
             let a = &atoms[i];
-            if matches!(a.kind, AKind::Image(_)) {
+            if matches!(a.kind, AKind::Image(_) | AKind::Box(_)) {
                 segs.push((i, i + 1));
                 i += 1;
                 continue;
@@ -971,6 +1326,7 @@ impl Flow<'_, '_> {
             faux: Option<(Arc<Galley>, f32)>,
             base: f32,
             img: Option<(usize, Vec2)>,
+            bx: Option<usize>,
             ruby: Option<usize>,
             ascent: f32,
         }
@@ -986,6 +1342,23 @@ impl Flow<'_, '_> {
                     faux: None,
                     base: 0.0,
                     img: Some((k, size)),
+                    bx: None,
+                    ruby: None,
+                    ascent: 0.0,
+                });
+                continue;
+            }
+            if let AKind::Box(k) = first.kind {
+                let b = &self.boxes[k];
+                above = above.max(b.base);
+                below = below.max(b.size.y - b.base);
+                out.push(Seg {
+                    x: xs[a],
+                    galley: None,
+                    faux: None,
+                    base: 0.0,
+                    img: None,
+                    bx: Some(k),
                     ruby: None,
                     ascent: 0.0,
                 });
@@ -1048,6 +1421,7 @@ impl Flow<'_, '_> {
                 faux,
                 base,
                 img: None,
+                bx: None,
                 ruby: first.ruby,
                 ascent,
             });
@@ -1073,6 +1447,10 @@ impl Flow<'_, '_> {
                     rect: Rect::from_min_size(pos2(s.x, baseline_y - size.y), size),
                     path: imgs[k].0.path.clone(),
                 });
+                continue;
+            }
+            if let Some(k) = s.bx {
+                self.emit_box(k, pos2(s.x, baseline_y));
                 continue;
             }
             let Some(g) = s.galley else { continue };
@@ -1124,6 +1502,27 @@ impl Flow<'_, '_> {
                 i += 1;
             }
         }
+        // Characters, for the dictionary.
+        let start = self.hits.x.len() as u32;
+        for (i, a) in atoms.iter().enumerate() {
+            if a.kind == AKind::Char && a.src != NO_SRC {
+                self.hits.x.push(xs[i]);
+                self.hits.w.push(a.w);
+                self.hits.src.push(a.src);
+            }
+        }
+        let len = self.hits.x.len() as u32 - start;
+        if len > 0 {
+            self.hits.lines.push(HitLine {
+                top,
+                bottom,
+                glyph_top: baseline_y - strut_base,
+                glyph_bottom: baseline_y - strut_base + strut_h,
+                unit,
+                start,
+                len,
+            });
+        }
         let chars = atoms
             .iter()
             .filter(|a| a.kind == AKind::Char && a.ch != ' ')
@@ -1155,6 +1554,86 @@ fn near_white(c: Color32) -> bool {
 mod tests {
     use super::*;
 
+    /// A document laid out with the app's fonts, `cols` characters of 20 px wide.
+    fn lay_out_html(html: &str, cols: f32) -> (Chapter, ChapterLayout) {
+        use super::super::tree::{Source, build_doc, ua_rules};
+        let ctx = eframe::egui::Context::default();
+        crate::install_fonts(&ctx);
+        ctx.run_ui(Default::default(), |_| {})
+            .textures_delta
+            .clear();
+        let doc = scraper::Html::parse_document(html);
+        let ch = build_doc(
+            &doc,
+            &ua_rules(),
+            &Default::default(),
+            Source::Epub {
+                base: String::new(),
+                path: String::new(),
+            },
+        );
+        let p = Params {
+            base: 20.0,
+            content_w: 20.0 * cols,
+            page_h: 2000.0,
+            line_spacing: 1.75,
+            fonts: super::super::fonts::Installed {
+                serif: FontFamily::Proportional,
+                serif_bold: FontFamily::Proportional,
+                sans: FontFamily::Proportional,
+                sans_bold: FontFamily::Proportional,
+                serif_faux_bold: true,
+                sans_faux_bold: true,
+                key: Default::default(),
+            },
+            serif_default: true,
+            text: Color32::BLACK,
+            link: Color32::BLUE,
+            rule: Color32::GRAY,
+        };
+        let mut images = Images::with_source("test", Arc::new(|_: &str| None));
+        let l = ctx.fonts_mut(|f| layout(&ch, &p, f, &mut images));
+        (ch, l)
+    }
+
+    /// The text is indexed in layout order with block boundaries, and the
+    /// character under a point and the boxes of a range come back from the
+    /// layout, across a line break.
+    #[test]
+    fn characters_under_the_pointer() {
+        let (ch, l) = lay_out_html(
+            "<html><body><p>你好世界</p><p>第二段<ruby>文<rt>wén</rt></ruby>字很长很长很长很长很长</p></body></html>",
+            8.0,
+        );
+        let text: String = ch.chars.iter().collect();
+        assert_eq!(text, "你好世界\0第二段文字很长很长很长很长很长\0");
+        // Every character's box finds the character back.
+        for src in 0..ch.chars.len() as u32 {
+            if ch.chars[src as usize] == '\0' {
+                assert!(l.char_rects(0, src..src + 1).is_empty());
+                continue;
+            }
+            let r = l.char_rects(0, src..src + 1);
+            assert_eq!(r.len(), 1, "one box for {src}");
+            assert_eq!(l.char_at(0, r[0].center()), Some(src), "at {src}");
+        }
+        // The second paragraph wraps: one box per line, top to bottom. (How
+        // many lines depends on the fonts installed: CI machines may have no
+        // Chinese font.)
+        let lines = l.char_rects(0, 5..21);
+        assert!(lines.len() >= 2, "{lines:?}");
+        assert!(lines.windows(2).all(|w| w[0].bottom() <= w[1].top() + 0.5));
+        // Off the text: nothing.
+        let first = l.char_rects(0, 0..4)[0];
+        assert_eq!(l.char_at(0, first.right_center() + vec2(5.0, 0.0)), None);
+        assert_eq!(
+            l.char_at(0, pos2(first.left() - 5.0, first.center().y)),
+            None
+        );
+        assert_eq!(l.char_at(0, pos2(10.0, -50.0)), None);
+        assert_eq!(l.char_at(5, pos2(10.0, 10.0)), None, "no such page");
+    }
+
     fn atom(ch: char) -> Atom {
         Atom {
             ch,
@@ -1164,6 +1643,7 @@ mod tests {
             ruby: None,
             w: 1.0,
             lead: 0.0,
+            src: 0,
         }
     }
 

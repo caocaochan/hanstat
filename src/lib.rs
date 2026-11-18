@@ -4,6 +4,7 @@ pub mod cache;
 pub mod chars;
 pub mod child_guard;
 pub mod ckip;
+pub mod dict;
 pub mod discover;
 pub mod extract;
 pub mod history;

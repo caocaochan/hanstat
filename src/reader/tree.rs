@@ -25,6 +25,8 @@ pub enum Inline {
         text: String,
         style: StyleId,
         link: Option<u32>,
+        /// Index of the first character in [`Chapter::chars`].
+        src: u32,
     },
     Image {
         img: Img,
@@ -40,6 +42,13 @@ pub enum Inline {
         style: StyleId,
     },
     RubyEnd,
+    /// An inline box (dictionary popups: `inline-block` with a background,
+    /// border or padding): its content on one line inside its own box.
+    Box {
+        items: Vec<Inline>,
+        style: StyleId,
+        link: Option<u32>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -63,15 +72,33 @@ pub struct Block {
     pub id: Option<String>,
 }
 
+/// Where a link goes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LinkTarget {
+    /// A file of the book (ZIP path) and an element id in it; external links
+    /// are not kept.
+    Chapter {
+        path: String,
+        fragment: Option<String>,
+    },
+    /// A dictionary popup's cross-reference: look this up.
+    Lookup(String),
+    /// A dictionary popup's `<details>` (its number in the document): open
+    /// or close it.
+    Toggle(u32),
+}
+
 pub struct Chapter {
     pub styles: Vec<Style>,
     pub root: Block,
-    /// Link targets: (ZIP path, fragment); external links are not kept.
-    pub links: Vec<(String, Option<String>)>,
+    pub links: Vec<LinkTarget>,
     /// Characters of text, for the book's progress.
     pub text_len: usize,
     /// Element ids and the characters of text before them.
     pub anchors: Vec<(String, usize)>,
+    /// The text in layout order, `'\0'` between blocks and at line breaks:
+    /// what a dictionary lookup reads from the character under the pointer.
+    pub chars: Vec<char>,
 }
 
 /// Style sheets parsed once per book, by the list of sheets a chapter links.
@@ -81,22 +108,29 @@ pub struct SheetCache {
     ua: Option<Arc<RuleSet>>,
 }
 
+/// Rules from a style sheet's text, with no files to import.
+pub fn rules(css: &str) -> RuleSet {
+    let mut set = RuleSet::default();
+    let none = |_: &str| None;
+    let mut p = Parser {
+        set: &mut set,
+        order: 0,
+        load: &none,
+        seen: Vec::new(),
+    };
+    p.sheet(css, "");
+    set
+}
+
+/// The user-agent sheet's rules, parsed once.
+pub fn ua_rules() -> Arc<RuleSet> {
+    static UA: std::sync::OnceLock<Arc<RuleSet>> = std::sync::OnceLock::new();
+    UA.get_or_init(|| Arc::new(rules(style::UA_SHEET))).clone()
+}
+
 impl SheetCache {
     fn ua(&mut self) -> Arc<RuleSet> {
-        self.ua
-            .get_or_insert_with(|| {
-                let mut set = RuleSet::default();
-                let none = |_: &str| None;
-                let mut p = Parser {
-                    set: &mut set,
-                    order: 0,
-                    load: &none,
-                    seen: Vec::new(),
-                };
-                p.sheet(style::UA_SHEET, "");
-                Arc::new(set)
-            })
-            .clone()
+        self.ua.get_or_insert_with(ua_rules).clone()
     }
 
     fn get(&mut self, epub: &Epub, key: Vec<String>, inline: &[(String, String)]) -> Arc<RuleSet> {
@@ -156,20 +190,58 @@ pub fn build(epub: &Epub, path: &str, sheets: &mut SheetCache) -> Chapter {
     }
     let author = sheets.get(epub, linked, &inline);
     let ua = sheets.ua();
+    build_doc(
+        &doc,
+        &ua,
+        &author,
+        Source::Epub {
+            base: base.to_owned(),
+            path: path.to_owned(),
+        },
+    )
+}
+
+/// What a document is, for its links and images.
+pub enum Source {
+    /// A file of the book: links and image paths resolve against it.
+    Epub { base: String, path: String },
+    /// A dictionary popup's entry: `?query=` links look up, `<details>` not in
+    /// `open` (numbered in document order) show only their summary, and image
+    /// paths are the dictionary's media paths.
+    Popup {
+        open: std::collections::HashSet<u32>,
+        /// Put before image paths (which dictionary's media they are).
+        media: String,
+        /// The popup's text colour: the document's own, so `currentColor`
+        /// (and `color-mix` with it) means it.
+        ink: eframe::egui::Color32,
+    },
+}
+
+/// The styled tree of a parsed document, with `ua` and `author` sheets.
+pub fn build_doc(doc: &scraper::Html, ua: &RuleSet, author: &RuleSet, source: Source) -> Chapter {
     let mut b = Builder {
-        ua: &ua,
-        author: &author,
+        ua,
+        author,
         styles: Vec::new(),
         links: Vec::new(),
-        base: base.to_owned(),
-        path: path.to_owned(),
+        source,
+        details: 0,
+        summary: None,
         text_len: 0,
         anchors: Vec::new(),
         cands: Vec::new(),
         root_font: 1.0,
     };
     let html = doc.root_element();
-    let root_style = b.compute(&html, &Style::default());
+    let top = match &b.source {
+        Source::Popup { ink, .. } => Style {
+            color: Some(*ink),
+            ..Style::default()
+        },
+        Source::Epub { .. } => Style::default(),
+    };
+    let root_style = b.compute(&html, &top);
     b.root_font = root_style.font;
     let root_id = b.push(root_style.clone());
     let mut root = Block {
@@ -192,12 +264,40 @@ pub fn build(epub: &Epub, path: &str, sheets: &mut SheetCache) -> Chapter {
         block.id = None;
         root.children.push(Child::Block(block));
     }
+    let mut chars = Vec::new();
+    index_text(&mut root, &mut chars);
     Chapter {
         styles: b.styles,
         root,
         links: b.links,
         text_len: b.text_len,
         anchors: b.anchors,
+        chars,
+    }
+}
+
+/// Number the text runs in layout order and collect their characters, with
+/// `'\0'` between blocks and inline groups and at forced breaks.
+fn index_text(block: &mut Block, chars: &mut Vec<char>) {
+    for c in &mut block.children {
+        match c {
+            Child::Block(b) => index_text(b, chars),
+            Child::Inline(items) => {
+                for it in items.iter_mut() {
+                    match it {
+                        Inline::Text { text, src, .. } => {
+                            *src = chars.len() as u32;
+                            chars.extend(text.chars());
+                        }
+                        Inline::Break => chars.push('\0'),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if chars.last().is_some_and(|c| *c != '\0') {
+            chars.push('\0');
+        }
     }
 }
 
@@ -205,9 +305,12 @@ struct Builder<'a> {
     ua: &'a RuleSet,
     author: &'a RuleSet,
     styles: Vec<Style>,
-    links: Vec<(String, Option<String>)>,
-    base: String,
-    path: String,
+    links: Vec<LinkTarget>,
+    source: Source,
+    /// `<details>` elements seen so far (popup documents).
+    details: u32,
+    /// A `<summary>` about to be built: its marker and toggle link.
+    summary: Option<(String, u32)>,
     text_len: usize,
     anchors: Vec<(String, usize)>,
     cands: Vec<u32>,
@@ -229,7 +332,7 @@ impl Run {
     fn has_content(&self) -> bool {
         self.items.iter().any(|i| match i {
             Inline::Text { text, .. } => !text.is_empty(),
-            Inline::Image { .. } | Inline::Break => true,
+            Inline::Image { .. } | Inline::Break | Inline::Box { .. } => true,
             _ => false,
         })
     }
@@ -239,6 +342,7 @@ impl Run {
             text,
             style: s,
             link: l,
+            ..
         }) = self.items.last_mut()
             && *s == style
             && *l == link
@@ -249,6 +353,7 @@ impl Run {
                 text: c.to_string(),
                 style,
                 link,
+                src: 0,
             });
         }
         self.last = Some(c);
@@ -322,6 +427,19 @@ impl Run {
         self.items.push(item);
         self.last = Some('\u{FFFC}');
     }
+}
+
+/// The word a dictionary cross-reference looks up: Yomitan's structured
+/// content links to `?query=<word>&wildcards=off`.
+fn lookup_query(href: &str) -> Option<String> {
+    let q = href.strip_prefix('?')?;
+    let v = q.split('&').find_map(|kv| kv.strip_prefix("query="))?;
+    let v = v.replace('+', " ");
+    let s = percent_encoding::percent_decode_str(&v)
+        .decode_utf8()
+        .ok()?
+        .into_owned();
+    (!s.is_empty()).then_some(s)
 }
 
 /// Whether `c` counts toward a chapter's length: letters (Chinese
@@ -400,15 +518,24 @@ impl Builder<'_> {
             return None;
         }
         let href = el.value().attr("href")?;
-        if href.contains("://") || href.starts_with("mailto:") {
-            return None;
-        }
-        let path = if href.starts_with('#') {
-            self.path.clone()
-        } else {
-            epub::resolve(&self.base, href)
+        let target = match &self.source {
+            Source::Epub { base, path } => {
+                if href.contains("://") || href.starts_with("mailto:") {
+                    return None;
+                }
+                let path = if href.starts_with('#') {
+                    path.clone()
+                } else {
+                    epub::resolve(base, href)
+                };
+                LinkTarget::Chapter {
+                    path,
+                    fragment: epub::fragment(href),
+                }
+            }
+            Source::Popup { .. } => LinkTarget::Lookup(lookup_query(href)?),
         };
-        self.links.push((path, epub::fragment(href)));
+        self.links.push(target);
         Some((self.links.len() - 1) as u32)
     }
 
@@ -428,6 +555,17 @@ impl Builder<'_> {
             id,
         };
         let mut run = Run::default();
+        let mut link = None;
+        if let Some((marker, l)) = self.summary.take() {
+            run.items.push(Inline::Text {
+                text: marker,
+                style: sid,
+                link: Some(l),
+                src: 0,
+            });
+            run.last = Some(' ');
+            link = Some(l);
+        }
         if list && marker_style != ListStyle::None {
             let n = el
                 .prev_siblings()
@@ -443,10 +581,11 @@ impl Builder<'_> {
                 text: marker,
                 style: sid,
                 link: None,
+                src: 0,
             });
             run.last = Some(' ');
         }
-        self.children(el, &style, sid, &mut block, &mut run, None);
+        self.children(el, &style, sid, &mut block, &mut run, link);
         self.flush(&mut block, &mut run);
         block
     }
@@ -605,7 +744,47 @@ impl Builder<'_> {
                 return;
             }
             "rt" | "rp" | "rtc" => return,
+            "details" if matches!(self.source, Source::Popup { .. }) => {
+                self.details(el, style, block, run);
+                return;
+            }
             _ => {}
+        }
+        if matches!(self.source, Source::Popup { .. })
+            && style.display == Display::Inline
+            && style.inline_block
+            && (style.background.is_some()
+                || style.border.iter().any(|b| b.visible())
+                || style
+                    .padding
+                    .iter()
+                    .any(|p| matches!(p, Len::Base(v) if *v > 0.0)))
+        {
+            let link = self.link(el).or(link);
+            let sid = self.push(style.clone());
+            let mut inner = Run::default();
+            let mut scratch = Block {
+                style: sid,
+                kind: BlockKind::Flow,
+                children: Vec::new(),
+                id: None,
+            };
+            self.children(el, &style, sid, &mut scratch, &mut inner, link);
+            // Content only; any blocks inside are flattened into the line.
+            let mut items = Vec::new();
+            for c in scratch.children {
+                if let Child::Inline(i) = c {
+                    items.extend(i);
+                }
+            }
+            items.extend(inner.items);
+            items.retain(|i| !matches!(i, Inline::Break));
+            run.atomic(Inline::Box {
+                items,
+                style: sid,
+                link,
+            });
+            return;
         }
         let is_block = matches!(style.display, Display::Block | Display::ListItem)
             || style.float != style::Float::None && style.display != Display::Inline;
@@ -624,13 +803,91 @@ impl Builder<'_> {
         }
     }
 
+    /// A popup's `<details>`: its summary, with ▸ (closed) or ▾ (open) as
+    /// a link that toggles it; the rest only when open. Open: its `open`
+    /// attribute, unless the popup's toggles say otherwise.
+    fn details(
+        &mut self,
+        el: &scraper::ElementRef,
+        style: Style,
+        block: &mut Block,
+        run: &mut Run,
+    ) {
+        let n = self.details;
+        self.details += 1;
+        let toggled = match &self.source {
+            Source::Popup { open, .. } => open.contains(&n),
+            Source::Epub { .. } => false,
+        };
+        let is_open = (el.value().attr("open").is_some()) != toggled;
+        self.links.push(LinkTarget::Toggle(n));
+        let toggle = (self.links.len() - 1) as u32;
+        self.flush(block, run);
+        let sid = self.push(style.clone());
+        let mut d = Block {
+            style: sid,
+            kind: BlockKind::Flow,
+            children: Vec::new(),
+            id: None,
+        };
+        let mut inner = Run::default();
+        let mut has_summary = false;
+        for node in el.children() {
+            match node.value() {
+                scraper::Node::Element(e) if e.name() == "summary" => {
+                    let Some(c) = scraper::ElementRef::wrap(node) else {
+                        continue;
+                    };
+                    has_summary = true;
+                    self.flush(&mut d, &mut inner);
+                    let st = self.compute(&c, &style);
+                    self.summary = Some((if is_open { "▾ " } else { "▸ " }.to_owned(), toggle));
+                    let b = self.block(&c, st);
+                    d.children.push(Child::Block(b));
+                }
+                _ if !is_open => {}
+                scraper::Node::Text(t) => {
+                    self.text_len += inner.text(t, sid, style.white_space, None);
+                }
+                scraper::Node::Element(_) => {
+                    if let Some(c) = scraper::ElementRef::wrap(node) {
+                        self.element(&c, &style, &mut d, &mut inner, None);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !has_summary {
+            // A details without a summary is "Details", as in browsers.
+            inner.items.insert(
+                0,
+                Inline::Text {
+                    text: if is_open {
+                        "▾ Details"
+                    } else {
+                        "▸ Details"
+                    }
+                    .to_owned(),
+                    style: sid,
+                    link: Some(toggle),
+                    src: 0,
+                },
+            );
+        }
+        self.flush(&mut d, &mut inner);
+        block.children.push(Child::Block(d));
+    }
+
     fn img(&mut self, el: &scraper::ElementRef, fit_page: bool) -> Option<Img> {
         let v = el.value();
         let href = v
             .attr("src")
             .or_else(|| v.attr("xlink:href"))
             .or_else(|| v.attrs().find(|(k, _)| k.ends_with("href")).map(|(_, x)| x))?;
-        let path = epub::resolve(&self.base, href);
+        let path = match &self.source {
+            Source::Epub { base, .. } => epub::resolve(base, href),
+            Source::Popup { media, .. } => format!("{media}{href}"),
+        };
         let num = |a: &str| {
             v.attr(a)
                 .and_then(|x| x.trim_end_matches("px").parse::<f32>().ok())
@@ -641,5 +898,92 @@ impl Builder<'_> {
             attr_h: num("height"),
             fit_page,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn popup_text(html: &str, open: &[u32]) -> (String, Vec<LinkTarget>) {
+        let doc = scraper::Html::parse_document(html);
+        let ch = build_doc(
+            &doc,
+            &ua_rules(),
+            &RuleSet::default(),
+            Source::Popup {
+                open: open.iter().copied().collect(),
+                media: "d/".into(),
+                ink: eframe::egui::Color32::WHITE,
+            },
+        );
+        (ch.chars.iter().filter(|c| **c != '\0').collect(), ch.links)
+    }
+
+    /// `<details>`: the summary with ▸ (a toggle link) while closed, the
+    /// rest only when open; `open` toggled by the popup's set.
+    #[test]
+    fn details_open_and_close() {
+        let html = "<html><body><details><summary>例</summary><p>正文</p></details><details open><summary>源</summary>出处</details></body></html>";
+        let (t, links) = popup_text(html, &[]);
+        assert_eq!(t, "▸ 例▾ 源出处");
+        assert_eq!(links, [LinkTarget::Toggle(0), LinkTarget::Toggle(1)]);
+        let (t, _) = popup_text(html, &[0, 1]);
+        assert_eq!(t, "▾ 例正文▸ 源");
+    }
+
+    #[test]
+    fn cross_references_look_up() {
+        let (_, links) = popup_text(
+            r#"<html><body><a href="?query=%E8%AF%B4%E8%AF%9D&wildcards=off">说话</a><a href="https://x.org">x</a></body></html>"#,
+            &[],
+        );
+        assert_eq!(links, [LinkTarget::Lookup("说话".into())]);
+        assert_eq!(lookup_query("?wildcards=off&query=a+b"), Some("a b".into()));
+        assert_eq!(lookup_query("#x"), None);
+    }
+
+    /// Popups only: inline boxes with a background become boxes; plain
+    /// inline-block stays text, and so does any in a book.
+    #[test]
+    fn inline_boxes() {
+        let doc = scraper::Html::parse_document(
+            r#"<html><body><p><span style="display:inline-block;background:#111">简</span><span style="display:inline-block">x</span></p></body></html>"#,
+        );
+        let boxes = |ch: &Chapter| -> usize {
+            fn count(b: &Block) -> usize {
+                b.children
+                    .iter()
+                    .map(|c| match c {
+                        Child::Block(b) => count(b),
+                        Child::Inline(i) => {
+                            i.iter().filter(|x| matches!(x, Inline::Box { .. })).count()
+                        }
+                    })
+                    .sum()
+            }
+            count(&ch.root)
+        };
+        let popup = build_doc(
+            &doc,
+            &ua_rules(),
+            &RuleSet::default(),
+            Source::Popup {
+                open: Default::default(),
+                media: String::new(),
+                ink: eframe::egui::Color32::WHITE,
+            },
+        );
+        assert_eq!(boxes(&popup), 1);
+        let book = build_doc(
+            &doc,
+            &ua_rules(),
+            &RuleSet::default(),
+            Source::Epub {
+                base: String::new(),
+                path: String::new(),
+            },
+        );
+        assert_eq!(boxes(&book), 0);
     }
 }

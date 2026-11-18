@@ -6,13 +6,16 @@
 //! with the fonts chosen in the reader, and drawn page by page.
 
 mod css;
+mod dicts_ui;
 mod epub;
 pub(crate) mod fonts;
 mod images;
 mod layout;
 mod markup;
+mod popup;
 #[cfg(test)]
 mod preview;
+mod render;
 mod style;
 mod tree;
 
@@ -41,6 +44,8 @@ mod theme {
     pub const INK: Color32 = Color32::from_rgb(0x1f, 0x3c, 0x46);
     /// The desk around the pages.
     pub const DESK: Color32 = Color32::from_rgb(0xe4, 0xdd, 0xc7);
+    /// The word looked up: Solarized yellow, see-through.
+    pub const HIGHLIGHT: Color32 = Color32::from_rgba_premultiplied(0x4a, 0x38, 0x00, 0x48);
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -67,6 +72,18 @@ struct Settings {
     spread: bool,
     /// Where each book was left, by its Library id.
     positions: HashMap<String, Position>,
+    /// The key held to look up the word under the pointer.
+    lookup_key: popup::LookupKey,
+    /// The frequency list whose ranks order the popup's entries (its id).
+    freq_sort: Option<String>,
+    /// Show frequency ranks in the popup.
+    show_freq: bool,
+    /// Look for dictionary updates once a day.
+    check_updates: bool,
+    /// Install dictionary updates found, without asking.
+    auto_install: bool,
+    /// The popup's height, in lines of its text.
+    popup_lines: f32,
 }
 
 impl Default for Settings {
@@ -80,6 +97,12 @@ impl Default for Settings {
             margins: 1.0,
             spread: true,
             positions: HashMap::new(),
+            lookup_key: popup::LookupKey::Shift,
+            freq_sort: None,
+            show_freq: true,
+            check_updates: true,
+            auto_install: false,
+            popup_lines: popup::DEFAULT_LINES,
         }
     }
 }
@@ -115,6 +138,8 @@ struct Probe {
     contents: Option<Rect>,
     /// The contents menu is open: its sixth entry.
     toc_item: Option<Rect>,
+    /// The pages shown: (page, flow → screen offset).
+    sides: Vec<(usize, Vec2)>,
 }
 
 /// Where to go once a chapter is laid out.
@@ -178,6 +203,10 @@ pub struct Reader {
     /// The time of this frame, and of the last page turn.
     now: f64,
     turned_at: f64,
+    /// The dictionary popup.
+    dict: popup::Popup,
+    /// The Dictionaries window.
+    dicts: dicts_ui::Manager,
 }
 
 impl Drop for Reader {
@@ -249,6 +278,10 @@ impl Reader {
                 .map_err(|e| e.to_string())?;
         }
         let toc_labels = toc_labels(&epub.toc);
+        let dict = popup::Popup::new(ctx, settings.freq_sort.clone());
+        let mut dicts = dicts_ui::Manager::new(ctx, &dict);
+        dicts.install_default();
+        dicts.auto_check(ctx, &settings);
         fonts::prefetch();
         // The reader's colours for every widget and popup while it is open.
         let theme = ctx.theme();
@@ -288,6 +321,8 @@ impl Reader {
             error: None,
             now: 0.0,
             turned_at: 0.0,
+            dict,
+            dicts,
         })
     }
 
@@ -510,14 +545,41 @@ impl Reader {
         self.images.next_frame();
         self.images.poll(&ctx);
         let mut open = true;
+        self.dict.warm(&ctx);
+        self.dict.lines = self.settings.popup_lines;
+        self.dict.poll();
+        self.dict.anchor = None;
+        self.dicts.poll(&ctx, &self.dict, &self.settings);
+        // Dictionaries dropped on the reader are imported.
+        let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_path_buf())
+                .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")))
+                .collect()
+        });
+        if !dropped.is_empty() {
+            self.dicts.import(dropped);
+            self.dicts.open = true;
+        }
         // A click that closes a popup doesn't also turn the page.
-        let popup_was_open = egui::Popup::is_any_open(&ctx) || self.settings_open;
-        // Esc closes an open panel or menu (egui closes its menus itself
-        // while drawing them), never the reader with it.
+        let menus_open = egui::Popup::is_any_open(&ctx) || self.settings_open || self.dicts.open;
+        let dict_open = self.dict.is_open();
+        let popup_was_open = menus_open || dict_open;
+        // Esc closes an open panel, menu or the dictionary popup (egui closes
+        // its menus itself while drawing them), never the reader with it.
         let esc_for_popup = popup_was_open && ctx.input(|i| i.key_pressed(Key::Escape));
         if esc_for_popup {
             self.settings_open = false;
+            if self.dicts.open {
+                self.dicts.open = false;
+            } else if !menus_open {
+                self.dict.close_top();
+            }
         }
+        let lookup_key = self.settings.lookup_key;
+        let key_held = ctx.input(|i| lookup_key.held(&i.modifiers));
         let mut geom_for_keys: Option<Geometry> = self.last_geom;
 
         egui::Panel::top("reader-bar")
@@ -545,6 +607,23 @@ impl Reader {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         self.settings_menu(ui);
                         self.contents_menu(ui);
+                        let n = self.dicts.updates();
+                        let label = if self.dicts.working() {
+                            "Dictionaries …".to_owned()
+                        } else if n > 0 {
+                            format!("Dictionaries ({n} update{})", if n == 1 { "" } else { "s" })
+                        } else {
+                            "Dictionaries".to_owned()
+                        };
+                        let b = ui
+                            .selectable_label(self.dicts.open, RichText::new(label).size(14.0))
+                            .on_hover_text(format!(
+                                "Look up a word: hold {} with the pointer on it",
+                                self.settings.lookup_key.label()
+                            ));
+                        if b.clicked() {
+                            self.dicts.open = !self.dicts.open;
+                        }
                         ui.separator();
                         let before = self.settings.spread;
                         ui.selectable_value(
@@ -646,23 +725,59 @@ impl Reader {
             let label = self.toc_label().map(str::to_owned);
             let resp = ui.interact(area, egui::Id::unique("reader-page"), egui::Sense::click());
             let mut clicked_link = None;
+            // Where each page's text is drawn: (page, flow → screen offset, clip).
+            let sides: Vec<(usize, Vec2, Rect)> = (0..step)
+                .filter_map(|side| {
+                    let idx = self.page + side;
+                    if idx >= l.pages.len() {
+                        return None;
+                    }
+                    let origin = g.pages[side].min + g.inset;
+                    let mut off = origin.to_vec2();
+                    if l.pages[idx].center {
+                        off.y += ((g.content.y - l.page_height(idx)) / 2.0).max(0.0);
+                    }
+                    let off = off + l.page_items(idx).1;
+                    Some((idx, off, Rect::from_min_size(origin, g.content).expand(4.0)))
+                })
+                .collect();
+            // The word under the pointer, with the lookup key held: looked up
+            // before the pages are drawn, so its highlight shows this frame.
+            if key_held
+                && !menus_open
+                && let Some(h) = resp.hover_pos()
+                && let Some(spot) = sides.iter().find_map(|(idx, off, clip)| {
+                    clip.contains(h)
+                        .then(|| l.char_at(*idx, h - *off))
+                        .flatten()
+                        .map(|src| popup::Spot {
+                            spine: self.spine,
+                            src,
+                        })
+                })
+                && let Some(ch) = self.chapter(self.spine)
+            {
+                self.dict.point(spot, &ch.chars, lookup_key, now, &ctx);
+            }
+            self.probe.sides = sides.iter().map(|(i, o, _)| (*i, *o)).collect();
+            let highlight = self.dict.highlight(self.spine);
             for side in 0..step {
                 let page_rect = g.pages[side];
                 draw_page(ui, page_rect, side, g.spread);
                 let idx = self.page + side;
-                if idx >= l.pages.len() {
+                let Some(&(_, off, clip)) = sides.iter().find(|s| s.0 == idx) else {
                     continue;
-                }
-                let origin = page_rect.min + g.inset;
-                let mut off = origin.to_vec2();
-                if l.pages[idx].center {
-                    off.y += ((g.content.y - l.page_height(idx)) / 2.0).max(0.0);
-                }
-                let (items, shift) = l.page_items(idx);
-                let off = off + shift;
-                let clip = Rect::from_min_size(origin, g.content).expand(4.0);
+                };
+                let items = l.page_items(idx).0;
                 let painter = ui.painter_at(clip.expand2(vec2(g.inset.x * 0.5, 0.0)));
                 let ppp = ctx.pixels_per_point();
+                if let Some((src, n)) = highlight {
+                    for r in l.char_rects(idx, src..src + n as u32) {
+                        let r = r.translate(off);
+                        painter.rect_filled(r.expand2(vec2(1.0, 0.0)), 3.0, theme::HIGHLIGHT);
+                        self.dict.anchor = Some(self.dict.anchor.map_or(r, |a| a.union(r)));
+                    }
+                }
                 for i in items {
                     paint_item(&mut self.images, &painter, &l.items[i], off, ppp);
                 }
@@ -703,12 +818,14 @@ impl Reader {
             // Clicks: links, else the left third back and the rest forward.
             if resp.clicked() && popup_was_open {
                 self.settings_open = false;
+                self.dict.close();
             } else if resp.clicked() {
                 if let Some(t) = clicked_link {
                     if let Some(ch) = self.chapter(self.spine)
-                        && let Some((path, frag)) = ch.links.get(t as usize).cloned()
+                        && let Some(tree::LinkTarget::Chapter { path, fragment }) =
+                            ch.links.get(t as usize).cloned()
                     {
-                        self.follow(&path, frag);
+                        self.follow(&path, fragment);
                     }
                 } else if let Some(p) = resp.interact_pointer_pos() {
                     let left = g.pages[0].left();
@@ -740,12 +857,28 @@ impl Reader {
         });
 
         // Keys and the wheel turn pages.
+        // With the dictionary popup open they close it too; the wheel over
+        // the popup scrolls it instead.
+        let over_dict = ctx
+            .pointer_hover_pos()
+            .is_some_and(|p| self.dict.contains(p));
         if let Some(g) = geom_for_keys
             && !ctx.text_edit_focused()
             && !egui::Popup::is_any_open(&ctx)
             && !self.settings_open
-            && !popup_was_open
+            && !menus_open
+            && !esc_for_popup
         {
+            // With the popup open, ↑ and ↓ scroll it.
+            if self.dict.is_open() {
+                let (down, up) = ctx.input_mut(|i| {
+                    (
+                        i.consume_key(egui::Modifiers::NONE, Key::ArrowDown),
+                        i.consume_key(egui::Modifiers::NONE, Key::ArrowUp),
+                    )
+                });
+                self.dict.scroll_lines += down as i32 - up as i32;
+            }
             let (fwd, back, home, end, esc, wheel) = ctx.input_mut(|i| {
                 let fwd = [Key::ArrowRight, Key::ArrowDown, Key::PageDown, Key::Space]
                     .iter()
@@ -774,6 +907,10 @@ impl Reader {
                         .sum::<f32>(),
                 )
             });
+            let wheel = if over_dict { 0.0 } else { wheel };
+            if fwd || back || home || end || wheel != 0.0 {
+                self.dict.close();
+            }
             if fwd {
                 self.next(&g);
             }
@@ -802,6 +939,24 @@ impl Reader {
             } else if wheel == 0.0 {
                 self.scroll *= 0.8;
             }
+        }
+        // The popup, beside its word; gone with the word (a page turned).
+        if self.dict.is_open() {
+            if let (Some(_), Some(params)) = (self.dict.anchor, self.params.clone()) {
+                self.dict.ui(
+                    &ctx,
+                    &params,
+                    self.settings.show_freq,
+                    key_held,
+                    lookup_key,
+                    now,
+                );
+            } else {
+                self.dict.close();
+            }
+        }
+        if self.dicts.ui(&ctx, &mut self.dict, &mut self.settings) {
+            self.dirty = true;
         }
         if self.dirty && !ctx.input(|i| i.pointer.any_down()) {
             self.save();
@@ -1132,10 +1287,27 @@ fn paint_item(
                 }
             }
         }
-        Item::Fill { rect, color } => {
+        Item::Fill {
+            rect,
+            color,
+            radius,
+        } => {
             if rect.is_positive() {
-                painter.rect_filled(rect.translate(off), 0.0, *color);
+                painter.rect_filled(rect.translate(off), *radius, *color);
             }
+        }
+        Item::Frame {
+            rect,
+            radius,
+            width,
+            color,
+        } => {
+            painter.rect_stroke(
+                rect.translate(off),
+                *radius,
+                egui::Stroke::new(*width, *color),
+                egui::StrokeKind::Middle,
+            );
         }
         Item::Line {
             a,

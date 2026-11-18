@@ -1,7 +1,7 @@
-//! The book's images: sizes read from their headers when a chapter is laid
-//! out, pixels decoded in the background at the size they are drawn (a cover
-//! is several megapixels; a page shows a fraction of that), kept as textures
-//! within a memory budget.
+//! The book's images (or a dictionary's): sizes read from their headers when
+//! a chapter is laid out, pixels decoded in the background at the size they
+//! are drawn (a cover is several megapixels; a page shows a fraction of that),
+//! kept as textures within a memory budget.
 
 use super::epub::Epub;
 use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
@@ -22,8 +22,16 @@ struct Tex {
     used: u64,
 }
 
+/// Reads a file's bytes by path.
+pub type Source = Arc<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>;
+
 pub struct Images {
-    epub: Arc<Epub>,
+    read: Source,
+    /// Show greyscale images light on dark (a dictionary's black glyph
+    /// images in the dark popup).
+    invert_grey: bool,
+    /// Texture names start with it, so two sources never share one.
+    name: String,
     dims: HashMap<String, Option<[u32; 2]>>,
     tex: HashMap<String, Tex>,
     pending: HashSet<String>,
@@ -35,9 +43,21 @@ pub struct Images {
 
 impl Images {
     pub fn new(epub: Arc<Epub>) -> Images {
+        Images::with_source("reader", Arc::new(move |p: &str| epub.read(p)))
+    }
+
+    /// Greyscale images inverted (light on dark).
+    pub fn invert_grey(mut self) -> Images {
+        self.invert_grey = true;
+        self
+    }
+
+    pub fn with_source(name: &str, read: Source) -> Images {
         let (tx, rx) = channel();
         Images {
-            epub,
+            read,
+            invert_grey: false,
+            name: name.to_owned(),
             dims: HashMap::new(),
             tex: HashMap::new(),
             pending: HashSet::new(),
@@ -53,7 +73,7 @@ impl Images {
         if let Some(d) = self.dims.get(path) {
             return *d;
         }
-        let d = self.epub.read(path).and_then(|b| {
+        let d = (self.read)(path).and_then(|b| {
             image::ImageReader::new(Cursor::new(b))
                 .with_guessed_format()
                 .ok()?
@@ -74,8 +94,11 @@ impl Images {
             match img {
                 Some((img, full)) => {
                     let size = [img.size[0] as u32, img.size[1] as u32];
-                    let handle =
-                        ctx.load_texture(format!("reader:{path}"), img, TextureOptions::LINEAR);
+                    let handle = ctx.load_texture(
+                        format!("{}:{path}", self.name),
+                        img,
+                        TextureOptions::LINEAR,
+                    );
                     self.tex.insert(
                         path,
                         Tex {
@@ -117,11 +140,12 @@ impl Images {
         };
         if want_more && !self.pending.contains(path) {
             self.pending.insert(path.to_owned());
-            let epub = self.epub.clone();
+            let read = self.read.clone();
+            let invert = self.invert_grey;
             let tx = self.tx.clone();
             let p = path.to_owned();
             rayon::spawn(move || {
-                let img = epub.read(&p).and_then(|b| decode(&b, px));
+                let img = read(&p).and_then(|b| decode(&b, px, invert));
                 let _ = tx.send((p, img));
             });
         }
@@ -133,9 +157,11 @@ impl Images {
     /// Decode now (for rendering pages to files, where nothing waits a frame).
     #[cfg(test)]
     pub fn load_now(&mut self, ctx: &egui::Context, path: &str, px: [u32; 2]) {
-        if let Some((img, full)) = self.epub.read(path).and_then(|b| decode(&b, px)) {
+        if let Some((img, full)) = (self.read)(path).and_then(|b| decode(&b, px, self.invert_grey))
+        {
             let size = [img.size[0] as u32, img.size[1] as u32];
-            let handle = ctx.load_texture(format!("reader:{path}"), img, TextureOptions::LINEAR);
+            let handle =
+                ctx.load_texture(format!("{}:{path}", self.name), img, TextureOptions::LINEAR);
             self.tex.insert(
                 path.to_owned(),
                 Tex {
@@ -172,7 +198,7 @@ impl Images {
 }
 
 /// Decode and scale down to fit `px` (keeping the aspect ratio).
-fn decode(bytes: &[u8], px: [u32; 2]) -> Option<(ColorImage, bool)> {
+fn decode(bytes: &[u8], px: [u32; 2], invert_grey: bool) -> Option<(ColorImage, bool)> {
     let img = image::load_from_memory(bytes).ok()?;
     let (w, h) = (img.width(), img.height());
     let scale = (px[0].max(1) as f32 / w as f32).min(px[1].max(1) as f32 / h as f32);
@@ -186,7 +212,21 @@ fn decode(bytes: &[u8], px: [u32; 2]) -> Option<(ColorImage, bool)> {
     } else {
         (img, true)
     };
-    let rgba = img.to_rgba8();
+    let mut rgba = img.to_rgba8();
+    if invert_grey {
+        let px: Vec<&image::Rgba<u8>> = rgba.pixels().filter(|p| p[3] > 32).collect();
+        let grey = px
+            .iter()
+            .filter(|p| p[0].max(p[1]).max(p[2]) - p[0].min(p[1]).min(p[2]) < 24)
+            .count();
+        if !px.is_empty() && grey * 10 >= px.len() * 9 {
+            for p in rgba.pixels_mut() {
+                for c in &mut p.0[..3] {
+                    *c = 255 - *c;
+                }
+            }
+        }
+    }
     Some((
         ColorImage::from_rgba_unmultiplied(
             [rgba.width() as usize, rgba.height() as usize],

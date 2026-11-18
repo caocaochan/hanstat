@@ -1,0 +1,201 @@
+//! A dictionary's glossaries for one word, laid out for the popup with the
+//! reader's own engine: their structured content as HTML
+//! ([`hanstat::dict::sc`]), styled by the dictionary's `styles.css` over a
+//! small popup sheet, laid out at the popup's width as one long page.
+//! Results are kept (by content, width, text size and which `<details>` are
+//! open), so redrawing or scrolling the popup lays nothing out again.
+
+use super::css::RuleSet;
+use super::images::Images;
+use super::layout::{self, ChapterLayout, Params};
+use super::tree::{self, Chapter, Source};
+use eframe::egui;
+use hanstat::dict::lookup::{DictInfo, Gloss};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+/// The popup's own defaults, after the user-agent sheet and before the
+/// dictionary's sheet.
+/// Compact: dictionaries without a sheet of their own (CC-CEDICT) would get
+/// the browser spacing, 1em around every list. Colours: Catppuccin Mocha.
+pub const POPUP_SHEET: &str = r#"
+body { margin: 0; padding: 0 }
+.entry { margin: 0 0 0.3em 0 }
+.tags { font-size: 0.72em; color: #9399b2; margin-right: 0.4em }
+ul, ol, menu, dir { margin: 0.05em 0; padding-left: 1.1em }
+ul.glossary { list-style-type: disc }
+li { margin: 0 }
+p, dl, figure { margin: 0.15em 0 }
+blockquote { margin: 0.15em 0 0.15em 1em }
+h1, h2, h3, h4, h5, h6 { margin: 0.2em 0 }
+details { margin: 0.1em 0 }
+summary, a[href] { color: #89b4fa }
+table { margin: 0.1em 0 }
+[data-sc-cccedict="headword"] { display: inline; font-size: 0.82em; color: #a6adc8; margin: 0 0.3em 0 0 }
+.sep { color: #7f849c }
+"#;
+
+const CACHE: usize = 160;
+
+/// Time spent building entries (µs): HTML, parsing, styling, layout; and
+/// how many (for measuring).
+pub static STAGES: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+fn stage(i: usize, since: std::time::Instant) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    STAGES[i].fetch_add(
+        (now - since).as_micros() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    now
+}
+
+pub struct Entry {
+    pub chapter: Chapter,
+    pub layout: ChapterLayout,
+    pub height: f32,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct Key {
+    content: u64,
+    width: u32,
+    size: u32,
+    fonts: (String, String),
+    open: Vec<u32>,
+}
+
+pub struct Renderer {
+    ua: Arc<RuleSet>,
+    sheets: HashMap<String, Arc<RuleSet>>,
+    cache: Vec<(Key, Arc<Entry>)>,
+    pub images: Images,
+    /// Each dictionary's folder, for its images.
+    dirs: Arc<Mutex<HashMap<String, PathBuf>>>,
+}
+
+impl Renderer {
+    pub fn new() -> Renderer {
+        let dirs: Arc<Mutex<HashMap<String, PathBuf>>> = Arc::default();
+        let d = dirs.clone();
+        let images = Images::with_source(
+            "dict",
+            Arc::new(move |p: &str| {
+                let (id, rest) = p.split_once('/')?;
+                let dir = d.lock().unwrap().get(id)?.clone();
+                hanstat::dict::store::read_media(&dir, rest)
+            }),
+        )
+        .invert_grey();
+        Renderer {
+            ua: Arc::new(tree::rules(&format!(
+                "{}\n{POPUP_SHEET}",
+                super::style::UA_SHEET
+            ))),
+            sheets: HashMap::new(),
+            cache: Vec::new(),
+            images,
+            dirs,
+        }
+    }
+
+    /// The dictionaries changed: their sheets and folders are read again.
+    pub fn set_dicts(&mut self, dicts: &[DictInfo]) {
+        self.sheets.clear();
+        self.cache.clear();
+        let mut d = self.dirs.lock().unwrap();
+        d.clear();
+        for x in dicts {
+            d.insert(x.id.clone(), x.dir.clone());
+        }
+    }
+
+    /// `glossaries` of `dict` laid out at `params.content_w`, with the
+    /// `<details>` numbered in `open` toggled.
+    pub fn part(
+        &mut self,
+        ctx: &egui::Context,
+        dict: &DictInfo,
+        glossaries: &[Gloss],
+        open: &HashSet<u32>,
+        params: &Params,
+    ) -> Arc<Entry> {
+        let t = std::time::Instant::now();
+        let mut html = String::from("<html><body><div class=\"entries\">");
+        for g in glossaries {
+            html.push_str("<div class=\"entry\">");
+            let tags: Vec<&str> = g
+                .def_tags
+                .split_whitespace()
+                .chain(g.term_tags.split_whitespace())
+                .collect();
+            if !tags.is_empty() {
+                html.push_str("<span class=\"tags\">");
+                hanstat::dict::sc::escape(&tags.join(" · "), &mut html);
+                html.push_str("</span>");
+            }
+            match &g.json {
+                Ok(j) => {
+                    if hanstat::dict::sc::glossary(j, &mut html).is_err() {
+                        html.push_str("(unreadable entry)");
+                    }
+                }
+                Err(e) => hanstat::dict::sc::escape(e, &mut html),
+            }
+            html.push_str("</div>");
+        }
+        html.push_str("</div></body></html>");
+        let mut open_v: Vec<u32> = open.iter().copied().collect();
+        open_v.sort_unstable();
+        let key = Key {
+            content: hanstat::dict::xxh64::xxh64(html.as_bytes(), 0)
+                ^ hanstat::dict::xxh64::key(&dict.id),
+            width: params.content_w.to_bits(),
+            size: params.base.to_bits(),
+            fonts: params.fonts.key.clone(),
+            open: open_v,
+        };
+        if let Some(i) = self.cache.iter().position(|(k, _)| *k == key) {
+            let e = self.cache.remove(i);
+            let r = e.1.clone();
+            self.cache.push(e);
+            return r;
+        }
+        STAGES[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let t = stage(0, t);
+        let sheet = self
+            .sheets
+            .entry(dict.id.clone())
+            .or_insert_with(|| Arc::new(tree::rules(&dict.styles)))
+            .clone();
+        let doc = scraper::Html::parse_document(&html);
+        let t = stage(1, t);
+        let chapter = tree::build_doc(
+            &doc,
+            &self.ua,
+            &sheet,
+            Source::Popup {
+                open: open.clone(),
+                media: format!("{}/", dict.id),
+                ink: params.text,
+            },
+        );
+        let t = stage(2, t);
+        let images = &mut self.images;
+        let layout = ctx.fonts_mut(|f| layout::layout(&chapter, params, f, images));
+        stage(3, t);
+        let height = layout.flow_height();
+        let e = Arc::new(Entry {
+            chapter,
+            layout,
+            height,
+        });
+        if self.cache.len() >= CACHE {
+            self.cache.remove(0);
+        }
+        self.cache.push((key, e.clone()));
+        e
+    }
+}

@@ -1,5 +1,20 @@
 # Changelog
 
+## [2026.11.18.03] - 2026-11-18
+
+### Added
+- **Look words up in the reader.** Hold Shift with the pointer on a word: its entries in your Yomitan dictionaries open beside it, and the word is highlighted on the page. The longest word starting there comes first, then shorter ones. Traditional text also finds entries that dictionaries list only in Simplified.
+  - The popup is dark (Catppuccin Mocha) and set in sans-serif. Entries look as their dictionaries style them: headword badges, numbered senses, examples, pictures. Short senses share a line (说话: *to speak; to say; to talk; …*). Each dictionary's entries sit under a bar that opens and closes (the first three are open); examples behind **▸** open with a click.
+  - Hold Shift over a word in the popup, or click a cross-reference, for that word's own popup beside it, up to three deep. Esc closes the topmost popup; a click on the page or a page turn closes them all; ↑ and ↓ scroll it.
+  - Frequency lists show each word's rank (说话: Danmei 194, Bilibili 563). A Traditional word shows its Simplified form's rank when that is the more frequent, marked **(简)**: lists made from Simplified text rank the Traditional spelling far down.
+  - A lookup in 17 dictionaries (8.9 million entries) takes about 0.1 ms, and the popup shows in the same frame as the pointer reaches the word.
+- **CC-CEDICT comes by itself.** With no dictionary installed, opening the reader downloads [CC-CEDICT](https://github.com/MarvNC/cc-cedict-yomitan) (8 MB, under a second), once: delete it and it stays deleted.
+- **Dictionaries**, in the reader's bar: import Yomitan dictionaries (.zip; or drop them on the reader). The 17 tried, 590 MB of zips including Wikipedia's 4 million titles, import in 5.4 seconds. Each is kept in hanstat's own files (`dictionaries` in the app folder), about 2.5 times its zip's size. Turn dictionaries on and off, put them in order, delete them; choose the key (Shift, Ctrl, Alt, or none: rest the pointer on the word) and the frequency list that orders entries of the same length.
+- **Dictionary updates.** Most dictionaries say where new revisions are published. Those are checked once a day when the reader opens, or with **Check for updates**; **Update to …** downloads and installs the new revision while the old one keeps working until the new one is ready. A check asks only each dictionary's own site. Installing what is found without asking is off unless you turn it on; `HANSTAT_NO_UPDATE` turns checks off.
+- `hanstat-cli dict import|list|lookup|bench|check` does the same from the command line.
+
+  Every book is analysed again once: the dictionaries brought new libraries into the build, and saved analyses are kept per set of libraries.
+
 ## [2026.11.18.02] - 2026-11-18
 
 ### Fixed

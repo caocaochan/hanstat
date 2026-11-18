@@ -2237,7 +2237,7 @@ dependencies = [
 
 [[package]]
 name = "hanstat"
-version = "2026.1118.2"
+version = "2026.1118.3"
 dependencies = [
  "aho-corasick",
  "candle-core",
@@ -2276,6 +2276,8 @@ dependencies = [
  "windows-sys 0.61.2",
  "winresource",
  "zip",
+ "zstd",
+ "zstd-sys",
 ]
 
 [[package]]

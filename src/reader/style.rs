@@ -182,6 +182,15 @@ pub struct Style {
     pub float: Float,
     pub break_before: bool,
     pub break_after: bool,
+    /// `display: inline-block` (or `inline-flex`, `inline-table`): an inline
+    /// box with its own background and border. Laid out as such only in a
+    /// dictionary popup; in a book it is plain inline text, as before.
+    pub inline_block: bool,
+    /// `border-radius`, base units.
+    pub radius: f32,
+    /// `opacity`, multiplied down through the element's descendants (CSS
+    /// composites the whole subtree; this fades each part the same).
+    pub opacity: f32,
 }
 
 impl Default for Style {
@@ -216,6 +225,9 @@ impl Default for Style {
             float: Float::None,
             break_before: false,
             break_after: false,
+            inline_block: false,
+            radius: 0.0,
+            opacity: 1.0,
         }
     }
 }
@@ -240,6 +252,7 @@ impl Style {
             list_style: self.list_style,
             underline: self.underline,
             strike: self.strike,
+            opacity: self.opacity,
             ..Style::default()
         }
     }
@@ -412,7 +425,9 @@ fn set(style: &mut Style, parent: &Style, name: &str, value: &str, em: f32, rem:
         "font-style" => style.italic = matches!(lower.as_str(), "italic" | "oblique"),
         "font" => font_shorthand(style, v),
         "color" => {
-            if let Some(c) = color(&lower) {
+            if let Some(c) =
+                color_mix(&lower, style.color.or(parent.color)).or_else(|| color(&lower))
+            {
                 style.color = c;
             }
         }
@@ -480,6 +495,27 @@ fn set(style: &mut Style, parent: &Style, name: &str, value: &str, em: f32, rem:
                 | "ruby" | "ruby-base" | "ruby-text" => Display::Inline,
                 "list-item" => Display::ListItem,
                 _ => Display::Block,
+            };
+            style.inline_block = matches!(
+                lower.as_str(),
+                "inline-block" | "inline-flex" | "inline-table"
+            );
+        }
+        "border-radius" => {
+            if let Some(Len::Base(b)) = lower.split_whitespace().next().and_then(len) {
+                style.radius = b.max(0.0);
+            } else if lower.trim_end().ends_with('%') {
+                // 50% and the like: a pill.
+                style.radius = 99.0;
+            }
+        }
+        "opacity" => {
+            if let Some(o) = lower
+                .strip_suffix('%')
+                .and_then(|p| p.trim().parse::<f32>().ok().map(|p| p / 100.0))
+                .or_else(|| lower.parse::<f32>().ok())
+            {
+                style.opacity = parent.opacity * o.clamp(0.0, 1.0);
             }
         }
         "margin" | "padding" => {
@@ -498,7 +534,9 @@ fn set(style: &mut Style, parent: &Style, name: &str, value: &str, em: f32, rem:
         "max-width" => style.max_width = len(&lower).unwrap_or(Len::Auto),
         "max-height" => style.max_height = len(&lower).unwrap_or(Len::Auto),
         "background-color" | "background" => {
-            if let Some(c) = lower.split_whitespace().find_map(color) {
+            if let Some(c) = color_mix(&lower, style.color) {
+                style.background = c;
+            } else if let Some(c) = lower.split_whitespace().find_map(color) {
                 style.background = c;
             } else if lower.contains("none") {
                 style.background = None;
@@ -790,6 +828,50 @@ fn font_size(v: &str, parent: f32, root: f32) -> Option<f32> {
 }
 
 /// A CSS length; `em` and `rem` are the element's and the root's font size.
+/// The ink `currentColor` means where a style leaves the colour to the theme.
+pub const THEME_INK: Color32 = Color32::from_rgb(0x1f, 0x3c, 0x46);
+
+/// `color-mix(in srgb, <a> N%, <b>)` with `transparent` as one side (what
+/// dictionaries use to tint with the text colour): `<a>` at N% opacity.
+/// `current` is the element's colour (`None`: the theme's).
+fn color_mix(v: &str, current: Option<Color32>) -> Option<Option<Color32>> {
+    let inner = v.trim().strip_prefix("color-mix(")?.strip_suffix(')')?;
+    let parts = super::css::split_top(inner, ',');
+    if parts.len() != 3 || !parts[0].contains("srgb") {
+        return None;
+    }
+    let side = |s: &str| -> Option<(Option<Color32>, Option<f32>)> {
+        let mut c = None;
+        let mut pct = None;
+        for t in s.split_whitespace() {
+            if let Some(p) = t.strip_suffix('%') {
+                pct = p.parse::<f32>().ok().map(|p| p / 100.0);
+            } else if t == "currentcolor" {
+                c = Some(Some(current.unwrap_or(THEME_INK)));
+            } else if t == "transparent" {
+                c = Some(None);
+            } else {
+                c = color(t);
+            }
+        }
+        Some((c?, pct))
+    };
+    let (a, pa) = side(parts[1])?;
+    let (b, pb) = side(parts[2])?;
+    let (col, share) = match (a, b) {
+        (Some(c), None) => (c, pa.or(pb.map(|p| 1.0 - p)).unwrap_or(0.5)),
+        (None, Some(c)) => (c, pb.or(pa.map(|p| 1.0 - p)).unwrap_or(0.5)),
+        _ => return None,
+    };
+    let [r, g, b, a] = col.to_srgba_unmultiplied();
+    Some(Some(Color32::from_rgba_unmultiplied(
+        r,
+        g,
+        b,
+        (a as f32 * share.clamp(0.0, 1.0)).round() as u8,
+    )))
+}
+
 pub fn length(v: &str, em: f32, rem: f32) -> Option<Len> {
     let v = v.trim();
     if v == "auto" {

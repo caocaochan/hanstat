@@ -626,7 +626,204 @@ fn run_plan(a: &PlanArgs, lang: Language, k: Option<&Knowledge>, fold: bool, jso
     println!("Easiest-now order:    {}", summary(&naive));
 }
 
+/// `hanstat-cli dict …`: the reader's Yomitan dictionaries.
+///
+/// ```text
+/// hanstat-cli dict import <zip>... [--dir D]   import (replacing the same dictionary)
+/// hanstat-cli dict list [--dir D]
+/// hanstat-cli dict lookup <text> [--dir D]
+/// hanstat-cli dict bench <text file> [--dir D]  2,000 lookups through a book
+/// hanstat-cli dict check [--dir D]              announced revisions
+/// ```
+fn dict_cli(args: Vec<String>) -> Result<(), String> {
+    use hanstat::dict::{format, import, lookup::Engine, manage};
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
+    let mut dir = hanstat::dict::root();
+    let mut rest = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        if a == "--dir" {
+            dir = PathBuf::from(it.next().ok_or("--dir expects a folder")?);
+        } else {
+            rest.push(a);
+        }
+    }
+    let cmd = rest.first().cloned().unwrap_or_default();
+    match cmd.as_str() {
+        "import" => {
+            manage::recover(&dir);
+            let t_all = Instant::now();
+            for zip in &rest[1..] {
+                let zip = PathBuf::from(zip);
+                let index = import::read_index(&zip)?;
+                let id = manage::existing(&dir, &index).unwrap_or_else(format::new_id);
+                let t = Instant::now();
+                let m = import::import(
+                    &zip,
+                    &manage::tmp_dir(&dir, &id),
+                    &import::Progress::default(),
+                    &AtomicBool::new(false),
+                )
+                .inspect_err(|_| {
+                    let _ = std::fs::remove_dir_all(manage::tmp_dir(&dir, &id));
+                })?;
+                manage::swap(&dir, &id)?;
+                manage::add_to_manifest(&dir, &id)?;
+                println!(
+                    "{:>7.2}s  {:>9} terms {:>9} glossaries {:>9} freq {:>5} media {:>7.1} MB  {}",
+                    t.elapsed().as_secs_f64(),
+                    m.terms,
+                    m.glossaries,
+                    m.freqs,
+                    m.media,
+                    m.bytes as f64 / 1e6,
+                    m.title
+                );
+            }
+            println!("{:.2}s in all", t_all.elapsed().as_secs_f64());
+        }
+        "list" => {
+            for (e, m) in manage::list(&dir) {
+                match m {
+                    Some(m) => println!(
+                        "{} {} {:>9} terms {:>9} freq  rev {}  {}{}",
+                        e.id,
+                        if e.enabled { "on " } else { "off" },
+                        m.terms,
+                        m.freqs,
+                        m.revision,
+                        m.title,
+                        if m.update.is_some() {
+                            "  (updatable)"
+                        } else {
+                            ""
+                        }
+                    ),
+                    None => println!("{} unreadable", e.id),
+                }
+            }
+        }
+        "lookup" => {
+            let text = rest.get(1).ok_or("dict lookup expects text")?;
+            let t = Instant::now();
+            let (mut e, errors) = Engine::load(&dir, None);
+            for err in errors {
+                eprintln!("{err}");
+            }
+            let t_open = t.elapsed();
+            let t = Instant::now();
+            let r = e.lookup(text);
+            let t_look = t.elapsed();
+            for g in &r.groups {
+                let freqs: Vec<String> = g
+                    .freqs
+                    .iter()
+                    .map(|b| format!("{} {}", e.dicts[b.dict].title, b.values[0].display))
+                    .collect();
+                println!(
+                    "{} [{}]{} {}",
+                    g.headword,
+                    g.reading,
+                    if g.folded { " (简)" } else { "" },
+                    freqs.join(", ")
+                );
+                for p in &g.parts {
+                    let first = p.glossaries[0].json.as_deref().unwrap_or("(unreadable)");
+                    let first: String = first.chars().take(100).collect();
+                    println!(
+                        "    {} ×{}: {first}",
+                        e.dicts[p.dict].title,
+                        p.glossaries.len()
+                    );
+                }
+            }
+            eprintln!("open {t_open:?}, lookup {t_look:?}");
+        }
+        "bench" => {
+            let path = rest.get(1).ok_or("dict bench expects a text file")?;
+            let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+            let chars: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+            let t = Instant::now();
+            let (mut e, _) = Engine::load(&dir, None);
+            let t_open = t.elapsed();
+            let positions: Vec<usize> = (0..chars.len())
+                .step_by((chars.len() / 2000).max(1))
+                .take(2000)
+                .collect();
+            let mut times = Vec::new();
+            let (mut groups, mut bytes) = (0usize, 0usize);
+            let cold = Instant::now();
+            let first: String = chars[positions[0]..].iter().take(16).collect();
+            let _ = e.lookup(&first);
+            let t_cold = cold.elapsed();
+            for &p in &positions[1..] {
+                let s: String = chars[p..].iter().take(16).collect();
+                let t = Instant::now();
+                let r = e.lookup(&s);
+                times.push(t.elapsed().as_secs_f64() * 1e3);
+                groups += r.groups.len();
+                bytes += r
+                    .groups
+                    .iter()
+                    .flat_map(|g| &g.parts)
+                    .flat_map(|p| &p.glossaries)
+                    .map(|g| g.json.as_ref().map_or(0, |j| j.len()))
+                    .sum::<usize>();
+            }
+            times.sort_by(|a, b| a.total_cmp(b));
+            println!(
+                "{} dictionaries, open {:?}, first lookup {:?}; {} lookups: median {:.3} ms, p99 {:.3} ms, max {:.3} ms; {} groups, {:.1} MB of glossary JSON",
+                e.dicts.len(),
+                t_open,
+                t_cold,
+                times.len(),
+                times[times.len() / 2],
+                times[times.len() * 99 / 100],
+                times.last().unwrap(),
+                groups,
+                bytes as f64 / 1e6
+            );
+        }
+        "check" => {
+            let urls: Vec<(String, String)> = manage::list(&dir)
+                .into_iter()
+                .filter_map(|(e, m)| Some((e.id, m?.update?.index_url)))
+                .collect();
+            let t = Instant::now();
+            let results = hanstat::dict::update::check_all(urls, true);
+            let wall = t.elapsed();
+            for (id, r) in results {
+                let m = manage::read_meta(&dir.join(&id));
+                let (title, rev) = m.map(|m| (m.title, m.revision)).unwrap_or_default();
+                match r {
+                    Ok(remote) => println!(
+                        "{}  {title}: {rev} → {}",
+                        if hanstat::dict::revision::is_newer(&rev, &remote.revision) {
+                            "UPDATE"
+                        } else {
+                            "same  "
+                        },
+                        remote.revision
+                    ),
+                    Err(e) => println!("FAILED  {title}: {e}"),
+                }
+            }
+            println!("checked in {wall:?}");
+        }
+        _ => return Err("dict expects import, list, lookup, bench or check".into()),
+    }
+    Ok(())
+}
+
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("dict") {
+        if let Err(e) = dict_cli(std::env::args().skip(2).collect()) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let mut args = std::env::args().skip(1);
     let mut file = None;
     let mut kind = SegmenterKind::Auto;
