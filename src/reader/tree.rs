@@ -70,6 +70,8 @@ pub struct Chapter {
     pub links: Vec<(String, Option<String>)>,
     /// Characters of text, for the book's progress.
     pub text_len: usize,
+    /// Element ids and the characters of text before them.
+    pub anchors: Vec<(String, usize)>,
 }
 
 /// Style sheets parsed once per book, by the list of sheets a chapter links.
@@ -162,6 +164,7 @@ pub fn build(epub: &Epub, path: &str, sheets: &mut SheetCache) -> Chapter {
         base: base.to_owned(),
         path: path.to_owned(),
         text_len: 0,
+        anchors: Vec::new(),
         cands: Vec::new(),
         root_font: 1.0,
     };
@@ -194,6 +197,7 @@ pub fn build(epub: &Epub, path: &str, sheets: &mut SheetCache) -> Chapter {
         root,
         links: b.links,
         text_len: b.text_len,
+        anchors: b.anchors,
     }
 }
 
@@ -205,6 +209,7 @@ struct Builder<'a> {
     base: String,
     path: String,
     text_len: usize,
+    anchors: Vec<(String, usize)>,
     cands: Vec<u32>,
     root_font: f32,
 }
@@ -266,7 +271,7 @@ impl Run {
                     }
                     c => {
                         self.push_char(c, style, link);
-                        n += 1;
+                        n += counts(c);
                     }
                 }
             }
@@ -297,7 +302,7 @@ impl Run {
                 }
             }
             self.push_char(c, style, link);
-            n += 1;
+            n += counts(c);
         }
         n
     }
@@ -317,6 +322,12 @@ impl Run {
         self.items.push(item);
         self.last = Some('\u{FFFC}');
     }
+}
+
+/// Whether `c` counts toward a chapter's length: letters (Chinese
+/// characters among them) and digits, not punctuation or symbols.
+fn counts(c: char) -> usize {
+    c.is_alphanumeric() as usize
 }
 
 fn wide(c: char) -> bool {
@@ -404,6 +415,9 @@ impl Builder<'_> {
     /// The block for `el`, whose style is computed.
     fn block(&mut self, el: &scraper::ElementRef, style: Style) -> Block {
         let id = el.value().id().map(str::to_owned);
+        if let Some(id) = &id {
+            self.anchors.push((id.clone(), self.text_len));
+        }
         let list = style.display == Display::ListItem;
         let marker_style = style.list_style;
         let sid = self.push(style.clone());
@@ -601,6 +615,7 @@ impl Builder<'_> {
             block.children.push(Child::Block(child));
         } else {
             if let Some(id) = el.value().id() {
+                self.anchors.push((id.to_owned(), self.text_len));
                 run.items.push(Inline::Anchor(id.to_owned()));
             }
             let link = self.link(el).or(link);

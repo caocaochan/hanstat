@@ -121,6 +121,64 @@ pub(crate) fn lay_out<T>(
     }
 }
 
+/// A window's frames, run by hand (in tests), kept as pictures: its
+/// textures followed across frames, any frame written as a PNG.
+#[cfg(test)]
+pub(crate) struct Screen {
+    textures: HashMap<TextureId, Texture>,
+}
+
+#[cfg(test)]
+impl Screen {
+    pub(crate) fn new() -> Self {
+        Screen {
+            textures: HashMap::new(),
+        }
+    }
+
+    /// Take in a frame's texture changes (every frame must come here).
+    pub(crate) fn absorb(&mut self, out: &mut egui::FullOutput) {
+        apply(&mut self.textures, &out.textures_delta);
+        for id in &out.textures_delta.free {
+            self.textures.remove(id);
+        }
+        out.textures_delta.clear();
+    }
+
+    /// The frame `out` (absorbed) as a picture of `size` points.
+    pub(crate) fn picture(
+        &self,
+        ctx: &egui::Context,
+        out: &mut egui::FullOutput,
+        size: egui::Vec2,
+    ) -> Scene {
+        let ppp = out.pixels_per_point;
+        let primitives = ctx.tessellate(std::mem::take(&mut out.shapes), ppp);
+        Scene {
+            primitives,
+            textures: self
+                .textures
+                .iter()
+                .map(|(k, t)| {
+                    (
+                        *k,
+                        Texture {
+                            size: t.size,
+                            pixels: t.pixels.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            pixels_per_point: ppp,
+            size: [
+                (size.x * ppp).round() as usize,
+                (size.y * ppp).round() as usize,
+            ],
+            background: Color32::BLACK,
+        }
+    }
+}
+
 fn apply(textures: &mut HashMap<TextureId, Texture>, delta: &TexturesDelta) {
     for (id, d) in delta
         .set

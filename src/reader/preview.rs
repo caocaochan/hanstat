@@ -172,6 +172,115 @@ fn render_pages() {
     }
 }
 
+/// The reader in a window-less egui context: frames run by hand with
+/// pointer and key events, any frame saved as a PNG.
+struct Driver {
+    ctx: egui::Context,
+    screen: crate::raster::Screen,
+    size: Vec2,
+    last: Option<egui::FullOutput>,
+    out_dir: Option<std::path::PathBuf>,
+    /// Seconds: 60 frames a second, so animations (popups fading in) run.
+    time: f64,
+}
+
+impl Driver {
+    fn new() -> Driver {
+        let ctx = egui::Context::default();
+        crate::install_fonts(&ctx);
+        Driver {
+            ctx,
+            screen: crate::raster::Screen::new(),
+            size: vec2(1200.0, 800.0),
+            last: None,
+            out_dir: env("READER_OUT").map(std::path::PathBuf::from),
+            time: 0.0,
+        }
+    }
+
+    fn open(&self, book: &str) -> Reader {
+        let mut r = Reader::open(Path::new(book), Some("ui-test"), false, &self.ctx).unwrap();
+        r.persist = false;
+        r
+    }
+
+    /// One frame; `false` once the reader closed.
+    fn frame(&mut self, r: &mut Reader, events: Vec<egui::Event>) -> bool {
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, self.size)),
+            events,
+            time: Some(self.time),
+            predicted_dt: 1.0 / 60.0,
+            ..Default::default()
+        };
+        self.time += 1.0 / 60.0;
+        let mut open = true;
+        let mut out = self.ctx.run_ui(raw, |ui| open = r.ui(ui));
+        self.screen.absorb(&mut out);
+        self.last = Some(out);
+        open
+    }
+
+    fn idle(&mut self, r: &mut Reader, n: usize) {
+        for _ in 0..n {
+            self.frame(r, vec![]);
+        }
+    }
+
+    /// Until the page is shown and every chapter is built.
+    fn ready(&mut self, r: &mut Reader) {
+        let t = Instant::now();
+        while fonts::families().is_none()
+            || !r.layouts.contains_key(&r.spine)
+            || r.target.is_some()
+            || r.progress().is_none()
+        {
+            self.frame(r, vec![]);
+            assert!(t.elapsed().as_secs() < 30, "never laid out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        self.idle(r, 2);
+    }
+
+    fn click(&mut self, r: &mut Reader, p: Pos2) -> bool {
+        let button = |pressed| egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let a = self.frame(r, vec![egui::Event::PointerMoved(p), button(true)]);
+        let b = self.frame(r, vec![button(false)]);
+        self.idle(r, 30);
+        a && b
+    }
+
+    fn key(&mut self, r: &mut Reader, key: Key) -> bool {
+        let open = self.frame(
+            r,
+            vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        self.idle(r, 30);
+        open
+    }
+
+    /// Save the last frame as `name`.png in `READER_OUT`, if set.
+    fn snap(&mut self, name: &str) {
+        let (Some(dir), Some(mut out)) = (self.out_dir.clone(), self.last.take()) else {
+            return;
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        let scene = self.screen.picture(&self.ctx, &mut out, self.size);
+        scene.write_png(&dir.join(format!("{name}.png"))).unwrap();
+    }
+}
+
 /// The reader's own UI, driven frame by frame without a window: it opens,
 /// finds its fonts, lays out, turns pages with the keys and across
 /// chapters, and closes on Esc.
@@ -179,48 +288,14 @@ fn render_pages() {
 #[ignore]
 fn drive_ui() {
     let book = env("READER_EPUB").expect("set READER_EPUB");
-    let ctx = egui::Context::default();
-    crate::install_fonts(&ctx);
-    let screen = Rect::from_min_size(Pos2::ZERO, vec2(1200.0, 800.0));
-    let frame = |reader: &mut Reader, keys: &[Key]| -> bool {
-        let raw = egui::RawInput {
-            screen_rect: Some(screen),
-            events: keys
-                .iter()
-                .map(|k| egui::Event::Key {
-                    key: *k,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers: egui::Modifiers::NONE,
-                })
-                .collect(),
-            ..Default::default()
-        };
-        let mut open = true;
-        let mut out = ctx.run_ui(raw, |ui| open = reader.ui(ui));
-        out.textures_delta.clear();
-        open
-    };
-    let mut r = Reader::open(Path::new(&book), Some("drive-ui-test"), false, &ctx).unwrap();
-    r.persist = false;
+    let mut d = Driver::new();
+    let mut r = d.open(&book);
     r.spine = 0;
     r.target = Some(Target::Offset(0));
-    let t = std::time::Instant::now();
-    let mut frames = 0;
-    while !r.layouts.contains_key(&r.spine) || r.target.is_some() {
-        assert!(frame(&mut r, &[]));
-        frames += 1;
-        assert!(t.elapsed().as_secs() < 30, "never laid out");
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    eprintln!("first page after {frames} frames, {:?}", t.elapsed());
+    d.ready(&mut r);
     let mut seen = vec![(r.spine, r.page)];
     for _ in 0..12 {
-        frame(&mut r, &[Key::ArrowRight]);
-        for _ in 0..3 {
-            frame(&mut r, &[]);
-        }
+        d.key(&mut r, Key::ArrowRight);
         seen.push((r.spine, r.page));
     }
     eprintln!("forward: {seen:?}");
@@ -229,15 +304,143 @@ fn drive_ui() {
         "pages move forward: {seen:?}"
     );
     let at = (r.spine, r.page);
-    frame(&mut r, &[Key::ArrowLeft]);
-    for _ in 0..3 {
-        frame(&mut r, &[]);
-    }
+    d.key(&mut r, Key::ArrowLeft);
     assert!(
         (r.spine, r.page) < at,
         "back from {at:?} to {:?}",
         (r.spine, r.page)
     );
-    assert!(!frame(&mut r, &[Key::Escape]), "Esc closes");
-    r.close(&ctx);
+    assert!(!d.key(&mut r, Key::Escape), "Esc closes");
+    r.close(&d.ctx);
+}
+
+/// The settings panel used with the mouse: the Aa button opens it, the
+/// serif box opens its list without closing the panel, a family picked in
+/// the list is applied with the panel still open, a click on the page closes
+/// the panel without turning the page, and Esc closes the panel, not the
+/// reader.
+#[test]
+#[ignore]
+fn settings_panel_clicks() {
+    let book = env("READER_EPUB").expect("set READER_EPUB");
+    let mut d = Driver::new();
+    let mut r = d.open(&book);
+    d.ready(&mut r);
+    let page = (r.spine, r.page);
+    let aa = r.probe.aa.expect("Aa drawn");
+    assert!(r.probe.serif_box.is_none(), "panel starts closed");
+    d.click(&mut r, aa.center());
+    let serif_box = r.probe.serif_box.expect("Aa opens the panel");
+    d.snap("panel");
+    d.click(&mut r, serif_box.center());
+    assert!(
+        r.probe.serif_box.is_some(),
+        "the panel stays open when the font box is clicked"
+    );
+    let (item, family) = r.probe.serif_item.clone().expect("the font list opens");
+    d.snap("panel-font-list");
+    d.click(&mut r, item.center());
+    assert_eq!(
+        r.settings.serif.as_deref(),
+        Some(family.as_str()),
+        "the family clicked is chosen"
+    );
+    assert!(
+        r.probe.serif_box.is_some(),
+        "the panel stays open after choosing"
+    );
+    assert!(
+        r.probe.serif_item.is_none(),
+        "the list closes after choosing"
+    );
+    d.idle(&mut r, 5);
+    d.snap("panel-font-chosen");
+    let page = (r.spine, r.page).max(page);
+    let on_page = pos2(d.size.x - 200.0, d.size.y / 2.0);
+    d.click(&mut r, on_page);
+    assert!(
+        r.probe.serif_box.is_none(),
+        "a click on the page closes the panel"
+    );
+    assert_eq!((r.spine, r.page), page, "and doesn't turn the page");
+    d.click(&mut r, on_page);
+    assert_ne!((r.spine, r.page), page, "the next click turns it");
+    d.click(&mut r, aa.center());
+    assert!(r.probe.serif_box.is_some(), "Aa opens the panel again");
+    assert!(
+        d.key(&mut r, Key::Escape),
+        "Esc with the panel open keeps the reader"
+    );
+    assert!(r.probe.serif_box.is_none(), "Esc closes the panel");
+    r.close(&d.ctx);
+}
+
+/// The contents menu: opens on a click, shows the entries (numbered when the
+/// book repeats names) with their lengths, goes to the entry clicked, and Esc
+/// closes the menu but not the reader.
+#[test]
+#[ignore]
+fn contents_clicks() {
+    let book = env("READER_EPUB").expect("set READER_EPUB");
+    let mut d = Driver::new();
+    let mut r = d.open(&book);
+    r.spine = 0;
+    r.target = Some(Target::Offset(0));
+    d.ready(&mut r);
+    let contents = r.probe.contents.expect("contents button drawn");
+    d.click(&mut r, contents.center());
+    let item = r.probe.toc_item.expect("the menu opens with its entries");
+    d.snap("contents");
+    let want = r.epub.toc[5].spine;
+    let lengths = r
+        .toc_lengths()
+        .expect("lengths once every chapter is built");
+    eprintln!(
+        "entries 1-8: {:?}",
+        (0..8.min(lengths.len()))
+            .map(|i| (&r.toc_labels[i], lengths[i]))
+            .collect::<Vec<_>>()
+    );
+    d.click(&mut r, item.center());
+    d.ready(&mut r);
+    assert_eq!(r.spine, want, "the entry clicked is opened");
+    assert!(r.probe.toc_item.is_none(), "the menu closes");
+    d.snap("contents-chosen");
+    d.click(&mut r, contents.center());
+    assert!(r.probe.toc_item.is_some(), "it opens again");
+    assert!(
+        d.key(&mut r, Key::Escape),
+        "Esc with the menu open keeps the reader"
+    );
+    assert!(r.probe.toc_item.is_none(), "Esc closes the menu");
+    r.close(&d.ctx);
+}
+
+#[test]
+fn repeated_contents_names_are_numbered() {
+    let e = |label: &str, depth| epub::TocEntry {
+        label: label.into(),
+        depth,
+        spine: 0,
+        fragment: None,
+    };
+    assert_eq!(toc_labels(&[e("一", 0), e("二", 0)]), ["一", "二"]);
+    assert_eq!(
+        toc_labels(&[
+            e("偷偷", 0),
+            e("偷偷", 0),
+            e("卷二", 0),
+            e("夜", 1),
+            e("夜", 1)
+        ]),
+        ["1. 偷偷", "2. 偷偷", "3. 卷二", "1. 夜", "2. 夜"]
+    );
+}
+
+#[test]
+fn digits_grouped() {
+    assert_eq!(group_digits(0), "0");
+    assert_eq!(group_digits(999), "999");
+    assert_eq!(group_digits(1000), "1,000");
+    assert_eq!(group_digits(1234567), "1,234,567");
 }

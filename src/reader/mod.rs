@@ -104,6 +104,19 @@ impl Settings {
     }
 }
 
+/// Widgets of the settings panel as drawn in the last frame.
+#[derive(Default)]
+struct Probe {
+    aa: Option<Rect>,
+    /// The serif font box, while the panel is open.
+    serif_box: Option<Rect>,
+    /// The serif list is open: one of its entries and its family.
+    serif_item: Option<(Rect, String)>,
+    contents: Option<Rect>,
+    /// The contents menu is open: its sixth entry.
+    toc_item: Option<Rect>,
+}
+
 /// Where to go once a chapter is laid out.
 #[derive(Clone, Debug)]
 enum Target {
@@ -153,6 +166,14 @@ pub struct Reader {
     /// Settings changed and not yet saved; `persist`: save at all.
     dirty: bool,
     persist: bool,
+    /// Table of contents entries as shown: numbered when the book repeats names.
+    toc_labels: Vec<String>,
+    /// The contents menu was open last frame.
+    contents_shown: bool,
+    /// The Aa panel is open.
+    settings_open: bool,
+    /// Where the settings' widgets were drawn this frame (for tests that click them).
+    probe: Probe,
     error: Option<String>,
     /// The time of this frame, and of the last page turn.
     now: f64,
@@ -227,6 +248,7 @@ impl Reader {
                 })
                 .map_err(|e| e.to_string())?;
         }
+        let toc_labels = toc_labels(&epub.toc);
         fonts::prefetch();
         // The reader's colours for every widget and popup while it is open.
         let theme = ctx.theme();
@@ -259,6 +281,10 @@ impl Reader {
             drawn: None,
             dirty: false,
             persist: true,
+            toc_labels,
+            contents_shown: false,
+            settings_open: false,
+            probe: Probe::default(),
             error: None,
             now: 0.0,
             turned_at: 0.0,
@@ -402,8 +428,13 @@ impl Reader {
 
     /// The table of contents entry the reader is in.
     fn toc_label(&self) -> Option<&str> {
+        self.toc_current().map(|i| self.toc_labels[i].as_str())
+    }
+
+    /// The index of the table of contents entry the reader is in.
+    fn toc_current(&self) -> Option<usize> {
         let mut best = None;
-        for e in &self.epub.toc {
+        for (i, e) in self.epub.toc.iter().enumerate() {
             if e.spine > self.spine {
                 break;
             }
@@ -414,9 +445,43 @@ impl Reader {
             {
                 break;
             }
-            best = Some(e.label.as_str());
+            best = Some(i);
         }
         best
+    }
+
+    /// Each contents entry's length in characters (letters, digits and
+    /// Chinese characters): from where it starts to where the next one does.
+    /// `None` until every chapter is built.
+    fn toc_lengths(&self) -> Option<Vec<usize>> {
+        let c = self.chapters.lock().unwrap();
+        let mut before = Vec::with_capacity(c.len() + 1);
+        let mut total = 0usize;
+        for ch in c.iter() {
+            before.push(total);
+            total += ch.as_ref()?.text_len;
+        }
+        let at = |e: &epub::TocEntry| -> usize {
+            let ch = c[e.spine].as_ref().unwrap();
+            let within = e
+                .fragment
+                .as_ref()
+                .and_then(|f| ch.anchors.iter().find(|(id, _)| id == f))
+                .map_or(0, |(_, n)| *n);
+            before[e.spine] + within
+        };
+        let starts: Vec<usize> = self.epub.toc.iter().map(at).collect();
+        Some(
+            (0..starts.len())
+                .map(|i| {
+                    starts
+                        .get(i + 1)
+                        .copied()
+                        .unwrap_or(total)
+                        .saturating_sub(starts[i])
+                })
+                .collect(),
+        )
     }
 
     /// The share of the book before the current page, once every chapter is read.
@@ -446,7 +511,13 @@ impl Reader {
         self.images.poll(&ctx);
         let mut open = true;
         // A click that closes a popup doesn't also turn the page.
-        let popup_was_open = egui::Popup::is_any_open(&ctx);
+        let popup_was_open = egui::Popup::is_any_open(&ctx) || self.settings_open;
+        // Esc closes an open panel or menu (egui closes its menus itself
+        // while drawing them), never the reader with it.
+        let esc_for_popup = popup_was_open && ctx.input(|i| i.key_pressed(Key::Escape));
+        if esc_for_popup {
+            self.settings_open = false;
+        }
         let mut geom_for_keys: Option<Geometry> = self.last_geom;
 
         egui::Panel::top("reader-bar")
@@ -631,7 +702,7 @@ impl Reader {
             }
             // Clicks: links, else the left third back and the rest forward.
             if resp.clicked() && popup_was_open {
-                egui::Popup::close_id(&ctx, settings_popup());
+                self.settings_open = false;
             } else if resp.clicked() {
                 if let Some(t) = clicked_link {
                     if let Some(ch) = self.chapter(self.spine)
@@ -672,6 +743,8 @@ impl Reader {
         if let Some(g) = geom_for_keys
             && !ctx.text_edit_focused()
             && !egui::Popup::is_any_open(&ctx)
+            && !self.settings_open
+            && !popup_was_open
         {
             let (fwd, back, home, end, esc, wheel) = ctx.input_mut(|i| {
                 let fwd = [Key::ArrowRight, Key::ArrowDown, Key::PageDown, Key::Space]
@@ -746,24 +819,97 @@ impl Reader {
             return;
         }
         let mut go = None;
-        ui.menu_button(RichText::new("☰ Contents").size(15.0), |ui| {
+        let current = self.toc_current();
+        let lengths = self.toc_lengths();
+        let scroll = !self.contents_shown;
+        self.probe.toc_item = None;
+        let mut toc_item = None;
+        // Each entry is one line of text: its name, then its length in a
+        // column just past the longest name, so the menu is as wide as its
+        // contents (a right-aligned column would stretch it across the window).
+        let font = egui::FontId::proportional(15.0);
+        let small = egui::FontId::proportional(13.0);
+        let indent = |e: &epub::TocEntry| e.depth as f32 * 16.0;
+        let name_w: Vec<f32> = ui.fonts_mut(|f| {
+            self.toc_labels
+                .iter()
+                .map(|l| {
+                    f.layout_no_wrap(l.clone(), font.clone(), Color32::WHITE)
+                        .size()
+                        .x
+                })
+                .collect()
+        });
+        let numbers: Vec<String> = (0..self.toc_labels.len())
+            .map(|i| {
+                lengths
+                    .as_ref()
+                    .map_or("…".to_owned(), |l| group_digits(l[i]))
+            })
+            .collect();
+        let number_w: Vec<f32> = ui.fonts_mut(|f| {
+            numbers
+                .iter()
+                .map(|n| {
+                    f.layout_no_wrap(n.clone(), small.clone(), Color32::WHITE)
+                        .size()
+                        .x
+                })
+                .collect()
+        });
+        let names_col = self
+            .epub
+            .toc
+            .iter()
+            .zip(&name_w)
+            .map(|(e, w)| indent(e) + w)
+            .fold(0.0, f32::max)
+            .min(480.0);
+        let numbers_col = number_w.iter().copied().fold(0.0, f32::max);
+        let text = ui.visuals().text_color();
+        let menu = ui.menu_button(RichText::new("☰ Contents").size(15.0), |ui| {
             egui::ScrollArea::vertical()
                 .max_height(ui.ctx().content_rect().height() * 0.7)
                 .show(ui, |ui| {
-                    let current = self.toc_label().map(str::to_owned);
                     for (i, e) in self.epub.toc.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.add_space(e.depth as f32 * 16.0);
-                            let here = current.as_deref() == Some(e.label.as_str())
-                                && e.spine == self.spine;
-                            if ui.selectable_label(here, &e.label).clicked() {
-                                go = Some(i);
-                                ui.close();
-                            }
-                        });
+                        let mut job = egui::text::LayoutJob::default();
+                        job.append(
+                            &self.toc_labels[i],
+                            indent(e),
+                            egui::TextFormat::simple(font.clone(), text),
+                        );
+                        // Gap to the numbers' column, numbers right-aligned in it.
+                        let gap = (names_col - indent(e) - name_w[i]).max(0.0)
+                            + 28.0
+                            + (numbers_col - number_w[i]);
+                        job.append(
+                            &numbers[i],
+                            gap,
+                            egui::TextFormat {
+                                valign: egui::Align::Center,
+                                ..egui::TextFormat::simple(small.clone(), theme::BASE1)
+                            },
+                        );
+                        let r = ui
+                            .selectable_label(current == Some(i), job)
+                            .on_hover_text("Its length: Chinese characters, letters and digits");
+                        // Opened at the reader's place.
+                        if scroll && current == Some(i) {
+                            r.scroll_to_me(Some(egui::Align::Center));
+                        }
+                        if i == 5 {
+                            toc_item = Some(r.rect);
+                        }
+                        if r.clicked() {
+                            go = Some(i);
+                            ui.close();
+                        }
                     }
                 });
         });
+        self.probe.contents = Some(menu.response.rect);
+        self.probe.toc_item = toc_item;
+        self.contents_shown = menu.inner.is_some();
         if let Some(i) = go {
             let e = self.epub.toc[i].clone();
             self.forward = true;
@@ -777,12 +923,22 @@ impl Reader {
 
     fn settings_menu(&mut self, ui: &mut egui::Ui) {
         let before = self.settings.clone();
-        // A popup that ignores clicks: a menu closes on any click, which the
-        // font lists (popups of their own) count as outside it. It closes
-        // with the button, Esc or a click on the page.
-        let button = ui.button(RichText::new("Aa").size(15.0).strong());
+        // The panel's open state is kept here, not in egui's memory: egui
+        // keeps one open popup per window, so opening a font list (a popup)
+        // would close a popup panel. It ignores clicks and closes with its
+        // button, Esc or a click on the page.
+        let button =
+            ui.selectable_label(self.settings_open, RichText::new("Aa").size(15.0).strong());
+        if button.clicked() {
+            self.settings_open = !self.settings_open;
+        }
+        self.probe.aa = Some(button.rect);
+        self.probe.serif_box = None;
+        self.probe.serif_item = None;
+        let mut open = self.settings_open;
         egui::Popup::menu(&button)
-            .id(settings_popup())
+            .id(egui::Id::unique("reader-settings"))
+            .open_bool(&mut open)
             .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
             .show(|ui| {
             ui.set_min_width(300.0);
@@ -798,7 +954,8 @@ impl Reader {
                             .unwrap_or_else(|| "App font".into())
                     });
                     let mut chosen = current.clone();
-                    egui::ComboBox::from_id_salt(("reader-font", serif))
+                    let mut item = None;
+                    let combo = egui::ComboBox::from_id_salt(("reader-font", serif))
                         .selected_text(&shown)
                         .width(220.0)
                         .height(420.0)
@@ -808,15 +965,23 @@ impl Reader {
                                     ui.label("Looking for fonts…");
                                 }
                                 Some(f) => {
-                                    for fam in f.iter() {
+                                    for (i, fam) in f.iter().enumerate() {
                                         let sel = shown.eq_ignore_ascii_case(&fam.name);
-                                        if ui.selectable_label(sel, fam.label()).clicked() {
+                                        let r = ui.selectable_label(sel, fam.label());
+                                        if r.clicked() {
                                             chosen = Some(fam.name.clone());
+                                        }
+                                        if i == 2 {
+                                            item = Some((r.rect, fam.name.clone()));
                                         }
                                     }
                                 }
                             }
                         });
+                    if serif {
+                        self.probe.serif_box = Some(combo.response.rect);
+                        self.probe.serif_item = item;
+                    }
                     if chosen != current {
                         if serif {
                             self.settings.serif = chosen;
@@ -854,14 +1019,43 @@ impl Reader {
                 ui.end_row();
             });
         });
+        self.settings_open = open;
         if self.settings != before {
             self.dirty = true;
         }
     }
 }
 
-fn settings_popup() -> egui::Id {
-    egui::Id::unique("reader-settings")
+/// `12345` as `12,345`.
+fn group_digits(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The table of contents' labels, numbered in front by position at their level when
+/// the book gives several entries the same name (some JJWXC books title every
+/// chapter alike: 偷偷, 偷偷, …), so they can be told apart.
+fn toc_labels(toc: &[epub::TocEntry]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let repeats = toc.iter().any(|e| !seen.insert(e.label.as_str()));
+    if !repeats {
+        return toc.iter().map(|e| e.label.clone()).collect();
+    }
+    let mut counters: Vec<usize> = Vec::new();
+    toc.iter()
+        .map(|e| {
+            counters.resize(e.depth + 1, 0);
+            counters[e.depth] += 1;
+            format!("{}. {}", counters[e.depth], e.label)
+        })
+        .collect()
 }
 
 /// Where the pages go in `area`.

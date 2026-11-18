@@ -1,5 +1,14 @@
 # Changelog
 
+## [2026.11.18.02] - 2026-11-18
+
+### Fixed
+- **The reader's font lists open.** Clicking the Serif or Sans-serif box in **Aa** still closed the panel in 2026.11.18.01: egui keeps one open popup per window, so the list replaced the panel. The panel now stays open while you choose, until you click **Aa** again, press Esc or click the page.
+- **Esc closes the open menu or panel, not the reader.** With **Aa** or **☰ Contents** open, Esc closed the reader too.
+
+### Changed
+- **Contents numbers its entries when the book repeats names.** Some books give every chapter the same title (偷偷藏不住: 偷偷, 偷偷, …; 难哄, 折月亮), so the entries read **1. 偷偷**, **2. 偷偷**, …, numbered at each level; the page heading shows the same. Each entry also shows its length in characters (Chinese characters, letters and digits; no punctuation), and the menu opens at the chapter you are in, no wider than its entries.
+
 ## [2026.11.18.01] - 2026-11-18
 
 ### Added
