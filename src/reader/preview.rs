@@ -725,6 +725,32 @@ fn dictionary_popup() {
     assert!(d.key(&mut r, Key::ArrowDown));
     assert!(r.dict.is_open(), "↓ scrolls the popup");
     assert_eq!((r.spine, r.page), page, "and doesn't turn the page");
+    for _ in 0..4 {
+        d.key(&mut r, Key::ArrowDown);
+    }
+    assert!(r.dict.levels[0].scroll_y > 0.0, "scrolled down");
+    // Another word's popup starts at the top.
+    let other = spots
+        .iter()
+        .find(|(s, rect)| {
+            !r.dict.contains(rect.center()) && r.dict.highlight(r.spine).is_none_or(|h| h.0 != *s)
+        })
+        .unwrap();
+    d.frame_with(
+        &mut r,
+        vec![egui::Event::PointerMoved(other.1.center())],
+        shift,
+    );
+    d.idle(&mut r, 2);
+    assert_eq!(
+        r.dict.highlight(r.spine).map(|h| h.0),
+        Some(other.0),
+        "another word"
+    );
+    assert_eq!(
+        r.dict.levels[0].scroll_y, 0.0,
+        "a new popup starts at the top"
+    );
     // Esc closes the popup, not the reader.
     assert!(r.dict.is_open());
     assert!(d.key(&mut r, Key::Escape), "the reader stays open");

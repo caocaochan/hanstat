@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.18.05] - 2026-11-18
+
+### Fixed
+- **A new word's popup starts at the top.** After scrolling down in the popup, the next word looked up opened scrolled down as far.
+
 ## [2026.11.18.04] - 2026-11-18
 
 ### Changed

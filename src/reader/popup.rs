@@ -118,6 +118,11 @@ pub struct Level {
     pub rect: Option<Rect>,
     /// Put above the other popups (once, when it first shows).
     raised: bool,
+    /// Not drawn yet: it starts scrolled to the top (egui keeps the scroll
+    /// of the popup it replaces otherwise).
+    fresh: bool,
+    /// How far its entries are scrolled.
+    pub scroll_y: f32,
 }
 
 pub struct Popup {
@@ -325,6 +330,8 @@ impl Popup {
                     heights: HashMap::new(),
                     rect: None,
                     raised: false,
+                    fresh: true,
+                    scroll_y: 0.0,
                 });
             }
         }
@@ -614,6 +621,8 @@ impl Popup {
         let mut resize: Option<Vec2> = None;
         let clicked = ctx.input(|i| i.pointer.primary_clicked());
         let ppp = ctx.pixels_per_point();
+        let fresh = self.levels[level].fresh;
+        let mut scroll_y = 0.0;
         let renderer = &mut self.renderer;
         let lvl = &self.levels[level];
         let area = egui::Area::new(popup_id(level))
@@ -640,12 +649,16 @@ impl Popup {
                         // Above its word, a popup takes all the room there: its
                         // bottom stays by the word whatever its entries' height
                         // (egui places it from last frame's size).
-                        let scroll_area = egui::ScrollArea::vertical()
+                        let mut scroll_area = egui::ScrollArea::vertical()
                             .id_salt(("dict-scroll", level))
                             .max_height(max_h)
                             .min_scrolled_height(max_h)
                             .auto_shrink([false, false]);
+                        if fresh {
+                            scroll_area = scroll_area.vertical_scroll_offset(0.0);
+                        }
                         scroll_area.show(ui, |ui| {
+                            scroll_y = (ui.clip_rect().top() - ui.cursor().top()).max(0.0);
                             ui.spacing_mut().item_spacing.y = 4.0;
                             if scroll != 0 {
                                 ui.scroll_with_delta(vec2(0.0, -(scroll as f32) * size * 3.0));
@@ -837,6 +850,8 @@ impl Popup {
             self.size_changed = true;
         }
         let l = &mut self.levels[level];
+        l.fresh = false;
+        l.scroll_y = scroll_y;
         l.rect = Some(area.response.rect);
         l.heights.extend(heights);
         if let Some(b) = toggle_bar
