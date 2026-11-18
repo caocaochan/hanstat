@@ -45,6 +45,10 @@ impl Service {
         freq_sort: Option<String>,
         wake: Arc<dyn Fn() + Send + Sync>,
     ) -> Service {
+        // Recovery deletes unfinished imports and downloads: done before
+        // anything can start one (an import or update job, the default
+        // dictionary's download), never alongside.
+        super::manage::recover(&root);
         let (tx, rx_req) = channel::<Request>();
         let (tx_rep, rx) = channel::<Reply>();
         std::thread::Builder::new()
@@ -115,7 +119,6 @@ fn worker(
     tx: Sender<Reply>,
     wake: Arc<dyn Fn() + Send + Sync>,
 ) {
-    super::manage::recover(&root);
     let mut freq_sort = freq_sort;
     let loaded = |e: &Engine, errors: Vec<String>| Reply::Loaded {
         dicts: e.dicts.clone(),
