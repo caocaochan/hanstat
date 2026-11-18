@@ -25,6 +25,8 @@ The first start downloads the Chinese segmenters (about 80 MB); Korean and Japan
 
 Open a book or drop it on the window. The language is detected and shown in the badge at the top right; Chinese is segmented with LTP (Simplified) or CKIP (Traditional), Japanese with Sudachi, Korean with Kiwi. In Chinese, idioms count as one word, and the rare non-words a segmenter makes by misplacing a boundary (木柯跑, 他/妈凭/什么) are split again into dictionary words and the book's own names. The tabs show the overview, every character and word with its count, the sections (untick front and back matter), and names the segmenter may have split.
 
+**Reading.** **📕 Read** beside a Chinese EPUB's title opens it in a paginated reader with the book's own layout and pictures, one or two pages side by side, in the installed fonts you choose. It reopens where you left off.
+
 **What you know.** Click **🃏 Anki**, tick your decks and the field that holds the word: young and mature cards count as known (your collection is only read, never changed). Or click **📚** to tick vocabulary levels (HSK 3.0, TOCFL, JLPT, Kaishi 1.5k, 1–6급) or import word lists, and mark single words known with **+** in the Words tab. Each language keeps its own.
 
 **Names.** Character names inflate the unknown words. **Suggested words** lists the likely names and terms the segmenter split or glued to other words; apply them, or type one into **Force a word**.

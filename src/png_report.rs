@@ -86,7 +86,7 @@ impl Look {
 /// LXGW WenKai Medium 1.530, for book titles (SIL OFL 1.1; its licence is
 /// beside it). It has Chinese, both scripts, and Japanese; Hangul comes
 /// from the bold family.
-static WENKAI: &[u8] = include_bytes!("../assets/fonts/LXGWWenKai-Medium.ttf");
+pub(crate) static WENKAI: &[u8] = include_bytes!("../assets/fonts/LXGWWenKai-Medium.ttf");
 
 /// The page's two extra families. Bold: the system's bold CJK faces
 /// (Windows), ahead of the regular fonts for what they lack; elsewhere the

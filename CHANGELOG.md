@@ -1,5 +1,15 @@
 # Changelog
 
+## [2026.11.18.01] - 2026-11-18
+
+### Added
+- **Read the book.** **📕 Read** beside a Chinese EPUB's title on the Overview opens it in a reader that fills the window, with the book's own layout: its headings, indents, spacing, rules, colours, links and pictures, cover and illustration pages, and ruby (notes above the text). Pages are laid out by hanstat itself for Chinese: lines are justified to a grid of whole characters, never start with closing punctuation (，。」…) or end with opening punctuation (「《“), and never split —— or ……. Books made for vertical reading (most Readmoo ones) are shown horizontally, with their spacing turned to match.
+  - **One page or two** side by side (when the window is wide enough), switched in the reader's bar. Turn pages with the arrow keys, Page Up/Down, Space, the mouse wheel, or a click (the left third goes back); Home and End go to the start and end of the chapter, **☰ Contents** to any chapter, Esc back to the statistics. The book reopens where you left it.
+  - **Aa** sets the serif and sans-serif fonts, chosen from those installed that have Chinese (or the bundled LXGW WenKai), which one text without a font of its own uses, the text size, the least line spacing and the margins.
+  - The page is Solarized Light. Chapters are prepared in the background as the book opens, and pictures are loaded at the size they are shown.
+
+  Nothing is analysed again.
+
 ## [2026.11.18.00] - 2026-11-18
 
 ### Changed

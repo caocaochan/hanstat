@@ -30,6 +30,7 @@ mod palette;
 mod png_report;
 mod raster;
 mod read_books;
+mod reader;
 mod shortcuts;
 mod style_scale;
 mod whats_new;
@@ -171,6 +172,7 @@ fn install_fonts(ctx: &egui::Context) {
             }
         }
     }
+    reader::fonts::set_base(fonts.clone());
     ctx.set_fonts(fonts);
 }
 
@@ -632,6 +634,8 @@ struct App {
     /// The release notes since the version used last, on the first start
     /// of a newer one ([`whats_new`]).
     whats_new: Option<whats_new::WhatsNew>,
+    /// The book open in the reader, which then fills the window.
+    reader: Option<reader::Reader>,
 }
 
 /// The floating windows, which the Close-window shortcut closes.
@@ -1269,6 +1273,7 @@ impl Default for App {
             typing_before: false,
             window_stack: Vec::new(),
             whats_new: None,
+            reader: None,
         }
     }
 }
@@ -2787,6 +2792,9 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        if let Some(r) = &mut self.reader {
+            r.save();
+        }
         self.finish_removal();
         hanstat::saver::flush();
     }
@@ -2856,8 +2864,18 @@ impl eframe::App for App {
                 .filter(|p| !p.as_os_str().is_empty())
                 .collect()
         });
-        if !dropped.is_empty() {
+        if self.reader.is_none() && !dropped.is_empty() {
             self.open_files(dropped, &ctx);
+        }
+        // The reader fills the window while a book is open in it.
+        if let Some(r) = &mut self.reader {
+            if !r.ui(ui) {
+                if let Some(r) = self.reader.take() {
+                    r.close(&ctx);
+                }
+                ctx.request_repaint();
+            }
+            return;
         }
         self.handle_shortcuts(&ctx);
 
@@ -4291,14 +4309,23 @@ impl App {
         let skip_hapax = self.settings.skip_hapax;
         let image_busy = self.image_busy();
         let mut save_image = false;
+        let mut read_book = false;
         let out = egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             // The title, wrapped clear of the image button at the right.
             ui.horizontal_top(|ui| {
                 let w = (ui.available_width() - 160.0).max(120.0);
                 ui.allocate_ui(egui::vec2(w, 0.0), |ui| {
-                    if let Some(t) = &r.title {
-                        ui.heading(t);
-                    }
+                    ui.horizontal_wrapped(|ui| {
+                        if let Some(t) = &r.title {
+                            ui.heading(t);
+                        }
+                        if chinese && r.format == "EPUB" && self.path.is_some() {
+                            read_book = ui
+                                .button(RichText::new("📕 Read").size(15.0))
+                                .on_hover_text("Read the book, with its layout and pictures")
+                                .clicked();
+                        }
+                    });
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                     save_image = ui
@@ -4758,6 +4785,16 @@ impl App {
         let ctx = ui.ctx().clone();
         if save_image {
             self.export_image(&ctx, png_report::ImageExport::Book);
+        }
+        if read_book && let Some(path) = self.path.clone() {
+            let traditional = self
+                .report
+                .as_ref()
+                .is_some_and(|r| r.variant == Variant::Traditional);
+            match reader::Reader::open(&path, self.report_id.as_deref(), traditional, &ctx) {
+                Ok(r) => self.reader = Some(r),
+                Err(e) => self.set_error("reader", e),
+            }
         }
         let now = ctx.input(|i| i.time);
         if std::mem::take(&mut self.fit_pending) {
