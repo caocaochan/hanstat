@@ -445,6 +445,8 @@ impl Reader {
         self.images.next_frame();
         self.images.poll(&ctx);
         let mut open = true;
+        // A click that closes a popup doesn't also turn the page.
+        let popup_was_open = egui::Popup::is_any_open(&ctx);
         let mut geom_for_keys: Option<Geometry> = self.last_geom;
 
         egui::Panel::top("reader-bar")
@@ -628,7 +630,9 @@ impl Reader {
                 }
             }
             // Clicks: links, else the left third back and the rest forward.
-            if resp.clicked() {
+            if resp.clicked() && popup_was_open {
+                egui::Popup::close_id(&ctx, settings_popup());
+            } else if resp.clicked() {
                 if let Some(t) = clicked_link {
                     if let Some(ch) = self.chapter(self.spine)
                         && let Some((path, frag)) = ch.links.get(t as usize).cloned()
@@ -773,7 +777,14 @@ impl Reader {
 
     fn settings_menu(&mut self, ui: &mut egui::Ui) {
         let before = self.settings.clone();
-        ui.menu_button(RichText::new("Aa").size(15.0).strong(), |ui| {
+        // A popup that ignores clicks: a menu closes on any click, which the
+        // font lists (popups of their own) count as outside it. It closes
+        // with the button, Esc or a click on the page.
+        let button = ui.button(RichText::new("Aa").size(15.0).strong());
+        egui::Popup::menu(&button)
+            .id(settings_popup())
+            .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
+            .show(|ui| {
             ui.set_min_width(300.0);
             let fams = fonts::families();
             egui::Grid::new("reader-settings").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
@@ -847,6 +858,10 @@ impl Reader {
             self.dirty = true;
         }
     }
+}
+
+fn settings_popup() -> egui::Id {
+    egui::Id::unique("reader-settings")
 }
 
 /// Where the pages go in `area`.
