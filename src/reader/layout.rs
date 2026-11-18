@@ -1558,7 +1558,20 @@ mod tests {
     fn lay_out_html(html: &str, cols: f32) -> (Chapter, ChapterLayout) {
         use super::super::tree::{Source, build_doc, ua_rules};
         let ctx = eframe::egui::Context::default();
-        crate::install_fonts(&ctx);
+        // The bundled LXGW WenKai first: the same glyphs on every machine
+        // (CI machines may have no Chinese font, which makes them 0 wide).
+        let mut defs = eframe::egui::FontDefinitions::default();
+        defs.font_data.insert(
+            "wenkai".into(),
+            Arc::new(eframe::egui::FontData::from_static(
+                crate::png_report::WENKAI,
+            )),
+        );
+        defs.families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, "wenkai".into());
+        ctx.set_fonts(defs);
         ctx.run_ui(Default::default(), |_| {})
             .textures_delta
             .clear();
