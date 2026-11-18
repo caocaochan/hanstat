@@ -434,22 +434,42 @@ fn cols_for(n: usize) -> usize {
     }
 }
 
-/// A titled card that fills the width it is given.
+/// A titled card that fills the width it is given. Returns the height of
+/// its contents.
 fn chart_card(
     ui: &mut egui::Ui,
     look: Look,
     title: &str,
     sub: &str,
     add: impl FnOnce(&mut egui::Ui),
-) {
-    frame(look).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.label(bold_text(title, 16.0, look.text));
-        ui.add_space(3.0);
-        ui.label(RichText::new(sub).size(12.5).color(look.weak));
-        ui.add_space(12.0);
-        add(ui);
-    });
+) -> f32 {
+    sized_card(ui, look, title, sub, None, |ui, _| add(ui))
+}
+
+/// A titled card whose contents are `height` tall (as returned by
+/// [`chart_card`] for a card beside it), so the two line up; `add` is given
+/// the height left under the title.
+fn sized_card(
+    ui: &mut egui::Ui,
+    look: Look,
+    title: &str,
+    sub: &str,
+    height: Option<f32>,
+    add: impl FnOnce(&mut egui::Ui, f32),
+) -> f32 {
+    frame(look)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let top = ui.cursor().top();
+            ui.label(bold_text(title, 16.0, look.text));
+            ui.add_space(3.0);
+            ui.label(RichText::new(sub).size(12.5).color(look.weak));
+            ui.add_space(12.0);
+            let left = height.map_or(CHART_HEIGHT, |h| h - (ui.cursor().top() - top));
+            add(ui, left.max(CHART_HEIGHT));
+            ui.min_rect().height()
+        })
+        .inner
 }
 
 /// Books by difficulty, as one bar with a legend.
@@ -1584,12 +1604,21 @@ impl App {
                     let p = c.running_words.percent();
                     (p, format!("You know {p:.1}% of the running words"))
                 });
-                chart_card(
+                // The table first: the curve fills a card as tall as it.
+                let table = chart_card(
+                    &mut cols[1],
+                    look,
+                    "Words to know",
+                    "The most frequent items needed to recognise a share of the running text",
+                    |ui| coverage_table(ui, look, r, chinese || japanese, japanese),
+                );
+                sized_card(
                     &mut cols[0],
                     look,
                     "Vocabulary coverage",
                     "How much of the text its most frequent words make up (log scale)",
-                    |ui| {
+                    Some(table),
+                    |ui, height| {
                         charts::coverage_curve(
                             ui,
                             &pts,
@@ -1597,16 +1626,9 @@ impl App {
                             level,
                             palette::accent(),
                             "words",
-                            CHART_HEIGHT,
+                            height,
                         )
                     },
-                );
-                chart_card(
-                    &mut cols[1],
-                    look,
-                    "Words to know",
-                    "The most frequent items needed to recognise a share of the running text",
-                    |ui| coverage_table(ui, look, r, chinese || japanese, japanese),
                 );
             });
         });

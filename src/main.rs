@@ -5972,17 +5972,23 @@ impl App {
         let mut mark_read: Option<String> = None;
         let mut sort = None;
         let dash = || RichText::new("–").weak();
+        // The other columns, and the ✕ column's least width.
+        let others = [
+            90.0, 100.0, 100.0, 100.0, 80.0, 100.0, 80.0, 92.0, 36.0, 36.0,
+        ];
+        let style_col = if style_on { 130.0 } else { 0.0 };
+        let book_w = title_column_width(
+            ui,
+            // Every book, not the search's: the columns stay put while typing.
+            entries.iter().map(|e| e.title.as_str()),
+            others.iter().sum::<f32>() + style_col,
+            others.len() + style_on as usize,
+        );
         TableBuilder::new(ui)
             // Cells otherwise inherit the top-down layout: text sits at the row top.
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .striped(true)
-            .column(
-                // Narrower while the writing-style column is shown, so the row still fits.
-                Column::initial(if style_on { 140.0 } else { 300.0 })
-                    .at_least(140.0)
-                    .resizable(true)
-                    .clip(true),
-            )
+            .column(Column::exact(book_w).clip(true))
             .column(Column::exact(90.0))
             .columns(Column::exact(100.0), 3)
             .column(Column::exact(80.0))
@@ -7355,19 +7361,23 @@ impl App {
                 72.0
             })
         .max(120.0);
+        // The other columns: #, the writing style, six figures, and the
+        // buttons' least width.
+        let others = 88.0 + 96.0 * 6.0 + 96.0 + if style_on { 130.0 } else { 0.0 };
+        let book_w = title_column_width(
+            ui,
+            // Every step, not the search's: the columns stay put while typing.
+            path.steps.iter().map(|s| lib.books[s.book].title.as_str()),
+            others,
+            8 + style_on as usize,
+        );
         TableBuilder::new(ui)
             .id_salt("plan_table")
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .striped(true)
             .max_scroll_height(table_h)
             .column(Column::exact(88.0))
-            .column(
-                // Narrower while the writing-style column is shown, so the row still fits.
-                Column::initial(if style_on { 200.0 } else { 300.0 })
-                    .at_least(140.0)
-                    .resizable(true)
-                    .clip(true),
-            )
+            .column(Column::exact(book_w).clip(true))
             .columns(Column::exact(130.0), style_on as usize)
             .columns(Column::exact(96.0), 6)
             .column(Column::remainder())
@@ -7785,6 +7795,34 @@ fn knowledge_digest(k: &anki::Knowledge) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+/// Width of a Library table's Book column (a cover, then the title): as
+/// wide as the longest of `titles`, but no wider than the `n` other columns,
+/// `others` wide together, leave, and at least 140 points (longer titles
+/// are cut with "…").
+fn title_column_width<'a>(
+    ui: &egui::Ui,
+    titles: impl Iterator<Item = &'a str>,
+    others: f32,
+    n: usize,
+) -> f32 {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let p = ui.painter();
+    let longest = titles
+        .map(|t| {
+            p.layout_no_wrap(t.to_owned(), font.clone(), Color32::WHITE)
+                .size()
+                .x
+        })
+        .fold(0.0, f32::max);
+    let gap = ui.spacing().item_spacing.x;
+    // The cover, 6 points, and the spacing either side of them; a little
+    // slack so the last letter isn't cut.
+    let want = COVER_SIZE.0 + 6.0 + 2.0 * gap + longest + 4.0;
+    // Between the columns, and room for the scroll bar.
+    let room = ui.available_width() - others - gap * n as f32 - 12.0;
+    want.min(room).max(140.0)
 }
 
 /// Size cover thumbnails are drawn at in the History table (points), and its row height.

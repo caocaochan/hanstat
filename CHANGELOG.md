@@ -1,5 +1,11 @@
 # Changelog
 
+## [2026.11.18.00] - 2026-11-18
+
+### Changed
+- **Library titles are shown in full when there is room.** The Book column of the Library's Books and Reading path tabs is as wide as the longest title, where the window leaves room for it; titles were cut at 300 points (140 with writing style on) however wide the window. It is never narrower than 140 points, and stays the same width while you search. It can no longer be resized by dragging.
+- **A book's image lines up its two last cards.** The Vocabulary coverage chart is as tall as the Words to know table beside it.
+
 ## [2026.11.17.16] - 2026-11-17
 
 ### Added
