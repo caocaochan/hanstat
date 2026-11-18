@@ -416,12 +416,8 @@ impl Popup {
     pub fn open_all(&mut self) {
         if let Some(l) = self.levels.last_mut() {
             for (gi, g) in l.result.groups.iter().enumerate() {
-                for pi in 0..g.parts.len() {
-                    if self
-                        .dicts
-                        .get(g.parts[pi].dict)
-                        .is_some_and(|d| d.collapsed)
-                    {
+                for (pi, p) in g.parts.iter().enumerate() {
+                    if self.dicts.get(p.dict).is_some_and(|d| d.collapsed) {
                         l.bars.insert((gi, pi));
                     }
                 }
