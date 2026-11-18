@@ -88,7 +88,13 @@ pub fn hsk2_count(level: u8) -> usize {
 pub fn hsk2_label(levels: &[u8]) -> String {
     let parts: Vec<String> = runs(levels)
         .into_iter()
-        .map(|(a, b)| if a == b { a.to_string() } else { format!("{a}–{b}") })
+        .map(|(a, b)| {
+            if a == b {
+                a.to_string()
+            } else {
+                format!("{a}–{b}")
+            }
+        })
         .collect();
     format!("HSK 2.0 {}", parts.join(", "))
 }
