@@ -801,8 +801,15 @@ impl Server {
         lines[lines.len().saturating_sub(6)..].join("\n")
     }
 
-    /// `text` read with `s`: 16-bit mono samples at [`opus::RATE`].
-    pub fn synth(&self, text: &str, s: &LocalSettings, seed: u64) -> Result<Vec<i16>, String> {
+    /// `text` read with `s`: 16-bit mono samples at [`opus::RATE`], and
+    /// whether the take stopped at its frame budget ([`frame_budget`])
+    /// instead of at the end of the text: cut off, or run on.
+    pub fn synth(
+        &self,
+        text: &str,
+        s: &LocalSettings,
+        seed: u64,
+    ) -> Result<(Vec<i16>, bool), String> {
         {
             let mut b = self.busy.lock().unwrap();
             while *b >= self.parallel {
@@ -810,14 +817,25 @@ impl Server {
             }
             *b += 1;
         }
-        let r = self.request(text, s, seed);
+        let budget = frame_budget(text, s);
+        let r = self.request(text, s, seed, budget);
         *self.busy.lock().unwrap() -= 1;
         self.freed.notify_one();
-        r
+        r.map(|pcm| {
+            let stopped = at_budget(pcm.len(), budget);
+            (pcm, stopped)
+        })
     }
 
-    fn request(&self, text: &str, s: &LocalSettings, seed: u64) -> Result<Vec<i16>, String> {
+    fn request(
+        &self,
+        text: &str,
+        s: &LocalSettings,
+        seed: u64,
+        budget: usize,
+    ) -> Result<Vec<i16>, String> {
         let mut body = serde_json::json!({
+            "max_new_tokens": budget,
             "input": text,
             "voice": s.speaker,
             "language": "chinese",
@@ -866,6 +884,33 @@ impl Server {
         }
         wav_samples(&bytes).ok_or_else(|| "The local voice sent no audio".to_owned())
     }
+}
+
+/// Samples an audio frame makes (the 12.5 Hz codec at 24 kHz).
+const FRAME_SAMPLES: usize = 1920;
+/// Positions a request may fill in the server's context: the prompt and
+/// every frame made (qwentts.cpp 2edb35f sizes its KV cache to 4096 and
+/// does not check for running past it).
+const CONTEXT: usize = 4096;
+
+/// Most frames to let the model make for `text` read with `s`: three times
+/// its expected length plus 4 s (longer and it has run on; the same rule
+/// as [`make_chunk`]'s retry), within what the context holds after the
+/// prompt, counted generously (a position for every character of text and
+/// instruction, and the template). Without this the server stops at 2048
+/// frames (163.8 s), which a slow voice could reach before the end of a
+/// long chunk, dropping its last sentences without a word.
+pub fn frame_budget(text: &str, s: &LocalSettings) -> usize {
+    let chars = text.chars().count();
+    let frames = ((seconds(chars) * 3.0 + 4.0) * 12.5).ceil() as usize;
+    let prompt = chars + s.instruct.chars().count() + 64;
+    frames.min(CONTEXT.saturating_sub(prompt + 64)).max(25)
+}
+
+/// A take of `samples` stopped at its `budget` of frames (within two, for
+/// what the codec trims), not at the end of the text.
+fn at_budget(samples: usize, budget: usize) -> bool {
+    samples + 2 * FRAME_SAMPLES >= budget * FRAME_SAMPLES
 }
 
 /// The 16-bit mono samples of a RIFF/WAVE file at [`opus::RATE`].
@@ -967,15 +1012,25 @@ pub fn make_chunk(
     let (own, _, _) = assemble(texts, paras, None);
     let base = hanstat::dict::xxh64::xxh64(own.as_bytes(), s.seed as u64);
     let mut pcm = Vec::new();
+    let mut stopped = false;
     for attempt in 0..2u64 {
-        pcm = server
+        (pcm, stopped) = server
             .synth(&text, s, base.wrapping_add(attempt))
             .map_err(Fail::Other)?;
         let secs = pcm.len() as f64 / opus::RATE as f64;
         let want = seconds(chars);
-        if secs < want * 3.0 + 4.0 && secs > want * 0.25 {
+        if !stopped && secs < want * 3.0 + 4.0 && secs > want * 0.25 {
             break;
         }
+    }
+    if stopped {
+        // Twice past its budget: cut into clips, the text it never reached
+        // would put every highlight in the wrong place.
+        return Err(Fail::Other(format!(
+            "The local voice ran past {} characters of text twice without finishing; \
+             a shorter chunk length (Advanced) may help",
+            chars
+        )));
     }
     let points = cut_points(&pcm, &all, &all_paras);
     let mut cut: Vec<usize> = points.iter().map(|c| c.0).collect();
@@ -1002,7 +1057,8 @@ pub fn make_chunk(
 /// chapter: its samples at [`opus::RATE`]. Not saved.
 pub fn preview(text: &str, s: &LocalSettings) -> Result<Vec<i16>, String> {
     let seed = hanstat::dict::xxh64::xxh64(text.as_bytes(), s.seed as u64);
-    server(s.parallel)?.synth(text, s, seed)
+    // A preview cut short is still worth hearing.
+    server(s.parallel)?.synth(text, s, seed).map(|t| t.0)
 }
 
 /// Run `f` on a thread of its own and tell `repaint` when it is done.
@@ -1131,6 +1187,42 @@ mod tests {
         assert_eq!(c.len(), 1);
         assert!(c[0].abs_diff(at(3.0)) < at(0.4), "{c:?}");
         assert!(cuts(&pcm, &[said(5, "。")], &[0]).is_empty());
+    }
+
+    #[test]
+    fn frame_budgets() {
+        let s = LocalSettings::default();
+        // A short text: three times its length plus 4 s.
+        let short = frame_budget("你好。", &s);
+        assert!((70..=90).contains(&short), "{short}");
+        // The longest chunk the settings allow (400) and a lead-in (60):
+        // room for a voice far slower than measured (2.5 characters a
+        // second, against 3.8), and never past the context.
+        let longest = said(459, "。");
+        let b = frame_budget(&longest, &s);
+        assert!(b as f64 >= 460.0 / 2.5 * 12.5, "{b}");
+        // Past the server's default of 2048 frames, which would cut it off.
+        assert!(b > 2048, "{b}");
+        // Whatever the length and instruction, prompt and frames fit.
+        let mut s2 = s.clone();
+        s2.instruct = "史诗感十足的低沉有声书旁白声线".into();
+        for n in [1, 50, 200, 460, 1000, 2000, 3500] {
+            let t = said(n, "");
+            let b = frame_budget(&t, &s2);
+            assert!(
+                n + s2.instruct.chars().count() + 64 + b <= CONTEXT || b == 25,
+                "{n}: {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn takes_stopped_at_their_budget() {
+        assert!(at_budget(100 * FRAME_SAMPLES, 100));
+        // The codec may trim a frame or two at the end.
+        assert!(at_budget(98 * FRAME_SAMPLES, 100));
+        assert!(!at_budget(97 * FRAME_SAMPLES, 100));
+        assert!(!at_budget(10 * FRAME_SAMPLES, 100));
     }
 
     #[test]

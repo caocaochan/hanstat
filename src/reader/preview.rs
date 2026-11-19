@@ -1666,7 +1666,8 @@ fn local_cut_eval() {
                     let pcm = tts::local::server(4)
                         .unwrap()
                         .synth(&text, &s, seed)
-                        .unwrap();
+                        .unwrap()
+                        .0;
                     let bytes: Vec<u8> = pcm.iter().flat_map(|x| x.to_le_bytes()).collect();
                     std::fs::write(dir.join(format!("chunk-{name}.pcm")), bytes).unwrap();
                     eprintln!("made chunk {name}");
