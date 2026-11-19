@@ -554,66 +554,133 @@ impl Tts {
 
 /// The settings few will change: sampling, seed, chunk size, parallel requests.
 fn advanced(ui: &mut egui::Ui, l: &mut LocalSettings, running: bool) {
+    ui.label(
+        RichText::new(
+            "Hover a setting to see what it changes. Use Preview to hear it before \
+             making a chapter.",
+        )
+        .size(12.0)
+        .weak(),
+    );
     egui::Grid::new("reader-tts-local-advanced")
         .num_columns(2)
         .spacing([12.0, 6.0])
         .show(ui, |ui| {
-            let f = |ui: &mut egui::Ui, v: &mut f32, r: std::ops::RangeInclusive<f32>, step: f64, tip: &str| {
-                ui.add(egui::Slider::new(v, r).step_by(step)).on_hover_text(tip);
+            // The explanation shows on the name and on the control.
+            let row = |ui: &mut egui::Ui,
+                       name: &str,
+                       tip: &str,
+                       add: &mut dyn FnMut(&mut egui::Ui) -> egui::Response| {
+                ui.label(name).on_hover_text(tip);
+                add(ui).on_hover_text(tip);
+                ui.end_row();
             };
-            ui.label("Temperature");
-            f(ui, &mut l.temperature, 0.0..=1.5, 0.05,
-              "Randomness of what is said and how: lower is steadier and flatter, higher livelier \
-               and less predictable; 0 always takes the likeliest (0.9 default)");
-            ui.end_row();
-            ui.label("Top-p");
-            f(ui, &mut l.top_p, 0.05..=1.0, 0.05,
-              "Sample only from the likeliest choices making up this share (1 = all)");
-            ui.end_row();
-            ui.label("Top-k");
-            ui.add(egui::Slider::new(&mut l.top_k, 0..=200))
-                .on_hover_text("Sample only from this many likeliest choices (0 = no limit; 50 default)");
-            ui.end_row();
-            ui.label("Repetition penalty");
-            f(ui, &mut l.repetition_penalty, 1.0..=1.5, 0.01,
-              "Discourages repeating sounds: too high can garble (1.05 default)");
-            ui.end_row();
-            ui.label("Detail temperature");
-            f(ui, &mut l.sub_temperature, 0.0..=1.5, 0.05,
-              "Randomness of the fine acoustic detail (timbre, breath) (0.9 default)");
-            ui.end_row();
-            ui.label("Detail top-p");
-            f(ui, &mut l.sub_top_p, 0.05..=1.0, 0.05, "Top-p for the fine detail (1 default)");
-            ui.end_row();
-            ui.label("Detail top-k");
-            ui.add(egui::Slider::new(&mut l.sub_top_k, 0..=200))
-                .on_hover_text("Top-k for the fine detail (50 default)");
-            ui.end_row();
-            ui.label("Seed");
-            ui.add(egui::DragValue::new(&mut l.seed))
-                .on_hover_text("Another number gives another take of the same text and settings");
-            ui.end_row();
-            ui.label("Chunk length");
-            ui.add(egui::Slider::new(&mut l.chunk_chars, 40..=400).step_by(10.0).suffix(" chars"))
-                .on_hover_text(
-                    "Whole paragraphs are read together up to this many characters: longer \
-                     keeps the voice steadier across sentences (200 default)",
-                );
-            ui.end_row();
-            ui.label("At once");
-            ui.add_enabled(!running, egui::Slider::new(&mut l.parallel, 1..=4).suffix(" requests"))
-                .on_hover_text(
-                    "Requests the GPU works on together: 4 is fastest but holds about 5 GB \
-                     of GPU memory, 1 about 3.7 GB. Doesn't change the audio.",
-                );
-            ui.end_row();
+            row(ui, "Temperature", TIP_TEMPERATURE, &mut |ui| {
+                ui.add(egui::Slider::new(&mut l.temperature, 0.0..=1.5).step_by(0.05))
+            });
+            row(ui, "Top-p", TIP_TOP_P, &mut |ui| {
+                ui.add(egui::Slider::new(&mut l.top_p, 0.05..=1.0).step_by(0.05))
+            });
+            row(ui, "Top-k", TIP_TOP_K, &mut |ui| {
+                ui.add(egui::Slider::new(&mut l.top_k, 0..=200))
+            });
+            row(ui, "Repetition penalty", TIP_REPETITION, &mut |ui| {
+                ui.add(egui::Slider::new(&mut l.repetition_penalty, 1.0..=1.5).step_by(0.01))
+            });
+            row(ui, "Detail temperature", TIP_SUB_TEMPERATURE, &mut |ui| {
+                ui.add(egui::Slider::new(&mut l.sub_temperature, 0.0..=1.5).step_by(0.05))
+            });
+            row(ui, "Detail top-p", TIP_SUB_TOP_P, &mut |ui| {
+                ui.add(egui::Slider::new(&mut l.sub_top_p, 0.05..=1.0).step_by(0.05))
+            });
+            row(ui, "Detail top-k", TIP_SUB_TOP_K, &mut |ui| {
+                ui.add(egui::Slider::new(&mut l.sub_top_k, 0..=200))
+            });
+            row(ui, "Seed", TIP_SEED, &mut |ui| {
+                ui.add(egui::DragValue::new(&mut l.seed))
+            });
+            row(ui, "Chunk length", TIP_CHUNK, &mut |ui| {
+                ui.add(
+                    egui::Slider::new(&mut l.chunk_chars, 40..=400)
+                        .step_by(10.0)
+                        .suffix(" chars"),
+                )
+            });
+            row(ui, "At once", TIP_PARALLEL, &mut |ui| {
+                ui.add_enabled(
+                    !running,
+                    egui::Slider::new(&mut l.parallel, 1..=4).suffix(" requests"),
+                )
+            });
         });
-    if ui.small_button("Reset to defaults").clicked() {
+    if ui
+        .small_button("Reset to defaults")
+        .on_hover_text("Every setting here back to its default; the voice and instructions stay")
+        .clicked()
+    {
         let keep = (l.speaker.clone(), l.instruct.clone());
         *l = LocalSettings::default();
         (l.speaker, l.instruct) = keep;
     }
 }
+
+// What each advanced setting does, for someone listening to learn rather
+// than tuning a model. Every one but "At once" makes new audio when changed.
+
+const TIP_TEMPERATURE: &str = "How lively and varied the reading is.\n\n\
+Lower (0.5–0.7): a calm, even narrator who reads every sentence much the same way. \
+Easier to follow, and fewer slips such as a wrong tone or an odd stress.\n\
+Higher (1.0+): more expressive and dramatic, but less predictable: sudden changes \
+of mood, rushed or mumbled words, now and then a wrong reading.\n\n\
+Default 0.9. If the voice sounds too excitable or stumbles, try 0.7.";
+
+const TIP_TOP_P: &str = "Keeps the voice to its most natural-sounding choices.\n\n\
+Lower (0.7–0.9) cuts unlikely choices, the source of most strange intonation and \
+mispronounced words, at the cost of a slightly flatter delivery.\n\
+1.0 sets no limit.\n\n\
+Default 1.0. Try 0.8 if you hear odd readings that would teach you the wrong sound.";
+
+const TIP_TOP_K: &str = "Another way of keeping the voice to safe choices: only the \
+most likely few are ever considered: this many of them.\n\n\
+Lower is safer and more uniform; 0 sets no limit. It rarely needs changing; \
+temperature and top-p make a bigger difference.\n\nDefault 50.";
+
+const TIP_REPETITION: &str = "Stops the voice getting stuck on a sound.\n\n\
+Raise it a little (1.1) if you hear a syllable or word repeated, a stutter, or a \
+long hum. Too high makes it skip or slur syllables, which is worse for learning.\n\n\
+Default 1.05.";
+
+const TIP_SUB_TEMPERATURE: &str = "How much the sound of the voice varies: its \
+texture, breathiness and crispness, not the words or the intonation.\n\n\
+Lower sounds cleaner and more uniform, a little synthetic.\n\
+Higher sounds more natural and alive, but can add hiss, crackle or a rough edge.\n\n\
+Default 0.9. Lower it if the voice sounds noisy or unclear.";
+
+const TIP_SUB_TOP_P: &str = "Top-p for the sound of the voice: lower trims the rare \
+choices that cause crackles and odd timbre.\n\nDefault 1.0 (no limit).";
+
+const TIP_SUB_TOP_K: &str = "Top-k for the sound of the voice: lower is cleaner and \
+more uniform; 0 sets no limit.\n\nDefault 50.";
+
+const TIP_SEED: &str = "Which take you get. The voice is a little different every \
+time it reads, and the seed picks one reading: the same text, settings and seed always \
+sound the same.\n\n\
+Change it to hear a different take of everything, for example if the reading came \
+out with a tone you don't like.";
+
+const TIP_CHUNK: &str = "How much text the voice reads in one go. Whole paragraphs \
+are read together up to this many characters, then cut into sentences.\n\n\
+Longer keeps the voice consistent from sentence to sentence, like a narrator \
+reading on.\nShorter means each sentence is read more on its own, and changes \
+of tone between them are more likely.\n\n\
+Default 200. Reading from a new place starts within a few seconds either way.";
+
+const TIP_PARALLEL: &str = "How many pieces of text the graphics card reads at once \
+when making audio.\n\n\
+4 is the fastest (about 18 times faster than listening on an RTX 5070) and holds \
+about 5 GB of its memory; 1 is about a third as fast and holds about 3.7 GB. Lower it \
+if other programs need the graphics card.\n\n\
+It never changes how the audio sounds.";
 
 /// `pcm` (the clip rate) played on the default device.
 fn play(pcm: &[i16], repaint: &super::engine::Repaint) -> Result<Output, String> {

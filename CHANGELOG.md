@@ -1,5 +1,11 @@
 # Changelog
 
+## [2026.11.19.04] - 2026-11-19
+
+### Changed
+- **The voice on this computer reads on from one chunk to the next.** Each chunk of paragraphs used to be read as if the book started there, and it began only about 0.1 s after the last one ended, against about 0.7 s between sentences inside a chunk, so every new chunk sounded abrupt. Now the model first reads the end of the sentence before (up to 60 characters), so the chunk's first sentence comes out as a continuation; that part is cut away, keeping the pause after it (now 0.55–0.9 s where chunks meet). A speech recogniser heard nothing of the cut-away part in the test chapter. Making audio takes about 15% longer. Audio made before keeps its old joins: **Delete** this book's local audio and make it again to get the new ones.
+- **The Advanced settings explain themselves.** Hovering a setting's name or its slider now says what it changes in what you hear and when to change it: Temperature for a calmer or livelier narrator, Top-p for fewer odd readings, Repetition penalty for stutters, the Detail settings for a cleaner or more natural-sounding voice, Seed for another take, Chunk length for steadier reading, and At once for speed and graphics memory.
+
 ## [2026.11.19.03] - 2026-11-19
 
 ### Added

@@ -417,7 +417,13 @@ fn marks(texts: &[String], paras: &[usize]) -> (Vec<(f64, Mark, Option<usize>)>,
 /// which a choice by pause length alone got wrong. A sentence end with its
 /// pause is cut in the middle of it; one without falls where the characters
 /// put it between the matches around it, at the quietest frame near there.
-pub fn cuts(pcm: &[i16], texts: &[String], paras: &[usize]) -> Vec<usize> {
+///
+/// Each cut comes with its pause (first and last sample) when it is at one.
+fn cut_points(
+    pcm: &[i16],
+    texts: &[String],
+    paras: &[usize],
+) -> Vec<(usize, Option<(usize, usize)>)> {
     if texts.len() < 2 {
         return Vec::new();
     }
@@ -511,8 +517,11 @@ pub fn cuts(pcm: &[i16], texts: &[String], paras: &[usize]) -> Vec<usize> {
         if boundary.is_none() {
             continue;
         }
-        let cut = match matched.iter().find(|m| m.0 == k) {
-            Some(&(_, r)) => (pauses[r].0 + pauses[r].1) / 2 * HOP,
+        let (cut, pause) = match matched.iter().find(|m| m.0 == k) {
+            Some(&(_, r)) => (
+                (pauses[r].0 + pauses[r].1) / 2 * HOP,
+                Some((pauses[r].0 * HOP, pauses[r].1 * HOP)),
+            ),
             None => {
                 let i = anchors
                     .partition_point(|a| a.0 <= c)
@@ -523,13 +532,45 @@ pub fn cuts(pcm: &[i16], texts: &[String], paras: &[usize]) -> Vec<usize> {
                 } else {
                     v0
                 };
-                ac.at_voiced(v)
+                (ac.at_voiced(v), None)
             }
         };
-        let floor = out.last().copied().unwrap_or(0);
-        out.push(cut.clamp(floor, pcm.len()));
+        let floor = out.last().map_or(0, |c: &(usize, _)| c.0);
+        out.push((cut.clamp(floor, pcm.len()), pause));
     }
     out
+}
+
+/// Where to cut a chunk's audio into its sentences ([`cut_points`]).
+#[cfg(test)]
+pub fn cuts(pcm: &[i16], texts: &[String], paras: &[usize]) -> Vec<usize> {
+    cut_points(pcm, texts, paras)
+        .into_iter()
+        .map(|c| c.0)
+        .collect()
+}
+
+/// Longest a lead-in may be, in characters.
+const LEAD_MAX: usize = 60;
+/// Most of the pause after a lead-in kept at the start of the chunk, in
+/// samples: 0.8 s. After a paragraph the model paused up to 1.5 s; inside
+/// chunks a sentence or paragraph pause is 0.5–1.0 s (middle half).
+const LEAD_PAUSE: usize = opus::RATE as usize * 8 / 10;
+
+/// What to read before a chunk so that it goes on from the text before it
+/// instead of starting afresh: the sentence before (`prev`), or only its
+/// last clauses when it is long (cut after a comma or the like).
+pub fn lead_in(prev: &str) -> String {
+    let chars: Vec<char> = prev.chars().collect();
+    if chars.len() <= LEAD_MAX {
+        return prev.to_owned();
+    }
+    // The longest tail within the limit that starts after a clause.
+    (chars.len() - LEAD_MAX..chars.len())
+        .find(|&i| i > 0 && matches!(chars[i - 1], '，' | '、' | '；' | '：' | ',' | ';' | ':'))
+        .map(|i| chars[i..].iter().collect::<String>())
+        .filter(|t| t.chars().any(char::is_alphanumeric))
+        .unwrap_or_else(|| chars[chars.len() - LEAD_MAX..].iter().collect())
 }
 
 /// The first build's cuts (2026.11.19.03, never released): every boundary at a pause, chosen by
@@ -864,27 +905,67 @@ fn wav_samples(b: &[u8]) -> Option<Vec<i16>> {
 pub const NOT_DOWNLOADED: &str =
     "Download the local voice first (Read aloud → On this computer → Download).";
 
-/// One chunk read and cut into its sentences' clips. A take far longer or
-/// shorter than the text should be (the model ran on or skipped text) is
-/// tried again once with another seed.
-pub fn make_chunk(
+/// Text read before a chunk and thrown away ([`lead_in`]): the end of the
+/// sentence before it, and whether that is in the chunk's first paragraph.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Lead {
+    pub text: String,
+    pub same_para: bool,
+}
+
+/// What is sent for a chunk: the lead-in (if any) then the chunk's
+/// sentences, paragraphs on lines of their own, sentences run together;
+/// and the sentences and paragraphs as read (the lead-in first).
+fn assemble(
     texts: &[String],
     paras: &[usize],
-    s: &LocalSettings,
-) -> Result<Vec<Vec<i16>>, Fail> {
-    // Not downloaded, or it won't start: no use trying the next chunk.
-    let server = server(s.parallel).map_err(Fail::Refused)?;
-    // Paragraphs on lines of their own, sentences run together.
+    lead: Option<&Lead>,
+) -> (String, Vec<String>, Vec<usize>) {
+    let mut all = Vec::with_capacity(texts.len() + 1);
+    let mut all_paras = Vec::with_capacity(texts.len() + 1);
+    if let Some(l) = lead {
+        all.push(l.text.clone());
+        all_paras.push(if l.same_para {
+            paras[0]
+        } else {
+            paras[0].wrapping_sub(1)
+        });
+    }
+    all.extend(texts.iter().cloned());
+    all_paras.extend_from_slice(paras);
     let mut text = String::new();
-    for (i, t) in texts.iter().enumerate() {
-        if i > 0 && paras[i] != paras[i - 1] {
+    for (i, t) in all.iter().enumerate() {
+        if i > 0 && all_paras[i] != all_paras[i - 1] {
             text.push('\n');
         }
         text.push_str(t);
     }
-    let lens: Vec<usize> = texts.iter().map(|t| t.chars().count()).collect();
-    let chars: usize = lens.iter().sum();
-    let base = hanstat::dict::xxh64::xxh64(text.as_bytes(), s.seed as u64);
+    (text, all, all_paras)
+}
+
+/// One chunk read and cut into its sentences' clips. With a lead-in, the
+/// model reads the end of the sentence before first, so the chunk's first
+/// sentence sounds like what comes next rather than a new start; that audio
+/// is cut away in the pause after it, so the first clip opens with the
+/// model's own pause, up to [`LEAD_PAUSE`] (where chunks met, the pause was
+/// otherwise 0.09–0.18 s against a median 0.7 s inside a chunk). On
+/// 死亡万花筒 a speech recogniser heard no trace of the lead-in in any of
+/// seven chunks' first clips. A take far longer or shorter than
+/// the text should be (the model ran on or skipped text) is tried again
+/// once with another seed.
+pub fn make_chunk(
+    texts: &[String],
+    paras: &[usize],
+    lead: Option<&Lead>,
+    s: &LocalSettings,
+) -> Result<Vec<Vec<i16>>, Fail> {
+    // Not downloaded, or it won't start: no use trying the next chunk.
+    let server = server(s.parallel).map_err(Fail::Refused)?;
+    let (text, all, all_paras) = assemble(texts, paras, lead);
+    let chars: usize = all.iter().map(|t| t.chars().count()).sum();
+    // The seed follows the chunk's own text, lead-in or not.
+    let (own, _, _) = assemble(texts, paras, None);
+    let base = hanstat::dict::xxh64::xxh64(own.as_bytes(), s.seed as u64);
     let mut pcm = Vec::new();
     for attempt in 0..2u64 {
         pcm = server
@@ -896,13 +977,23 @@ pub fn make_chunk(
             break;
         }
     }
-    let cut = cuts(&pcm, texts, paras);
-    let mut out = Vec::with_capacity(texts.len());
+    let points = cut_points(&pcm, &all, &all_paras);
+    let mut cut: Vec<usize> = points.iter().map(|c| c.0).collect();
+    if lead.is_some() && !points.is_empty() {
+        // The lead-in goes; the pause after it stays, up to LEAD_PAUSE.
+        cut[0] = points[0]
+            .1
+            .map_or(points[0].0, |(a, b)| a.max(b.saturating_sub(LEAD_PAUSE)));
+    }
+    let mut out = Vec::with_capacity(all.len());
     let mut a = 0;
     for &c in cut.iter().chain(std::iter::once(&pcm.len())) {
         let c = c.clamp(a, pcm.len());
         out.push(pcm[a..c].to_vec());
         a = c;
+    }
+    if lead.is_some() {
+        out.remove(0);
     }
     Ok(out)
 }
@@ -1040,6 +1131,56 @@ mod tests {
         assert_eq!(c.len(), 1);
         assert!(c[0].abs_diff(at(3.0)) < at(0.4), "{c:?}");
         assert!(cuts(&pcm, &[said(5, "。")], &[0]).is_empty());
+    }
+
+    #[test]
+    fn lead_ins() {
+        // Short: the whole sentence.
+        assert_eq!(lead_in("他点了点头。"), "他点了点头。");
+        // Long: its last clauses within the limit, from after a comma.
+        let long = format!("{}，{}，{}。", said(30, ""), said(30, ""), said(20, ""));
+        let l = lead_in(&long);
+        assert_eq!(l, format!("{}，{}。", said(30, ""), said(20, "")));
+        assert!(l.chars().count() <= LEAD_MAX);
+        // No comma near the end: the last characters.
+        let flat = said(100, "。");
+        assert_eq!(lead_in(&flat).chars().count(), LEAD_MAX);
+    }
+
+    #[test]
+    fn lead_ins_are_read_first_and_on_their_line() {
+        let texts = [said(3, "。"), said(2, "。")];
+        let lead = Lead {
+            text: "前面。".into(),
+            same_para: false,
+        };
+        let (text, all, paras) = assemble(&texts, &[5, 6], Some(&lead));
+        assert_eq!(text, "前面。\n字字字。\n字字。");
+        assert_eq!(all.len(), 3);
+        assert_eq!(paras, [4, 5, 6]);
+        let same = Lead {
+            same_para: true,
+            ..lead
+        };
+        assert_eq!(
+            assemble(&texts, &[5, 6], Some(&same)).0,
+            "前面。字字字。\n字字。"
+        );
+        assert_eq!(assemble(&texts, &[5, 6], None).0, "字字字。\n字字。");
+    }
+
+    #[test]
+    fn cut_points_give_their_pause() {
+        let texts = [said(10, "。"), said(10, "。")];
+        let pcm = speech(&[(2.0, 0.6), (2.0, 0.0)]);
+        let p = cut_points(&pcm, &texts, &[0, 1]);
+        let (cut, pause) = (p[0].0, p[0].1.unwrap());
+        // The pause runs 2.0–2.6 s; the cut is in its middle.
+        assert!(
+            pause.0.abs_diff(at(2.0)) <= 240 && pause.1.abs_diff(at(2.6)) <= 240,
+            "{pause:?}"
+        );
+        assert!(cut > pause.0 && cut < pause.1);
     }
 
     #[test]

@@ -1725,3 +1725,154 @@ fn local_cut_eval() {
     eprintln!("{} chunks cut into {}", jobs.len(), dir.display());
     r.close(&d.ctx);
 }
+
+/// Where local-voice chunks meet, with and without a lead-in: chunks
+/// `1..=JOIN_N` (6 by default) of chapter `JOIN_SPINE` are made again with
+/// the end of the sentence before read first and cut away
+/// ([`tts::local::make_chunk`]), and each join is written as the last 6 s
+/// of the chunk before and the first 8 s of the chunk after, to
+/// `join-old.wav` (chunks as `local_cut_eval` made them, in `CUT_DIR`) and
+/// `join-new.wav`, with the silence at each join reported. The new chunks'
+/// first clips go to `lead-*.wav` with `lead.tsv`, to check by speech
+/// recognition that the lead-in is gone.
+#[test]
+#[ignore]
+fn local_join_eval() {
+    let book = env("READER_EPUB").expect("set READER_EPUB");
+    let dir = std::path::PathBuf::from(env("CUT_DIR").expect("set CUT_DIR"));
+    let spine: usize = env("JOIN_SPINE").expect("set JOIN_SPINE").parse().unwrap();
+    let n: usize = env("JOIN_N").and_then(|v| v.parse().ok()).unwrap_or(6);
+    let s = tts::local::LocalSettings::default();
+    let d = Driver::new();
+    let r = d.open(&book);
+    let t = Instant::now();
+    let ch = loop {
+        if let Some(c) = r.chapter(spine) {
+            break c;
+        }
+        assert!(t.elapsed().as_secs() < 60);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let sents = tts::sentences(&ch.chars);
+    let paras = tts::local::paragraphs(&ch.chars, &sents);
+    let lens: Vec<usize> = sents.iter().map(|r| r.len()).collect();
+    let text = |i: usize| -> String {
+        ch.chars[sents[i].start as usize..sents[i].end as usize]
+            .iter()
+            .collect()
+    };
+    let groups = tts::local::chunks(&lens, &paras, 0, |_| s.chunk_chars, n + 1);
+    let old_clips = |i: usize| -> Vec<Vec<i16>> {
+        let g = &groups[i];
+        let bytes = std::fs::read(dir.join(format!("chunk-{spine}-{i:02}.pcm")))
+            .expect("run local_cut_eval for this chapter first");
+        let pcm: Vec<i16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| i16::from_le_bytes(*c))
+            .collect();
+        let texts: Vec<String> = g.clone().map(text).collect();
+        let cut = tts::local::cuts(&pcm, &texts, &paras[g.clone()]);
+        let mut out = Vec::new();
+        let mut a = 0;
+        for &c in cut.iter().chain(std::iter::once(&pcm.len())) {
+            out.push(pcm[a..c.max(a)].to_vec());
+            a = c.max(a);
+        }
+        out
+    };
+    // Silence at the join: the quiet run around the meeting point.
+    let quiet = |x: &[i16]| {
+        let rms = |w: &[i16]| {
+            (w.iter().map(|&v| (v as f64 / 32768.0).powi(2)).sum::<f64>() / w.len() as f64).sqrt()
+        };
+        x.chunks(240).map(|w| rms(w) < 0.01).collect::<Vec<bool>>()
+    };
+    let gap = |before: &[i16], after: &[i16]| {
+        let (b, a) = (quiet(before), quiet(after));
+        let tail = b.iter().rev().take_while(|q| **q).count();
+        let head = a.iter().take_while(|q| **q).count();
+        (tail + head) as f64 / 100.0
+    };
+    let (mut old_wav, mut new_wav) = (Vec::new(), Vec::new());
+    let mut lead_tsv = String::new();
+    let next = std::sync::atomic::AtomicUsize::new(1);
+    let made: Vec<std::sync::Mutex<Option<Vec<Vec<i16>>>>> =
+        (0..=n).map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|sc| {
+        for _ in 0..4 {
+            sc.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i > n || i >= groups.len() {
+                        break;
+                    }
+                    let g = &groups[i];
+                    let texts: Vec<String> = g.clone().map(text).collect();
+                    let lead = tts::local::Lead {
+                        text: tts::local::lead_in(&text(g.start - 1)),
+                        same_para: paras[g.start - 1] == paras[g.start],
+                    };
+                    let clips =
+                        tts::local::make_chunk(&texts, &paras[g.clone()], Some(&lead), &s).unwrap();
+                    assert_eq!(clips.len(), texts.len());
+                    *made[i].lock().unwrap() = Some(clips);
+                }
+            });
+        }
+    });
+    tts::local::unload();
+    let silence = vec![0i16; 36_000];
+    let (mut gaps_old, mut gaps_new) = (Vec::new(), Vec::new());
+    for i in 1..=n.min(groups.len() - 1) {
+        let prev = old_clips(i - 1).concat();
+        let tail = &prev[prev.len().saturating_sub(6 * 24_000)..];
+        let old = old_clips(i);
+        let new = made[i].lock().unwrap().take().unwrap();
+        gaps_old.push(gap(tail, &old[0]));
+        gaps_new.push(gap(tail, &new[0]));
+        for (wav, clips) in [(&mut old_wav, &old), (&mut new_wav, &new)] {
+            let head = clips.concat();
+            wav.extend_from_slice(tail);
+            wav.extend_from_slice(&head[..head.len().min(8 * 24_000)]);
+            wav.extend_from_slice(&silence);
+        }
+        let file = format!("lead-{spine}-{i:02}.pcm");
+        let bytes: Vec<u8> = new[0].iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(dir.join(&file), bytes).unwrap();
+        lead_tsv += &format!(
+            "{file}	{}	{}
+",
+            text(groups[i].start - 1),
+            text(groups[i].start)
+        );
+    }
+    let write = |name: &str, pcm: &[i16]| {
+        let mut w = Vec::new();
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36 + pcm.len() as u32 * 2).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        for v in [
+            16u32.to_le_bytes(),
+            [1, 0, 1, 0],
+            24_000u32.to_le_bytes(),
+            48_000u32.to_le_bytes(),
+            [2, 0, 16, 0],
+        ] {
+            w.extend_from_slice(&v);
+        }
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&(pcm.len() as u32 * 2).to_le_bytes());
+        for x in pcm {
+            w.extend_from_slice(&x.to_le_bytes());
+        }
+        std::fs::write(dir.join(name), w).unwrap();
+    };
+    write("join-old.wav", &old_wav);
+    write("join-new.wav", &new_wav);
+    std::fs::write(dir.join("lead.tsv"), lead_tsv).unwrap();
+    eprintln!("silence at joins, old: {gaps_old:.2?}");
+    eprintln!("silence at joins, new: {gaps_new:.2?}");
+    r.close(&d.ctx);
+}

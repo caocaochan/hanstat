@@ -55,6 +55,9 @@ struct Job {
     clips: Vec<Clip>,
     speech: Speech,
     batch: Option<Arc<Batch>>,
+    /// The local voice: the end of the sentence before, read first and
+    /// thrown away so the chunk goes on from it.
+    lead: Option<local::Lead>,
 }
 
 impl Job {
@@ -333,7 +336,7 @@ fn make(c: &Azure, clip: &Clip, speech: &Speech) -> Result<(), Fail> {
 fn make_local(l: &local::LocalSettings, job: &Job) -> Result<(), Fail> {
     let texts: Vec<String> = job.clips.iter().map(|c| c.text.clone()).collect();
     let paras: Vec<usize> = job.clips.iter().map(|c| c.para).collect();
-    let pcm = local::make_chunk(&texts, &paras, l)?;
+    let pcm = local::make_chunk(&texts, &paras, job.lead.as_ref(), l)?;
     for (c, pcm) in job.clips.iter().zip(pcm) {
         if c.save && !c.path.exists() {
             let file = opus::encode(&pcm).map_err(Fail::Other)?;
@@ -341,6 +344,16 @@ fn make_local(l: &local::LocalSettings, job: &Job) -> Result<(), Fail> {
         }
     }
     Ok(())
+}
+
+/// The lead-in of a chunk starting at clip `start` of a chapter's `clips`:
+/// the end of the sentence before, none at the chapter's start.
+fn lead(clips: &[Clip], start: usize) -> Option<local::Lead> {
+    let prev = clips.get(start.checked_sub(1)?)?;
+    Some(local::Lead {
+        text: local::lead_in(&prev.text),
+        same_para: clips.get(start).is_some_and(|c| c.para == prev.para),
+    })
 }
 
 /// Write `bytes` to `path` (via a temporary name: a clip is whole or absent).
@@ -740,6 +753,7 @@ impl Player {
                     let jobs: Vec<Job> = groups
                         .into_iter()
                         .map(|g| Job {
+                            lead: speech.local.as_ref().and_then(|_| lead(&clips, g.start)),
                             clips: clips[g].to_vec(),
                             speech: speech.clone(),
                             batch: Some(batch.clone()),
@@ -923,6 +937,7 @@ impl Player {
                     }],
                     speech: self.speech.clone(),
                     batch: None,
+                    lead: None,
                 });
             }
             pos = Some((p.0, p.1 + 1));
@@ -985,6 +1000,10 @@ impl Player {
             for g in groups {
                 end = g.end;
                 seen += lens[g.clone()].iter().sum::<usize>();
+                let lead = (g.start > 0).then(|| local::Lead {
+                    text: local::lead_in(&self.text(p.0, &sents[g.start - 1])),
+                    same_para: paras[g.start - 1] == paras[g.start],
+                });
                 let clips: Vec<Clip> = g
                     .map(|k| {
                         let text = self.text(p.0, &sents[k]);
@@ -1004,6 +1023,7 @@ impl Player {
                         clips,
                         speech: self.speech.clone(),
                         batch: None,
+                        lead,
                     });
                 }
             }
