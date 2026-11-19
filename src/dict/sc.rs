@@ -168,7 +168,10 @@ pub fn content(v: &Value, out: &mut String) {
                     attrs(o, out);
                     out.push('>');
                     for (i, li) in compact_items(o).unwrap().into_iter().enumerate() {
-                        if i > 0 {
+                        // A classifier (CL: 個) starts a line of its own.
+                        if i > 0 && classifier(li) {
+                            out.push_str("<br>");
+                        } else if i > 0 {
                             out.push_str("<span class=\"sep\">; </span>");
                         }
                         if let Some(c) = li.get("content") {
@@ -232,6 +235,19 @@ fn text_len(v: &Value) -> usize {
 
 /// A list's items, if it can be one line: `li` of plain inline content, at
 /// most 60 characters each.
+/// A CC-CEDICT item that begins with its classifier label (`CL:`).
+fn classifier(li: &serde_json::Map<String, Value>) -> bool {
+    let first = match li.get("content") {
+        Some(Value::Array(a)) => a.first(),
+        c => c,
+    };
+    first
+        .and_then(|v| v.get("data"))
+        .and_then(|d| d.get("cccedict"))
+        .and_then(|c| c.as_str())
+        == Some("classifier")
+}
+
 fn compact_items(
     o: &serde_json::Map<String, Value>,
 ) -> Option<Vec<&serde_json::Map<String, Value>>> {
@@ -406,6 +422,15 @@ mod tests {
                 r#"<span class="gloss-sc-list" data-sc-cccedict="definition">to speak<span class="sep">; </span>to <a href="?query=x">say</a></span>"#,
                 "</div></div>"
             )
+        );
+        // A classifier goes on a line of its own (as CC-CEDICT writes it).
+        let j = r#"[{"type":"structured-content","content":{"tag":"ul","content":[
+            {"tag":"li","content":["nervous"]},{"tag":"li","content":["tense"]},
+            {"tag":"li","content":[{"tag":"span","data":{"cccedict":"classifier"},"content":"CL:"},"陣"]}]}}]"#;
+        assert!(
+            html(j).contains(r#"nervous<span class="sep">; </span>tense<br><span class="gloss-sc-span" data-sc-cccedict="classifier">CL:</span>陣"#),
+            "{}",
+            html(j)
         );
         let j = r#"[{"type":"structured-content","content":{"tag":"ul","content":[
             {"tag":"li","content":"a"},{"tag":"li","content":{"tag":"div","content":"b"}}]}}]"#;

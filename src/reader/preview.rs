@@ -816,8 +816,24 @@ fn popup_words() {
             vec![egui::Event::PointerMoved(first.center())],
             shift,
         );
+        // The first lookup can miss its frame while the files are cold.
+        for _ in 0..100 {
+            if r.dict.is_open() {
+                break;
+            }
+            d.frame_with(&mut r, vec![], shift);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert!(r.dict.is_open());
         r.dict.show_word(w);
+        for _ in 0..100 {
+            if r.dict.levels[0].result.text == w {
+                break;
+            }
+            d.frame_with(&mut r, vec![], egui::Modifiers::NONE);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(r.dict.levels[0].result.text, w);
         r.dict.open_all();
         let t = Instant::now();
         d.frame_with(&mut r, vec![], egui::Modifiers::NONE);

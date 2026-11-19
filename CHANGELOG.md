@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.19.01] - 2026-11-19
+
+### Changed
+- **CC-CEDICT's classifiers get their own line in the popup.** `CL:` and its measure words used to follow the senses on the same line (nervous; tense; scarce; CL:陣); they now start a line below them, also in the glossaries the popup's **+** sends to Anki.
+
 ## [2026.11.19.00] - 2026-11-19
 
 ### Added
