@@ -570,6 +570,28 @@ impl Manager {
                         }
                     });
                     ui.end_row();
+                    ui.label("Anki cards");
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("Set up…")
+                            .on_hover_text("The deck, note type and fields of the notes the popup's + adds")
+                            .clicked()
+                        {
+                            popup.cards.open_setup();
+                        }
+                        let c = &settings.anki;
+                        ui.label(
+                            RichText::new(if !c.enabled {
+                                "Off".to_owned()
+                            } else if c.ready() {
+                                format!("{} → {}", c.model, c.deck)
+                            } else {
+                                "Not set up".to_owned()
+                            })
+                            .color(super::theme::BASE00),
+                        );
+                    });
+                    ui.end_row();
                     ui.label("Updates");
                     ui.vertical(|ui| {
                         ui.add_enabled(!updates_off(), egui::Checkbox::new(&mut settings.check_updates, "Check once a day"));

@@ -5,6 +5,7 @@
 //! first); the open chapter is laid out on the UI thread when it is shown,
 //! with the fonts chosen in the reader, and drawn page by page.
 
+mod anki;
 mod css;
 mod dicts_ui;
 mod epub;
@@ -85,6 +86,8 @@ struct Settings {
     /// The popup's size as dragged by its corner (width, height of its
     /// entries' area); `None`: the default.
     popup_size: Option<[f32; 2]>,
+    /// Anki cards from the popup.
+    anki: anki::CardSettings,
 }
 
 impl Default for Settings {
@@ -104,6 +107,7 @@ impl Default for Settings {
             check_updates: true,
             auto_install: false,
             popup_size: None,
+            anki: anki::CardSettings::default(),
         }
     }
 }
@@ -279,7 +283,9 @@ impl Reader {
                 .map_err(|e| e.to_string())?;
         }
         let toc_labels = toc_labels(&epub.toc);
-        let dict = popup::Popup::new(ctx, settings.freq_sort.clone());
+        let mut dict = popup::Popup::new(ctx, settings.freq_sort.clone());
+        dict.cards.book = Arc::from(epub.title.as_str());
+        dict.sync_cards(&settings.anki);
         let mut dicts = dicts_ui::Manager::new(ctx, &dict);
         dicts.install_default();
         dicts.auto_check(ctx, &settings);
@@ -565,7 +571,10 @@ impl Reader {
             self.dicts.open = true;
         }
         // A click that closes a popup doesn't also turn the page.
-        let menus_open = egui::Popup::is_any_open(&ctx) || self.settings_open || self.dicts.open;
+        let menus_open = egui::Popup::is_any_open(&ctx)
+            || self.settings_open
+            || self.dicts.open
+            || self.dict.cards.setup_open;
         let dict_open = self.dict.is_open();
         let popup_was_open = menus_open || dict_open;
         // Esc closes an open panel, menu or the dictionary popup (egui closes
@@ -573,7 +582,9 @@ impl Reader {
         let esc_for_popup = popup_was_open && ctx.input(|i| i.key_pressed(Key::Escape));
         if esc_for_popup {
             self.settings_open = false;
-            if self.dicts.open {
+            if self.dict.cards.setup_open {
+                self.dict.cards.setup_open = false;
+            } else if self.dicts.open {
                 self.dicts.open = false;
             } else if !menus_open {
                 self.dict.close_top();
@@ -962,6 +973,10 @@ impl Reader {
             }
         }
         if self.dicts.ui(&ctx, &mut self.dict, &mut self.settings) {
+            self.dirty = true;
+        }
+        if self.dict.cards.window(&ctx, &mut self.settings.anki) {
+            self.dict.sync_cards(&self.settings.anki);
             self.dirty = true;
         }
         if self.dirty && !ctx.input(|i| i.pointer.any_down()) {

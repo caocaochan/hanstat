@@ -1,5 +1,15 @@
 # Changelog
 
+## [2026.11.19.00] - 2026-11-19
+
+### Added
+- **Add Anki cards from the popup.** Each entry in the dictionary popup has a **+** at the right of its headword that adds a note for that word to Anki. It is greyed out when the word is already in Anki, and turns into **✔** once added (click it to see the note in Anki's browser). Notes go through AnkiConnect, as Yomitan's do: Anki must be running with the AnkiConnect add-on (2055492159) or one that answers the same way (AnkiConnect Extended, Tsunagi). hanstat never writes to the collection file itself.
+  - **Setting up.** **Dictionaries → Anki cards → Set up…** (or the **+** before anything is chosen) picks the deck and note type, then the template of each field, with Yomitan's markers: `{expression}`, `{reading}`, `{main-definition}` (the first dictionary's definitions, also `{glossary-first}`), `{glossary}`, `{sentence}` (the book's sentence with the word in bold), `{cloze-prefix}`, `{cloze-body}`, `{cloze-suffix}`, `{document-title}` (the book's title), `{frequencies}` and `{frequency-harmonic-rank}`. `{audio}`, `{screenshot}` and `{popup-selection-text}` are accepted and left empty, so Yomitan templates work unchanged (HyperTTS can add the audio in Anki). Lapis fields get Yomitan's usual templates on their own: Expression `{expression}`, ExpressionReading `{reading}`, ExpressionAudio `{audio}`, SelectionText `{popup-selection-text}`, MainDefinition `{main-definition}`, Sentence `{cloze-prefix}<b>{cloze-body}</b>{cloze-suffix}`, Picture `{screenshot}`, Glossary `{glossary}`, Frequency `{frequencies}`, FreqSort `{frequency-harmonic-rank}`, MiscInfo `{document-title}`; other note types' fields are guessed from their names. Tags default to `hanstat`.
+  - **Duplicates.** A word is already in Anki when a note of the same type has the same first field, as in Yomitan; **Notes of every type count** widens that to every note type. Anki itself refuses a duplicate, so a click can never add one twice.
+  - **Speed.** The popup shows as fast as before: Anki is asked on a thread of its own after the popup is drawn, and the buttons update a moment later.
+  - Glossaries keep their formatting; links to other words become plain text and dictionary images are left out. Words looked up inside a popup have no sentence.
+  - Saved in `reader.json` as `anki`. Older versions ignore the key.
+
 ## [2026.11.18.06] - 2026-11-18
 
 ### Added

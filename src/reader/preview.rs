@@ -841,6 +841,132 @@ fn popup_words() {
     r.close(&d.ctx);
 }
 
+/// The popup's Anki buttons against a running Anki (read only: it asks
+/// whether notes could be added, never adds one). Point `LOCALAPPDATA` at a
+/// scratch folder whose `reader.json` has its `anki` settings set; words in
+/// `READER_WORDS` (one already in Anki, one not) are shown in turn, their
+/// statuses printed once Anki answers, one PNG each in `READER_OUT`.
+#[test]
+#[ignore]
+fn anki_buttons() {
+    let book = env("READER_EPUB").expect("set READER_EPUB");
+    let words = env("READER_WORDS").unwrap_or_else(|| "养精蓄锐,说话".into());
+    let mut d = Driver::new();
+    d.size = vec2(1200.0, 900.0);
+    let mut r = d.open(&book);
+    assert!(
+        r.settings.anki.ready(),
+        "set the anki settings in reader.json"
+    );
+    r.spine = env("READER_SPINE")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    r.target = Some(Target::Offset(0));
+    d.ready(&mut r);
+    while !r.dict.has_terms() {
+        d.frame(&mut r, vec![]);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let l = r.layouts[&r.spine].clone();
+    let ch = r.chapter(r.spine).unwrap();
+    let (idx, off) = r.probe.sides[0];
+    let first = (0..ch.chars.len() as u32)
+        .filter(|&s| hanstat::chars::is_han(ch.chars[s as usize]))
+        .find_map(|s| {
+            l.char_rects(idx, s..s + 1)
+                .first()
+                .map(|b| b.translate(off))
+        })
+        .unwrap();
+    let shift = egui::Modifiers::SHIFT;
+    d.frame_with(
+        &mut r,
+        vec![egui::Event::PointerMoved(first.center())],
+        shift,
+    );
+    assert!(r.dict.is_open());
+    let lv = &r.dict.levels[0];
+    let g = &lv.result.groups[0];
+    eprintln!(
+        "page word {}: {:?}, sentence {:?}",
+        g.headword,
+        r.dict.cards.status(g),
+        lv.sentence_text()
+    );
+    for (i, w) in words.split(',').enumerate() {
+        r.dict.show_word(w);
+        let t = Instant::now();
+        loop {
+            d.frame_with(&mut r, vec![], egui::Modifiers::NONE);
+            let res = &r.dict.levels[0].result;
+            if res.text == w
+                && !matches!(
+                    r.dict.cards.status(&res.groups[0]),
+                    None | Some(super::anki::Status::Checking)
+                )
+            {
+                break;
+            }
+            assert!(t.elapsed().as_secs() < 15, "Anki never answered");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let res = r.dict.levels[0].result.clone();
+        let st: Vec<String> = res
+            .groups
+            .iter()
+            .map(|g| format!("{} {:?}", g.headword, r.dict.cards.status(g)))
+            .collect();
+        eprintln!("{w}: answered in {:?}: {st:?}", t.elapsed());
+        d.idle(&mut r, 3);
+        d.snap(&format!("anki-{i}-{w}"));
+    }
+    // A click on the first entry's +, with nothing listening at the address:
+    // it tries to add, and fails (nothing is written anywhere).
+    r.settings.anki.url = "http://127.0.0.1:9".into();
+    r.dict.sync_cards(&r.settings.anki);
+    d.idle(&mut r, 2);
+    let rect = r.dict.levels[0].rect.unwrap();
+    let side = (r.settings.size * 0.8).max(13.0) * 1.45;
+    let plus = pos2(
+        rect.max.x - 13.0 - side / 2.0,
+        rect.min.y + 11.0 + side / 2.0,
+    );
+    d.frame(&mut r, vec![egui::Event::PointerMoved(plus)]);
+    d.click(&mut r, plus);
+    let t = Instant::now();
+    loop {
+        d.frame(&mut r, vec![]);
+        let g = &r.dict.levels[0].result.groups[0];
+        match r.dict.cards.status(g) {
+            Some(super::anki::Status::Failed(e)) => {
+                eprintln!("clicked +: {e}");
+                break;
+            }
+            s => assert!(t.elapsed().as_secs() < 10, "no add tried: {s:?}"),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    // The setup window, with Anki's lists.
+    r.settings.anki.url = hanstat::anki_connect::DEFAULT_URL.into();
+    r.dict.sync_cards(&r.settings.anki);
+    r.dict.close();
+    r.dict.cards.open_setup();
+    let t = Instant::now();
+    while r.dict.cards.lists.is_none() || r.dict.cards.fields_of.is_none() {
+        d.frame(&mut r, vec![]);
+        assert!(t.elapsed().as_secs() < 10, "no lists");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    d.idle(&mut r, 3);
+    eprintln!(
+        "setup: {} fields, ready {}",
+        r.settings.anki.fields.len(),
+        r.settings.anki.ready()
+    );
+    d.snap("anki-setup");
+    r.close(&d.ctx);
+}
+
 /// The Dictionaries window from an empty start (point `LOCALAPPDATA` at an
 /// empty scratch folder; `READER_DICTS` is the folder of zips): CC-CEDICT and
 /// Danmei imported through it, then looked up; CC-CEDICT turned off (no

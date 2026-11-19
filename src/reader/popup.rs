@@ -12,6 +12,7 @@
 //! open). Words in the popup can be looked up the same way, or by clicking a
 //! cross-reference: a child popup opens beside them, up to [`MAX_LEVELS`].
 
+use super::anki::{Cards, Sentence, Source, Status};
 use super::layout::Params;
 use super::render::Renderer;
 use super::tree::LinkTarget;
@@ -99,6 +100,8 @@ struct Asked {
     origin: Origin,
     /// Where the word is on screen (the new popup goes beside it).
     anchor: Option<Rect>,
+    /// On the page: the sentence it is in (for Anki cards).
+    sentence: Option<Arc<Sentence>>,
 }
 
 /// One popup.
@@ -107,6 +110,8 @@ pub struct Level {
     pub result: Arc<Lookup>,
     /// Where it sits beside (screen).
     anchor: Option<Rect>,
+    /// On the page: the sentence its word is in.
+    sentence: Option<Arc<Sentence>>,
     /// `<details>` toggled, by (group, part).
     details: HashMap<(usize, usize), HashSet<u32>>,
     /// Dictionary bars toggled from their default, by (group, part).
@@ -123,6 +128,14 @@ pub struct Level {
     fresh: bool,
     /// How far its entries are scrolled.
     pub scroll_y: f32,
+}
+
+impl Level {
+    /// The sentence its word is in (tests).
+    #[cfg(test)]
+    pub fn sentence_text(&self) -> Option<String> {
+        self.sentence.as_ref().map(|s| s.text.iter().collect())
+    }
 }
 
 pub struct Popup {
@@ -150,6 +163,8 @@ pub struct Popup {
     pub size_changed: bool,
     /// The popups' areas exist in egui (see [`Popup::warm`]).
     warmed: bool,
+    /// Anki cards: the entries' **+** buttons.
+    pub cards: Cards,
 }
 
 /// The text a lookup reads from `src`: up to `max` characters, stopping at a
@@ -201,6 +216,8 @@ pub mod mocha {
     pub const SUBTEXT1: Color32 = Color32::from_rgb(0xba, 0xc2, 0xde);
     pub const TEXT: Color32 = Color32::from_rgb(0xcd, 0xd6, 0xf4);
     pub const BLUE: Color32 = Color32::from_rgb(0x89, 0xb4, 0xfa);
+    pub const GREEN: Color32 = Color32::from_rgb(0xa6, 0xe3, 0xa1);
+    pub const RED: Color32 = Color32::from_rgb(0xf3, 0x8b, 0xa8);
     pub const TEAL: Color32 = Color32::from_rgb(0x94, 0xe2, 0xd5);
     pub const YELLOW: Color32 = Color32::from_rgb(0xf9, 0xe2, 0xaf);
 }
@@ -231,12 +248,28 @@ fn popup_visuals() -> egui::Visuals {
 }
 
 const TEAL: Color32 = mocha::TEAL;
+
+/// An entry's Anki button, as drawn.
+enum CardButton<'a> {
+    /// No deck or note type yet: it opens the setup.
+    Setup,
+    Status(Option<&'a Status>),
+}
+
+/// A click on an entry's Anki button.
+enum CardClick {
+    Add(usize),
+    Browse(i64),
+    Setup,
+}
 const FAINT: Color32 = mocha::OVERLAY1;
 
 impl Popup {
     pub fn new(ctx: &egui::Context, freq_sort: Option<String>) -> Popup {
         let c = ctx.clone();
+        let c2 = ctx.clone();
         Popup {
+            cards: Cards::new(Arc::new(move || c2.request_repaint())),
             service: Service::start(
                 hanstat::dict::root(),
                 freq_sort,
@@ -296,6 +329,7 @@ impl Popup {
                 errors,
             } => {
                 self.renderer.set_dicts(&dicts);
+                self.cards.set_dicts(&dicts);
                 self.dicts = dicts;
                 self.scan_len = scan_len;
                 self.errors = errors;
@@ -321,10 +355,13 @@ impl Popup {
                     return;
                 }
                 self.levels.truncate(level);
+                // A channel send: Anki is asked on the cards' thread.
+                self.cards.check(level, &result, a.sentence.as_ref());
                 self.levels.push(Level {
                     origin: a.origin,
                     result,
                     anchor: a.anchor,
+                    sentence: a.sentence.clone(),
                     details: HashMap::new(),
                     bars: HashSet::new(),
                     heights: HashMap::new(),
@@ -337,18 +374,40 @@ impl Popup {
         }
     }
 
-    /// Take in the lookup thread's answers.
+    /// Take in the lookup thread's answers (and the Anki thread's).
     pub fn poll(&mut self) {
         while let Some(r) = self.service.try_recv() {
             self.take(r);
+        }
+        self.cards.poll();
+    }
+
+    /// The Anki card settings as now; if they changed, the open popups'
+    /// words are checked again.
+    pub fn sync_cards(&mut self, s: &super::anki::CardSettings) {
+        if self.cards.set_settings(s) {
+            for (i, l) in self.levels.iter().enumerate() {
+                self.cards.check(i, &l.result, l.sentence.as_ref());
+            }
         }
     }
 
     /// Ask a lookup and wait briefly for it (usually answered at once, so
     /// the popup shows this frame). Answers to earlier lookups may come first.
-    fn ask(&mut self, text: String, origin: Origin, anchor: Option<Rect>) {
+    fn ask(
+        &mut self,
+        text: String,
+        origin: Origin,
+        anchor: Option<Rect>,
+        sentence: Option<Arc<Sentence>>,
+    ) {
         let id = self.service.lookup(text);
-        self.asked = Some(Asked { id, origin, anchor });
+        self.asked = Some(Asked {
+            id,
+            origin,
+            anchor,
+            sentence,
+        });
         let deadline = std::time::Instant::now() + WAIT;
         while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
             let Some(r) = self.service.recv_timeout(left) else {
@@ -405,7 +464,13 @@ impl Popup {
         }
         let text = scan_text(chars, spot.src as usize, self.scan_len);
         if !text.is_empty() {
-            self.ask(text, origin, None);
+            // The sentence only if cards are made (a scan of a few hundred
+            // characters at most).
+            let sentence = (self.cards.shown() && self.cards.cfg.ready())
+                .then(|| super::anki::sentence_around(chars, spot.src as usize))
+                .flatten()
+                .map(Arc::new);
+            self.ask(text, origin, None, sentence);
         }
     }
 
@@ -414,7 +479,7 @@ impl Popup {
     pub fn show_word(&mut self, word: &str) {
         if let Some(origin) = self.levels.first().map(|l| l.origin) {
             self.levels.truncate(1);
-            self.ask(word.to_owned(), origin, None);
+            self.ask(word.to_owned(), origin, None, None);
         }
     }
 
@@ -524,7 +589,7 @@ impl Popup {
             ) {
                 let link = matches!(origin, Origin::Link(_));
                 if !self.asked_for(origin) && (link || self.rested(origin, key, now, ctx)) {
-                    self.ask(text, origin, Some(anchor));
+                    self.ask(text, origin, Some(anchor), None);
                 }
             }
             level += 1;
@@ -609,6 +674,9 @@ impl Popup {
             0
         };
         let mut want = None;
+        let mut card_click = None;
+        let cards = &self.cards;
+        let card_ready = cards.cfg.ready();
         let mut toggle_bar = None;
         let mut toggle_details = None;
         let mut heights: Vec<((usize, usize), f32)> = Vec::new();
@@ -668,7 +736,16 @@ impl Popup {
                                     ui.add_space(4.0);
                                     ui.separator();
                                 }
-                                header(ui, g, &dicts, size, show_freq);
+                                let card = cards.shown().then(|| {
+                                    if card_ready {
+                                        CardButton::Status(cards.status(g))
+                                    } else {
+                                        CardButton::Setup
+                                    }
+                                });
+                                if let Some(c) = header(ui, gi, g, &dicts, size, show_freq, card) {
+                                    card_click = Some(c);
+                                }
                                 for (pi, p) in g.parts.iter().enumerate() {
                                     let Some(dict) = dicts.get(p.dict) else {
                                         continue;
@@ -849,6 +926,16 @@ impl Popup {
             ));
             self.size_changed = true;
         }
+        match card_click {
+            Some(CardClick::Add(group)) => self.cards.add(Source {
+                lookup: result.clone(),
+                group,
+                sentence: self.levels[level].sentence.clone(),
+            }),
+            Some(CardClick::Browse(id)) => self.cards.browse(id),
+            Some(CardClick::Setup) => self.cards.open_setup(),
+            None => {}
+        }
         let l = &mut self.levels[level];
         l.fresh = false;
         l.scroll_y = scroll_y;
@@ -886,50 +973,163 @@ fn estimate(gl: &[hanstat::dict::lookup::Gloss], width: f32, size: f32) -> f32 {
     (chars / per_line).ceil().max(1.0) * size * 1.4 + gl.len() as f32 * size * 0.5
 }
 
-/// A group's headword, reading and frequency ranks.
+/// A group's headword, reading and frequency ranks, and its Anki button at
+/// the right.
+#[allow(clippy::too_many_arguments)]
 fn header(
+    ui: &mut egui::Ui,
+    gi: usize,
+    g: &hanstat::dict::lookup::Group,
+    dicts: &[DictInfo],
+    size: f32,
+    show_freq: bool,
+    card: Option<CardButton>,
+) -> Option<CardClick> {
+    let top = ui.cursor().min;
+    let full = ui.available_width();
+    let side = (size * 1.45).round();
+    let reserve = if card.is_some() { side + 8.0 } else { 0.0 };
+    let row = ui.allocate_ui_with_layout(
+        vec2(full - reserve, ui.spacing().interact_size.y),
+        egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+        |ui| header_text(ui, g, dicts, size, show_freq),
+    );
+    let card = card?;
+    // Beside the headword, on the first line.
+    let line = row.response.rect.height().min(size * 1.55 * 1.4);
+    let rect = Rect::from_min_size(
+        pos2(top.x + full - side, top.y + ((line - side) / 2.0).max(0.0)),
+        vec2(side, side),
+    );
+    card_button(ui, rect, gi, card)
+}
+
+/// An entry's Anki button: + to add (greyed out when the word is already in
+/// Anki), ✔ once added (opens it in Anki's browser).
+fn card_button(ui: &mut egui::Ui, rect: Rect, gi: usize, card: CardButton) -> Option<CardClick> {
+    let (label, fg, enabled, tip, click): (&str, Color32, bool, String, Option<CardClick>) =
+        match card {
+            CardButton::Setup => (
+                "+",
+                mocha::SUBTEXT1,
+                true,
+                "Add to Anki: choose a deck, note type and fields first".into(),
+                Some(CardClick::Setup),
+            ),
+            CardButton::Status(None | Some(Status::Checking)) => (
+                "+",
+                mocha::SUBTEXT1,
+                true,
+                "Add to Anki".into(),
+                Some(CardClick::Add(gi)),
+            ),
+            CardButton::Status(Some(Status::CanAdd)) => (
+                "+",
+                TEAL,
+                true,
+                "Add to Anki".into(),
+                Some(CardClick::Add(gi)),
+            ),
+            CardButton::Status(Some(Status::Duplicate)) => {
+                ("+", mocha::SURFACE2, false, "Already in Anki".into(), None)
+            }
+            CardButton::Status(Some(Status::Adding)) => {
+                ("…", mocha::SUBTEXT1, false, "Adding…".into(), None)
+            }
+            CardButton::Status(Some(Status::Added(id))) => (
+                "✔",
+                mocha::GREEN,
+                true,
+                "Added. Click to see it in Anki's browser".into(),
+                Some(CardClick::Browse(*id)),
+            ),
+            CardButton::Status(Some(Status::Failed(e))) => (
+                "+",
+                mocha::RED,
+                true,
+                format!("{e}\nClick to try adding it anyway"),
+                Some(CardClick::Add(gi)),
+            ),
+        };
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let resp = ui.interact(rect, ui.scope_id().with(("anki-card", gi)), sense);
+    let bg = if !enabled {
+        mocha::MANTLE
+    } else if resp.hovered() {
+        mocha::SURFACE1
+    } else {
+        mocha::SURFACE0
+    };
+    let p = ui.painter();
+    p.rect_filled(rect, 5.0, bg);
+    p.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(rect.height() * 0.72),
+        fg,
+    );
+    if enabled && resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let clicked = resp.clicked();
+    resp.on_hover_text(tip);
+    if clicked { click } else { None }
+}
+
+fn header_text(
     ui: &mut egui::Ui,
     g: &hanstat::dict::lookup::Group,
     dicts: &[DictInfo],
     size: f32,
     show_freq: bool,
 ) {
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
-        ui.label(RichText::new(&g.headword).size(size * 1.55).color(mocha::TEXT));
-        if g.reading != g.headword && !g.reading.is_empty() {
-            ui.label(RichText::new(&g.reading).size(size * 1.05).color(mocha::SUBTEXT1));
-        }
-        if show_freq {
-            for b in &g.freqs {
-                let v = b
-                    .values
-                    .iter()
-                    .map(|v| v.display.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let name = dicts.get(b.dict).map_or("", |d| d.title.as_str());
-                let text = if b.folded {
-                    format!("{name} {v} (简)")
+    ui.spacing_mut().item_spacing.x = 8.0;
+    ui.label(
+        RichText::new(&g.headword)
+            .size(size * 1.55)
+            .color(mocha::TEXT),
+    );
+    if g.reading != g.headword && !g.reading.is_empty() {
+        ui.label(
+            RichText::new(&g.reading)
+                .size(size * 1.05)
+                .color(mocha::SUBTEXT1),
+        );
+    }
+    if show_freq {
+        for b in &g.freqs {
+            let v = b
+                .values
+                .iter()
+                .map(|v| v.display.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let name = dicts.get(b.dict).map_or("", |d| d.title.as_str());
+            let text = if b.folded {
+                format!("{name} {v} (简)")
+            } else {
+                format!("{name} {v}")
+            };
+            egui::Frame::new()
+                .fill(mocha::SURFACE0)
+                .corner_radius(4.0)
+                .inner_margin(egui::Margin::symmetric(5, 1))
+                .show(ui, |ui| {
+                    ui.label(RichText::new(text).size(size * 0.68).color(TEAL));
+                })
+                .response
+                .on_hover_text(if b.folded {
+                    "The rank of the Simplified form: this list has none for the Traditional one"
                 } else {
-                    format!("{name} {v}")
-                };
-                egui::Frame::new()
-                    .fill(mocha::SURFACE0)
-                    .corner_radius(4.0)
-                    .inner_margin(egui::Margin::symmetric(5, 1))
-                    .show(ui, |ui| {
-                        ui.label(RichText::new(text).size(size * 0.68).color(TEAL));
-                    })
-                    .response
-                    .on_hover_text(if b.folded {
-                        "The rank of the Simplified form: this list has none for the Traditional one"
-                    } else {
-                        "Frequency rank"
-                    });
-            }
+                    "Frequency rank"
+                });
         }
-    });
+    }
 }
 
 #[cfg(test)]

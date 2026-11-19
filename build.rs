@@ -47,6 +47,7 @@ const NOT_ANALYSIS: &[&str] = &[
     "src/style_scale.rs",
     "src/extract",
     "src/anki.rs",
+    "src/anki_connect.rs",
     "src/known.rs",
     "src/discover.rs",
     "src/child_guard.rs",
