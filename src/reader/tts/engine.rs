@@ -450,6 +450,9 @@ struct Player {
     pool: Pool,
     output: Option<Output>,
     state: State,
+    /// A cloned voice starts once a short heading and its next sentence
+    /// have enough audio queued to avoid an immediate gap.
+    buffering: bool,
     /// The next sentence to queue: chapter and index in its sentences.
     cursor: Option<(usize, usize)>,
     /// Sentences on the device, by clip id.
@@ -483,6 +486,7 @@ impl Player {
             repaint,
             output: None,
             state: State::Stopped,
+            buffering: false,
             cursor: None,
             queued: HashMap::new(),
             next_id: 1,
@@ -617,7 +621,14 @@ impl Player {
                 }
                 let o = self.output.as_ref().unwrap();
                 o.clear();
-                o.set_paused(false);
+                // A short heading alone can finish before the following
+                // cloned sentence is ready. Buffer a few seconds first.
+                self.buffering = self
+                    .speech
+                    .local
+                    .as_ref()
+                    .is_some_and(|s| s.designed.is_some());
+                o.set_paused(self.buffering);
                 self.queued.clear();
                 self.asked = None;
                 let Some(s) = self.sentences(spine) else {
@@ -643,7 +654,7 @@ impl Player {
             Cmd::Resume => {
                 if self.state == State::Paused {
                     if let Some(o) = &self.output {
-                        o.set_paused(false);
+                        o.set_paused(self.buffering);
                     }
                     self.state = State::Loading;
                 }
@@ -808,7 +819,14 @@ impl Player {
             self.heard = Some((q.spine, q.idx));
         }
         self.fill(&out);
-        let playing = !out.queued().is_empty();
+        if self.buffering
+            && self.state != State::Paused
+            && (out.ahead() >= 3.0 || self.cursor.is_none())
+        {
+            self.buffering = false;
+            out.set_paused(false);
+        }
+        let playing = !self.buffering && !out.queued().is_empty();
         if self.state != State::Paused {
             self.state = if playing {
                 State::Playing
@@ -950,10 +968,17 @@ impl Player {
     /// The local voice: from the first sentence at or after `at` that is
     /// neither saved nor being made, a few chunks of whole paragraphs. When
     /// the sentence at `at` itself is missing, the first chunks are short
-    /// (a quarter, then half the size), so sound starts within seconds and
-    /// each chunk is ready before the one before it has been heard.
+    /// so sound starts within seconds and each chunk is ready before the
+    /// one before it has been heard.
     fn ask_local(&mut self, at: (usize, usize), l: &local::LocalSettings) {
         let full = l.chunk_chars.max(20);
+        // A clone can copy a slower pace from its sample. Start with less
+        // text, so even a take that has to be retried can play promptly.
+        let startup = if l.designed.is_some() {
+            [full / 8, full / 4, full / 2]
+        } else {
+            [full / 4, full / 2, full]
+        };
         // How far ahead to look, in characters.
         let reach = full * LOCAL_AHEAD;
         let mut jobs = Vec::new();
@@ -986,11 +1011,7 @@ impl Player {
             let done = jobs.len();
             let limit = |k: usize| {
                 if cold {
-                    [full / 4, full / 2]
-                        .get(done + k)
-                        .copied()
-                        .unwrap_or(full)
-                        .max(20)
+                    startup.get(done + k).copied().unwrap_or(full).max(20)
                 } else {
                     full
                 }

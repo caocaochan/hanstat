@@ -565,6 +565,14 @@ pub const QWEN_TTS: Model = Model {
     files: qwentts_bin::FILES,
 };
 
+const QWEN_TTS_CODEC_FILE: ModelFile = ModelFile {
+    name: "qwen-tokenizer-12hz-Q8_0.gguf",
+    url: "https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/b7ee2e8c7459c3bea99da23e3d178125a7d1713c/qwen-tokenizer-12hz-Q8_0.gguf",
+    sha256: "1883beeed99348fc35e23dd225e9082f93f6f8c109330a33d935baa8acdbfd94",
+    size: 291_150_624,
+    unpack: Unpack::Keep,
+};
+
 /// The local read-aloud voice: Qwen3-TTS 12Hz 1.7B CustomVoice (nine named
 /// speakers, style instructions) and its audio tokenizer, both Q8_0 GGUF as
 /// converted by qwentts.cpp's author, pinned to a commit. Q8_0 over BF16:
@@ -583,11 +591,35 @@ pub const QWEN_TTS_MODEL: Model = Model {
             size: 2_042_834_304,
             unpack: Unpack::Keep,
         },
+        QWEN_TTS_CODEC_FILE,
+    ],
+};
+
+/// The same tokenizer and cache path, for voices that don't need CustomVoice.
+pub const QWEN_TTS_CODEC: Model = Model {
+    files: &[QWEN_TTS_CODEC_FILE],
+    ..QWEN_TTS_MODEL
+};
+
+/// VoiceDesign makes a sample once; Base uses that reference to read books.
+pub const QWEN_TTS_DESIGN: Model = Model {
+    id: "qwen3-tts-1.7b-design-base-q8_0",
+    title: "Qwen3-TTS 12Hz 1.7B VoiceDesign and Base, Q8_0 (Alibaba Qwen; GGUF by Serveurperso)",
+    licence: "Apache-2.0",
+    homepage: "https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF",
+    files: &[
         ModelFile {
-            name: "qwen-tokenizer-12hz-Q8_0.gguf",
-            url: "https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/b7ee2e8c7459c3bea99da23e3d178125a7d1713c/qwen-tokenizer-12hz-Q8_0.gguf",
-            sha256: "1883beeed99348fc35e23dd225e9082f93f6f8c109330a33d935baa8acdbfd94",
-            size: 291_150_624,
+            name: "qwen-talker-1.7b-voicedesign-Q8_0.gguf",
+            url: "https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/b7ee2e8c7459c3bea99da23e3d178125a7d1713c/qwen-talker-1.7b-voicedesign-Q8_0.gguf",
+            sha256: "575610ab1ddcca4dca6bd9a64bcd859d93bbad8764f9cab24e1dbc0c51f62276",
+            size: 2_042_833_824,
+            unpack: Unpack::Keep,
+        },
+        ModelFile {
+            name: "qwen-talker-1.7b-base-Q8_0.gguf",
+            url: "https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/b7ee2e8c7459c3bea99da23e3d178125a7d1713c/qwen-talker-1.7b-base-Q8_0.gguf",
+            sha256: "4b9a33a236908dd9435a42f7a396e38038329d053b704342a6413c08544c4fda",
+            size: 2_079_448_256,
             unpack: Unpack::Keep,
         },
     ],

@@ -1,10 +1,10 @@
-//! The local voice: Qwen3-TTS 1.7B CustomVoice (Alibaba Qwen, Apache-2.0),
+//! The local voice: Qwen3-TTS 1.7B (Alibaba Qwen, Apache-2.0),
 //! Q8_0 GGUF, run on the GPU by qwentts.cpp's `tts-server`
 //! ([`hanstat::models::QWEN_TTS`], [`hanstat::models::QWEN_TTS_MODEL`]),
 //! nothing downloaded until the user asks.
 //!
-//! One server for the whole app, started on first use and kept until
-//! hanstat closes (or "Unload"), so the model is loaded once. It batches up
+//! One server for the whole app, kept until the model changes, hanstat
+//! closes or the user chooses Unload. It batches up
 //! to [`LocalSettings::parallel`] requests on the GPU: on an RTX 5070 (Vulkan,
 //! 2026-11-19) one request ran at 6.5× real time, four at once at 17.9×.
 //!
@@ -16,13 +16,18 @@
 use super::azure::Fail;
 use super::engine::Repaint;
 use super::opus;
-use hanstat::models::{QWEN_TTS, QWEN_TTS_MODEL, QWEN_TTS_SERVER};
+use hanstat::models::{
+    Model, QWEN_TTS, QWEN_TTS_CODEC, QWEN_TTS_DESIGN, QWEN_TTS_MODEL, QWEN_TTS_SERVER,
+};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
+
+mod voices;
+pub use voices::{SavedVoice, VoiceStore};
 
 /// A named voice of the CustomVoice model: its id, what it sounds like (the
 /// model card's descriptions) and its own language.
@@ -100,6 +105,8 @@ pub fn speaker(id: &str) -> &'static Speaker {
 #[serde(default)]
 pub struct LocalSettings {
     pub speaker: String,
+    /// A kept sample's WAV hash. Base reads it in place of a named speaker.
+    pub designed: Option<String>,
     /// Free-text style instruction (any language), e.g. "用温柔平稳的语气朗读".
     pub instruct: String,
     /// Sampling of the main model (the first codebook: what is said and how).
@@ -124,6 +131,7 @@ impl Default for LocalSettings {
         // The server's own defaults (qwentts.cpp, Qwen's generation config).
         LocalSettings {
             speaker: "vivian".into(),
+            designed: None,
             instruct: String::new(),
             temperature: 0.9,
             top_k: 50,
@@ -140,15 +148,28 @@ impl Default for LocalSettings {
 }
 
 impl LocalSettings {
+    pub fn mode(&self) -> Mode {
+        if self.designed.is_some() {
+            Mode::Base
+        } else {
+            Mode::Custom
+        }
+    }
+
     /// The cache-key part: what the audio depends on.
     pub fn key_text(&self) -> String {
+        let voice = match &self.designed {
+            Some(id) => format!("qwen3-tts-1.7b-base-q8_0|{}|cuts-{CUTS}|{id}", opus::FORMAT),
+            None => format!(
+                "{}|{}|cuts-{CUTS}|{}|{}",
+                QWEN_TTS_MODEL.id,
+                opus::FORMAT,
+                self.speaker,
+                self.instruct.trim()
+            ),
+        };
         format!(
-            "{}|{}|cuts-{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
-            QWEN_TTS_MODEL.id,
-            opus::FORMAT,
-            CUTS,
-            self.speaker,
-            self.instruct.trim(),
+            "{voice}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             self.temperature,
             self.top_k,
             self.top_p,
@@ -186,6 +207,39 @@ pub fn download(progress: &dyn Fn(u64, u64)) -> Result<(), String> {
     let first = QWEN_TTS.total_size();
     QWEN_TTS.ensure(&|d, _| progress(d, total))?;
     QWEN_TTS_MODEL.ensure(&|d, _| progress(first + d, total))?;
+    Ok(())
+}
+
+/// The designer and the clone share the codec and server with CustomVoice.
+const DESIGN_DOWNLOADS: [Model; 3] = [QWEN_TTS, QWEN_TTS_CODEC, QWEN_TTS_DESIGN];
+
+pub fn design_downloaded() -> bool {
+    QWEN_TTS_SERVER.is_some() && DESIGN_DOWNLOADS.iter().all(Model::is_cached)
+}
+
+pub fn design_download_size() -> u64 {
+    DESIGN_DOWNLOADS
+        .iter()
+        .filter(|m| !m.is_cached())
+        .map(Model::total_size)
+        .sum()
+}
+
+pub fn download_design(progress: &dyn Fn(u64, u64)) -> Result<(), String> {
+    if QWEN_TTS_SERVER.is_none() {
+        return Err("The local voice has no build for this platform".into());
+    }
+    let missing: Vec<_> = DESIGN_DOWNLOADS
+        .into_iter()
+        .filter(|m| !m.is_cached())
+        .collect();
+    let total = missing.iter().map(Model::total_size).sum();
+    let mut done = 0;
+    for m in missing {
+        m.ensure(&|d, _| progress(done + d, total))?;
+        done += m.total_size();
+        progress(done, total);
+    }
     Ok(())
 }
 
@@ -652,12 +706,38 @@ pub fn seconds(chars: usize) -> f64 {
 // ---------------------------------------------------------------------------
 // The server.
 
+/// Each server process can load just one talker. A kept sample is read by
+/// Base, since VoiceDesign can change the speaker with every request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Custom,
+    Design,
+    Base,
+}
+
+struct Reference {
+    id: String,
+    text: String,
+    wav: Vec<u8>,
+    frames: usize,
+}
+
+#[derive(Clone, Copy)]
+enum Voice<'a> {
+    Custom,
+    Design(&'a str),
+    Base(&'a Reference),
+}
+
 /// qwentts.cpp's server with the model loaded, on a free local port.
 pub struct Server {
     child: Mutex<Child>,
     url: String,
     agent: ureq::Agent,
+    mode: Mode,
     parallel: usize,
+    /// Check and register together so batch workers don't all upload the WAV.
+    registry: Mutex<()>,
     /// Requests in flight, at most `parallel` (more would wait in the
     /// server's queue behind what was asked first).
     busy: Mutex<usize>,
@@ -665,51 +745,85 @@ pub struct Server {
     log: PathBuf,
 }
 
-/// The one server, shared by every reader and the preview.
-static SERVER: Mutex<Option<Arc<Server>>> = Mutex::new(None);
+/// Workers share a read guard while synthesising. Switching models takes a
+/// write guard, so a running request gets to finish before the server stops.
+static SERVER: RwLock<Option<Server>> = RwLock::new(None);
 
 /// What the server is doing, for the panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Unloaded,
+    Loading,
     Loaded,
 }
 
 pub fn status() -> Status {
-    match SERVER.lock().unwrap().as_ref() {
+    let Ok(g) = SERVER.try_read() else {
+        return Status::Loading;
+    };
+    match g.as_ref() {
         Some(s) if s.alive() => Status::Loaded,
         _ => Status::Unloaded,
     }
 }
 
+/// A different talker on the GPU still needs swapping out before this one
+/// can speak.
+pub fn loaded(mode: Mode, parallel: usize) -> bool {
+    SERVER.try_read().is_ok_and(|g| {
+        g.as_ref()
+            .is_some_and(|s| s.mode == mode && s.parallel == parallel.max(1) && s.alive())
+    })
+}
+
 /// Stop the server, freeing the GPU memory.
 pub fn unload() {
-    if let Some(s) = SERVER.lock().unwrap().take() {
+    if let Ok(mut g) = SERVER.try_write()
+        && let Some(s) = g.take()
+    {
         s.kill();
     }
 }
 
-/// The running server for `parallel` requests at once, started (and the
-/// model loaded) if there is none or it ran for another number.
-pub fn server(parallel: usize) -> Result<Arc<Server>, String> {
-    let mut g = SERVER.lock().unwrap();
-    if let Some(s) = g.as_ref() {
-        if s.alive() && s.parallel == parallel {
-            return Ok(s.clone());
+/// Use the server in the requested mode, starting it if necessary. Keep it
+/// alive through the request and any retries, even if another window needs
+/// a different model or batch size.
+pub fn server<T>(mode: Mode, parallel: usize, f: impl FnOnce(&Server) -> T) -> Result<T, String> {
+    let parallel = if mode == Mode::Design {
+        1
+    } else {
+        parallel.max(1)
+    };
+    let matches = |s: &&Server| s.mode == mode && s.parallel == parallel && s.alive();
+    loop {
+        let g = SERVER.read().unwrap();
+        if let Some(s) = g.as_ref().filter(matches) {
+            return Ok(f(s));
         }
-        s.kill();
-        *g = None;
+        drop(g);
+        let mut g = SERVER.write().unwrap();
+        if g.as_ref().filter(matches).is_none() {
+            if let Some(s) = g.take() {
+                s.kill();
+            }
+            *g = Some(Server::start(mode, parallel)?);
+        }
     }
-    let s = Arc::new(Server::start(parallel)?);
-    *g = Some(s.clone());
-    Ok(s)
 }
 
 impl Server {
-    fn start(parallel: usize) -> Result<Server, String> {
-        if !downloaded() {
-            return Err(NOT_DOWNLOADED.into());
-        }
+    fn start(mode: Mode, parallel: usize) -> Result<Server, String> {
+        let talker = match mode {
+            Mode::Custom if downloaded() => QWEN_TTS_MODEL.dir().join(QWEN_TTS_MODEL.files[0].name),
+            Mode::Custom => return Err(NOT_DOWNLOADED.into()),
+            Mode::Design if design_downloaded() => {
+                QWEN_TTS_DESIGN.dir().join(QWEN_TTS_DESIGN.files[0].name)
+            }
+            Mode::Base if design_downloaded() => {
+                QWEN_TTS_DESIGN.dir().join(QWEN_TTS_DESIGN.files[1].name)
+            }
+            _ => return Err(DESIGN_NOT_DOWNLOADED.into()),
+        };
         let exe = QWEN_TTS.dir().join(QWEN_TTS_SERVER.unwrap());
         #[cfg(unix)]
         {
@@ -717,21 +831,23 @@ impl Server {
             std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))
                 .map_err(|e| format!("Cannot make {} executable: {e}", exe.display()))?;
         }
-        let dir = QWEN_TTS_MODEL.dir();
         let port = std::net::TcpListener::bind(("127.0.0.1", 0))
             .and_then(|l| l.local_addr())
             .map_err(|e| format!("No free local port: {e}"))?
             .port();
-        let log = hanstat::models::cache_root().join("tts-server.log");
+        let dir = hanstat::models::app_dir();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
+        let log = dir.join("tts-server.log");
         let out = std::fs::File::create(&log)
             .map_err(|e| format!("Cannot create {}: {e}", log.display()))?;
         let err = out.try_clone().map_err(|e| e.to_string())?;
         let mut cmd = Command::new(&exe);
         cmd.current_dir(QWEN_TTS.dir())
             .arg("--model")
-            .arg(dir.join(QWEN_TTS_MODEL.files[0].name))
+            .arg(talker)
             .arg("--codec")
-            .arg(dir.join(QWEN_TTS_MODEL.files[1].name))
+            .arg(QWEN_TTS_CODEC.dir().join(QWEN_TTS_CODEC.files[0].name))
             .args(["--host", "127.0.0.1", "--port", &port.to_string()])
             .args(["--lang", "chinese", "--max-batch", &parallel.to_string()])
             .stdin(Stdio::null())
@@ -742,8 +858,14 @@ impl Server {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
-        let child = hanstat::child_guard::spawn(&mut cmd, |_| {})
+        let mut guard_error = None;
+        let mut child = hanstat::child_guard::spawn(&mut cmd, |error| guard_error = Some(error))
             .map_err(|e| format!("Cannot start {}: {e}", exe.display()))?;
+        if let Some(error) = guard_error {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
         let s = Server {
             child: Mutex::new(child),
             url: format!("http://127.0.0.1:{port}"),
@@ -752,7 +874,9 @@ impl Server {
                 .http_status_as_error(false)
                 .build()
                 .into(),
-            parallel: parallel.max(1),
+            mode,
+            parallel,
+            registry: Mutex::new(()),
             busy: Mutex::new(0),
             freed: Condvar::new(),
             log,
@@ -801,15 +925,26 @@ impl Server {
         lines[lines.len().saturating_sub(6)..].join("\n")
     }
 
-    /// `text` read with `s`: 16-bit mono samples at [`opus::RATE`], and
-    /// whether the take stopped at its frame budget ([`frame_budget`])
-    /// instead of at the end of the text: cut off, or run on.
+    #[cfg(test)]
     pub fn synth(
         &self,
         text: &str,
         s: &LocalSettings,
         seed: u64,
     ) -> Result<(Vec<i16>, bool), String> {
+        self.synth_voice(text, s, seed, Voice::Custom)
+    }
+
+    /// `text` read with `s`: samples and whether the take ran out of
+    /// frames ([`frame_budget`]) before reaching the end of the text.
+    fn synth_voice(
+        &self,
+        text: &str,
+        s: &LocalSettings,
+        seed: u64,
+        voice: Voice<'_>,
+    ) -> Result<(Vec<i16>, bool), String> {
+        let budget = frame_budget(text, s, voice)?;
         {
             let mut b = self.busy.lock().unwrap();
             while *b >= self.parallel {
@@ -817,8 +952,9 @@ impl Server {
             }
             *b += 1;
         }
-        let budget = frame_budget(text, s);
-        let r = self.request(text, s, seed, budget);
+        let r = self.speech(text, s, seed, budget, voice).and_then(|wav| {
+            wav_samples(&wav).ok_or_else(|| "The local voice sent no audio".into())
+        });
         *self.busy.lock().unwrap() -= 1;
         self.freed.notify_one();
         r.map(|pcm| {
@@ -827,36 +963,70 @@ impl Server {
         })
     }
 
-    fn request(
+    fn speech(
         &self,
         text: &str,
         s: &LocalSettings,
         seed: u64,
         budget: usize,
-    ) -> Result<Vec<i16>, String> {
-        let mut body = serde_json::json!({
-            "max_new_tokens": budget,
-            "input": text,
-            "voice": s.speaker,
-            "language": "chinese",
-            "response_format": "wav",
-            // The server takes a signed 64-bit seed.
-            "seed": (seed >> 1) as i64,
-            "temperature": s.temperature,
-            "top_k": s.top_k,
-            "top_p": s.top_p.clamp(0.01, 1.0),
-            "repetition_penalty": s.repetition_penalty.max(0.01),
-            "subtalker_temperature": s.sub_temperature,
-            "subtalker_top_k": s.sub_top_k,
-            "subtalker_top_p": s.sub_top_p.clamp(0.01, 1.0),
-        });
-        if !s.instruct.trim().is_empty() {
-            body["instructions"] = s.instruct.trim().into();
+        voice: Voice<'_>,
+    ) -> Result<Vec<u8>, String> {
+        if let Voice::Base(reference) = voice {
+            self.register(reference)?;
         }
+        self.post(
+            "/v1/audio/speech",
+            request_body(text, s, seed, budget, voice),
+        )
+    }
+
+    /// The registry is in the Base process's memory. It starts empty and
+    /// can lose a voice, so check the list before using the reference.
+    fn register(&self, reference: &Reference) -> Result<(), String> {
+        let _guard = self.registry.lock().unwrap();
+        let mut resp = self
+            .agent
+            .get(format!("{}/v1/audio/voices", self.url))
+            .call()
+            .map_err(|e| format!("Cannot check the local voice list: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!("Cannot check the local voice list ({status})"));
+        }
+        #[derive(Deserialize)]
+        struct Entry {
+            name: String,
+            kind: String,
+        }
+        #[derive(Deserialize)]
+        struct Registry {
+            voices: Vec<Entry>,
+        }
+        let bytes = resp.body_mut().read_to_vec().map_err(|e| e.to_string())?;
+        let list: Registry = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("Cannot read the local voice list: {e}"))?;
+        if !list
+            .voices
+            .iter()
+            .any(|v| v.name == reference.id && v.kind == "registered")
+        {
+            self.post(
+                "/v1/audio/voices",
+                serde_json::json!({
+                    "name": reference.id,
+                    "ref_text": reference.text,
+                    "wav_b64": base64(&reference.wav),
+                }),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn post(&self, path: &str, body: serde_json::Value) -> Result<Vec<u8>, String> {
         let body = serde_json::to_vec(&body).unwrap();
         let resp = self
             .agent
-            .post(format!("{}/v1/audio/speech", self.url))
+            .post(format!("{}{path}", self.url))
             .header("Content-Type", "application/json")
             .send(&body[..]);
         let mut resp = match resp {
@@ -882,8 +1052,65 @@ impl Server {
                 String::from_utf8_lossy(&bytes).trim()
             ));
         }
-        wav_samples(&bytes).ok_or_else(|| "The local voice sent no audio".to_owned())
+        Ok(bytes)
     }
+}
+
+/// The three talkers accept different voice and instruction fields.
+fn request_body(
+    text: &str,
+    s: &LocalSettings,
+    seed: u64,
+    budget: usize,
+    voice: Voice<'_>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+            "max_new_tokens": budget,
+            "input": text,
+            "language": "chinese",
+            "response_format": "wav",
+            // The server takes a signed 64-bit seed.
+            "seed": (seed >> 1) as i64,
+            "temperature": s.temperature,
+            "top_k": s.top_k,
+            "top_p": s.top_p.clamp(0.01, 1.0),
+            "repetition_penalty": s.repetition_penalty.max(0.01),
+            "subtalker_temperature": s.sub_temperature,
+            "subtalker_top_k": s.sub_top_k,
+            "subtalker_top_p": s.sub_top_p.clamp(0.01, 1.0),
+    });
+    match voice {
+        Voice::Custom => {
+            body["voice"] = s.speaker.as_str().into();
+            if !s.instruct.trim().is_empty() {
+                body["instructions"] = s.instruct.trim().into();
+            }
+        }
+        Voice::Base(r) => body["voice"] = r.id.as_str().into(),
+        Voice::Design(description) => body["instructions"] = description.into(),
+    }
+    body
+}
+
+/// The server takes standard padded base64 for the reference WAV.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let digit = |n| char::from(ALPHABET[n as usize]);
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let a = chunk[0];
+        let b = chunk.get(1).copied().unwrap_or(0);
+        let c = chunk.get(2).copied().unwrap_or(0);
+        out.push(digit(a >> 2));
+        out.push(digit((a & 3) << 4 | b >> 4));
+        out.push(if chunk.len() >= 2 {
+            digit((b & 15) << 2 | c >> 6)
+        } else {
+            '='
+        });
+        out.push(if chunk.len() == 3 { digit(c & 63) } else { '=' });
+    }
+    out
 }
 
 /// Samples an audio frame makes (the 12.5 Hz codec at 24 kHz).
@@ -897,14 +1124,23 @@ const CONTEXT: usize = 4096;
 /// its expected length plus 4 s (longer and it has run on; the same rule
 /// as [`make_chunk`]'s retry), within what the context holds after the
 /// prompt, counted generously (a position for every character of text and
-/// instruction, and the template). Without this the server stops at 2048
+/// instruction, the template and, for Base, the reference transcript and
+/// codec frames). Without this the server stops at 2048
 /// frames (163.8 s), which a slow voice could reach before the end of a
 /// long chunk, dropping its last sentences without a word.
-pub fn frame_budget(text: &str, s: &LocalSettings) -> usize {
+fn frame_budget(text: &str, s: &LocalSettings, voice: Voice<'_>) -> Result<usize, String> {
     let chars = text.chars().count();
     let frames = ((seconds(chars) * 3.0 + 4.0) * 12.5).ceil() as usize;
-    let prompt = chars + s.instruct.chars().count() + 64;
-    frames.min(CONTEXT.saturating_sub(prompt + 64)).max(25)
+    let extra = match voice {
+        Voice::Custom => s.instruct.chars().count(),
+        Voice::Design(description) => description.chars().count(),
+        Voice::Base(r) => r.text.chars().count() + r.frames,
+    };
+    let room = CONTEXT.saturating_sub(chars + extra + 128);
+    if room < 25 {
+        return Err("The text and voice settings are too long. Try shorter text or a shorter description or sample.".into());
+    }
+    Ok(frames.min(room))
 }
 
 /// A take of `samples` stopped at its `budget` of frames (within two, for
@@ -949,6 +1185,7 @@ fn wav_samples(b: &[u8]) -> Option<Vec<i16>> {
 
 pub const NOT_DOWNLOADED: &str =
     "Download the local voice first (Read aloud → On this computer → Download).";
+pub const DESIGN_NOT_DOWNLOADED: &str = "Download the models in Design a voice first.";
 
 /// Text read before a chunk and thrown away ([`lead_in`]): the end of the
 /// sentence before it, and whether that is in the chunk's first paragraph.
@@ -1004,25 +1241,41 @@ pub fn make_chunk(
     lead: Option<&Lead>,
     s: &LocalSettings,
 ) -> Result<Vec<Vec<i16>>, Fail> {
-    // Not downloaded, or it won't start: no use trying the next chunk.
-    let server = server(s.parallel).map_err(Fail::Refused)?;
+    // A bare chapter heading can make Base run on instead of continuing
+    // the narration. Carry over a preceding paragraph only when it has
+    // sentence punctuation. CustomVoice keeps its existing lead-ins.
+    let lead = lead.filter(|l| {
+        s.designed.is_none()
+            || l.same_para
+            || l.text.contains(['。', '！', '？', '.', '!', '?', '…'])
+    });
+    let reference = s
+        .designed
+        .as_deref()
+        .map(|id| VoiceStore::default().reference(id))
+        .transpose()
+        .map_err(Fail::Refused)?;
+    let voice = reference.as_ref().map_or(Voice::Custom, Voice::Base);
     let (text, all, all_paras) = assemble(texts, paras, lead);
     let chars: usize = all.iter().map(|t| t.chars().count()).sum();
     // The seed follows the chunk's own text, lead-in or not.
     let (own, _, _) = assemble(texts, paras, None);
     let base = hanstat::dict::xxh64::xxh64(own.as_bytes(), s.seed as u64);
-    let mut pcm = Vec::new();
-    let mut stopped = false;
-    for attempt in 0..2u64 {
-        (pcm, stopped) = server
-            .synth(&text, s, base.wrapping_add(attempt))
-            .map_err(Fail::Other)?;
-        let secs = pcm.len() as f64 / opus::RATE as f64;
-        let want = seconds(chars);
-        if !stopped && secs < want * 3.0 + 4.0 && secs > want * 0.25 {
-            break;
+    // If the server won't start, there is no use trying the next chunk.
+    let (pcm, stopped) = server(s.mode(), s.parallel, |server| {
+        let mut take = (Vec::new(), false);
+        for attempt in 0..2u64 {
+            take = server.synth_voice(&text, s, base.wrapping_add(attempt), voice)?;
+            let secs = take.0.len() as f64 / opus::RATE as f64;
+            let want = seconds(chars);
+            if !take.1 && secs < want * 3.0 + 4.0 && secs > want * 0.25 {
+                break;
+            }
         }
-    }
+        Ok(take)
+    })
+    .map_err(Fail::Refused)?
+    .map_err(Fail::Other)?;
     if stopped {
         // Twice past its budget: cut into clips, the text it never reached
         // would put every highlight in the wrong place.
@@ -1056,9 +1309,48 @@ pub fn make_chunk(
 /// A short passage read with `s`, for hearing the settings before making a
 /// chapter: its samples at [`opus::RATE`]. Not saved.
 pub fn preview(text: &str, s: &LocalSettings) -> Result<Vec<i16>, String> {
+    let reference = s
+        .designed
+        .as_deref()
+        .map(|id| VoiceStore::default().reference(id))
+        .transpose()?;
+    let voice = reference.as_ref().map_or(Voice::Custom, Voice::Base);
     let seed = hanstat::dict::xxh64::xxh64(text.as_bytes(), s.seed as u64);
     // A preview cut short is still worth hearing.
-    server(s.parallel)?.synth(text, s, seed).map(|t| t.0)
+    server(s.mode(), s.parallel, |server| {
+        server.synth_voice(text, s, seed, voice).map(|t| t.0)
+    })?
+}
+
+/// The original WAV is kept for cloning and hashing. Play the decoded
+/// samples so the user hears exactly what will be kept.
+pub struct Sample {
+    pub wav: Vec<u8>,
+    pub pcm: Vec<i16>,
+}
+
+/// Make a take to hear before keeping it. A cut-off take can't be used for
+/// cloning because its transcript would include words it never said.
+pub fn design_sample(description: &str, text: &str, seed: u64) -> Result<Sample, String> {
+    if description.trim().is_empty() || text.trim().is_empty() {
+        return Err("Enter a description and sample text first.".into());
+    }
+    let settings = LocalSettings::default();
+    let voice = Voice::Design(description);
+    let budget = frame_budget(text, &settings, voice)?;
+    let wav = server(Mode::Design, 1, |server| {
+        server.speech(text, &settings, seed, budget, voice)
+    })??;
+    let pcm = wav_samples(&wav)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "The voice designer sent no audio".to_owned())?;
+    if at_budget(pcm.len(), budget) {
+        return Err(
+            "The voice designer didn't finish the sample. Try shorter text or make another take."
+                .into(),
+        );
+    }
+    Ok(Sample { wav, pcm })
 }
 
 /// Run `f` on a thread of its own and tell `repaint` when it is done.
@@ -1193,13 +1485,13 @@ mod tests {
     fn frame_budgets() {
         let s = LocalSettings::default();
         // A short text: three times its length plus 4 s.
-        let short = frame_budget("你好。", &s);
+        let short = frame_budget("你好。", &s, Voice::Custom).unwrap();
         assert!((70..=90).contains(&short), "{short}");
         // The longest chunk the settings allow (400) and a lead-in (60):
         // room for a voice far slower than measured (2.5 characters a
         // second, against 3.8), and never past the context.
         let longest = said(459, "。");
-        let b = frame_budget(&longest, &s);
+        let b = frame_budget(&longest, &s, Voice::Custom).unwrap();
         assert!(b as f64 >= 460.0 / 2.5 * 12.5, "{b}");
         // Past the server's default of 2048 frames, which would cut it off.
         assert!(b > 2048, "{b}");
@@ -1208,12 +1500,95 @@ mod tests {
         s2.instruct = "史诗感十足的低沉有声书旁白声线".into();
         for n in [1, 50, 200, 460, 1000, 2000, 3500] {
             let t = said(n, "");
-            let b = frame_budget(&t, &s2);
+            let b = frame_budget(&t, &s2, Voice::Custom).unwrap();
             assert!(
-                n + s2.instruct.chars().count() + 64 + b <= CONTEXT || b == 25,
+                n + s2.instruct.chars().count() + 128 + b <= CONTEXT,
                 "{n}: {b}"
             );
         }
+    }
+
+    fn reference() -> Reference {
+        Reference {
+            id: "sample-hash".into(),
+            text: said(59, "。"),
+            wav: Vec::new(),
+            frames: 188, // About 15 seconds.
+        }
+    }
+
+    #[test]
+    fn icl_reference_takes_context_space() {
+        let s = LocalSettings {
+            instruct: said(4096, ""),
+            ..Default::default()
+        };
+        let text = said(859, "。");
+        let reference = reference();
+        let budget = frame_budget(&text, &s, Voice::Base(&reference)).unwrap();
+        assert_eq!(860 + 60 + 188 + 128 + budget, CONTEXT);
+        assert!(frame_budget(&said(3800, ""), &s, Voice::Base(&reference)).is_err());
+    }
+
+    #[test]
+    fn request_fields_follow_the_model() {
+        let s = LocalSettings {
+            instruct: " 慢一点 ".into(),
+            ..Default::default()
+        };
+        let body = |voice| request_body("你好。", &s, 8, 20, voice);
+        let custom = body(Voice::Custom);
+        assert_eq!(custom["voice"], "vivian");
+        assert_eq!(custom["instructions"], "慢一点");
+        assert_eq!(custom["seed"], 4);
+        assert_eq!(custom["max_new_tokens"], 20);
+        let reference = reference();
+        let base = body(Voice::Base(&reference));
+        assert_eq!(base["voice"], reference.id);
+        assert!(base.get("instructions").is_none());
+        let design = body(Voice::Design("低沉温和"));
+        assert_eq!(design["instructions"], "低沉温和");
+        assert!(design.get("voice").is_none());
+    }
+
+    #[test]
+    fn base64_uses_standard_padding() {
+        for (bytes, encoded) in [
+            (b"".as_slice(), ""),
+            (b"f", "Zg=="),
+            (b"fo", "Zm8="),
+            (b"foo", "Zm9v"),
+            (b"\xfb\xff\xff", "+///"),
+        ] {
+            assert_eq!(base64(bytes), encoded);
+        }
+    }
+
+    #[test]
+    fn designed_keys_use_the_sample_hash_and_leave_custom_keys_stable() {
+        let mut s: LocalSettings =
+            serde_json::from_str(r#"{"speaker":"vivian","instruct":"  慢一点  "}"#).unwrap();
+        assert_eq!(s.designed, None);
+        let custom = s.key_text();
+        assert_eq!(
+            custom,
+            "qwen3-tts-1.7b-customvoice-q8_0|ogg-opus-24khz-mono-32kbps-vbr|cuts-2|vivian|慢一点|0.9|50|1|1.05|0.9|50|1|0|200"
+        );
+        s.designed = Some("f13e".into());
+        let base = s.key_text();
+        assert_ne!(base, custom);
+        s.speaker = "serena".into();
+        s.instruct = "有精神一点".into();
+        s.parallel = 1;
+        assert_eq!(s.key_text(), base);
+        s.designed = Some("ffd2".into());
+        assert_ne!(s.key_text(), base);
+        s.designed = Some("f13e".into());
+        s.seed = 4;
+        assert_ne!(s.key_text(), base);
+        s.seed = 0;
+        s.chunk_chars = 120;
+        assert_ne!(s.key_text(), base);
     }
 
     #[test]
@@ -1297,8 +1672,7 @@ mod tests {
         assert_eq!(total, 9.0);
     }
 
-    #[test]
-    fn wav_parsing() {
+    pub(super) fn test_wav() -> Vec<u8> {
         let mut w = Vec::new();
         w.extend_from_slice(b"RIFF\0\0\0\0WAVEfmt ");
         w.extend_from_slice(&16u32.to_le_bytes());
@@ -1311,7 +1685,12 @@ mod tests {
         w.extend_from_slice(b"data");
         w.extend_from_slice(&4u32.to_le_bytes());
         w.extend_from_slice(&[1, 0, 0xff, 0xff]);
-        assert_eq!(wav_samples(&w), Some(vec![1, -1]));
+        w
+    }
+
+    #[test]
+    fn wav_parsing() {
+        assert_eq!(wav_samples(&test_wav()), Some(vec![1, -1]));
         assert_eq!(wav_samples(b"nope"), None);
     }
 }

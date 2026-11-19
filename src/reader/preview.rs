@@ -1407,8 +1407,7 @@ fn read_aloud() {
 
 /// Reading aloud with the local voice (Qwen3-TTS on the GPU), the sound
 /// device open but silent. Run with `HANSTAT_MODEL_DIR` at a folder holding
-/// the model (`qwen3-tts-1.7b-customvoice-q8_0/`: the server, 14 MB, is
-/// downloaded from its pinned release if missing), `LOCALAPPDATA` at a
+/// the model and server, `LOCALAPPDATA` at a
 /// scratch folder and `HANSTAT_NO_UPDATE=1`; `READER_SPINE` picks the
 /// chapter made ahead of time.
 ///
@@ -1421,21 +1420,49 @@ fn read_aloud() {
 #[test]
 #[ignore]
 fn read_aloud_local() {
+    check_local_read_aloud(false);
+}
+
+/// As for CustomVoice, but make and keep a real VoiceDesign sample, then
+/// switch to Base and read with the clone. Install the models using the
+/// download button first. `READER_OUT` receives the settled Design window
+/// and the full chapter to listen to.
+#[test]
+#[ignore]
+fn read_aloud_designed() {
+    assert_eq!(env("HANSTAT_NO_UPDATE").as_deref(), Some("1"));
+    assert!(
+        env("LOCALAPPDATA").is_some(),
+        "set LOCALAPPDATA to a scratch folder"
+    );
+    assert!(env("HANSTAT_MODEL_DIR").is_some(), "set HANSTAT_MODEL_DIR");
+    assert!(
+        env("READER_OUT").is_some(),
+        "set READER_OUT for the PNG and chapter audio"
+    );
+    check_local_read_aloud(true);
+}
+
+fn check_local_read_aloud(designed: bool) {
     use std::sync::atomic::Ordering::Relaxed;
     use tts::PlayState;
     let book = env("READER_EPUB").expect("set READER_EPUB");
     tts::audio::MUTE.store(true, Relaxed);
-    tts::local::download(&|_, _| {}).expect("the server downloads");
+    let downloaded = if designed {
+        tts::local::design_downloaded()
+    } else {
+        tts::local::downloaded()
+    };
     assert!(
-        tts::local::downloaded(),
-        "the model is in HANSTAT_MODEL_DIR"
+        downloaded,
+        "the models and server must be in HANSTAT_MODEL_DIR"
     );
     let mut d = Driver::new();
     let mut r = d.open(&book);
     r.settings.tts.source = tts::Source::Local;
     r.spine = env("READER_SPINE")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(2);
+        .unwrap_or(if designed { 5 } else { 2 });
     r.target = Some(Target::Offset(0));
     d.ready(&mut r);
     let spine = r.spine;
@@ -1454,25 +1481,67 @@ fn read_aloud_local() {
             }
         };
 
-    // The panel and the window.
+    let prefix = if designed {
+        "tts-designed"
+    } else {
+        "tts-local"
+    };
+    if designed {
+        let description = "三十岁左右的男声，低沉温和，像深夜电台主持人";
+        let text = "天渐渐亮了，河面上还飘着一层薄雾。她沿着石板路慢慢走到桥边，停下脚步，听见远处传来几声清脆的鸟鸣。";
+        let seed = 86;
+        let start = Instant::now();
+        let sample = tts::local::design_sample(description, text, seed).unwrap();
+        let sample_secs = sample.pcm.len() as f64 / tts::opus::RATE as f64;
+        eprintln!(
+            "VoiceDesign: {sample_secs:.1} s sample in {:.2} s (including model load)",
+            start.elapsed().as_secs_f64()
+        );
+        assert!(sample_secs > 1.0);
+        let id = tts::local::VoiceStore::default()
+            .save_voice("Late-night radio", description, text, seed, &sample.wav)
+            .unwrap();
+        r.settings.tts.local.designed = Some(id);
+        r.tts.open_design_window();
+        d.idle(&mut r, 30);
+        d.snap("tts-design-window");
+        r.tts.close_design_window();
+        d.idle(&mut r, 2);
+
+        let start = Instant::now();
+        tts::local::server(
+            tts::local::Mode::Base,
+            r.settings.tts.local.parallel,
+            |_| (),
+        )
+        .unwrap();
+        eprintln!("Base loaded in {:.2} s", start.elapsed().as_secs_f64());
+    }
+
+    // The panel and the generation window show the voice about to read.
     r.tts.panel_open = true;
     d.idle(&mut r, 30);
-    d.snap("tts-local-panel");
+    d.snap(&format!("{prefix}-panel"));
     r.tts.panel_open = false;
     r.tts.open_local_window(spine);
     d.idle(&mut r, 30);
-    d.snap("tts-local-window");
+    d.snap(&format!("{prefix}-window"));
     r.tts.close_local_window();
     d.idle(&mut r, 2);
 
-    // A preview (loads the model the first time).
+    // Base's first preview registers the kept sample.
     let s = r.settings.tts.local.clone();
     let t = Instant::now();
     let pcm = tts::local::preview("这是一段试听。我们听听现在的设置。", &s).unwrap();
     eprintln!(
-        "preview: {:.1} s of audio in {:.1} s (model load included)",
-        pcm.len() as f64 / 24_000.0,
-        t.elapsed().as_secs_f64()
+        "preview: {:.1} s of audio in {:.1} s ({})",
+        pcm.len() as f64 / tts::opus::RATE as f64,
+        t.elapsed().as_secs_f64(),
+        if designed {
+            "includes Base voice registration"
+        } else {
+            "includes model load"
+        }
     );
     assert!(pcm.len() > 24_000);
 
@@ -1498,14 +1567,19 @@ fn read_aloud_local() {
     };
     let sents = tts::sentences(&c.chars);
     let (mut audio, mut bytes, mut odd) = (0.0, 0u64, Vec::new());
+    let mut chapter_pcm = Vec::new();
     for rg in &sents {
         let text: String = c.chars[rg.start as usize..rg.end as usize].iter().collect();
         let p = tts::clip_path(r.tts.dir(), speech.key(&text), tts::OPUS);
         let file = std::fs::read(&p).unwrap_or_else(|_| panic!("saved: {text}"));
         bytes += file.len() as u64;
         let (samples, rate) = tts::opus::decode(file).unwrap();
+        assert_eq!(rate, tts::opus::RATE);
         let len = samples.len() as f64 / rate as f64;
         audio += len;
+        if designed {
+            chapter_pcm.extend(samples.iter().map(|&x| (x * 32_768.0) as i16));
+        }
         // Expected about 3.8 characters a second; a cut in the wrong pause
         // makes one clip far too long and a neighbour far too short.
         let want = tts::local::seconds(rg.len());
@@ -1527,6 +1601,13 @@ fn read_aloud_local() {
         odd.len() * 20 <= sents.len(),
         "more than 1 in 20 clips implausibly long or short"
     );
+    if designed && let Some(dir) = &d.out_dir {
+        write_pcm_wav(
+            &dir.join("tts-designed-chapter.wav"),
+            &chapter_pcm,
+            tts::opus::RATE,
+        );
+    }
 
     // Reading from where nothing is made: the next chapter with text.
     let next = (spine + 1..r.epub.spine.len())
@@ -1540,11 +1621,12 @@ fn read_aloud_local() {
     wait(&mut d, &mut r, 120, "starts", &|r| {
         r.tts.state() == PlayState::Playing
     });
-    eprintln!(
-        "cold start: first audio after {:.1} s",
-        t.elapsed().as_secs_f32()
-    );
-    d.snap("tts-local-reading");
+    let cold = t.elapsed().as_secs_f64();
+    eprintln!("cold start: first uncached audio after {cold:.2} s");
+    if designed {
+        assert!(cold < 5.0, "cold start took {cold:.2} s with Base loaded");
+    }
+    d.snap(&format!("{prefix}-reading"));
     // A minute of reading: how long it waits for audio after starting.
     let t = Instant::now();
     let mut stalled = 0.0;
@@ -1552,6 +1634,11 @@ fn read_aloud_local() {
     let first = r.tts.at();
     while t.elapsed().as_secs() < 60 {
         d.frame(&mut r, vec![]);
+        assert!(
+            r.tts.error().is_none(),
+            "playback failed: {:?}",
+            r.tts.error()
+        );
         let dt = last.elapsed().as_secs_f64();
         last = Instant::now();
         if r.tts.state() == PlayState::Loading {
@@ -1565,7 +1652,8 @@ fn read_aloud_local() {
         r.tts.at().map(|(s, rg)| (s, rg.start))
     );
     assert_ne!(r.tts.at(), first, "the reading went on");
-    assert!(stalled < 10.0, "stalled {stalled:.1} s");
+    let max_stall = if designed { 0.1 } else { 10.0 };
+    assert!(stalled < max_stall, "stalled {stalled:.2} s");
 
     // A saved sentence plays at once.
     let mid = sents.len() / 2;
@@ -1585,6 +1673,22 @@ fn read_aloud_local() {
     d.idle(&mut r, 20);
     assert!(!r.tts.active());
     r.close(&d.ctx);
+}
+
+/// A playable chapter in the reader's sentence order, with the same
+/// samples the reader decodes from its saved clips.
+fn write_pcm_wav(path: &Path, pcm: &[i16], rate: u32) {
+    let len = u32::try_from(pcm.len() * 2).unwrap();
+    let mut wav = Vec::with_capacity(44 + len as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt \x10\0\0\0\x01\0\x01\0"); // PCM mono
+    wav.extend_from_slice(&rate.to_le_bytes());
+    wav.extend_from_slice(&(rate * 2).to_le_bytes());
+    wav.extend_from_slice(b"\x02\0\x10\0data"); // 16-bit samples
+    wav.extend_from_slice(&len.to_le_bytes());
+    wav.extend(pcm.iter().flat_map(|x| x.to_le_bytes()));
+    std::fs::write(path, wav).unwrap();
 }
 
 /// How well local-voice chunks are cut into sentences, on real audio: the
@@ -1663,11 +1767,12 @@ fn local_cut_eval() {
                         text.push_str(t);
                     }
                     let seed = hanstat::dict::xxh64::xxh64(text.as_bytes(), s.seed as u64);
-                    let pcm = tts::local::server(4)
-                        .unwrap()
-                        .synth(&text, &s, seed)
-                        .unwrap()
-                        .0;
+                    let pcm = tts::local::server(tts::local::Mode::Custom, 4, |server| {
+                        server.synth(&text, &s, seed)
+                    })
+                    .unwrap()
+                    .unwrap()
+                    .0;
                     let bytes: Vec<u8> = pcm.iter().flat_map(|x| x.to_le_bytes()).collect();
                     std::fs::write(dir.join(format!("chunk-{name}.pcm")), bytes).unwrap();
                     eprintln!("made chunk {name}");

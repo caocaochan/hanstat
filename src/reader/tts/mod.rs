@@ -386,6 +386,8 @@ pub struct Tts {
     labels: Vec<String>,
     /// The first character of the page shown (the preview reads from it).
     pub page_src: u32,
+    /// First source character after the page or spread shown.
+    pub page_end: u32,
     /// The local voice's panel and window.
     local: local_ui::State,
     /// The chapter shown (the preview reads from it).
@@ -435,6 +437,7 @@ impl Tts {
             cache_job: None,
             labels,
             page_src: 0,
+            page_end: u32::MAX,
             local: local_ui::State::default(),
             local_spine: 0,
             estimates: Default::default(),
@@ -579,7 +582,7 @@ impl Tts {
     fn client_ready(&self, s: &TtsSettings) -> bool {
         match s.source {
             Source::Azure => self.the_key().is_some() && azure::valid_region(s.region.trim()),
-            Source::Local => self.local.downloaded(),
+            Source::Local => self.local.downloaded(&s.local) && !self.design_making(),
         }
     }
 
@@ -589,6 +592,11 @@ impl Tts {
         } else {
             self.now.state
         }
+    }
+
+    #[cfg(test)]
+    pub fn error(&self) -> Option<&str> {
+        self.now.error.as_deref()
     }
 
     /// Reading aloud (or paused, or waiting for audio).
@@ -608,9 +616,17 @@ impl Tts {
             self.last_visible = true;
             self.last_at = None;
             self.pending = None;
-            if !self.local.downloaded() {
+            if self.design_making() {
+                return;
+            }
+            if !self.local.downloaded(&s.local) {
                 self.panel_open = true;
-                self.key_note = Some((false, local::NOT_DOWNLOADED.to_owned()));
+                let note = if s.local.designed.is_some() {
+                    local::DESIGN_NOT_DOWNLOADED
+                } else {
+                    local::NOT_DOWNLOADED
+                };
+                self.key_note = Some((false, note.to_owned()));
                 return;
             }
             self.stop_preview();
@@ -886,6 +902,7 @@ impl Tts {
         let mut close = false;
         let ctx = button.ctx.clone();
         let mut open = self.panel_open;
+        let design_was_open = self.design_window_open();
         if open {
             self.load_key();
         }
@@ -931,7 +948,7 @@ impl Tts {
                             ui.label(
                                 RichText::new(match st {
                                     State::Loading if s.source == Source::Local => {
-                                        if local::status() == local::Status::Loaded {
+                                        if local::loaded(s.local.mode(), s.local.parallel) {
                                             "Making the audio…"
                                         } else {
                                             "Loading the voice…"
@@ -1025,11 +1042,12 @@ impl Tts {
                 }
                 });
             });
-        if close {
+        if close || (!design_was_open && self.design_window_open()) {
             open = false;
         }
         self.panel_open = open;
         self.local_window(&ctx, s, spine);
+        self.design_window(&ctx, s, spine);
         action
     }
 
@@ -1210,7 +1228,7 @@ impl Tts {
     }
 
     /// Making audio ahead of time, and the saved audio. True: close the
-    /// panel (the "Generate locally" window opens).
+    /// panel (a local voice window opens).
     fn ahead_of_time(
         &mut self,
         ui: &mut egui::Ui,
@@ -1235,6 +1253,21 @@ impl Tts {
                 }
             });
         });
+        if local {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(
+                        !self.local_voice_busy(),
+                        egui::Button::new("Design a voice…"),
+                    )
+                    .on_hover_text("Describe a voice, hear a sample and keep it to read your books")
+                    .clicked()
+                {
+                    self.open_design_window();
+                    close = true;
+                }
+            });
+        }
         ui.label(
             RichText::new(if local {
                 "Make the audio now, to listen without waiting. \

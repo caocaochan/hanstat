@@ -10,6 +10,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 
+mod designer;
+
 const RED: Color32 = Color32::from_rgb(0xdc, 0x32, 0x2f);
 
 /// The preview clip: being made, playing, or what went wrong.
@@ -23,16 +25,89 @@ enum Preview {
 }
 
 /// A download under way: bytes done and of all, and its end.
-type Download = (Arc<AtomicU64>, Arc<AtomicU64>, Receiver<Result<(), String>>);
+type Transfer = (Arc<AtomicU64>, Arc<AtomicU64>, Receiver<Result<(), String>>);
+
+#[derive(Default)]
+struct Download {
+    /// Files present (checked when the panel or window opens and
+    /// after a download, not every frame).
+    present: Option<bool>,
+    transfer: Option<Transfer>,
+    error: Option<String>,
+}
+
+impl Download {
+    fn poll(&mut self, present: fn() -> bool) -> bool {
+        if self.present.is_none() {
+            self.present = Some(present());
+        }
+        if let Some((_, _, rx)) = &self.transfer
+            && let Ok(result) = rx.try_recv()
+        {
+            self.transfer = None;
+            self.present = Some(present());
+            self.error = result.err();
+            return true;
+        }
+        false
+    }
+
+    fn button(&mut self, ui: &mut egui::Ui, size: u64, tip: &str) -> bool {
+        let present = self.present == Some(true);
+        let label = if present {
+            "Downloaded".to_owned()
+        } else if self.transfer.is_some() {
+            "Downloading…".to_owned()
+        } else {
+            format!("Download ({:.1} GB)", size as f64 / 1e9)
+        };
+        let clicked = ui
+            .add_enabled(
+                !present && self.transfer.is_none(),
+                egui::Button::new(label),
+            )
+            .on_hover_text(tip)
+            .clicked();
+        if let Some((done, total, _)) = &self.transfer {
+            let (d, t) = (
+                done.load(Ordering::Relaxed),
+                total.load(Ordering::Relaxed).max(1),
+            );
+            ui.add(
+                egui::ProgressBar::new(d as f32 / t as f32)
+                    .desired_width(180.0)
+                    .text(format!("{:.2} of {:.1} GB", d as f64 / 1e9, t as f64 / 1e9)),
+            );
+        }
+        clicked
+    }
+
+    fn start(
+        &mut self,
+        size: u64,
+        repaint: super::engine::Repaint,
+        download: impl FnOnce(&dyn Fn(u64, u64)) -> Result<(), String> + Send + 'static,
+    ) {
+        let done = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(size));
+        let (d, t) = (done.clone(), total.clone());
+        let rx = local::spawn("tts-download", repaint.clone(), move || {
+            download(&|a, b| {
+                d.store(a, Ordering::Relaxed);
+                t.store(b, Ordering::Relaxed);
+                repaint();
+            })
+        });
+        self.error = None;
+        self.transfer = Some((done, total, rx));
+    }
+}
 
 #[derive(Default)]
 pub struct State {
-    /// Both downloads present (checked when the panel or window opens and
-    /// after a download, not every frame).
-    present: Option<bool>,
-    /// A download under way.
-    downloading: Option<Download>,
-    download_error: Option<String>,
+    custom: Download,
+    design: Download,
+    designer: designer::State,
     preview: Preview,
     /// The "Generate locally" window.
     pub window_open: bool,
@@ -45,28 +120,32 @@ pub struct State {
 }
 
 impl State {
-    pub fn downloaded(&self) -> bool {
-        self.present.unwrap_or(false)
+    pub fn downloaded(&self, s: &LocalSettings) -> bool {
+        let download = if s.designed.is_some() {
+            &self.design
+        } else {
+            &self.custom
+        };
+        download.present.unwrap_or(false)
     }
 }
 
 impl Tts {
     /// Once a frame: the download's and the preview's answers.
     pub(super) fn local_poll(&mut self) {
-        if self.local.present.is_none() {
-            self.local.present = Some(local::downloaded());
-        }
-        if let Some((_, _, rx)) = &self.local.downloading
-            && let Ok(r) = rx.try_recv()
-        {
-            self.local.downloading = None;
-            self.local.present = Some(local::downloaded());
-            if let Err(e) = r {
-                self.local.download_error = Some(e);
-            } else {
+        let custom = self.local.custom.poll(local::downloaded);
+        let design = self.local.design.poll(local::design_downloaded);
+        if custom || design {
+            self.local.custom.present = Some(local::downloaded());
+            self.local.design.present = Some(local::design_downloaded());
+            if [local::NOT_DOWNLOADED, local::DESIGN_NOT_DOWNLOADED]
+                .iter()
+                .any(|note| self.key_note.as_ref().is_some_and(|(_, text)| text == note))
+            {
                 self.key_note = None;
             }
         }
+        self.local.designer.poll();
         match &self.local.preview {
             Preview::Making(rx) => {
                 if let Ok(r) = rx.try_recv() {
@@ -88,37 +167,19 @@ impl Tts {
             o.clear();
         }
         self.local.preview = Preview::None;
+        self.local.designer.stop_sample();
     }
 
-    fn start_download(&mut self) {
-        let done = Arc::new(AtomicU64::new(0));
-        let total = Arc::new(AtomicU64::new(local::download_size()));
-        let (d, t) = (done.clone(), total.clone());
-        let repaint = self.repaint.clone();
-        let rx = local::spawn("tts-download", self.repaint.clone(), move || {
-            local::download(&|a, b| {
-                d.store(a, Ordering::Relaxed);
-                t.store(b, Ordering::Relaxed);
-                repaint();
-            })
-        });
-        self.local.download_error = None;
-        self.local.downloading = Some((done, total, rx));
-    }
-
-    /// A short passage from the page shown, read with the current settings:
-    /// whole sentences up to about 120 characters, paragraphs on their own
-    /// lines, as chapters are read.
-    fn start_preview(&mut self, s: &LocalSettings, spine: usize) {
-        if self.active() {
-            self.stop();
-        }
-        self.stop_preview();
-        let ch = self.chapters.lock().unwrap().get(spine).cloned().flatten();
-        let Some(ch) = ch else {
-            self.local.preview = Preview::Failed("This chapter is still loading.".into());
-            return;
-        };
+    /// Whole sentences from the page shown, with paragraphs on their own
+    /// lines, as chapters are read. A long first sentence is kept whole.
+    fn page_passage(&self, spine: usize, limit: usize, end: u32) -> Option<String> {
+        let ch = self
+            .chapters
+            .lock()
+            .unwrap()
+            .get(spine)
+            .cloned()
+            .flatten()?;
         let sents = sentences(&ch.chars);
         let paras = local::paragraphs(&ch.chars, &sents);
         let first = sentence_at(&sents, self.page_src).min(sents.len().saturating_sub(1));
@@ -126,7 +187,7 @@ impl Tts {
         let mut n = 0;
         for i in first..sents.len() {
             let r = &sents[i];
-            if n > 0 && n + r.len() > 120 {
+            if r.start >= end || (n > 0 && n + r.len() > limit) {
                 break;
             }
             if n > 0 && paras[i] != paras[i - 1] {
@@ -135,6 +196,18 @@ impl Tts {
             text.extend(&ch.chars[r.start as usize..r.end as usize]);
             n += r.len();
         }
+        Some(text)
+    }
+
+    fn start_preview(&mut self, s: &LocalSettings, spine: usize) {
+        if self.active() {
+            self.stop();
+        }
+        self.stop_preview();
+        let Some(mut text) = self.page_passage(spine, 120, u32::MAX) else {
+            self.local.preview = Preview::Failed("This chapter is still loading.".into());
+            return;
+        };
         if text.is_empty() {
             text = "这是一段试听，用来听一听现在的设置读起来是什么样子。".into();
         }
@@ -148,58 +221,44 @@ impl Tts {
 
     /// The download row: a button that greys out once pressed, its
     /// progress, and whether the model is loaded on the GPU.
-    fn download_row(&mut self, ui: &mut egui::Ui) {
+    fn download_row(&mut self, ui: &mut egui::Ui, s: &LocalSettings) {
         if hanstat::models::QWEN_TTS_SERVER.is_none() {
             ui.colored_label(RED, "The local voice isn't available on this platform.");
             return;
         }
-        let size = local::download_size() as f64 / 1e9;
         ui.horizontal(|ui| {
-            let downloading = self.local.downloading.is_some();
-            let present = self.local.downloaded();
-            let label = if present {
-                "Downloaded".to_owned()
-            } else if downloading {
-                "Downloading…".to_owned()
-            } else {
-                format!("Download ({size:.1} GB)")
-            };
-            if ui
-                .add_enabled(!present && !downloading, egui::Button::new(label))
-                .on_hover_text(
-                    "Qwen3-TTS 1.7B CustomVoice (Alibaba Qwen, Apache-2.0) and \
-                     qwentts.cpp's server (MIT) that runs it on the GPU",
-                )
-                .clicked()
-            {
-                self.start_download();
+            let present = self.local.downloaded(s);
+            if s.designed.is_some() {
+                if !present {
+                    ui.label(local::DESIGN_NOT_DOWNLOADED);
+                }
+            } else if self.local.custom.button(
+                ui,
+                local::download_size(),
+                "Qwen3-TTS 1.7B CustomVoice (Alibaba Qwen, Apache-2.0) and \
+                 qwentts.cpp's server (MIT) that runs it on the GPU",
+            ) {
+                self.local.custom.start(
+                    local::download_size(),
+                    self.repaint.clone(),
+                    local::download,
+                );
             }
-            if let Some((done, total, _)) = &self.local.downloading {
-                let (d, t) = (
-                    done.load(Ordering::Relaxed),
-                    total.load(Ordering::Relaxed).max(1),
-                );
-                ui.add(
-                    egui::ProgressBar::new(d as f32 / t as f32)
-                        .desired_width(180.0)
-                        .text(format!("{:.2} of {:.1} GB", d as f64 / 1e9, t as f64 / 1e9)),
-                );
-            } else if present {
-                let loaded = local::status() == local::Status::Loaded;
+            if present {
                 ui.label(
-                    RichText::new(if loaded {
+                    RichText::new(if local::loaded(s.mode(), s.parallel) {
                         "loaded on the GPU"
                     } else {
-                        "loads on first use"
+                        "loads when needed"
                     })
                     .weak(),
                 );
-                let busy = self.batch.as_ref().is_some_and(|b| !b.finished())
-                    || matches!(self.local.preview, Preview::Making(_))
-                    || self.active();
-                if loaded
+                if local::status() == local::Status::Loaded
                     && ui
-                        .add_enabled(!busy, egui::Button::new("Unload").small())
+                        .add_enabled(
+                            !self.local_voice_busy() && !self.active(),
+                            egui::Button::new("Unload").small(),
+                        )
                         .on_hover_text("Free the GPU memory it holds (about 4–5 GB)")
                         .clicked()
                 {
@@ -207,7 +266,30 @@ impl Tts {
                 }
             }
         });
-        if let Some(e) = &self.local.download_error {
+        if s.designed.is_none()
+            && let Some(e) = &self.local.custom.error
+        {
+            ui.colored_label(RED, e);
+        }
+    }
+
+    fn design_download_row(&mut self, ui: &mut egui::Ui) {
+        if hanstat::models::QWEN_TTS_SERVER.is_none() {
+            return;
+        }
+        let size = local::design_download_size();
+        ui.horizontal(|ui| {
+            ui.label("Voice models");
+            let design = &mut self.local.design;
+            if design.button(
+                ui,
+                size,
+                "Qwen3-TTS VoiceDesign makes a sample. Qwen3-TTS Base uses it to read books.",
+            ) {
+                design.start(size, self.repaint.clone(), local::download_design);
+            }
+        });
+        if let Some(e) = &self.local.design.error {
             ui.colored_label(RED, e);
         }
     }
@@ -215,7 +297,11 @@ impl Tts {
     /// Voice, instructions, preview and the advanced settings: in the
     /// panel and in the window.
     fn local_controls(&mut self, ui: &mut egui::Ui, s: &mut TtsSettings, spine: usize, wide: bool) {
+        self.local.designer.load_voices();
+        let busy = self.local_voice_busy();
+        let mut design = false;
         let l = &mut s.local;
+        let voices = &self.local.designer.voices;
         if wide {
             // Nine voices, three a row, each with how it sounds below it.
             ui.label(RichText::new("Voice").strong());
@@ -226,7 +312,19 @@ impl Tts {
                     for (i, sp) in SPEAKERS.iter().enumerate() {
                         ui.vertical(|ui| {
                             ui.set_width(170.0);
-                            ui.radio_value(&mut l.speaker, sp.id.to_owned(), sp.name);
+                            if ui
+                                .add_enabled(
+                                    !busy,
+                                    egui::RadioButton::new(
+                                        l.designed.is_none() && l.speaker == sp.id,
+                                        sp.name,
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                l.speaker = sp.id.into();
+                                l.designed = None;
+                            }
                             ui.label(RichText::new(sp.sound).size(12.0).weak());
                             ui.label(RichText::new(sp.native).size(12.0).weak());
                         });
@@ -235,6 +333,23 @@ impl Tts {
                         }
                     }
                 });
+            ui.add_enabled_ui(!busy, |ui| {
+                if !voices.is_empty() {
+                    ui.label(RichText::new("Designed voices").strong());
+                    ui.horizontal_wrapped(|ui| {
+                        for v in voices {
+                            if ui
+                                .radio(l.designed.as_ref() == Some(&v.id), &v.info.name)
+                                .on_hover_text(&v.info.description)
+                                .clicked()
+                            {
+                                l.designed = Some(v.id.clone());
+                            }
+                        }
+                    });
+                }
+                design = ui.button("Design a voice…").clicked();
+            });
             ui.add_space(4.0);
         }
         egui::Grid::new(("reader-tts-local", wide))
@@ -244,37 +359,60 @@ impl Tts {
                 if !wide {
                     ui.label("Voice");
                     let cur = local::speaker(&l.speaker);
-                    egui::ComboBox::from_id_salt("reader-tts-local-voice")
-                        .selected_text(format!("{} — {}", cur.name, cur.sound))
+                    let selected = match &l.designed {
+                        Some(id) => voices.iter().find(|v| &v.id == id)
+                            .map_or("Missing designed voice", |v| v.info.name.as_str()).to_owned(),
+                        None => format!("{} — {}", cur.name, cur.sound),
+                    };
+                    ui.add_enabled_ui(!busy, |ui| egui::ComboBox::from_id_salt("reader-tts-local-voice")
+                        .selected_text(selected)
                         .width(260.0)
                         .show_ui(ui, |ui| {
                             for sp in SPEAKERS {
-                                ui.selectable_value(
-                                    &mut l.speaker,
-                                    sp.id.to_owned(),
-                                    format!("{} — {} · {}", sp.name, sp.sound, sp.native),
-                                );
+                                if ui.selectable_label(l.designed.is_none() && l.speaker == sp.id,
+                                    format!("{} — {} · {}", sp.name, sp.sound, sp.native)).clicked() {
+                                    l.speaker = sp.id.into();
+                                    l.designed = None;
+                                }
                             }
-                        });
+                            ui.separator();
+                            if !voices.is_empty() {
+                                ui.label(RichText::new("Designed voices").strong());
+                                for v in voices {
+                                    if ui.selectable_label(l.designed.as_ref() == Some(&v.id), &v.info.name)
+                                        .on_hover_text(&v.info.description).clicked() {
+                                        l.designed = Some(v.id.clone());
+                                    }
+                                }
+                            }
+                        }));
                     ui.end_row();
                 }
-                ui.label("Instructions");
-                ui.add(
+                let instructions = l.designed.is_none();
+                let tip = if instructions {
+                    "How to read, including tone, pace and emotion, in any language. Changing the wording makes new audio."
+                } else {
+                    designer::SAMPLE_STYLE
+                };
+                ui.label("Instructions").on_hover_text(tip);
+                ui.add_enabled(
+                    instructions,
                     egui::TextEdit::multiline(&mut l.instruct)
                         .hint_text("Optional, e.g. 用温柔平稳的语气，语速稍慢")
                         .desired_rows(2)
                         .desired_width(if wide { 320.0 } else { 260.0 }),
                 )
-                .on_hover_text(
-                    "How to read: tone, pace, emotion, in any language. Each wording \
-                     is its own audio: changing it makes sentences again.",
-                );
+                .on_disabled_hover_text(tip)
+                .on_hover_text(tip);
                 ui.end_row();
             });
+        if design {
+            self.open_design_window();
+        }
         self.preview_row(ui, s, spine);
         egui::CollapsingHeader::new("Advanced")
             .id_salt(("reader-tts-local-adv", wide))
-            .show(ui, |ui| advanced(ui, &mut s.local, self.batch_running()));
+            .show(ui, |ui| advanced(ui, &mut s.local, busy));
     }
 
     fn batch_running(&self) -> bool {
@@ -283,15 +421,22 @@ impl Tts {
             .is_some_and(|b| !b.finished() && !b.cancel.load(Ordering::Relaxed))
     }
 
+    /// Keep the running batch's talker and parallel count until it finishes.
+    pub(super) fn local_voice_busy(&self) -> bool {
+        self.batch_running()
+            || self.local.designer.making()
+            || matches!(self.local.preview, Preview::Making(_))
+    }
+
     fn preview_row(&mut self, ui: &mut egui::Ui, s: &TtsSettings, spine: usize) {
         ui.horizontal(|ui| {
-            let ready = self.local.downloaded();
+            let ready = self.local.downloaded(&s.local) && !self.local_voice_busy();
             match &self.local.preview {
                 Preview::Making(_) => {
                     ui.add_enabled(false, egui::Button::new("Preview"));
                     ui.spinner();
                     ui.label(
-                        RichText::new(if local::status() == local::Status::Loaded {
+                        RichText::new(if local::loaded(s.local.mode(), s.local.parallel) {
                             "Making the preview…"
                         } else {
                             "Loading the voice, then the preview…"
@@ -326,12 +471,17 @@ impl Tts {
 
     /// The local voice in the Read aloud panel.
     pub(super) fn local_settings(&mut self, ui: &mut egui::Ui, s: &mut TtsSettings) {
-        if self.local.present.is_none() {
-            self.local.present = Some(local::downloaded());
-        }
-        self.download_row(ui);
+        self.local
+            .custom
+            .present
+            .get_or_insert_with(local::downloaded);
+        self.local
+            .design
+            .present
+            .get_or_insert_with(local::design_downloaded);
+        self.download_row(ui, &s.local);
         if let Some((ok, note)) = &self.key_note
-            && note == local::NOT_DOWNLOADED
+            && (note == local::NOT_DOWNLOADED || note == local::DESIGN_NOT_DOWNLOADED)
         {
             let c = if *ok {
                 ui.visuals().weak_text_color()
@@ -366,7 +516,8 @@ impl Tts {
         if !self.local.chosen.iter().any(|&c| c) && spine < n {
             self.local.chosen[spine] = true;
         }
-        self.local.present = Some(local::downloaded());
+        self.local.custom.present = Some(local::downloaded());
+        self.local.design.present = Some(local::design_downloaded());
         self.local.window_open = true;
     }
 
@@ -408,7 +559,7 @@ impl Tts {
                         )
                         .weak(),
                     );
-                    self.download_row(ui);
+                    self.download_row(ui, &s.local);
                     ui.separator();
                     self.local_controls(ui, s, spine, true);
                     ui.separator();
@@ -504,11 +655,11 @@ impl Tts {
                 duration(audio / speed),
             )
         });
-        let running = self.batch_running();
+        let ready = self.local.downloaded(&s.local);
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    self.local.downloaded() && !chosen.is_empty() && !running,
+                    ready && !chosen.is_empty() && !self.local_voice_busy(),
                     egui::Button::new(RichText::new("Generate").strong()),
                 )
                 .clicked()
@@ -527,7 +678,7 @@ impl Tts {
                 self.poll(s);
                 self.pregenerate(s, chosen.clone(), &what);
             }
-            if !self.local.downloaded() {
+            if !ready {
                 ui.label(RichText::new("Download the voice first.").weak());
             }
         });
@@ -618,9 +769,13 @@ fn advanced(ui: &mut egui::Ui, l: &mut LocalSettings, running: bool) {
         .on_hover_text("Every setting here back to its default; the voice and instructions stay")
         .clicked()
     {
-        let keep = (l.speaker.clone(), l.instruct.clone());
+        let keep = (l.speaker.clone(), l.instruct.clone(), l.designed.clone());
+        let parallel = l.parallel;
         *l = LocalSettings::default();
-        (l.speaker, l.instruct) = keep;
+        (l.speaker, l.instruct, l.designed) = keep;
+        if running {
+            l.parallel = parallel;
+        }
     }
 }
 

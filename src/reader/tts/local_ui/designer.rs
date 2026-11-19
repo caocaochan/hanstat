@@ -1,0 +1,413 @@
+//! Make a reference to keep, and manage the references available to both
+//! local voice pickers.
+
+use super::super::{Tts, TtsSettings};
+use super::{Output, RED, local, play};
+use eframe::egui::{self, RichText};
+use local::{SavedVoice, VoiceStore};
+use std::hash::{BuildHasher, RandomState};
+use std::sync::mpsc::{Receiver, TryRecvError};
+
+const EXAMPLE: &str = "三十岁左右的男声，低沉温和，像深夜电台主持人";
+pub const SAMPLE_TEXT: &str = "天渐渐亮了，河面上还飘着一层薄雾。她沿着石板路慢慢走到桥边，停下脚步，听见远处传来几声清脆的鸟鸣。";
+const DESCRIPTION_TIP: &str = "Describe the voice you want to hear. You can give its gender, age, \
+    pitch, pace and mood, or suggest a setting such as a late-night radio show. \
+    Use any language.";
+pub(super) const SAMPLE_STYLE: &str = "A kept voice reads every book in the same voice. \
+    Its tone and pace come from the sample. To change them, make a new sample.";
+
+/// Keep the words that were actually sent even if the text box is edited
+/// before the sample is named.
+struct Take {
+    description: String,
+    text: String,
+    seed: u64,
+    sample: local::Sample,
+}
+
+enum Edit {
+    Rename { id: String, name: String },
+    Delete { id: String, name: String },
+}
+
+pub(super) struct State {
+    open: bool,
+    description: String,
+    text: String,
+    pending: Option<Receiver<Result<Take, String>>>,
+    take: Option<Take>,
+    keep_name: Option<String>,
+    /// A playing take has no id, since it hasn't been kept yet.
+    playing: Option<(Option<String>, Output)>,
+    listed: bool,
+    pub voices: Vec<SavedVoice>,
+    edit: Option<Edit>,
+    error: Option<String>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            open: false,
+            description: String::new(),
+            text: SAMPLE_TEXT.into(),
+            pending: None,
+            take: None,
+            keep_name: None,
+            playing: None,
+            listed: false,
+            voices: Vec::new(),
+            edit: None,
+            error: None,
+        }
+    }
+}
+
+impl State {
+    pub fn making(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    pub fn poll(&mut self) {
+        if let Some(rx) = &self.pending {
+            let answer = match rx.try_recv() {
+                Ok(answer) => Some(answer),
+                Err(TryRecvError::Disconnected) => Some(Err("The voice designer stopped.".into())),
+                Err(TryRecvError::Empty) => None,
+            };
+            if let Some(answer) = answer {
+                self.pending = None;
+                match answer {
+                    Ok(take) => self.take = Some(take),
+                    Err(e) => self.error = Some(e),
+                }
+            }
+        }
+        if self
+            .playing
+            .as_ref()
+            .is_some_and(|(_, o)| o.queued().is_empty() || o.failed())
+        {
+            self.stop_sample();
+        }
+    }
+
+    pub fn stop_sample(&mut self) {
+        if let Some((_, output)) = self.playing.take() {
+            output.clear();
+        }
+    }
+
+    fn playing(&self, id: Option<&str>) -> bool {
+        self.playing
+            .as_ref()
+            .is_some_and(|(from, _)| from.as_deref() == id)
+    }
+
+    pub fn load_voices(&mut self) {
+        if !self.listed {
+            self.refresh();
+        }
+    }
+
+    fn refresh(&mut self) {
+        self.listed = true;
+        match VoiceStore::default().list_voices() {
+            Ok(voices) => self.voices = voices,
+            Err(e) => self.error = Some(e),
+        }
+    }
+}
+
+impl Tts {
+    pub fn open_design_window(&mut self) {
+        self.local.design.present = Some(local::design_downloaded());
+        self.local.designer.refresh();
+        self.local.designer.open = true;
+    }
+
+    pub fn design_window_open(&self) -> bool {
+        self.local.designer.open
+    }
+
+    pub fn close_design_window(&mut self) {
+        self.local.designer.open = false;
+        self.local.designer.edit = None;
+        self.local.designer.stop_sample();
+    }
+
+    pub(in crate::reader::tts) fn design_making(&self) -> bool {
+        self.local.designer.making()
+    }
+
+    fn start_sample(&mut self) {
+        if self.active() {
+            self.stop();
+        }
+        self.stop_preview();
+        let d = &mut self.local.designer;
+        let description = d.description.trim().to_owned();
+        let text = d.text.trim().to_owned();
+        // Fresh randomness for each press, without a new dependency.
+        let seed = RandomState::new().hash_one(());
+        d.error = None;
+        d.keep_name = None;
+        d.take = None;
+        d.pending = Some(local::spawn(
+            "tts-design",
+            self.repaint.clone(),
+            move || {
+                let sample = local::design_sample(&description, &text, seed)?;
+                Ok(Take {
+                    description,
+                    text,
+                    seed,
+                    sample,
+                })
+            },
+        ));
+    }
+
+    fn toggle_sample(&mut self, id: Option<&str>) {
+        if self.local.designer.playing(id) {
+            self.local.designer.stop_sample();
+            return;
+        }
+        if self.active() {
+            self.stop();
+        }
+        self.stop_preview();
+        let d = &mut self.local.designer;
+        let played = match id {
+            Some(id) => VoiceStore::default()
+                .samples(id)
+                .and_then(|pcm| play(&pcm, &self.repaint)),
+            None => {
+                let Some(take) = &d.take else { return };
+                play(&take.sample.pcm, &self.repaint)
+            }
+        };
+        match played {
+            Ok(output) => d.playing = Some((id.map(str::to_owned), output)),
+            Err(e) => d.error = Some(e),
+        }
+    }
+
+    pub(in crate::reader::tts) fn design_window(
+        &mut self,
+        ctx: &egui::Context,
+        s: &mut TtsSettings,
+        spine: usize,
+    ) {
+        if !self.design_window_open() {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Design a voice")
+            .id(egui::Id::unique("reader-tts-designer"))
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    self.design_download_row(ui);
+                    ui.separator();
+                    self.make_sample_form(ui, s, spine);
+                    ui.separator();
+                    self.kept_voices(ui, s);
+                    if let Some(e) = &self.local.designer.error {
+                        ui.colored_label(RED, e);
+                    }
+                });
+            });
+        if !open {
+            self.close_design_window();
+        }
+    }
+
+    fn make_sample_form(&mut self, ui: &mut egui::Ui, s: &mut TtsSettings, spine: usize) {
+        let busy = self.local_voice_busy();
+        let d = &mut self.local.designer;
+        let mut from_page = false;
+        ui.add_enabled_ui(!d.making(), |ui| {
+            ui.label("Description").on_hover_text(DESCRIPTION_TIP);
+            ui.add(egui::TextEdit::multiline(&mut d.description)
+                .hint_text(EXAMPLE).desired_rows(2).desired_width(f32::INFINITY))
+                .on_hover_text(DESCRIPTION_TIP);
+            ui.horizontal(|ui| {
+                ui.label("Sample text");
+                from_page = ui.small_button("Use this page")
+                    .on_hover_text("Take a few sentences from the page you are reading.").clicked();
+            });
+            ui.add(egui::TextEdit::multiline(&mut d.text).desired_rows(3).desired_width(f32::INFINITY))
+                .on_hover_text("A short passage lets you hear the voice's pace and tone. The kept voice reads other passages in the same style.");
+        });
+        if from_page {
+            let passage = self
+                .page_passage(spine, 60, self.page_end)
+                .filter(|text| !text.is_empty());
+            let d = &mut self.local.designer;
+            if let Some(text) = passage {
+                d.text = text;
+                d.error = None;
+            } else {
+                d.error = Some("There is no text on this page yet.".into());
+            }
+        }
+        ui.horizontal(|ui| {
+            let d = &self.local.designer;
+            let ready = self.local.design.present == Some(true)
+                && !busy && !d.description.trim().is_empty() && !d.text.trim().is_empty();
+            if ui.add_enabled(ready, egui::Button::new("Make sample"))
+                .on_hover_text("Hear a new take from this description. You can make another if you prefer a different reading.")
+                .clicked() {
+                self.start_sample();
+            }
+            let d = &self.local.designer;
+            if d.making() {
+                ui.spinner();
+                ui.label(RichText::new(if local::loaded(local::Mode::Design, 1) {
+                    "Making the sample…"
+                } else {
+                    "Loading the voice designer…"
+                }).weak());
+            } else if d.take.is_some() {
+                if ui.button(if d.playing(None) { "Stop sample" } else { "Play sample" }).clicked() {
+                    self.toggle_sample(None);
+                }
+                if ui.add_enabled(!busy, egui::Button::new("Keep…")).on_hover_text(SAMPLE_STYLE).clicked() {
+                    self.local.designer.keep_name = Some(String::new());
+                }
+            }
+        });
+        let d = &mut self.local.designer;
+        if let (Some(name), Some(take)) = (&mut d.keep_name, &d.take) {
+            let mut keep = false;
+            let mut cancel = false;
+            ui.add_enabled_ui(!busy, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Name");
+                    ui.text_edit_singleline(name);
+                    keep = ui
+                        .add_enabled(!name.trim().is_empty(), egui::Button::new("Keep"))
+                        .clicked();
+                    cancel = ui.button("Cancel").clicked();
+                })
+            });
+            if cancel {
+                d.keep_name = None;
+            } else if keep {
+                match VoiceStore::default().save_voice(
+                    name,
+                    &take.description,
+                    &take.text,
+                    take.seed,
+                    &take.sample.wav,
+                ) {
+                    Ok(id) => {
+                        s.local.designed = Some(id);
+                        d.keep_name = None;
+                        d.error = None;
+                        d.refresh();
+                    }
+                    Err(e) => d.error = Some(e),
+                }
+            }
+        }
+    }
+
+    fn kept_voices(&mut self, ui: &mut egui::Ui, s: &mut TtsSettings) {
+        let busy = self.local_voice_busy();
+        let d = &mut self.local.designer;
+        ui.label(RichText::new("Kept voices").strong())
+            .on_hover_text(SAMPLE_STYLE);
+        if d.voices.is_empty() {
+            ui.label(RichText::new("No voices kept yet.").weak());
+            return;
+        }
+        let mut play_id = None;
+        for voice in &d.voices {
+            let playing = d.playing(Some(&voice.id));
+            ui.push_id(&voice.id, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(&voice.info.name)
+                        .on_hover_text(&voice.info.description);
+                    if ui
+                        .small_button(if playing {
+                            "Stop sample"
+                        } else {
+                            "Play sample"
+                        })
+                        .clicked()
+                    {
+                        play_id = Some(voice.id.clone());
+                    }
+                    ui.add_enabled_ui(!busy, |ui| {
+                        if ui.small_button("Rename…").clicked() {
+                            d.edit = Some(Edit::Rename {
+                                id: voice.id.clone(),
+                                name: voice.info.name.clone(),
+                            });
+                        }
+                        if ui.small_button("Delete…").clicked() {
+                            d.edit = Some(Edit::Delete {
+                                id: voice.id.clone(),
+                                name: voice.info.name.clone(),
+                            });
+                        }
+                    });
+                })
+            });
+        }
+        if let Some(id) = play_id {
+            self.toggle_sample(Some(&id));
+        }
+        self.edit_voice(ui, s, busy);
+    }
+
+    fn edit_voice(&mut self, ui: &mut egui::Ui, s: &mut TtsSettings, busy: bool) {
+        let d = &mut self.local.designer;
+        let Some(edit) = &mut d.edit else { return };
+        let mut confirm = false;
+        let mut cancel = false;
+        ui.add_enabled_ui(!busy, |ui| match edit {
+            Edit::Rename { name, .. } => {
+                ui.horizontal(|ui| {
+                    ui.label("New name");
+                    ui.text_edit_singleline(name);
+                    confirm = ui
+                        .add_enabled(!name.trim().is_empty(), egui::Button::new("Rename"))
+                        .clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            }
+            Edit::Delete { name, .. } => {
+                ui.label(format!(
+                    "Delete “{name}”? Its book audio stays under Saved audio."
+                ));
+                ui.horizontal(|ui| {
+                    confirm = ui.button("Delete voice").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            }
+        });
+        if cancel {
+            d.edit = None;
+        } else if confirm {
+            let store = VoiceStore::default();
+            let result = match edit {
+                Edit::Rename { id, name } => store.rename_voice(id, name),
+                Edit::Delete { id, .. } => {
+                    let result = store.delete_voice(id);
+                    if result.is_ok() && s.local.designed.as_ref() == Some(id) {
+                        s.local.designed = None;
+                    }
+                    result
+                }
+            };
+            d.edit = None;
+            d.error = result.err();
+            d.refresh();
+        }
+    }
+}
