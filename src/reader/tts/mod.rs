@@ -21,7 +21,7 @@ pub use engine::State as PlayState;
 use engine::{Batch, Chapters, Cmd, Engine, Now, Repaint, State};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
@@ -94,10 +94,109 @@ pub fn cache_root() -> PathBuf {
     hanstat::models::cache_dir().join("read-aloud")
 }
 
-pub fn clip_path(key: u64) -> PathBuf {
+/// The folder of one book's saved audio: its title, to be found in a file
+/// manager, and a hash of its Library id, so two books of one title differ.
+pub fn book_dir(title: &str, book_id: &str) -> PathBuf {
+    let name: String = title
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .take(60)
+        .collect();
+    let name = name.trim().trim_end_matches('.').trim();
+    let hash = format!(
+        "{:08x}",
+        hanstat::dict::xxh64::xxh64(book_id.as_bytes(), 0) as u32
+    );
+    cache_root().join(if name.is_empty() {
+        hash
+    } else {
+        format!("{name} [{hash}]")
+    })
+}
+
+/// A sentence's audio in its book's folder.
+pub fn clip_path(dir: &Path, key: u64) -> PathBuf {
+    dir.join(format!("{key:016x}.mp3"))
+}
+
+/// Where 2026.11.19.02's build kept audio: 256 folders by the key's first
+/// byte, every book's mixed.
+fn legacy_path(key: u64) -> PathBuf {
     cache_root()
         .join(format!("{:02x}", key >> 56))
         .join(format!("{key:016x}.mp3"))
+}
+
+/// A legacy folder (two hex digits).
+fn is_legacy(name: &str) -> bool {
+    name.len() == 2 && name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The saved audio of `key` for the book in `dir`, if any; one saved in a
+/// legacy folder is moved into the book's.
+pub fn saved_clip(dir: &Path, key: u64) -> Option<PathBuf> {
+    let p = clip_path(dir, key);
+    if p.exists() {
+        return Some(p);
+    }
+    let old = legacy_path(key);
+    if !old.exists() {
+        return None;
+    }
+    if std::fs::create_dir_all(dir).is_ok() && std::fs::rename(&old, &p).is_ok() {
+        Some(p)
+    } else {
+        Some(old)
+    }
+}
+
+/// Saved audio: sentences and bytes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Usage {
+    pub files: usize,
+    pub bytes: u64,
+}
+
+/// What a folder's files take.
+fn usage(dir: &Path) -> Usage {
+    let mut u = Usage::default();
+    if let Ok(files) = std::fs::read_dir(dir) {
+        for f in files.flatten() {
+            if let Ok(m) = f.metadata()
+                && m.is_file()
+            {
+                u.files += 1;
+                u.bytes += m.len();
+            }
+        }
+    }
+    u
+}
+
+/// This book's saved audio and every book's; empty legacy folders go.
+fn measure(dir: &Path) -> (Usage, Usage) {
+    let book = usage(dir);
+    let mut all = Usage::default();
+    if let Ok(dirs) = std::fs::read_dir(cache_root()) {
+        for d in dirs.flatten() {
+            if !d.path().is_dir() {
+                continue;
+            }
+            let u = usage(&d.path());
+            if u.files == 0 && is_legacy(&d.file_name().to_string_lossy()) {
+                let _ = std::fs::remove_dir(d.path());
+            }
+            all.files += u.files;
+            all.bytes += u.bytes;
+        }
+    }
+    (book, all)
 }
 
 /// Past this many characters a sentence is split at a comma, past
@@ -201,8 +300,11 @@ pub struct Tts {
     /// Read when the key is known (asked before it was loaded).
     pending: Option<(usize, u32)>,
     batch: Option<Arc<Batch>>,
-    cache_size: Option<(u64, usize)>,
-    cache_job: Option<Receiver<(u64, usize)>>,
+    /// This book's folder of saved audio.
+    dir: PathBuf,
+    /// Saved audio: this book's and every book's.
+    cache_size: Option<(Usage, Usage)>,
+    cache_job: Option<Receiver<(Usage, Usage)>>,
     /// Sentences and billed characters: per chapter, and the book's.
     estimates: std::collections::HashMap<(usize, i32), (usize, usize)>,
     book_estimate: Option<(i32, usize, usize)>,
@@ -219,10 +321,13 @@ impl Tts {
     pub fn new(
         chapters: Arc<Mutex<Vec<Option<Arc<Chapter>>>>>,
         traditional: bool,
+        title: &str,
+        book_id: &str,
         ctx: &egui::Context,
     ) -> Tts {
         let ctx = ctx.clone();
         Tts {
+            dir: book_dir(title, book_id),
             chapters,
             repaint: Arc::new(move || ctx.request_repaint()),
             traditional,
@@ -283,6 +388,7 @@ impl Tts {
         if self.engine.is_none() {
             self.engine = Some(Engine::start(
                 self.chapters.clone(),
+                self.dir.clone(),
                 self.speech(s),
                 self.repaint.clone(),
             ));
@@ -495,52 +601,45 @@ impl Tts {
         self.voices = Voices::Loading(rx);
     }
 
+    /// Measure the saved audio (this book's and all), and remove the
+    /// legacy folders left empty.
     fn measure_cache(&mut self) {
         if self.cache_job.is_some() {
             return;
         }
         let (tx, rx) = channel();
         let repaint = self.repaint.clone();
+        let dir = self.dir.clone();
         let _ = std::thread::Builder::new()
             .name("tts-cache".into())
             .spawn(move || {
-                let mut bytes = 0u64;
-                let mut n = 0usize;
-                if let Ok(dirs) = std::fs::read_dir(cache_root()) {
-                    for d in dirs.flatten() {
-                        if let Ok(files) = std::fs::read_dir(d.path()) {
-                            for f in files.flatten() {
-                                if let Ok(m) = f.metadata()
-                                    && m.is_file()
-                                {
-                                    bytes += m.len();
-                                    n += 1;
-                                }
-                            }
-                        }
-                    }
-                }
-                let _ = tx.send((bytes, n));
+                let _ = tx.send(measure(&dir));
                 repaint();
             });
         self.cache_job = Some(rx);
     }
 
-    fn delete_cache(&mut self) {
+    /// Delete this book's saved audio, or every book's.
+    fn delete_cache(&mut self, all: bool) {
         let (tx, rx) = channel();
         let repaint = self.repaint.clone();
+        let dir = self.dir.clone();
         let _ = std::thread::Builder::new()
             .name("tts-cache".into())
             .spawn(move || {
-                if let Ok(dirs) = std::fs::read_dir(cache_root()) {
-                    for d in dirs.flatten() {
-                        // The audio folders; the voice lists stay.
-                        if d.path().is_dir() {
-                            let _ = std::fs::remove_dir_all(d.path());
+                if all {
+                    if let Ok(dirs) = std::fs::read_dir(cache_root()) {
+                        for d in dirs.flatten() {
+                            // The audio folders; the voice lists stay.
+                            if d.path().is_dir() {
+                                let _ = std::fs::remove_dir_all(d.path());
+                            }
                         }
                     }
+                } else {
+                    let _ = std::fs::remove_dir_all(&dir);
                 }
-                let _ = tx.send((0, 0));
+                let _ = tx.send(measure(&dir));
                 repaint();
             });
         self.cache_job = Some(rx);
@@ -597,6 +696,11 @@ impl Tts {
     #[cfg(test)]
     pub fn use_key(&mut self, key: &str) {
         self.key = KeyState::Loaded(Some(key.to_owned()));
+    }
+
+    #[cfg(test)]
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     #[cfg(test)]
@@ -1002,26 +1106,58 @@ impl Tts {
                     .request_repaint_after(std::time::Duration::from_millis(250));
             }
         }
-        ui.horizontal(|ui| {
-            match self.cache_size {
-                Some((bytes, n)) => ui.label(format!(
-                    "Saved audio: {} sentences, {:.1} MB",
-                    group(n),
-                    bytes as f64 / 1e6
-                )),
-                None => ui.label(RichText::new("Saved audio: …").weak()),
-            };
-            if ui
-                .add_enabled(
-                    !running && self.cache_size.is_some_and(|(_, n)| n > 0),
-                    egui::Button::new("Delete"),
-                )
-                .on_hover_text("Delete every saved sentence, of every book")
-                .clicked()
-            {
-                self.delete_cache();
-            }
-        });
+        let sizes = self.cache_size;
+        let mut delete = None;
+        egui::Grid::new("reader-tts-saved")
+            .num_columns(3)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                for (all, what, tip) in [
+                    (
+                        false,
+                        "This book's audio",
+                        "Delete this book's saved sentences",
+                    ),
+                    (
+                        true,
+                        "Every book's",
+                        "Delete every saved sentence, of every book",
+                    ),
+                ] {
+                    ui.label(what);
+                    let u = sizes.map(|(b, a)| if all { a } else { b });
+                    match u {
+                        Some(u) => ui.label(
+                            RichText::new(format!(
+                                "{} sentences, {:.1} MB",
+                                group(u.files),
+                                u.bytes as f64 / 1e6
+                            ))
+                            .weak(),
+                        ),
+                        None => ui.label(RichText::new("…").weak()),
+                    };
+                    if ui
+                        .add_enabled(
+                            !running && u.is_some_and(|u| u.files > 0),
+                            egui::Button::new("Delete"),
+                        )
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
+                        delete = Some(all);
+                    }
+                    ui.end_row();
+                }
+            });
+        if let Some(all) = delete {
+            self.delete_cache(all);
+        }
+        ui.label(
+            RichText::new(format!("Kept in {}", self.dir.display()))
+                .size(12.0)
+                .weak(),
+        );
     }
 }
 
@@ -1081,6 +1217,20 @@ mod tests {
         assert_eq!(sentence_at(&s, 2), 1);
         assert_eq!(sentence_at(&s, 6), 2);
         assert_eq!(sentence_at(&s, 7), 3);
+    }
+
+    #[test]
+    fn book_folders() {
+        let a = book_dir("《酒与枪》番外集", "lib-1");
+        let name = a.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("《酒与枪》番外集 ["), "{name}");
+        assert_eq!(a.parent().unwrap(), cache_root());
+        assert_ne!(a, book_dir("《酒与枪》番外集", "lib-2"));
+        let b = book_dir("a/b:c?. ", "x");
+        let name = b.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("a_b_c_ ["), "{name}");
+        assert!(!book_dir("", "x").to_string_lossy().ends_with("] "));
+        assert!(is_legacy("0d") && is_legacy("ff") && !is_legacy("0g") && !is_legacy("abc"));
     }
 
     #[test]

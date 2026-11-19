@@ -97,20 +97,53 @@ pub fn resample(input: &[f32], from: u32, to: u32) -> Vec<f32> {
 #[cfg(test)]
 pub static MUTE: AtomicBool = AtomicBool::new(false);
 
+/// Seconds over which sound fades out (pause, stop, a jump to another
+/// sentence) and back in (resume): no click where the wave is cut.
+const FADE_OUT: f32 = 0.06;
+const FADE_IN: f32 = 0.04;
+
 struct Clip {
     id: u64,
     samples: Vec<f32>,
     pos: usize,
 }
 
-#[derive(Default)]
 struct Queue {
     clips: VecDeque<Clip>,
     paused: bool,
+    /// Clips below this id are being cut: faded out, then dropped.
+    cut_below: u64,
+    /// The volume now, from 0 (silent) to 1, moving towards 0 while paused
+    /// or cutting and towards 1 otherwise.
+    gain: f32,
     /// The clip being heard (the last one heard once the queue runs dry).
     current: Option<u64>,
     /// Clips played to their end since asked.
     finished: Vec<u64>,
+}
+
+impl Default for Queue {
+    fn default() -> Self {
+        Queue {
+            clips: VecDeque::new(),
+            paused: false,
+            cut_below: 0,
+            gain: 1.0,
+            current: None,
+            finished: Vec::new(),
+        }
+    }
+}
+
+impl Queue {
+    /// Fade out and drop every clip queued; the id the next one needs.
+    fn cut(&mut self) -> u64 {
+        let next = self.clips.iter().map(|c| c.id + 1).max().unwrap_or(0);
+        self.cut_below = self.cut_below.max(next);
+        self.current = None;
+        self.finished.clear();
+        next
+    }
 }
 
 /// The sound device, open while reading aloud.
@@ -121,9 +154,15 @@ pub struct Output {
     _stream: cpal::Stream,
 }
 
+/// A smooth step: the fade's volume for `g` from 0 to 1, flat at both ends.
+fn smooth(g: f32) -> f32 {
+    g * g * (3.0 - 2.0 * g)
+}
+
 fn fill<T: SizedSample + FromSample<f32>>(
     out: &mut [T],
     channels: usize,
+    rate: u32,
     queue: &Mutex<Queue>,
     wake: &(dyn Fn() + Send + Sync),
 ) {
@@ -134,12 +173,27 @@ fn fill<T: SizedSample + FromSample<f32>>(
             return;
         }
     };
+    let down = 1.0 / (FADE_OUT * rate as f32);
+    let up = 1.0 / (FADE_IN * rate as f32);
     let mut ended = false;
     for frame in out.chunks_mut(channels) {
-        let s = if q.paused {
+        let cutting = q.clips.front().is_some_and(|c| c.id < q.cut_below);
+        if q.paused || cutting {
+            q.gain = (q.gain - down).max(0.0);
+        } else {
+            q.gain = (q.gain + up).min(1.0);
+        }
+        if cutting && q.gain == 0.0 {
+            // Faded out: what was cut goes, the next clip fades in.
+            let cut = q.cut_below;
+            q.clips.retain(|c| c.id >= cut);
+        }
+        // Paused and silent: the sound waits where it stopped.
+        let s = if q.paused && q.gain == 0.0 {
             0.0
         } else {
             loop {
+                let cut = q.cut_below;
                 let Some(c) = q.clips.front_mut() else {
                     break 0.0;
                 };
@@ -147,15 +201,20 @@ fn fill<T: SizedSample + FromSample<f32>>(
                     let s = c.samples[c.pos];
                     c.pos += 1;
                     let id = c.id;
-                    q.current = Some(id);
+                    if id >= cut {
+                        q.current = Some(id);
+                    }
                     break s;
                 }
                 let id = c.id;
                 q.clips.pop_front();
-                q.finished.push(id);
-                ended = true;
+                if id >= cut {
+                    q.finished.push(id);
+                    ended = true;
+                }
             }
         };
+        let s = s * smooth(q.gain);
         #[cfg(test)]
         let s = if MUTE.load(Ordering::Relaxed) { 0.0 } else { s };
         let v = T::from_sample(s);
@@ -197,7 +256,7 @@ impl Output {
                 let (queue, wake) = (queue.clone(), wake.clone());
                 device.build_output_stream::<$t, _, _>(
                     config.clone(),
-                    move |out: &mut [$t], _| fill(out, channels, &queue, &*wake),
+                    move |out: &mut [$t], _| fill(out, channels, rate, &queue, &*wake),
                     err,
                     None,
                 )
@@ -236,25 +295,21 @@ impl Output {
         });
     }
 
-    /// Stop and forget everything queued.
+    /// Stop and forget everything queued: what is heard fades out first.
     pub fn clear(&self) {
-        let mut q = self.queue.lock().unwrap();
-        q.clips.clear();
-        q.current = None;
-        q.finished.clear();
+        self.queue.lock().unwrap().cut();
     }
 
     pub fn set_paused(&self, paused: bool) {
         self.queue.lock().unwrap().paused = paused;
     }
 
-    /// Clips queued, the one playing included.
+    /// Clips queued, the one playing included (not those being cut).
     pub fn queued(&self) -> Vec<u64> {
-        self.queue
-            .lock()
-            .unwrap()
-            .clips
+        let q = self.queue.lock().unwrap();
+        q.clips
             .iter()
+            .filter(|c| c.id >= q.cut_below)
             .map(|c| c.id)
             .collect()
     }
@@ -267,7 +322,12 @@ impl Output {
     /// Seconds of sound queued and not yet heard.
     pub fn ahead(&self) -> f32 {
         let q = self.queue.lock().unwrap();
-        let n: usize = q.clips.iter().map(|c| c.samples.len() - c.pos).sum();
+        let n: usize = q
+            .clips
+            .iter()
+            .filter(|c| c.id >= q.cut_below)
+            .map(|c| c.samples.len() - c.pos)
+            .sum();
         n as f32 / self.rate as f32
     }
 
@@ -313,11 +373,84 @@ mod tests {
         let woke = AtomicBool::new(false);
         let wake = || woke.store(true, Ordering::Relaxed);
         let mut out = [0f32; 8];
-        fill(&mut out, 2, &queue, &wake);
+        fill(&mut out, 2, 48_000, &queue, &wake);
         assert_eq!(out, [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 2.0]);
         assert!(woke.load(Ordering::Relaxed));
         let q = queue.lock().unwrap();
         assert_eq!(q.finished, [1]);
         assert_eq!(q.current, Some(2));
+    }
+
+    fn queue_of(clips: &[(u64, f32, usize)]) -> Mutex<Queue> {
+        let mut q = Queue::default();
+        for &(id, v, n) in clips {
+            q.clips.push_back(Clip {
+                id,
+                samples: vec![v; n],
+                pos: 0,
+            });
+        }
+        Mutex::new(q)
+    }
+
+    /// 1 kHz: a fade of 60 frames out, 40 in.
+    const RATE: u32 = 1000;
+
+    #[test]
+    fn pausing_fades_out_and_resuming_fades_in() {
+        let queue = queue_of(&[(1, 1.0, 1000)]);
+        let wake = || {};
+        let mut out = [0f32; 10];
+        fill(&mut out, 1, RATE, &queue, &wake);
+        assert_eq!(out, [1.0; 10]);
+        queue.lock().unwrap().paused = true;
+        let mut out = [0f32; 100];
+        fill(&mut out, 1, RATE, &queue, &wake);
+        // Down smoothly, never a jump, to silence after 60 frames.
+        assert!(
+            out.windows(2).all(|w| w[1] <= w[0] && w[0] - w[1] < 0.03),
+            "{out:?}"
+        );
+        assert!(out[0] > 0.99 && out[30] > 0.3 && out[30] < 0.7);
+        assert!(out[60..].iter().all(|&s| s == 0.0));
+        // The sound under the fade was played; then nothing more.
+        assert_eq!(queue.lock().unwrap().clips[0].pos, 10 + 60);
+        queue.lock().unwrap().paused = false;
+        let mut out = [0f32; 50];
+        fill(&mut out, 1, RATE, &queue, &wake);
+        assert!(
+            out.windows(2).all(|w| w[1] >= w[0] && w[1] - w[0] < 0.05),
+            "{out:?}"
+        );
+        assert!(out[0] < 0.01 && out[45] == 1.0);
+    }
+
+    #[test]
+    fn a_cut_fades_out_before_the_next_clip() {
+        let queue = queue_of(&[(1, 1.0, 1000)]);
+        let wake = || {};
+        let mut out = [0f32; 10];
+        fill(&mut out, 1, RATE, &queue, &wake);
+        let o = queue.lock().unwrap().cut();
+        queue.lock().unwrap().clips.push_back(Clip {
+            id: o,
+            samples: vec![-1.0; 1000],
+            pos: 0,
+        });
+        let mut out = [0f32; 120];
+        fill(&mut out, 1, RATE, &queue, &wake);
+        // The old clip fades out from 1, the new one fades in towards -1.
+        assert!(out[0] > 0.99);
+        let low = out.iter().position(|&s| s <= 0.0).unwrap();
+        assert!((55..=62).contains(&low), "faded out at {low}");
+        assert!(
+            out.windows(2).all(|w| (w[1] - w[0]).abs() < 0.06),
+            "{out:?}"
+        );
+        assert_eq!(out[119], -1.0);
+        let q = queue.lock().unwrap();
+        assert_eq!(q.clips.len(), 1);
+        assert_eq!(q.current, Some(o));
+        assert!(q.finished.is_empty(), "a cut clip isn't reported as heard");
     }
 }

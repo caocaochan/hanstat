@@ -293,7 +293,7 @@ impl Reader {
                 .map_err(|e| e.to_string())?;
         }
         let toc_labels = toc_labels(&epub.toc);
-        let tts = tts::Tts::new(chapters.clone(), traditional, ctx);
+        let tts = tts::Tts::new(chapters.clone(), traditional, &epub.title, &book_id, ctx);
         let mut dict = popup::Popup::new(ctx, settings.freq_sort.clone());
         dict.cards.book = Arc::from(epub.title.as_str());
         dict.sync_cards(&settings.anki);

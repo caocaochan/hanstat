@@ -1387,7 +1387,10 @@ fn read_aloud() {
     };
     for rg in tts::sentences(&c.chars) {
         let t: String = c.chars[rg.start as usize..rg.end as usize].iter().collect();
-        assert!(tts::clip_path(speech.key(&t)).exists(), "saved: {t}");
+        assert!(
+            tts::clip_path(r.tts.dir(), speech.key(&t)).exists(),
+            "saved in the book's folder: {t}"
+        );
     }
     // The panel, with the voices fetched from Azure.
     r.tts.panel_open = true;

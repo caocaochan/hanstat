@@ -10,10 +10,11 @@
 
 use super::audio::{self, Output};
 use super::azure::{self, Azure, Fail};
-use super::{Speech, clip_path, sentence_at, sentences};
+use super::{Speech, clip_path, saved_clip, sentence_at, sentences};
 use crate::reader::tree::Chapter;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
@@ -33,6 +34,8 @@ const QUEUED_SECONDS: f32 = 6.0;
 #[derive(Clone)]
 struct Job {
     key: u64,
+    /// Where its audio is saved (its book's folder).
+    path: PathBuf,
     text: String,
     speech: Speech,
     batch: Option<Arc<Batch>>,
@@ -197,7 +200,7 @@ fn worker(p: &PoolInner) {
             p.state.lock().unwrap().busy.remove(&job.key);
             continue;
         }
-        let path = clip_path(job.key);
+        let path = job.path.clone();
         let result = if path.exists() {
             Ok(())
         } else {
@@ -314,7 +317,8 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn start(chapters: Chapters, speech: Speech, repaint: Repaint) -> Engine {
+    /// `dir`: the book's folder of saved audio.
+    pub fn start(chapters: Chapters, dir: PathBuf, speech: Speech, repaint: Repaint) -> Engine {
         let (tx, rx) = channel();
         let now = Arc::new(Mutex::new(Now::default()));
         {
@@ -322,7 +326,7 @@ impl Engine {
             let _ = std::thread::Builder::new()
                 .name("tts-player".into())
                 .spawn(move || {
-                    let mut p = Player::new(chapters, speech, now, repaint);
+                    let mut p = Player::new(chapters, dir, speech, now, repaint);
                     p.run(rx);
                 });
         }
@@ -346,6 +350,8 @@ struct Queued {
 
 struct Player {
     chapters: Chapters,
+    /// The book's folder of saved audio.
+    dir: PathBuf,
     speech: Speech,
     now: Arc<Mutex<Now>>,
     repaint: Repaint,
@@ -363,13 +369,22 @@ struct Player {
     asked: Option<(usize, usize, Speech)>,
     error: Option<String>,
     sentences: HashMap<usize, Arc<Vec<Range<u32>>>>,
+    /// Stopped: the device closes at this time, once the sound faded out.
+    closing: Option<Instant>,
 }
 
 impl Player {
-    fn new(chapters: Chapters, speech: Speech, now: Arc<Mutex<Now>>, repaint: Repaint) -> Player {
+    fn new(
+        chapters: Chapters,
+        dir: PathBuf,
+        speech: Speech,
+        now: Arc<Mutex<Now>>,
+        repaint: Repaint,
+    ) -> Player {
         Player {
             pool: Pool::new(repaint.clone()),
             chapters,
+            dir,
             speech,
             now,
             repaint,
@@ -382,6 +397,7 @@ impl Player {
             asked: None,
             error: None,
             sentences: HashMap::new(),
+            closing: None,
         }
     }
 
@@ -439,7 +455,15 @@ impl Player {
             match rx.recv_timeout(tick) {
                 Ok(c) => self.command(c),
                 Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
+                Err(RecvTimeoutError::Disconnected) => {
+                    // The reader closed: fade out before the device goes.
+                    if let Some(o) = &self.output {
+                        o.clear();
+                        o.set_paused(true);
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    return;
+                }
             }
             while let Ok(c) = rx.try_recv() {
                 self.command(c);
@@ -472,6 +496,7 @@ impl Player {
         match c {
             Cmd::Play { spine, src } => {
                 self.error = None;
+                self.closing = None;
                 if !self.open_output() {
                     return;
                 }
@@ -509,7 +534,11 @@ impl Player {
                 }
             }
             Cmd::Stop => {
-                self.output = None;
+                // Faded out; the device closes once it has.
+                if let Some(o) = &self.output {
+                    o.clear();
+                    self.closing = Some(Instant::now() + Duration::from_millis(150));
+                }
                 self.queued.clear();
                 self.cursor = None;
                 self.heard = None;
@@ -549,6 +578,7 @@ impl Player {
     fn pregenerate(&mut self, spines: Vec<usize>, batch: Arc<Batch>) {
         let chapters = self.chapters.clone();
         let speech = self.speech.clone();
+        let dir = self.dir.clone();
         let pool = self.pool.inner.clone();
         let repaint = self.repaint.clone();
         let _ = std::thread::Builder::new()
@@ -573,7 +603,7 @@ impl Player {
                             ch.chars[r.start as usize..r.end as usize].iter().collect();
                         let key = speech.key(&text);
                         batch.total.fetch_add(1, Ordering::Relaxed);
-                        if clip_path(key).exists() {
+                        if saved_clip(&dir, key).is_some() {
                             batch.cached.fetch_add(1, Ordering::Relaxed);
                         } else {
                             batch
@@ -581,6 +611,7 @@ impl Player {
                                 .fetch_add(azure::billed(&text, speech.rate), Ordering::Relaxed);
                             jobs.push(Job {
                                 key,
+                                path: clip_path(&dir, key),
                                 text,
                                 speech: speech.clone(),
                                 batch: Some(batch.clone()),
@@ -597,6 +628,10 @@ impl Player {
 
     fn step(&mut self) {
         if self.state == State::Stopped {
+            if self.closing.is_some_and(|t| Instant::now() >= t) {
+                self.output = None;
+                self.closing = None;
+            }
             return;
         }
         if self.output.as_ref().is_some_and(Output::failed) {
@@ -679,8 +714,10 @@ impl Player {
             let r = s[at.1].clone();
             let text = self.text(at.0, &r);
             let key = self.speech.key(&text);
-            let path = clip_path(key);
-            if let Ok(bytes) = std::fs::read(&path) {
+            let saved = saved_clip(&self.dir, key);
+            if let Some(path) = &saved
+                && let Ok(bytes) = std::fs::read(path)
+            {
                 match audio::decode_mp3(bytes) {
                     Ok((samples, rate)) => {
                         let id = self.next_id;
@@ -696,7 +733,7 @@ impl Player {
                     }
                     Err(_) => {
                         // A damaged file: made again.
-                        let _ = std::fs::remove_file(&path);
+                        let _ = std::fs::remove_file(path);
                         self.asked = None;
                         return;
                     }
@@ -729,7 +766,8 @@ impl Player {
         self.asked = Some((at.0, at.1, self.speech.clone()));
         let mut jobs = Vec::new();
         let mut pos = Some(at);
-        while jobs.len() < AHEAD {
+        // The next few sentences, saved or not.
+        for _ in 0..AHEAD {
             let Some(p) = pos else { break };
             let Some(Some(p)) = self.normalise(p) else {
                 break;
@@ -737,9 +775,10 @@ impl Player {
             let s = self.sentences(p.0).unwrap();
             let text = self.text(p.0, &s[p.1]);
             let key = self.speech.key(&text);
-            if !clip_path(key).exists() {
+            if saved_clip(&self.dir, key).is_none() {
                 jobs.push(Job {
                     key,
+                    path: clip_path(&self.dir, key),
                     text,
                     speech: self.speech.clone(),
                     batch: None,
