@@ -1586,3 +1586,142 @@ fn read_aloud_local() {
     assert!(!r.tts.active());
     r.close(&d.ctx);
 }
+
+/// How well local-voice chunks are cut into sentences, on real audio: the
+/// chunks of `CUT_SPINES` (comma-separated, at most `CUT_CHUNKS` each, 12 by
+/// default) are made once with the model in `HANSTAT_MODEL_DIR` and kept in
+/// `CUT_DIR`, then cut by [`tts::local::cuts`] and by the first build's
+/// [`tts::local::cuts_by_pauses`]. Every sentence clip is written there as
+/// 16 kHz WAV, with `manifest.tsv` (algorithm, file, text) for a speech
+/// recogniser to check that each clip says its own sentence. `CUT_SPEAKER`
+/// and `CUT_INSTRUCT` set the voice.
+#[test]
+#[ignore]
+fn local_cut_eval() {
+    let book = env("READER_EPUB").expect("set READER_EPUB");
+    let dir = std::path::PathBuf::from(env("CUT_DIR").expect("set CUT_DIR"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let max: usize = env("CUT_CHUNKS").and_then(|v| v.parse().ok()).unwrap_or(12);
+    let mut s = tts::local::LocalSettings::default();
+    if let Some(v) = env("CUT_SPEAKER") {
+        s.speaker = v;
+    }
+    if let Some(v) = env("CUT_INSTRUCT") {
+        s.instruct = v;
+    }
+    let d = Driver::new();
+    let r = d.open(&book);
+    let spines: Vec<usize> = env("CUT_SPINES")
+        .expect("set CUT_SPINES")
+        .split(',')
+        .map(|v| v.trim().parse().unwrap())
+        .collect();
+    // Every chunk to cut: (name, texts, paragraphs).
+    let mut jobs = Vec::new();
+    for &spine in &spines {
+        let t = Instant::now();
+        let ch = loop {
+            if let Some(c) = r.chapter(spine) {
+                break c;
+            }
+            assert!(t.elapsed().as_secs() < 60, "chapter {spine} not built");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let sents = tts::sentences(&ch.chars);
+        let paras = tts::local::paragraphs(&ch.chars, &sents);
+        let lens: Vec<usize> = sents.iter().map(|r| r.len()).collect();
+        for (i, g) in tts::local::chunks(&lens, &paras, 0, |_| s.chunk_chars, max)
+            .into_iter()
+            .enumerate()
+        {
+            let texts: Vec<String> = sents[g.clone()]
+                .iter()
+                .map(|r| ch.chars[r.start as usize..r.end as usize].iter().collect())
+                .collect();
+            if texts.len() > 1 {
+                jobs.push((format!("{spine}-{i:02}"), texts, paras[g].to_vec()));
+            }
+        }
+    }
+    // Made once, four at a time.
+    let missing: Vec<usize> = (0..jobs.len())
+        .filter(|&i| !dir.join(format!("chunk-{}.pcm", jobs[i].0)).exists())
+        .collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|sc| {
+        for _ in 0..4 {
+            sc.spawn(|| {
+                loop {
+                    let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(&i) = missing.get(k) else { break };
+                    let (name, texts, paras) = &jobs[i];
+                    let mut text = String::new();
+                    for (j, t) in texts.iter().enumerate() {
+                        if j > 0 && paras[j] != paras[j - 1] {
+                            text.push('\n');
+                        }
+                        text.push_str(t);
+                    }
+                    let seed = hanstat::dict::xxh64::xxh64(text.as_bytes(), s.seed as u64);
+                    let pcm = tts::local::server(4)
+                        .unwrap()
+                        .synth(&text, &s, seed)
+                        .unwrap();
+                    let bytes: Vec<u8> = pcm.iter().flat_map(|x| x.to_le_bytes()).collect();
+                    std::fs::write(dir.join(format!("chunk-{name}.pcm")), bytes).unwrap();
+                    eprintln!("made chunk {name}");
+                }
+            });
+        }
+    });
+    tts::local::unload();
+    let wav16 = |path: &std::path::Path, pcm: &[i16]| {
+        let f: Vec<f32> = pcm.iter().map(|&x| x as f32 / 32768.0).collect();
+        let r = tts::audio::resample(&f, 24_000, 16_000);
+        let mut w = Vec::with_capacity(44 + r.len() * 2);
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36 + r.len() as u32 * 2).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        for v in [
+            16u32.to_le_bytes(),
+            [1, 0, 1, 0],
+            16_000u32.to_le_bytes(),
+            32_000u32.to_le_bytes(),
+            [2, 0, 16, 0],
+        ] {
+            w.extend_from_slice(&v);
+        }
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&(r.len() as u32 * 2).to_le_bytes());
+        for x in r {
+            w.extend_from_slice(&((x.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
+        }
+        std::fs::write(path, w).unwrap();
+    };
+    let mut manifest = String::new();
+    for (name, texts, paras) in &jobs {
+        let bytes = std::fs::read(dir.join(format!("chunk-{name}.pcm"))).unwrap();
+        let pcm: Vec<i16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| i16::from_le_bytes(*c))
+            .collect();
+        let lens: Vec<usize> = texts.iter().map(|t| t.chars().count()).collect();
+        for (alg, cut) in [
+            ("new", tts::local::cuts(&pcm, texts, paras)),
+            ("old", tts::local::cuts_by_pauses(&pcm, &lens)),
+        ] {
+            let mut a = 0;
+            for (k, &c) in cut.iter().chain(std::iter::once(&pcm.len())).enumerate() {
+                let file = format!("{alg}-{name}-{k:02}.wav");
+                wav16(&dir.join(&file), &pcm[a..c.max(a)]);
+                manifest += &format!("{alg}\t{file}\t{}\n", texts[k]);
+                a = c.max(a);
+            }
+        }
+    }
+    std::fs::write(dir.join("manifest.tsv"), manifest).unwrap();
+    eprintln!("{} chunks cut into {}", jobs.len(), dir.display());
+    r.close(&d.ctx);
+}

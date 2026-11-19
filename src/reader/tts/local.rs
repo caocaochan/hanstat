@@ -143,9 +143,10 @@ impl LocalSettings {
     /// The cache-key part: what the audio depends on.
     pub fn key_text(&self) -> String {
         format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|cuts-{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             QWEN_TTS_MODEL.id,
             opus::FORMAT,
+            CUTS,
             self.speaker,
             self.instruct.trim(),
             self.temperature,
@@ -160,6 +161,11 @@ impl LocalSettings {
         )
     }
 }
+
+/// How chunks are cut into sentences, in the cache key: clips cut another
+/// way are made again. 1: by pause length (misplaced 13% of clips on
+/// 死亡万花筒, 2026-11-19); 2: pauses matched to the punctuation ([`cuts`]).
+const CUTS: u32 = 2;
 
 /// Both downloads are present.
 pub fn downloaded() -> bool {
@@ -253,58 +259,293 @@ const QUIET: f64 = 0.01;
 /// The shortest pause a sentence may end at.
 const MIN_PAUSE: usize = 6;
 
-/// Where to cut a chunk's audio (`pcm`) into its sentences, whose lengths in
-/// characters are `lens`: one sample index per boundary, increasing.
-///
-/// Every boundary gets its own pause (a run of silent frames), in order;
-/// of all such assignments the one where pauses are long and close to the
-/// boundary's expected place wins (dynamic programming). The expected place
-/// is the boundary's share of the characters, measured in voiced time, so
-/// long paragraph pauses don't push later estimates off. A cut is the middle
-/// of its pause. With fewer pauses than boundaries the cuts fall at the
-/// expected places, at the quietest frame near each.
-pub fn cuts(pcm: &[i16], lens: &[usize]) -> Vec<usize> {
-    let m = lens.len().saturating_sub(1);
-    if m == 0 {
-        return Vec::new();
-    }
-    let frames = pcm.len() / HOP;
-    let energy: Vec<f64> = (0..frames)
-        .map(|f| {
-            let s = &pcm[f * HOP..(f + 1) * HOP];
-            (s.iter().map(|&x| (x as f64 / 32768.0).powi(2)).sum::<f64>() / HOP as f64).sqrt()
-        })
-        .collect();
-    // Pauses inside the speech (not leading or trailing silence).
-    let mut pauses: Vec<(usize, usize)> = Vec::new();
-    let mut f = 0;
-    while f < frames {
-        if energy[f] < QUIET {
-            let a = f;
-            while f < frames && energy[f] < QUIET {
+/// A chunk's audio, frame by frame: loudness, the pauses inside the speech
+/// (not leading or trailing silence) and the voiced time before each frame.
+struct Acoustic {
+    energy: Vec<f64>,
+    /// Silent runs: first frame and the frame after.
+    pauses: Vec<(usize, usize)>,
+    /// Voiced frames before frame `f` (pauses not counted).
+    voiced: Vec<usize>,
+}
+
+impl Acoustic {
+    fn new(pcm: &[i16]) -> Acoustic {
+        let frames = pcm.len() / HOP;
+        let energy: Vec<f64> = (0..frames)
+            .map(|f| {
+                let s = &pcm[f * HOP..(f + 1) * HOP];
+                (s.iter().map(|&x| (x as f64 / 32768.0).powi(2)).sum::<f64>() / HOP as f64).sqrt()
+            })
+            .collect();
+        let mut pauses = Vec::new();
+        let mut f = 0;
+        while f < frames {
+            if energy[f] < QUIET {
+                let a = f;
+                while f < frames && energy[f] < QUIET {
+                    f += 1;
+                }
+                if a > 0 && f < frames && f - a >= MIN_PAUSE {
+                    pauses.push((a, f));
+                }
+            } else {
                 f += 1;
             }
-            if a > 0 && f < frames && f - a >= MIN_PAUSE {
-                pauses.push((a, f));
-            }
-        } else {
-            f += 1;
         }
-    }
-    // Voiced frames before each frame.
-    let mut voiced = vec![0usize; frames + 1];
-    {
         let mut in_pause = vec![false; frames];
         for &(a, b) in &pauses {
             in_pause[a..b].iter_mut().for_each(|x| *x = true);
         }
+        let mut voiced = vec![0usize; frames + 1];
         for f in 0..frames {
             voiced[f + 1] = voiced[f] + usize::from(!in_pause[f]);
         }
+        Acoustic {
+            energy,
+            pauses,
+            voiced,
+        }
     }
+
+    fn frames(&self) -> usize {
+        self.energy.len()
+    }
+
+    /// The sample where `v` voiced seconds have been spoken, moved to the
+    /// quietest frame within 0.3 s.
+    fn at_voiced(&self, v: f64) -> usize {
+        let frames = self.frames();
+        let target = (v * 100.0).round().max(0.0) as usize;
+        let f = self
+            .voiced
+            .partition_point(|&x| x < target)
+            .min(frames.saturating_sub(1));
+        let (lo, hi) = (f.saturating_sub(30), (f + 30).min(frames));
+        let q = (lo..hi)
+            .min_by(|&a, &b| self.energy[a].total_cmp(&self.energy[b]))
+            .unwrap_or(f);
+        q * HOP + HOP / 2
+    }
+}
+
+/// What the text says where the voice may pause.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Mark {
+    /// A comma, colon, dash… inside a sentence.
+    Minor,
+    /// The end of one of the reader's sentences.
+    Sentence,
+    /// The end of a paragraph.
+    Paragraph,
+}
+
+impl Mark {
+    /// The cost of reading past it without a pause.
+    fn skip(self) -> f64 {
+        match self {
+            Mark::Minor => 0.3,
+            Mark::Sentence => 2.0,
+            Mark::Paragraph => 3.0,
+        }
+    }
+}
+
+fn pause_punct(c: char) -> bool {
+    matches!(
+        c,
+        '，' | '、'
+            | '；'
+            | '：'
+            | '。'
+            | '！'
+            | '？'
+            | '…'
+            | '—'
+            | '～'
+            | ','
+            | ';'
+            | ':'
+            | '.'
+            | '!'
+            | '?'
+            | '~'
+    )
+}
+
+/// The places the voice may pause, with the spoken characters (letters,
+/// digits, Chinese characters) before each and, for sentence ends, which
+/// boundary it is. And the spoken characters in all.
+fn marks(texts: &[String], paras: &[usize]) -> (Vec<(f64, Mark, Option<usize>)>, f64) {
+    let mut out = Vec::new();
+    let mut spoken = 0usize;
+    for (i, t) in texts.iter().enumerate() {
+        let chars: Vec<char> = t.chars().collect();
+        for (k, &c) in chars.iter().enumerate() {
+            if c.is_alphanumeric() {
+                spoken += 1;
+            } else if pause_punct(c)
+                // The end of a run of punctuation with more to say after it.
+                && chars[k + 1..].iter().any(|c| c.is_alphanumeric())
+                && !chars.get(k + 1).is_some_and(|&n| pause_punct(n))
+            {
+                out.push((spoken as f64, Mark::Minor, None));
+            }
+        }
+        if i + 1 < texts.len() {
+            let kind = if paras[i + 1] != paras[i] {
+                Mark::Paragraph
+            } else {
+                Mark::Sentence
+            };
+            out.push((spoken as f64, kind, Some(i)));
+        }
+    }
+    (out, spoken as f64)
+}
+
+/// Where to cut a chunk's audio (`pcm`) into its sentences (`texts`, in
+/// paragraphs `paras`): one sample index per boundary, increasing.
+///
+/// The pauses in the audio are matched, in order, to the places in the text
+/// where the voice may pause: commas and the like, sentence ends, paragraph
+/// ends. A pause may be left unmatched (a breath) and so may a place (read
+/// on without a pause), each at a cost, and between two matches the voiced
+/// time must fit the characters spoken at the chunk's own pace. Of all such
+/// matchings the cheapest wins (dynamic programming). A long pause at a comma
+/// thus stays at that comma instead of being taken for the sentence's end,
+/// which a choice by pause length alone got wrong. A sentence end with its
+/// pause is cut in the middle of it; one without falls where the characters
+/// put it between the matches around it, at the quietest frame near there.
+pub fn cuts(pcm: &[i16], texts: &[String], paras: &[usize]) -> Vec<usize> {
+    if texts.len() < 2 {
+        return Vec::new();
+    }
+    let ac = Acoustic::new(pcm);
+    let (marks, total_c) = marks(texts, paras);
+    let total_v = *ac.voiced.last().unwrap() as f64 / 100.0;
+    let pauses = &ac.pauses;
+    // Seconds of voice a character.
+    let rate = if total_c > 0.0 {
+        total_v / total_c
+    } else {
+        0.25
+    };
+    let (k_n, r_n) = (marks.len(), pauses.len());
+    let v_at = |r: usize| ac.voiced[pauses[r].0] as f64 / 100.0;
+    let len_at = |r: usize| (pauses[r].1 - pauses[r].0) as f64 / 100.0;
+    // Leaving a pause unexplained: the longer, the less likely.
+    let skip_pause = |r: usize| 1.0 + 3.0 * len_at(r).min(1.0);
+    // Prefix sums of skip costs: marks before k, pauses before r.
+    let mut mark_skip = vec![0.0; k_n + 1];
+    for k in 0..k_n {
+        mark_skip[k + 1] = mark_skip[k] + marks[k].1.skip();
+    }
+    let mut pause_skip = vec![0.0; r_n + 1];
+    for r in 0..r_n {
+        pause_skip[r + 1] = pause_skip[r] + skip_pause(r);
+    }
+    // The fit of `dv` voiced seconds to `dc` characters.
+    let fit = |dc: f64, dv: f64| {
+        let want = dc * rate;
+        let e = (dv - want) / (0.2 * want + 0.4);
+        -e * e
+    };
+    // Nodes: (mark k, pause r) matched. best[k][r] and where it came from
+    // (None: the chunk's start).
+    let mut best = vec![vec![f64::NEG_INFINITY; r_n]; k_n];
+    let mut from: Vec<Vec<Option<(usize, usize)>>> = vec![vec![None; r_n]; k_n];
+    for k in 0..k_n {
+        for r in 0..r_n {
+            let (c, v) = (marks[k].0, v_at(r));
+            // From the start.
+            let mut b = fit(c, v) - mark_skip[k] - pause_skip[r];
+            let mut f = None;
+            for k2 in 0..k {
+                for r2 in 0..r {
+                    let prev = best[k2][r2];
+                    if prev == f64::NEG_INFINITY {
+                        continue;
+                    }
+                    let s = prev + fit(c - marks[k2].0, v - v_at(r2))
+                        - (mark_skip[k] - mark_skip[k2 + 1])
+                        - (pause_skip[r] - pause_skip[r2 + 1]);
+                    if s > b {
+                        b = s;
+                        f = Some((k2, r2));
+                    }
+                }
+            }
+            best[k][r] = b;
+            from[k][r] = f;
+        }
+    }
+    // To the end: the best last match (or none at all).
+    let mut end = fit(total_c, total_v) - mark_skip[k_n] - pause_skip[r_n];
+    let mut last = None;
+    for k in 0..k_n {
+        for r in 0..r_n {
+            let s = best[k][r] + fit(total_c - marks[k].0, total_v - v_at(r))
+                - (mark_skip[k_n] - mark_skip[k + 1])
+                - (pause_skip[r_n] - pause_skip[r + 1]);
+            if s > end {
+                end = s;
+                last = Some((k, r));
+            }
+        }
+    }
+    // The matches, in order.
+    let mut matched: Vec<(usize, usize)> = Vec::new();
+    let mut at = last;
+    while let Some((k, r)) = at {
+        matched.push((k, r));
+        at = from[k][r];
+    }
+    matched.reverse();
+    // Anchors (characters, voiced seconds) for sentence ends without a pause.
+    let mut anchors = vec![(0.0, 0.0)];
+    anchors.extend(matched.iter().map(|&(k, r)| (marks[k].0, v_at(r))));
+    anchors.push((total_c, total_v));
+    let mut out = Vec::with_capacity(texts.len() - 1);
+    for (k, &(c, _, boundary)) in marks.iter().enumerate() {
+        if boundary.is_none() {
+            continue;
+        }
+        let cut = match matched.iter().find(|m| m.0 == k) {
+            Some(&(_, r)) => (pauses[r].0 + pauses[r].1) / 2 * HOP,
+            None => {
+                let i = anchors
+                    .partition_point(|a| a.0 <= c)
+                    .clamp(1, anchors.len() - 1);
+                let ((c0, v0), (c1, v1)) = (anchors[i - 1], anchors[i]);
+                let v = if c1 > c0 {
+                    v0 + (c - c0) / (c1 - c0) * (v1 - v0)
+                } else {
+                    v0
+                };
+                ac.at_voiced(v)
+            }
+        };
+        let floor = out.last().copied().unwrap_or(0);
+        out.push(cut.clamp(floor, pcm.len()));
+    }
+    out
+}
+
+/// The first build's cuts (2026.11.19.03, never released): every boundary at a pause, chosen by
+/// length and closeness to the boundary's share of the characters. Kept for
+/// the evaluation that replaced it.
+#[cfg(test)]
+pub fn cuts_by_pauses(pcm: &[i16], lens: &[usize]) -> Vec<usize> {
+    let m = lens.len().saturating_sub(1);
+    if m == 0 {
+        return Vec::new();
+    }
+    let ac = Acoustic::new(pcm);
+    let (pauses, voiced) = (&ac.pauses, &ac.voiced);
+    let frames = ac.frames();
     let total_voiced = voiced[frames].max(1) as f64;
     let total_chars: usize = lens.iter().sum::<usize>().max(1);
-    // Expected place of boundary j, in voiced seconds.
     let mut acc = 0;
     let expected: Vec<f64> = lens[..m]
         .iter()
@@ -315,31 +556,14 @@ pub fn cuts(pcm: &[i16], lens: &[usize]) -> Vec<usize> {
         .collect();
     let r = pauses.len();
     if r < m {
-        return expected
-            .iter()
-            .map(|&e| {
-                // Voiced seconds to a frame: the first frame with that many before it.
-                let target = (e * 100.0) as usize;
-                let f = voiced
-                    .partition_point(|&v| v < target)
-                    .min(frames.saturating_sub(1));
-                let lo = f.saturating_sub(30);
-                let hi = (f + 30).min(frames);
-                let q = (lo..hi)
-                    .min_by(|&a, &b| energy[a].total_cmp(&energy[b]))
-                    .unwrap_or(f);
-                q * HOP + HOP / 2
-            })
-            .collect();
+        return expected.iter().map(|&e| ac.at_voiced(e)).collect();
     }
-    // score(j, k): pause k as boundary j. Long pauses count up to 1 s.
     let score = |j: usize, k: usize| {
         let (a, b) = pauses[k];
         let len = ((b - a) as f64 / 100.0).min(1.0);
         let at = voiced[a] as f64 / 100.0;
         1.5 * len - (at - expected[j]).abs()
     };
-    // best[j][k]: best total for boundaries 0..=j with boundary j at pause k.
     let mut best = vec![vec![f64::NEG_INFINITY; r]; m];
     let mut from = vec![vec![usize::MAX; r]; m];
     for (k, b) in best[0].iter_mut().enumerate() {
@@ -349,7 +573,6 @@ pub fn cuts(pcm: &[i16], lens: &[usize]) -> Vec<usize> {
         let mut run_best = f64::NEG_INFINITY;
         let mut run_k = usize::MAX;
         for k in j..r {
-            // Best of best[j-1][..k].
             if best[j - 1][k - 1] > run_best {
                 run_best = best[j - 1][k - 1];
                 run_k = k - 1;
@@ -673,7 +896,7 @@ pub fn make_chunk(
             break;
         }
     }
-    let cut = cuts(&pcm, &lens);
+    let cut = cuts(&pcm, texts, paras);
     let mut out = Vec::with_capacity(texts.len());
     let mut a = 0;
     for &c in cut.iter().chain(std::iter::once(&pcm.len())) {
@@ -754,40 +977,91 @@ mod tests {
         out
     }
 
+    /// `n` Chinese characters then `end`.
+    fn said(n: usize, end: &str) -> String {
+        "字".repeat(n) + end
+    }
+
+    fn at(s: f64) -> usize {
+        (s * 24_000.0) as usize
+    }
+
     #[test]
-    fn cuts_land_in_sentence_pauses_not_comma_pauses() {
-        // Three sentences of 20, 10 and 30 characters (about 5.3, 2.6, 7.9 s),
-        // with short comma pauses inside and long pauses between.
-        let pcm = speech(&[(2.5, 0.15), (2.8, 0.7), (2.6, 0.9), (4.0, 0.2), (3.9, 0.0)]);
-        let c = cuts(&pcm, &[20, 10, 30]);
+    fn a_long_pause_at_a_comma_is_not_the_sentence_end() {
+        // What went wrong in 死亡万花筒: the voice paused 0.9 s at a comma
+        // inside a sentence, longer than at the paragraph end after it.
+        // 0.2 s a character: 4 s, then 2.2 s + comma pause + 2.8 s, then 4 s.
+        let texts = [
+            said(20, "。"),
+            said(11, "，") + &said(14, "。"),
+            said(20, "。"),
+        ];
+        let pcm = speech(&[(4.0, 0.6), (2.2, 0.9), (2.8, 0.5), (4.0, 0.0)]);
+        let c = cuts(&pcm, &texts, &[0, 1, 2]);
         assert_eq!(c.len(), 2);
-        let at = |s: f64| (s * 24_000.0) as usize;
-        // Inside the 0.7 s pause after 5.45 s and the 0.9 s one after 8.85 s.
-        assert!(c[0] > at(5.45) && c[0] < at(6.15), "{c:?}");
-        assert!(c[1] > at(8.85) && c[1] < at(9.75), "{c:?}");
+        assert!(c[0] > at(4.0) && c[0] < at(4.6), "{c:?}");
+        // In the 0.5 s pause after 10.5 s, not the 0.9 s one after 6.8 s.
+        assert!(c[1] > at(10.5) && c[1] < at(11.0), "{c:?}");
     }
 
     #[test]
     fn short_lines_each_get_their_own_pause() {
         // "……" lines between sentences: several short sentences in a row.
-        let pcm = speech(&[(3.0, 1.0), (0.6, 1.0), (0.5, 1.0), (3.0, 0.0)]);
-        let c = cuts(&pcm, &[12, 2, 2, 12]);
+        let texts = [said(12, "。"), "“……”".into(), said(2, "？"), said(12, "。")];
+        let pcm = speech(&[(2.4, 1.0), (0.3, 1.0), (0.4, 1.0), (2.4, 0.0)]);
+        let c = cuts(&pcm, &texts, &[0, 1, 2, 3]);
         assert_eq!(c.len(), 3);
         assert!(c[0] < c[1] && c[1] < c[2], "distinct and in order: {c:?}");
-        let at = |s: f64| (s * 24_000.0) as usize;
-        assert!(c[0] > at(3.0) && c[0] < at(4.0));
-        assert!(c[1] > at(4.6) && c[1] < at(5.6));
-        assert!(c[2] > at(6.1) && c[2] < at(7.1));
+        assert!(c[0] > at(2.4) && c[0] < at(3.4), "{c:?}");
+        assert!(c[1] > at(3.7) && c[1] < at(4.7), "{c:?}");
+        assert!(c[2] > at(5.1) && c[2] < at(6.1), "{c:?}");
     }
 
     #[test]
-    fn without_enough_pauses_cuts_fall_by_characters() {
+    fn sentences_of_one_paragraph_and_commas() {
+        // One paragraph: a sentence end inside it pauses less than a
+        // paragraph would, but commas around it pause too.
+        let texts = [
+            said(8, "，") + &said(8, "。"),
+            said(10, "，") + &said(6, "！"),
+            said(16, "。"),
+        ];
+        let pcm = speech(&[(1.6, 0.25), (1.6, 0.45), (2.0, 0.3), (1.2, 0.5), (3.2, 0.0)]);
+        let c = cuts(&pcm, &texts, &[0, 0, 0]);
+        assert!(c[0] > at(3.45) && c[0] < at(3.9), "{c:?}");
+        // The 0.5 s pause from 7.4 s, not the comma's at 5.9 s.
+        assert!(c[1] > at(7.4) && c[1] < at(7.9), "{c:?}");
+    }
+
+    #[test]
+    fn without_pauses_cuts_fall_by_characters() {
         let pcm = speech(&[(6.0, 0.0)]);
-        let c = cuts(&pcm, &[1, 1]);
+        let c = cuts(&pcm, &[said(10, "。"), said(10, "。")], &[0, 0]);
         assert_eq!(c.len(), 1);
-        let mid = 3 * 24_000;
-        assert!(c[0].abs_diff(mid) < 24_000, "{c:?}");
-        assert!(cuts(&pcm, &[5]).is_empty());
+        assert!(c[0].abs_diff(at(3.0)) < at(0.4), "{c:?}");
+        assert!(cuts(&pcm, &[said(5, "。")], &[0]).is_empty());
+    }
+
+    #[test]
+    fn marks_in_text() {
+        let texts = [
+            "他说：“你好，再见。”".to_owned(),
+            "好！".to_owned(),
+            "是的……".to_owned(),
+        ];
+        let (m, total) = marks(&texts, &[0, 0, 1]);
+        let kinds: Vec<(f64, Mark)> = m.iter().map(|x| (x.0, x.1)).collect();
+        assert_eq!(
+            kinds,
+            [
+                (2.0, Mark::Minor),
+                (4.0, Mark::Minor),
+                (6.0, Mark::Sentence),
+                (7.0, Mark::Paragraph)
+            ]
+        );
+        assert_eq!(m[2].2, Some(0));
+        assert_eq!(total, 9.0);
     }
 
     #[test]
