@@ -24,8 +24,13 @@ finish-args:
   - --socket=fallback-x11
   - --share=ipc
   - --device=dri
-  # Downloading the segmentation models and SudachiDict on first use.
+  # Downloading the segmentation models and SudachiDict on first use, and
+  # the reader's read-aloud (Azure).
   - --share=network
+  # Read-aloud: sound (PulseAudio, or PipeWire's PulseAudio server), and the
+  # Azure key kept in the keyring (Secret Service).
+  - --socket=pulseaudio
+  - --talk-name=org.freedesktop.secrets
   # Books are opened through the file chooser portal, but the Library
   # reopens them by path and dropped files arrive as plain paths.
   - --filesystem=home:ro

@@ -19,6 +19,7 @@ mod preview;
 mod render;
 mod style;
 mod tree;
+mod tts;
 
 use eframe::egui::{self, Color32, Key, Pos2, Rect, RichText, Vec2, pos2, vec2};
 use epub::Epub;
@@ -47,6 +48,8 @@ mod theme {
     pub const DESK: Color32 = Color32::from_rgb(0xe4, 0xdd, 0xc7);
     /// The word looked up: Solarized yellow, see-through.
     pub const HIGHLIGHT: Color32 = Color32::from_rgba_premultiplied(0x4a, 0x38, 0x00, 0x48);
+    /// The sentence read aloud: Solarized cyan, see-through.
+    pub const READING: Color32 = Color32::from_rgba_premultiplied(0x09, 0x23, 0x21, 0x38);
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -88,6 +91,8 @@ struct Settings {
     popup_size: Option<[f32; 2]>,
     /// Anki cards from the popup.
     anki: anki::CardSettings,
+    /// Reading aloud.
+    tts: tts::TtsSettings,
 }
 
 impl Default for Settings {
@@ -108,6 +113,7 @@ impl Default for Settings {
             auto_install: false,
             popup_size: None,
             anki: anki::CardSettings::default(),
+            tts: tts::TtsSettings::default(),
         }
     }
 }
@@ -151,6 +157,8 @@ struct Probe {
 #[derive(Clone, Debug)]
 enum Target {
     Offset(usize),
+    /// A character of [`Chapter::chars`] (the sentence read aloud).
+    Src(u32),
     Anchor(String),
     Last,
 }
@@ -212,6 +220,8 @@ pub struct Reader {
     dict: popup::Popup,
     /// The Dictionaries window.
     dicts: dicts_ui::Manager,
+    /// Reading aloud.
+    tts: tts::Tts,
 }
 
 impl Drop for Reader {
@@ -283,6 +293,7 @@ impl Reader {
                 .map_err(|e| e.to_string())?;
         }
         let toc_labels = toc_labels(&epub.toc);
+        let tts = tts::Tts::new(chapters.clone(), traditional, ctx);
         let mut dict = popup::Popup::new(ctx, settings.freq_sort.clone());
         dict.cards.book = Arc::from(epub.title.as_str());
         dict.sync_cards(&settings.anki);
@@ -330,6 +341,7 @@ impl Reader {
             turned_at: 0.0,
             dict,
             dicts,
+            tts,
         })
     }
 
@@ -557,6 +569,7 @@ impl Reader {
         self.dict.poll();
         self.dict.anchor = None;
         self.dicts.poll(&ctx, &self.dict, &self.settings);
+        self.tts.poll(&self.settings.tts);
         // Dictionaries dropped on the reader are imported.
         let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
             i.raw
@@ -573,6 +586,7 @@ impl Reader {
         // A click that closes a popup doesn't also turn the page.
         let menus_open = egui::Popup::is_any_open(&ctx)
             || self.settings_open
+            || self.tts.panel_open
             || self.dicts.open
             || self.dict.cards.setup_open;
         let dict_open = self.dict.is_open();
@@ -582,6 +596,7 @@ impl Reader {
         let esc_for_popup = popup_was_open && ctx.input(|i| i.key_pressed(Key::Escape));
         if esc_for_popup {
             self.settings_open = false;
+            self.tts.panel_open = false;
             if self.dict.cards.setup_open {
                 self.dict.cards.setup_open = false;
             } else if self.dicts.open {
@@ -593,6 +608,7 @@ impl Reader {
         let lookup_key = self.settings.lookup_key;
         let key_held = ctx.input(|i| lookup_key.held(&i.modifiers));
         let mut geom_for_keys: Option<Geometry> = self.last_geom;
+        let mut play_page = false;
 
         egui::Panel::top("reader-bar")
             .frame(
@@ -635,6 +651,16 @@ impl Reader {
                             ));
                         if b.clicked() {
                             self.dicts.open = !self.dicts.open;
+                        }
+                        let before = self.settings.tts.clone();
+                        let read = self.tts.bar(ui);
+                        if let Some(tts::Action::PlayPage) =
+                            self.tts.panel(&read, &mut self.settings.tts, self.spine)
+                        {
+                            play_page = true;
+                        }
+                        if self.settings.tts != before {
+                            self.dirty = true;
                         }
                         ui.separator();
                         let before = self.settings.spread;
@@ -724,6 +750,7 @@ impl Reader {
                 let by_offset = matches!(t, Target::Offset(_));
                 self.page = match t {
                     Target::Offset(o) => l.page_of_offset(o),
+                    Target::Src(s) => l.page_of_src(s).unwrap_or(l.pages.len() - 1),
                     Target::Anchor(a) => l.page_of_anchor(&a).unwrap_or(0),
                     Target::Last => l.pages.len() - 1,
                 };
@@ -734,6 +761,16 @@ impl Reader {
             }
             self.page = self.page.min(l.pages.len().saturating_sub(1));
             self.page -= self.page % step;
+            if play_page {
+                let src = l.page_first_src(self.page).unwrap_or(0);
+                self.tts.play_from(self.spine, src, &self.settings.tts);
+            }
+            self.follow_reading(&l, step);
+            let reading = self
+                .tts
+                .at()
+                .filter(|(sp, _)| *sp == self.spine)
+                .map(|(_, r)| r);
             let label = self.toc_label().map(str::to_owned);
             let resp = ui.interact(area, egui::Id::unique("reader-page"), egui::Sense::click());
             let mut clicked_link = None;
@@ -783,6 +820,15 @@ impl Reader {
                 let items = l.page_items(idx).0;
                 let painter = ui.painter_at(clip.expand2(vec2(g.inset.x * 0.5, 0.0)));
                 let ppp = ctx.pixels_per_point();
+                if let Some(r) = &reading {
+                    for r in l.char_rects(idx, r.clone()) {
+                        painter.rect_filled(
+                            r.translate(off).expand2(vec2(1.0, 0.0)),
+                            3.0,
+                            theme::READING,
+                        );
+                    }
+                }
                 if let Some((src, n)) = highlight {
                     for r in l.char_rects(idx, src..src + n as u32) {
                         let r = r.translate(off);
@@ -827,10 +873,29 @@ impl Reader {
                     ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
             }
-            // Clicks: links, else the left third back and the rest forward.
+            // While reading aloud, a word under the pointer reads from its sentence.
+            let char_at = |p: Pos2| {
+                sides.iter().find_map(|(idx, off, clip)| {
+                    clip.contains(p)
+                        .then(|| l.char_at(*idx, p - *off))
+                        .flatten()
+                })
+            };
+            if self.tts.active() && !menus_open && resp.hover_pos().and_then(char_at).is_some() {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            // Clicks: links, a word while reading aloud, else the left third
+            // back and the rest forward.
             if resp.clicked() && popup_was_open {
                 self.settings_open = false;
+                self.tts.panel_open = false;
                 self.dict.close();
+            } else if resp.clicked()
+                && clicked_link.is_none()
+                && self.tts.active()
+                && let Some(src) = resp.interact_pointer_pos().and_then(char_at)
+            {
+                self.tts.play_from(self.spine, src, &self.settings.tts);
             } else if resp.clicked() {
                 if let Some(t) = clicked_link {
                     if let Some(ch) = self.chapter(self.spine)
@@ -972,6 +1037,7 @@ impl Reader {
                 self.dict.close();
             }
         }
+        self.tts.popup(self.dict.is_open(), &self.settings.tts);
         if self.dicts.ui(&ctx, &mut self.dict, &mut self.settings) {
             self.dirty = true;
         }
@@ -988,6 +1054,44 @@ impl Reader {
                 .show(&ctx, |ui| ui.label(e));
         }
         open
+    }
+
+    /// Turn to the sentence read aloud when it leaves the pages shown, if
+    /// the one before was on them (pages turned away by hand stay).
+    fn follow_reading(&mut self, l: &ChapterLayout, step: usize) {
+        let Some((spine, r)) = self.tts.at() else {
+            return;
+        };
+        let first = l.page_of_src(r.start);
+        let visible = spine == self.spine
+            && first.is_some_and(|a| {
+                let z = l.page_of_src(r.end.saturating_sub(1)).unwrap_or(a);
+                a < self.page + step && z >= self.page
+            });
+        let key = (spine, r.start);
+        if self.tts.last_at == Some(key) {
+            self.tts.last_visible = visible;
+            return;
+        }
+        self.tts.last_at = Some(key);
+        if !self.tts.last_visible || visible {
+            self.tts.last_visible = visible;
+            return;
+        }
+        // Followed: still "visible" while the turn happens.
+        self.tts.last_visible = true;
+        self.turned_at = self.now;
+        if spine == self.spine {
+            if let Some(p) = first {
+                self.forward = p > self.page;
+                self.page = p - p % step;
+                self.offset = l.page_offset(self.page);
+            }
+        } else {
+            self.forward = spine > self.spine;
+            self.go_chapter(spine, Target::Src(r.start));
+            self.save();
+        }
     }
 
     fn contents_menu(&mut self, ui: &mut egui::Ui) {

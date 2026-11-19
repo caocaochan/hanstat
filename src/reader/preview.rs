@@ -1166,3 +1166,237 @@ fn digits_grouped() {
     assert_eq!(group_digits(1000), "1,000");
     assert_eq!(group_digits(1234567), "1,234,567");
 }
+
+/// Reading aloud through Azure with a real key, the sound device open but
+/// silent: `HANSTAT_TTS_TEST` is a file with the key on its first line and
+/// the region on its second (the key is used, never stored). Run with
+/// `LOCALAPPDATA` at a scratch folder (the audio cache goes there) and
+/// `HANSTAT_NO_UPDATE=1`; `READER_SPINE` picks the chapter.
+///
+/// From the page's first sentence, the sentence heard is the one
+/// highlighted and the reading goes on; a click on a word of a later
+/// sentence reads from that one without turning the page; the popup pauses
+/// and resumes it; the page turns when the sentence heard leaves it; Stop
+/// stops; a short chapter made ahead of time has every sentence saved.
+#[test]
+#[ignore]
+fn read_aloud() {
+    use std::sync::atomic::Ordering::Relaxed;
+    use tts::PlayState;
+    let book = env("READER_EPUB").expect("set READER_EPUB");
+    let file = env("HANSTAT_TTS_TEST").expect("set HANSTAT_TTS_TEST");
+    let text = std::fs::read_to_string(file).unwrap();
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let (key, region) = (lines.next().unwrap(), lines.next().unwrap());
+    tts::audio::MUTE.store(true, Relaxed);
+    let mut d = Driver::new();
+    let mut r = d.open(&book);
+    r.settings.tts.region = region.to_owned();
+    r.tts.use_key(key);
+    r.spine = env("READER_SPINE")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
+    r.target = Some(Target::Offset(0));
+    d.ready(&mut r);
+    let spine = r.spine;
+    let page = r.page;
+    let l = r.layouts[&spine].clone();
+    let ch = r.chapter(spine).unwrap();
+    let sents = tts::sentences(&ch.chars);
+    let text_of = |i: usize| -> String {
+        ch.chars[sents[i].start as usize..sents[i].end as usize]
+            .iter()
+            .collect()
+    };
+    let wait =
+        |d: &mut Driver, r: &mut Reader, secs: u64, what: &str, ok: &dyn Fn(&Reader) -> bool| {
+            let t = Instant::now();
+            while !ok(r) {
+                d.frame(r, vec![]);
+                assert!(
+                    t.elapsed().as_secs() < secs,
+                    "{what}: state {:?}, at {:?}",
+                    r.tts.state(),
+                    r.tts.at()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+    let index = |r: &Reader| r.tts.at().map(|(_, rg)| tts::sentence_at(&sents, rg.start));
+
+    // From the page.
+    let first = l.page_first_src(page).unwrap();
+    let i0 = tts::sentence_at(&sents, first);
+    let t = Instant::now();
+    r.tts.play_from(spine, first, &r.settings.tts);
+    wait(&mut d, &mut r, 30, "starts", &|r| {
+        r.tts.state() == PlayState::Playing
+    });
+    eprintln!(
+        "first audio after {:.2} s: {:?}",
+        t.elapsed().as_secs_f32(),
+        text_of(i0)
+    );
+    assert_eq!(r.tts.at(), Some((spine, sents[i0].clone())));
+    d.idle(&mut r, 2);
+    d.snap("tts-reading");
+    wait(&mut d, &mut r, 60, "goes on", &|r| {
+        index(r).is_some_and(|i| i > i0)
+    });
+    eprintln!(
+        "then: sentence {} {:?} (started at {i0})",
+        index(&r).unwrap(),
+        text_of(index(&r).unwrap())
+    );
+
+    // A click on a later sentence of the page.
+    let on_page = |i: usize| l.page_of_src(sents[i].start) == Some(page);
+    let k = (i0 + 3..sents.len())
+        .find(|&i| on_page(i) && sents[i].len() > 2)
+        .expect("a later sentence on the page");
+    let (_, off) = *r.probe.sides.iter().find(|(p, _)| *p == page).unwrap();
+    let at = l.char_rects(page, sents[k].start + 1..sents[k].start + 2)[0]
+        .translate(off)
+        .center();
+    d.click(&mut r, at);
+    assert_eq!(
+        (r.spine, r.page),
+        (spine, page),
+        "the click doesn't turn the page"
+    );
+    wait(&mut d, &mut r, 30, "reads the clicked sentence", &|r| {
+        r.tts.state() == PlayState::Playing && index(r) == Some(k)
+    });
+    eprintln!("clicked: {:?}", text_of(k));
+    d.snap("tts-clicked");
+
+    // The dictionary popup (a word looked up with Shift) pauses the reading,
+    // and closing it (Esc) resumes it.
+    let t = Instant::now();
+    while !r.dict.has_terms() {
+        d.frame(&mut r, vec![]);
+        assert!(
+            t.elapsed().as_secs() < 30,
+            "no dictionaries in {:?}",
+            hanstat::dict::root()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let word = (sents[k].start..sents[k].end)
+        .find(|&s| hanstat::chars::is_han(ch.chars[s as usize]))
+        .unwrap();
+    let at = l.char_rects(page, word..word + 1)[0]
+        .translate(off)
+        .center();
+    let shift = egui::Modifiers::SHIFT;
+    d.frame_with(&mut r, vec![egui::Event::PointerMoved(at)], shift);
+    // The first lookup can take a few frames in a debug build.
+    let t = Instant::now();
+    while !r.dict.is_open() && t.elapsed().as_secs() < 5 {
+        d.frame_with(&mut r, vec![], shift);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    d.frame(&mut r, vec![]);
+    assert!(r.dict.is_open(), "the popup opened");
+    wait(&mut d, &mut r, 5, "paused by the popup", &|r| {
+        r.tts.state() == PlayState::Paused
+    });
+    let held = r.tts.at();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    d.idle(&mut r, 5);
+    assert_eq!(r.tts.at(), held, "nothing heard while paused");
+    d.snap("tts-popup");
+    assert!(
+        d.key(&mut r, Key::Escape),
+        "Esc closes the popup, not the reader"
+    );
+    assert!(!r.dict.is_open());
+    wait(&mut d, &mut r, 10, "resumes", &|r| {
+        r.tts.state() == PlayState::Playing
+    });
+    // Not with the setting off.
+    r.settings.tts.pause_for_popup = false;
+    d.frame_with(&mut r, vec![egui::Event::PointerMoved(at)], shift);
+    for _ in 0..5 {
+        d.frame_with(&mut r, vec![], shift);
+    }
+    d.idle(&mut r, 10);
+    assert!(r.dict.is_open());
+    assert_ne!(r.tts.state(), PlayState::Paused, "the setting is off");
+    d.key(&mut r, Key::Escape);
+    r.settings.tts.pause_for_popup = true;
+
+    // The page turns with the reading: from the last sentence starting on it.
+    let step = if r.last_geom.is_some_and(|g| g.spread) {
+        2
+    } else {
+        1
+    };
+    let last = (0..sents.len())
+        .rev()
+        .find(|&i| {
+            l.page_of_src(sents[i].start)
+                .is_some_and(|p| p < page + step)
+        })
+        .unwrap();
+    r.tts.play_from(spine, sents[last].start, &r.settings.tts);
+    wait(&mut d, &mut r, 90, "the page follows", &|r| {
+        (r.spine, r.page) > (spine, page) && r.target.is_none()
+    });
+    eprintln!(
+        "followed to {:?} reading {:?}",
+        (r.spine, r.page),
+        r.tts.at().map(|(s, rg)| (s, rg.start))
+    );
+    d.idle(&mut r, 2);
+    d.snap("tts-followed");
+    r.tts.stop();
+    d.idle(&mut r, 20);
+    assert!(!r.tts.active());
+    assert_eq!(r.tts.at(), None);
+
+    // Ahead of time: the shortest chapter with something to read.
+    let target = (0..r.epub.spine.len())
+        .filter_map(|i| {
+            let c = r.chapter(i)?;
+            let n = tts::sentences(&c.chars).len();
+            (n >= 3).then_some((n, i))
+        })
+        .min()
+        .unwrap()
+        .1;
+    let s = r.settings.tts.clone();
+    r.tts.pregenerate(&s, vec![target], "test chapter");
+    let b = r.tts.batch().unwrap();
+    wait(&mut d, &mut r, 300, "made ahead", &|_| b.finished());
+    let (total, cached, done, failed) = (
+        b.total.load(Relaxed),
+        b.cached.load(Relaxed),
+        b.done.load(Relaxed),
+        b.failed.load(Relaxed),
+    );
+    eprintln!(
+        "ahead of time, chapter {target}: {total} sentences, {cached} saved before, {done} made, {failed} failed, ~{} characters billed",
+        b.billed.load(Relaxed)
+    );
+    assert_eq!(failed, 0, "{:?}", b.error.lock().unwrap());
+    let c = r.chapter(target).unwrap();
+    let speech = tts::Speech {
+        voice: s.voice(false),
+        rate: s.rate,
+    };
+    for rg in tts::sentences(&c.chars) {
+        let t: String = c.chars[rg.start as usize..rg.end as usize].iter().collect();
+        assert!(tts::clip_path(speech.key(&t)).exists(), "saved: {t}");
+    }
+    // The panel, with the voices fetched from Azure.
+    r.tts.panel_open = true;
+    let t = Instant::now();
+    while t.elapsed().as_secs() < 10 {
+        d.frame(&mut r, vec![]);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    d.idle(&mut r, 3);
+    d.snap("tts-panel");
+    r.close(&d.ctx);
+}

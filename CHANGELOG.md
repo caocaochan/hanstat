@@ -1,5 +1,18 @@
 # Changelog
 
+## [2026.11.19.02] - 2026-11-19
+
+### Added
+- **Read aloud.** **Read aloud** in the reader's bar has the book read by an Azure AI Speech neural voice, sentence by sentence, using your own Azure Speech key and region (from the Speech resource's **Keys and Endpoint** page; the free F0 tier gives 500,000 characters a month, and Azure counts each Chinese character twice).
+  - **Reading.** **Read from this page** starts at the page's first sentence. The sentence heard is highlighted, the pages turn with it (into the next chapter too), and **Pause**, **Resume** and **Stop** sit in the bar while it reads. While reading, a click on a word reads from its sentence, so you can go back to an earlier one; pages turned by hand stay where they are until the reading comes back to them.
+  - **The dictionary popup** pauses the reading while it is open and resumes it when it closes (**Pause while the popup is open**, on by default).
+  - **Voices.** Only Chinese neural voices are offered (Mandarin, Taiwanese Mandarin, Cantonese, Wu and the regional ones), from the region's own list. Simplified and Traditional books each keep their voice (Xiaoxiao and HsiaoChen by default). The speed goes from −50% to +100%.
+  - **Saved audio.** Every sentence's audio is saved (24 kHz MP3, in the cache folder) and reused, so a passage is paid for once. **Ahead of time** makes a chapter's or the whole book's audio now, showing how many characters Azure will bill at most; sentences already saved are skipped. **Delete** removes all saved audio. Each voice and speed is saved separately.
+  - **The key is never stored in plain text.** On Windows it is encrypted for your Windows account (DPAPI), on macOS it goes in the Keychain, and on Linux it goes in the keyring (Secret Service: GNOME Keyring, KWallet). It is not in `reader.json`. If the keyring refuses it, the key is used until hanstat closes.
+  - Azure's rate limits are respected: a 429 answer makes every request wait (Retry-After).
+  - The Flatpak now asks for sound (`--socket=pulseaudio`) and the keyring (`--talk-name=org.freedesktop.secrets`).
+  - Saved in `reader.json` as `tts`. Older versions ignore the key.
+
 ## [2026.11.19.01] - 2026-11-19
 
 ### Changed

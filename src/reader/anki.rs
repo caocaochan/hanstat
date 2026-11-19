@@ -151,12 +151,12 @@ pub struct Sentence {
 }
 
 /// Characters that end a sentence.
-fn ends(c: char) -> bool {
+pub(super) fn ends(c: char) -> bool {
     matches!(c, '。' | '！' | '？' | '!' | '?' | '；' | ';' | '．')
 }
 
 /// Closing quotes and brackets: after a sentence's end, still its own.
-fn closer(c: char) -> bool {
+pub(super) fn closer(c: char) -> bool {
     matches!(
         c,
         '」' | '』' | '”' | '’' | '）' | ')' | '》' | '】' | '〉' | '"' | '\''

@@ -224,6 +224,27 @@ impl ChapterLayout {
         (p.x < h.x[k] + h.w[k]).then_some(h.src[k])
     }
 
+    /// The page holding character `src` of [`Chapter::chars`], or the first
+    /// character laid out after it; `None` past the last one.
+    pub fn page_of_src(&self, src: u32) -> Option<usize> {
+        let h = &self.hits;
+        let k = h.src.partition_point(|x| *x < src);
+        if k >= h.src.len() {
+            return None;
+        }
+        let i = h.lines.partition_point(|l| (l.start + l.len) as usize <= k);
+        h.lines.get(i).map(|l| self.page_of_unit(l.unit))
+    }
+
+    /// The first character on `page` (its index in [`Chapter::chars`]).
+    pub fn page_first_src(&self, page: usize) -> Option<u32> {
+        let h = &self.hits;
+        h.lines[self.page_lines(page)]
+            .iter()
+            .find(|l| l.len > 0)
+            .map(|l| h.src[l.start as usize])
+    }
+
     /// The boxes (flow coordinates) of the characters `src` of
     /// [`Chapter::chars`] that are on `page`, one per line.
     pub fn char_rects(&self, page: usize, src: Range<u32>) -> Vec<Rect> {

@@ -1,0 +1,778 @@
+//! The read-aloud machinery, all off the UI thread:
+//!
+//! - a [`Pool`] of workers asks Azure for sentences and saves their MP3 in
+//!   the audio cache (what playback needs first, pre-generation after);
+//! - the player thread walks the book sentence by sentence (into the next
+//!   chapter at the end of one), decodes saved clips and queues them on the
+//!   sound device a few seconds ahead, and says which sentence is heard.
+//!
+//! The UI sends [`Cmd`]s and reads [`Now`].
+
+use super::audio::{self, Output};
+use super::azure::{self, Azure, Fail};
+use super::{Speech, clip_path, sentence_at, sentences};
+use crate::reader::tree::Chapter;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::Range;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+pub type Chapters = Arc<Mutex<Vec<Option<Arc<Chapter>>>>>;
+pub type Repaint = Arc<dyn Fn() + Send + Sync>;
+
+/// Requests to Azure at once.
+const WORKERS: usize = 4;
+/// Sentences asked for ahead of the one heard.
+const AHEAD: usize = 4;
+/// Seconds of sound kept queued on the device.
+const QUEUED_SECONDS: f32 = 6.0;
+
+/// A sentence to have read: its cache key and text.
+#[derive(Clone)]
+struct Job {
+    key: u64,
+    text: String,
+    speech: Speech,
+    batch: Option<Arc<Batch>>,
+}
+
+/// A pre-generation (a chapter or the book) and how far it got.
+#[derive(Default)]
+pub struct Batch {
+    /// What is generated, for the panel ("this chapter", "the book").
+    pub what: String,
+    /// Sentences found so far, and whether all chapters were gone through.
+    pub total: AtomicUsize,
+    pub listed: AtomicBool,
+    /// Sentences already saved before, made now, and failed.
+    pub cached: AtomicUsize,
+    pub done: AtomicUsize,
+    pub failed: AtomicUsize,
+    /// Characters Azure bills for the sentences not saved before.
+    pub billed: AtomicUsize,
+    pub cancel: AtomicBool,
+    pub error: Mutex<Option<String>>,
+}
+
+impl Batch {
+    pub fn finished(&self) -> bool {
+        self.listed.load(Ordering::Relaxed)
+            && self.cached.load(Ordering::Relaxed)
+                + self.done.load(Ordering::Relaxed)
+                + self.failed.load(Ordering::Relaxed)
+                >= self.total.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Default)]
+struct PoolState {
+    urgent: VecDeque<Job>,
+    background: VecDeque<Job>,
+    /// Keys queued or being made.
+    busy: HashSet<u64>,
+    failed: HashMap<u64, Fail>,
+    /// Azure said to slow down: nothing is sent before this.
+    wait_until: Option<Instant>,
+    /// The next wait after a 429 without Retry-After.
+    backoff: Duration,
+}
+
+struct PoolInner {
+    state: Mutex<PoolState>,
+    cv: Condvar,
+    client: Mutex<Option<Arc<Azure>>>,
+    stop: AtomicBool,
+    repaint: Repaint,
+}
+
+/// Workers asking Azure for sentences.
+pub struct Pool {
+    inner: Arc<PoolInner>,
+}
+
+impl Pool {
+    fn new(repaint: Repaint) -> Pool {
+        let inner = Arc::new(PoolInner {
+            state: Mutex::new(PoolState {
+                backoff: Duration::from_secs(2),
+                ..PoolState::default()
+            }),
+            cv: Condvar::new(),
+            client: Mutex::new(None),
+            stop: AtomicBool::new(false),
+            repaint,
+        });
+        for i in 0..WORKERS {
+            let inner = inner.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("tts-{i}"))
+                .spawn(move || worker(&inner));
+        }
+        Pool { inner }
+    }
+
+    fn set_client(&self, c: Option<Arc<Azure>>) {
+        *self.inner.client.lock().unwrap() = c;
+        // Failures may have been the old key's.
+        self.inner.state.lock().unwrap().failed.clear();
+    }
+
+    /// Make these first, in this order (sentences about to be heard).
+    fn want(&self, jobs: Vec<Job>) {
+        let mut s = self.inner.state.lock().unwrap();
+        let keys: HashSet<u64> = jobs.iter().map(|j| j.key).collect();
+        s.urgent.retain(|j| !keys.contains(&j.key));
+        s.background.retain(|j| !keys.contains(&j.key));
+        // Older urgent jobs are for sentences skipped since: drop them.
+        let stale: Vec<u64> = s.urgent.drain(..).map(|j| j.key).collect();
+        for k in stale {
+            s.busy.remove(&k);
+        }
+        for j in jobs {
+            s.failed.remove(&j.key);
+            s.busy.insert(j.key);
+            s.urgent.push_back(j);
+        }
+        self.inner.cv.notify_all();
+    }
+
+    fn failure(&self, key: u64) -> Option<Fail> {
+        self.inner.state.lock().unwrap().failed.get(&key).cloned()
+    }
+
+    fn busy(&self, key: u64) -> bool {
+        self.inner.state.lock().unwrap().busy.contains(&key)
+    }
+}
+
+impl PoolInner {
+    fn background(&self, jobs: Vec<Job>) {
+        let mut s = self.state.lock().unwrap();
+        for j in jobs {
+            if s.busy.insert(j.key) {
+                s.background.push_back(j);
+            } else if let Some(b) = &j.batch {
+                // Already being made for playback: counted as made.
+                b.done.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.cv.notify_all();
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        self.inner.stop.store(true, Ordering::Relaxed);
+        self.inner.cv.notify_all();
+    }
+}
+
+fn worker(p: &PoolInner) {
+    loop {
+        let job = {
+            let mut s = p.state.lock().unwrap();
+            loop {
+                if p.stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                if let Some(t) = s.wait_until {
+                    let now = Instant::now();
+                    if now < t {
+                        s = p.cv.wait_timeout(s, t - now).unwrap().0;
+                        continue;
+                    }
+                    s.wait_until = None;
+                }
+                if let Some(j) = s.urgent.pop_front().or_else(|| s.background.pop_front()) {
+                    break j;
+                }
+                s = p.cv.wait(s).unwrap();
+            }
+        };
+        if let Some(b) = &job.batch
+            && b.cancel.load(Ordering::Relaxed)
+        {
+            p.state.lock().unwrap().busy.remove(&job.key);
+            continue;
+        }
+        let path = clip_path(job.key);
+        let result = if path.exists() {
+            Ok(())
+        } else {
+            let client = p.client.lock().unwrap().clone();
+            match client {
+                None => Err(Fail::Refused("Add your Azure key first".to_owned())),
+                Some(c) => make(&c, &job, &path),
+            }
+        };
+        let mut s = p.state.lock().unwrap();
+        match result {
+            Err(Fail::Throttled(after)) => {
+                // Everyone waits; this one goes back where it was.
+                let wait = after
+                    .unwrap_or(s.backoff)
+                    .clamp(Duration::from_secs(1), Duration::from_secs(60));
+                s.backoff = (s.backoff * 2).min(Duration::from_secs(30));
+                s.wait_until = Some(Instant::now() + wait);
+                if job.batch.is_some() {
+                    s.background.push_front(job);
+                } else {
+                    s.urgent.push_front(job);
+                }
+                continue;
+            }
+            Ok(()) => {
+                s.backoff = Duration::from_secs(2);
+                if let Some(b) = &job.batch {
+                    b.done.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Err(e) => {
+                if let Some(b) = &job.batch {
+                    b.failed.fetch_add(1, Ordering::Relaxed);
+                    let mut err = b.error.lock().unwrap();
+                    if err.is_none() {
+                        *err = Some(e.to_string());
+                    }
+                    // A refused key fails every sentence: stop.
+                    if matches!(e, Fail::Refused(_)) {
+                        b.cancel.store(true, Ordering::Relaxed);
+                    }
+                }
+                s.failed.insert(job.key, e);
+            }
+        }
+        s.busy.remove(&job.key);
+        drop(s);
+        (p.repaint)();
+    }
+}
+
+/// Ask Azure for `job` (a second and third try on network errors) and save it.
+fn make(c: &Azure, job: &Job, path: &std::path::Path) -> Result<(), Fail> {
+    let mut tries = 0;
+    let audio = loop {
+        match c.synth(&job.text, &job.speech.voice, job.speech.rate) {
+            Ok(a) => break a,
+            Err(Fail::Other(_)) if tries < 2 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_secs(tries));
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    let save = || -> std::io::Result<()> {
+        if let Some(d) = path.parent() {
+            std::fs::create_dir_all(d)?;
+        }
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+        std::fs::write(&tmp, &audio)?;
+        std::fs::rename(&tmp, path)
+    };
+    save().map_err(|e| Fail::Other(format!("The audio can't be saved: {e}")))
+}
+
+/// What the UI asks the player.
+pub enum Cmd {
+    /// Read from the sentence holding (or after) character `src` of chapter `spine`.
+    Play {
+        spine: usize,
+        src: u32,
+    },
+    Pause,
+    Resume,
+    Stop,
+    Speech(Speech),
+    Client(Option<Arc<Azure>>),
+    Pregenerate(Vec<usize>, Arc<Batch>),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum State {
+    #[default]
+    Stopped,
+    /// Waiting for a sentence's audio.
+    Loading,
+    Playing,
+    Paused,
+}
+
+/// What the player is doing, for the UI.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Now {
+    pub state: State,
+    /// The sentence heard (or waited for): chapter and its characters.
+    pub at: Option<(usize, Range<u32>)>,
+    pub error: Option<String>,
+}
+
+pub struct Engine {
+    tx: Sender<Cmd>,
+    now: Arc<Mutex<Now>>,
+}
+
+impl Engine {
+    pub fn start(chapters: Chapters, speech: Speech, repaint: Repaint) -> Engine {
+        let (tx, rx) = channel();
+        let now = Arc::new(Mutex::new(Now::default()));
+        {
+            let now = now.clone();
+            let _ = std::thread::Builder::new()
+                .name("tts-player".into())
+                .spawn(move || {
+                    let mut p = Player::new(chapters, speech, now, repaint);
+                    p.run(rx);
+                });
+        }
+        Engine { tx, now }
+    }
+
+    pub fn send(&self, c: Cmd) {
+        let _ = self.tx.send(c);
+    }
+
+    pub fn now(&self) -> Now {
+        self.now.lock().unwrap().clone()
+    }
+}
+
+/// A clip on the device: its sentence.
+struct Queued {
+    spine: usize,
+    idx: usize,
+}
+
+struct Player {
+    chapters: Chapters,
+    speech: Speech,
+    now: Arc<Mutex<Now>>,
+    repaint: Repaint,
+    pool: Pool,
+    output: Option<Output>,
+    state: State,
+    /// The next sentence to queue: chapter and index in its sentences.
+    cursor: Option<(usize, usize)>,
+    /// Sentences on the device, by clip id.
+    queued: HashMap<u64, Queued>,
+    next_id: u64,
+    /// The last sentence heard (kept while paused or loading).
+    heard: Option<(usize, usize)>,
+    /// The cursor the urgent requests were made for.
+    asked: Option<(usize, usize, Speech)>,
+    error: Option<String>,
+    sentences: HashMap<usize, Arc<Vec<Range<u32>>>>,
+}
+
+impl Player {
+    fn new(chapters: Chapters, speech: Speech, now: Arc<Mutex<Now>>, repaint: Repaint) -> Player {
+        Player {
+            pool: Pool::new(repaint.clone()),
+            chapters,
+            speech,
+            now,
+            repaint,
+            output: None,
+            state: State::Stopped,
+            cursor: None,
+            queued: HashMap::new(),
+            next_id: 1,
+            heard: None,
+            asked: None,
+            error: None,
+            sentences: HashMap::new(),
+        }
+    }
+
+    fn chapter(&self, spine: usize) -> Option<Arc<Chapter>> {
+        self.chapters.lock().unwrap().get(spine).cloned().flatten()
+    }
+
+    fn spines(&self) -> usize {
+        self.chapters.lock().unwrap().len()
+    }
+
+    /// The sentences of chapter `spine`, once it is built.
+    fn sentences(&mut self, spine: usize) -> Option<Arc<Vec<Range<u32>>>> {
+        if let Some(s) = self.sentences.get(&spine) {
+            return Some(s.clone());
+        }
+        let ch = self.chapter(spine)?;
+        let s = Arc::new(sentences(&ch.chars));
+        // Keep a few chapters.
+        if self.sentences.len() > 8 {
+            self.sentences.clear();
+        }
+        self.sentences.insert(spine, s.clone());
+        Some(s)
+    }
+
+    fn text(&self, spine: usize, r: &Range<u32>) -> String {
+        self.chapter(spine)
+            .map(|c| c.chars[r.start as usize..r.end as usize].iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Past the end of chapter `spine`'s sentences: the next chapter's first.
+    fn normalise(&mut self, mut at: (usize, usize)) -> Option<Option<(usize, usize)>> {
+        let n = self.spines();
+        loop {
+            let s = self.sentences(at.0)?;
+            if at.1 < s.len() {
+                return Some(Some(at));
+            }
+            if at.0 + 1 >= n {
+                return Some(None);
+            }
+            at = (at.0 + 1, 0);
+        }
+    }
+
+    fn run(&mut self, rx: Receiver<Cmd>) {
+        loop {
+            let tick = if matches!(self.state, State::Loading | State::Playing) {
+                Duration::from_millis(30)
+            } else {
+                Duration::from_millis(250)
+            };
+            match rx.recv_timeout(tick) {
+                Ok(c) => self.command(c),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+            while let Ok(c) = rx.try_recv() {
+                self.command(c);
+            }
+            self.step();
+            self.publish();
+        }
+    }
+
+    fn open_output(&mut self) -> bool {
+        if self.output.as_ref().is_some_and(|o| !o.failed()) {
+            return true;
+        }
+        let repaint = self.repaint.clone();
+        match Output::open(Arc::new(move || repaint())) {
+            Ok(o) => {
+                self.output = Some(o);
+                true
+            }
+            Err(e) => {
+                self.output = None;
+                self.error = Some(e);
+                self.state = State::Stopped;
+                false
+            }
+        }
+    }
+
+    fn command(&mut self, c: Cmd) {
+        match c {
+            Cmd::Play { spine, src } => {
+                self.error = None;
+                if !self.open_output() {
+                    return;
+                }
+                let o = self.output.as_ref().unwrap();
+                o.clear();
+                o.set_paused(false);
+                self.queued.clear();
+                self.asked = None;
+                let Some(s) = self.sentences(spine) else {
+                    // Not built yet: from its start once it is.
+                    self.cursor = Some((spine, 0));
+                    self.heard = None;
+                    self.state = State::Loading;
+                    return;
+                };
+                let idx = sentence_at(&s, src);
+                self.cursor = Some((spine, idx));
+                self.heard = None;
+                self.state = State::Loading;
+            }
+            Cmd::Pause => {
+                if matches!(self.state, State::Loading | State::Playing) {
+                    if let Some(o) = &self.output {
+                        o.set_paused(true);
+                    }
+                    self.state = State::Paused;
+                }
+            }
+            Cmd::Resume => {
+                if self.state == State::Paused {
+                    if let Some(o) = &self.output {
+                        o.set_paused(false);
+                    }
+                    self.state = State::Loading;
+                }
+            }
+            Cmd::Stop => {
+                self.output = None;
+                self.queued.clear();
+                self.cursor = None;
+                self.heard = None;
+                self.asked = None;
+                self.state = State::Stopped;
+            }
+            Cmd::Speech(s) => {
+                if s != self.speech {
+                    self.speech = s;
+                    // Heard from the current sentence again in the new voice.
+                    if matches!(self.state, State::Loading | State::Playing | State::Paused)
+                        && let Some((spine, idx)) = self.heard.or(self.cursor)
+                        && let Some(s) = self.sentences(spine)
+                        && let Some(r) = s.get(idx)
+                    {
+                        let paused = self.state == State::Paused;
+                        self.command(Cmd::Play {
+                            spine,
+                            src: r.start,
+                        });
+                        if paused {
+                            self.command(Cmd::Pause);
+                        }
+                    }
+                }
+            }
+            Cmd::Client(c) => {
+                self.pool.set_client(c);
+                self.asked = None;
+            }
+            Cmd::Pregenerate(spines, batch) => self.pregenerate(spines, batch),
+        }
+    }
+
+    /// List the sentences of `spines` not saved yet and queue them, on a
+    /// thread of its own (it waits for chapters still being built).
+    fn pregenerate(&mut self, spines: Vec<usize>, batch: Arc<Batch>) {
+        let chapters = self.chapters.clone();
+        let speech = self.speech.clone();
+        let pool = self.pool.inner.clone();
+        let repaint = self.repaint.clone();
+        let _ = std::thread::Builder::new()
+            .name("tts-pregenerate".into())
+            .spawn(move || {
+                for spine in spines {
+                    let ch = loop {
+                        if batch.cancel.load(Ordering::Relaxed) {
+                            break None;
+                        }
+                        match chapters.lock().unwrap().get(spine).cloned() {
+                            Some(Some(c)) => break Some(c),
+                            Some(None) => {}
+                            None => break None,
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    };
+                    let Some(ch) = ch else { break };
+                    let mut jobs = Vec::new();
+                    for r in sentences(&ch.chars) {
+                        let text: String =
+                            ch.chars[r.start as usize..r.end as usize].iter().collect();
+                        let key = speech.key(&text);
+                        batch.total.fetch_add(1, Ordering::Relaxed);
+                        if clip_path(key).exists() {
+                            batch.cached.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            batch
+                                .billed
+                                .fetch_add(azure::billed(&text, speech.rate), Ordering::Relaxed);
+                            jobs.push(Job {
+                                key,
+                                text,
+                                speech: speech.clone(),
+                                batch: Some(batch.clone()),
+                            });
+                        }
+                    }
+                    pool.background(jobs);
+                    repaint();
+                }
+                batch.listed.store(true, Ordering::Relaxed);
+                repaint();
+            });
+    }
+
+    fn step(&mut self) {
+        if self.state == State::Stopped {
+            return;
+        }
+        if self.output.as_ref().is_some_and(Output::failed) {
+            // The device changed: open the default one again and go on
+            // from the sentence heard.
+            let at = self.heard.or(self.cursor);
+            self.output = None;
+            if let Some((spine, idx)) = at
+                && let Some(r) = self.sentences(spine).and_then(|s| s.get(idx).cloned())
+            {
+                let paused = self.state == State::Paused;
+                self.command(Cmd::Play {
+                    spine,
+                    src: r.start,
+                });
+                if paused {
+                    self.command(Cmd::Pause);
+                }
+            }
+            return;
+        }
+        let Some(out) = self.output.take() else {
+            self.state = State::Stopped;
+            return;
+        };
+        for id in out.take_finished() {
+            if let Some(q) = self.queued.remove(&id) {
+                self.heard = Some((q.spine, q.idx));
+            }
+        }
+        if let Some(q) = out.current().and_then(|id| self.queued.get(&id)) {
+            self.heard = Some((q.spine, q.idx));
+        }
+        self.fill(&out);
+        let playing = !out.queued().is_empty();
+        if self.state != State::Paused {
+            self.state = if playing {
+                State::Playing
+            } else {
+                State::Loading
+            };
+        }
+        if !playing && self.cursor.is_none() && self.error.is_none() {
+            // The end of the book.
+            self.state = State::Stopped;
+            self.heard = None;
+        }
+        if self.error.is_some() && !playing {
+            self.state = State::Stopped;
+        }
+        self.output = Some(out);
+        if self.state == State::Stopped {
+            self.output = None;
+        }
+    }
+
+    /// Queue sentences on the device while there is less than a few seconds
+    /// ahead and their audio is saved; ask for the next ones.
+    fn fill(&mut self, out: &Output) {
+        loop {
+            let Some(at) = self.cursor else { return };
+            let at = match self.normalise(at) {
+                None => return, // A chapter not built yet.
+                Some(None) => {
+                    self.cursor = None;
+                    return;
+                }
+                Some(Some(a)) => a,
+            };
+            self.cursor = Some(at);
+            if out.queued().is_empty() {
+                // Nothing playing: the sentence waited for is shown.
+                self.heard = Some(at);
+            }
+            self.ask(at);
+            if out.ahead() >= QUEUED_SECONDS || out.queued().len() >= 3 {
+                return;
+            }
+            let s = self.sentences(at.0).unwrap();
+            let r = s[at.1].clone();
+            let text = self.text(at.0, &r);
+            let key = self.speech.key(&text);
+            let path = clip_path(key);
+            if let Ok(bytes) = std::fs::read(&path) {
+                match audio::decode_mp3(bytes) {
+                    Ok((samples, rate)) => {
+                        let id = self.next_id;
+                        self.next_id += 1;
+                        out.push(id, audio::resample(&samples, rate, out.rate));
+                        self.queued.insert(
+                            id,
+                            Queued {
+                                spine: at.0,
+                                idx: at.1,
+                            },
+                        );
+                    }
+                    Err(_) => {
+                        // A damaged file: made again.
+                        let _ = std::fs::remove_file(&path);
+                        self.asked = None;
+                        return;
+                    }
+                }
+                self.cursor = Some((at.0, at.1 + 1));
+                continue;
+            }
+            if let Some(f) = self.pool.failure(key) {
+                self.error = Some(f.to_string());
+                self.cursor = None;
+                return;
+            }
+            if !self.pool.busy(key) {
+                // Lost (a stale request dropped): ask again.
+                self.asked = None;
+            }
+            return;
+        }
+    }
+
+    /// Ask for the sentence at `at` and the few after it, once per position.
+    fn ask(&mut self, at: (usize, usize)) {
+        if self
+            .asked
+            .as_ref()
+            .is_some_and(|(s, i, sp)| (*s, *i) == at && *sp == self.speech)
+        {
+            return;
+        }
+        self.asked = Some((at.0, at.1, self.speech.clone()));
+        let mut jobs = Vec::new();
+        let mut pos = Some(at);
+        while jobs.len() < AHEAD {
+            let Some(p) = pos else { break };
+            let Some(Some(p)) = self.normalise(p) else {
+                break;
+            };
+            let s = self.sentences(p.0).unwrap();
+            let text = self.text(p.0, &s[p.1]);
+            let key = self.speech.key(&text);
+            if !clip_path(key).exists() {
+                jobs.push(Job {
+                    key,
+                    text,
+                    speech: self.speech.clone(),
+                    batch: None,
+                });
+            }
+            pos = Some((p.0, p.1 + 1));
+        }
+        if !jobs.is_empty() {
+            self.pool.want(jobs);
+        }
+    }
+
+    fn publish(&mut self) {
+        let at = self.heard.and_then(|(spine, idx)| {
+            self.sentences
+                .get(&spine)
+                .and_then(|s| s.get(idx).cloned())
+                .map(|r| (spine, r))
+        });
+        let now = Now {
+            state: self.state,
+            at: if self.state == State::Stopped {
+                None
+            } else {
+                at
+            },
+            error: self.error.clone(),
+        };
+        let mut n = self.now.lock().unwrap();
+        if *n != now {
+            *n = now;
+            drop(n);
+            (self.repaint)();
+        }
+    }
+}
