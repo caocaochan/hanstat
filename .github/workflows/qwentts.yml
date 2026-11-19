@@ -1,0 +1,191 @@
+name: qwentts.cpp
+
+# Builds qwentts.cpp's tts-server (the reader's local read-aloud voice, see
+# src/reader/tts/local.rs) at a pinned commit, since upstream publishes no
+# binaries, and publishes the builds as a prerelease of this repository
+# tagged qwentts.cpp-<short sha>. src/models.rs downloads them from there,
+# pinned by SHA-256. A prerelease never becomes "latest", so the in-app
+# updater (which reads releases/latest) never sees it.
+#
+# Run by hand (Actions → qwentts.cpp → Run workflow) when moving to a new
+# commit, then update QWEN_TTS in src/models.rs with the new names, sizes and
+# hashes (each archive has a .sha256 next to it).
+#
+# Each build is one static executable: ggml linked in, OpenMP off (no
+# vcomp140.dll / libgomp), the MSVC runtime linked statically. Windows and
+# Linux use Vulkan (any GPU with a Vulkan driver; the CPU otherwise), macOS
+# Metal with the shader library embedded.
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: qwentts.cpp commit to build
+        required: true
+        default: 2edb35f87b709a070b2d5379f77e5c52a1daa585
+
+env:
+  VULKAN_SDK_VERSION: 1.4.363.0
+  COMMON_FLAGS: -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows x64 (Vulkan)
+    runs-on: windows-latest
+    steps:
+      - name: Source
+        shell: pwsh
+        run: |
+          git clone --recurse-submodules https://github.com/ServeurpersoCom/qwentts.cpp.git src
+          git -C src checkout "${{ inputs.commit }}"
+          git -C src submodule update --init --recursive
+
+      - name: Vulkan SDK
+        shell: pwsh
+        run: |
+          $v = $env:VULKAN_SDK_VERSION
+          Invoke-WebRequest "https://sdk.lunarg.com/sdk/download/$v/windows/vulkansdk-windows-X64-$v.exe" -OutFile vulkansdk.exe
+          Start-Process -Wait -FilePath .\vulkansdk.exe -ArgumentList '--root', "C:\VulkanSDK\$v", '--accept-licenses', '--default-answer', '--confirm-command', 'install'
+          "VULKAN_SDK=C:\VulkanSDK\$v" >> $env:GITHUB_ENV
+          "C:\VulkanSDK\$v\Bin" >> $env:GITHUB_PATH
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake -S src -B b -G Ninja $env:COMMON_FLAGS.Split(' ') -DGGML_VULKAN=ON -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          cmake --build b --target tts-server -j 4
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $short = "${{ inputs.commit }}".Substring(0, 7)
+          $name = "qwentts-$short-windows-x64-vulkan.zip"
+          New-Item -ItemType Directory pkg | Out-Null
+          Copy-Item b/tts-server.exe pkg/
+          Copy-Item src/LICENSE pkg/LICENSE-qwentts.cpp.txt
+          Copy-Item src/ggml/LICENSE pkg/LICENSE-ggml.txt
+          & "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -find '**\dumpbin.exe' | Select-Object -First 1 | ForEach-Object { & $_ /dependents pkg/tts-server.exe }
+          Compress-Archive -Path pkg/* -DestinationPath $name
+          $hash = (Get-FileHash $name -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name" | Out-File -Encoding ascii "$name.sha256"
+          Get-Item $name | Format-List Name, Length
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: qwentts-windows
+          path: qwentts-*.zip*
+          if-no-files-found: error
+
+  linux:
+    name: Linux x86_64 (Vulkan)
+    # The oldest supported runner: the binary needs this glibc or newer.
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Source
+        run: |
+          git clone --recurse-submodules https://github.com/ServeurpersoCom/qwentts.cpp.git src
+          git -C src checkout "${{ inputs.commit }}"
+          git -C src submodule update --init --recursive
+
+      - name: Vulkan SDK
+        run: |
+          v=$VULKAN_SDK_VERSION
+          curl -sSL --fail "https://sdk.lunarg.com/sdk/download/$v/linux/vulkansdk-linux-x86_64-$v.tar.xz" | tar xJ
+          echo "VULKAN_SDK=$PWD/$v/x86_64" >> "$GITHUB_ENV"
+          echo "$PWD/$v/x86_64/bin" >> "$GITHUB_PATH"
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build
+
+      - name: Build
+        run: |
+          cmake -S src -B b -G Ninja $COMMON_FLAGS -DGGML_VULKAN=ON
+          cmake --build b --target tts-server -j 4
+
+      - name: Package
+        run: |
+          short=$(echo "${{ inputs.commit }}" | cut -c1-7)
+          name="qwentts-$short-linux-x86_64-vulkan.tar.gz"
+          mkdir pkg
+          cp b/tts-server pkg/
+          strip pkg/tts-server
+          cp src/LICENSE pkg/LICENSE-qwentts.cpp.txt
+          cp src/ggml/LICENSE pkg/LICENSE-ggml.txt
+          ldd pkg/tts-server
+          tar -C pkg -czf "$name" .
+          sha256sum "$name" > "$name.sha256"
+          ls -l "$name"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: qwentts-linux
+          path: qwentts-*.tar.gz*
+          if-no-files-found: error
+
+  macos:
+    name: macOS arm64 (Metal)
+    runs-on: macos-latest
+    steps:
+      - name: Source
+        run: |
+          git clone --recurse-submodules https://github.com/ServeurpersoCom/qwentts.cpp.git src
+          git -C src checkout "${{ inputs.commit }}"
+          git -C src submodule update --init --recursive
+
+      - name: Build
+        run: |
+          cmake -S src -B b $COMMON_FLAGS -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0
+          cmake --build b --target tts-server -j 4
+
+      - name: Package
+        run: |
+          short=$(echo "${{ inputs.commit }}" | cut -c1-7)
+          name="qwentts-$short-macos-arm64-metal.tar.gz"
+          mkdir pkg
+          cp b/tts-server pkg/
+          strip pkg/tts-server
+          cp src/LICENSE pkg/LICENSE-qwentts.cpp.txt
+          cp src/ggml/LICENSE pkg/LICENSE-ggml.txt
+          otool -L pkg/tts-server
+          tar -C pkg -czf "$name" .
+          shasum -a 256 "$name" > "$name.sha256"
+          ls -l "$name"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: qwentts-macos
+          path: qwentts-*.tar.gz*
+          if-no-files-found: error
+
+  publish:
+    name: Publish prerelease
+    needs: [windows, linux, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          short=$(echo "${{ inputs.commit }}" | cut -c1-7)
+          tag="qwentts.cpp-$short"
+          cat > notes.md <<EOF
+          tts-server from [qwentts.cpp](https://github.com/ServeurpersoCom/qwentts.cpp) at
+          [${{ inputs.commit }}](https://github.com/ServeurpersoCom/qwentts.cpp/commit/${{ inputs.commit }}) (MIT),
+          for hanstat's local read-aloud voice. Built by
+          [this run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}):
+          Windows and Linux with Vulkan SDK $VULKAN_SDK_VERSION, macOS with Metal; static, OpenMP off.
+          Not a hanstat release: hanstat downloads these by itself.
+          EOF
+          cat dist/*.sha256
+          gh release create "$tag" dist/* --repo "${{ github.repository }}" --target "${{ github.sha }}" \
+            --title "$tag (tts-server build)" --notes-file notes.md --prerelease --latest=false
