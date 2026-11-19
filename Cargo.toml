@@ -1,6 +1,6 @@
 [package]
 name = "hanstat"
-version = "2026.1119.5"
+version = "2026.1119.6"
 edition = "2024"
 description = "Accurate character/word statistics for Chinese, Japanese and Korean EPUB and TXT files"
 license = "MIT OR Apache-2.0"
@@ -55,6 +55,7 @@ opus = "0.4.0"
 # Not on crates.io; pinned to the release tag (the 0.7 API is not yet stable).
 sudachi = { git = "https://github.com/WorksApplications/sudachi.rs", tag = "v0.7.0" }
 tar = { version = "0.4.46", default-features = false }
+tempfile = "3.27.0"
 unicode-general-category = "1.1.0"
 unicode-normalization = "0.1.26"
 unicode-script = "0.5.9"

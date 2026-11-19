@@ -910,28 +910,38 @@ impl Model {
 
     /// True if every file is present with the expected size (hash checked on download).
     pub fn is_cached(&self) -> bool {
-        let d = self.dir();
-        self.files.iter().all(|f| f.is_present(&d))
+        self.is_present_at(&self.dir())
+    }
+
+    /// Check the installed files in a caller-chosen directory.
+    pub fn is_present_at(&self, dir: &Path) -> bool {
+        self.files.iter().all(|f| f.is_present(dir))
     }
 
     /// Download any missing files. `progress(done_bytes, total_bytes)`.
     pub fn ensure(&self, progress: &dyn Fn(u64, u64)) -> Result<PathBuf, String> {
         let dir = self.dir();
-        if self.is_cached() {
-            return Ok(dir);
+        self.ensure_at(&dir, progress)?;
+        Ok(dir)
+    }
+
+    /// Download into a caller-chosen directory, using the same verified archives.
+    pub fn ensure_at(&self, dir: &Path, progress: &dyn Fn(u64, u64)) -> Result<(), String> {
+        if self.is_present_at(dir) {
+            return Ok(());
         }
         // One download at a time per process; re-check after waiting, since
         // another thread may have just finished the same files.
         let _guard = DOWNLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        if self.is_cached() {
-            return Ok(dir);
+        if self.is_present_at(dir) {
+            return Ok(());
         }
-        std::fs::create_dir_all(&dir)
+        std::fs::create_dir_all(dir)
             .map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
         let total = self.total_size();
         let mut done_before = 0u64;
         for f in self.files {
-            if f.is_present(&dir) {
+            if f.is_present(dir) {
                 done_before += f.size;
                 continue;
             }
@@ -948,12 +958,12 @@ impl Model {
             match f.unpack {
                 Unpack::Keep => {}
                 Unpack::Zip(ms) => {
-                    unpack_zip(&dest, &dir, ms)
+                    unpack_zip(&dest, dir, ms)
                         .map_err(|e| format!("Unpacking {} failed: {e}", f.name))?;
                     let _ = std::fs::remove_file(&dest);
                 }
                 Unpack::TarGz(ms) => {
-                    unpack_tar_gz(&dest, &dir, ms)
+                    unpack_tar_gz(&dest, dir, ms)
                         .map_err(|e| format!("Unpacking {} failed: {e}", f.name))?;
                     let _ = std::fs::remove_file(&dest);
                 }
@@ -961,7 +971,7 @@ impl Model {
             done_before += f.size;
         }
         progress(total, total);
-        Ok(dir)
+        Ok(())
     }
 }
 

@@ -20,6 +20,7 @@ mod render;
 mod style;
 mod tree;
 mod tts;
+pub(crate) use tts::audiobook::{Action as AudiobookAction, Audiobook};
 
 use eframe::egui::{self, Color32, Key, Pos2, Rect, RichText, Vec2, pos2, vec2};
 use epub::Epub;
@@ -179,6 +180,8 @@ pub struct Reader {
     book_id: String,
     traditional: bool,
     settings: Settings,
+    /// Settings to keep on disk when opened with the audiobook's voice.
+    session_tts_default: Option<tts::TtsSettings>,
     /// Chapters built by the worker, by spine index.
     chapters: Arc<Mutex<Vec<Option<Arc<Chapter>>>>>,
     want: Arc<AtomicUsize>,
@@ -237,16 +240,46 @@ impl Reader {
         traditional: bool,
         ctx: &egui::Context,
     ) -> Result<Reader, String> {
+        Self::open_at(path, book_id, traditional, None, ctx)
+    }
+
+    fn open_with_voice(
+        path: &Path,
+        book_id: &str,
+        traditional: bool,
+        spine: usize,
+        speech: &tts::Speech,
+        ctx: &egui::Context,
+    ) -> Result<Reader, String> {
+        Self::open_at(path, Some(book_id), traditional, Some((spine, speech)), ctx)
+    }
+
+    fn open_at(
+        path: &Path,
+        book_id: Option<&str>,
+        traditional: bool,
+        start: Option<(usize, &tts::Speech)>,
+        ctx: &egui::Context,
+    ) -> Result<Reader, String> {
         let epub = Arc::new(Epub::open(path)?);
-        let settings = Settings::load();
+        let mut settings = Settings::load();
         let book_id = book_id
             .map(str::to_owned)
             .unwrap_or_else(|| path.display().to_string());
-        let pos = settings
-            .positions
-            .get(&book_id)
-            .copied()
-            .unwrap_or_default();
+        let (pos, session_tts_default) = if let Some((spine, speech)) = start {
+            let previous = settings.tts.clone();
+            settings.tts.use_speech(speech, traditional);
+            (Position { spine, offset: 0 }, Some(previous))
+        } else {
+            (
+                settings
+                    .positions
+                    .get(&book_id)
+                    .copied()
+                    .unwrap_or_default(),
+                None,
+            )
+        };
         let spine = pos.spine.min(epub.spine.len() - 1);
         let n = epub.spine.len();
         let chapters = Arc::new(Mutex::new(vec![None; n]));
@@ -293,19 +326,9 @@ impl Reader {
                 .map_err(|e| e.to_string())?;
         }
         let toc_labels = toc_labels(&epub.toc);
-        // Each chapter's first entry in the table of contents, for the
-        // "Generate locally" window's list.
-        let mut spine_labels = vec![String::new(); n];
-        for (e, label) in epub.toc.iter().zip(&toc_labels) {
-            if let Some(l) = spine_labels.get_mut(e.spine)
-                && l.is_empty()
-            {
-                *l = label.trim().to_owned();
-            }
-        }
         let tts = tts::Tts::new(
             chapters.clone(),
-            spine_labels,
+            chapter_labels(&epub, &toc_labels),
             traditional,
             &epub.title,
             &book_id,
@@ -330,6 +353,7 @@ impl Reader {
             book_id,
             traditional,
             settings,
+            session_tts_default,
             chapters,
             want,
             stop,
@@ -382,7 +406,16 @@ impl Reader {
                 offset: self.offset,
             },
         );
-        if let Err(e) = self.settings.save() {
+        let result = if let Some(default) = &self.session_tts_default {
+            Settings {
+                tts: default.clone(),
+                ..self.settings.clone()
+            }
+            .save()
+        } else {
+            self.settings.save()
+        };
+        if let Err(e) = result {
             self.error = Some(e);
         }
     }
@@ -1348,6 +1381,19 @@ fn group_digits(n: usize) -> String {
 /// The table of contents' labels, numbered in front by position at their level when
 /// the book gives several entries the same name (some JJWXC books title every
 /// chapter alike: 偷偷, 偷偷, …), so they can be told apart.
+/// The first table-of-contents title for each reader chapter.
+fn chapter_labels(epub: &Epub, toc_labels: &[String]) -> Vec<String> {
+    let mut labels = vec![String::new(); epub.spine.len()];
+    for (entry, label) in epub.toc.iter().zip(toc_labels) {
+        if let Some(current) = labels.get_mut(entry.spine)
+            && current.is_empty()
+        {
+            *current = label.trim().to_owned();
+        }
+    }
+    labels
+}
+
 fn toc_labels(toc: &[epub::TocEntry]) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let repeats = toc.iter().any(|e| !seen.insert(e.label.as_str()));

@@ -16,7 +16,7 @@ use super::{Speech, clip_path, local, opus, saved_clip, sentence_at, sentences};
 use crate::reader::tree::Chapter;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
@@ -24,6 +24,24 @@ use std::time::{Duration, Instant};
 
 pub type Chapters = Arc<Mutex<Vec<Option<Arc<Chapter>>>>>;
 pub type Repaint = Arc<dyn Fn() + Send + Sync>;
+
+pub(super) struct Sentence {
+    pub text: String,
+    para: usize,
+}
+
+pub(super) fn chapter_sentences(chars: &[char]) -> Vec<Sentence> {
+    let ranges = sentences(chars);
+    let paragraphs = local::paragraphs(chars, &ranges);
+    ranges
+        .into_iter()
+        .zip(paragraphs)
+        .map(|(r, para)| Sentence {
+            text: chars[r.start as usize..r.end as usize].iter().collect(),
+            para,
+        })
+        .collect()
+}
 
 /// Requests to Azure at once.
 const WORKERS: usize = 4;
@@ -122,6 +140,7 @@ struct PoolInner {
 /// Workers asking Azure for sentences.
 pub struct Pool {
     inner: Arc<PoolInner>,
+    workers: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl Pool {
@@ -136,13 +155,57 @@ impl Pool {
             stop: AtomicBool::new(false),
             repaint,
         });
+        let mut workers = Vec::new();
         for i in 0..WORKERS {
             let inner = inner.clone();
-            let _ = std::thread::Builder::new()
+            if let Ok(worker) = std::thread::Builder::new()
                 .name(format!("tts-{i}"))
-                .spawn(move || worker(&inner));
+                .spawn(move || worker(&inner))
+            {
+                workers.push(worker);
+            }
         }
-        Pool { inner }
+        Pool { inner, workers }
+    }
+
+    pub(super) fn generate(
+        chapters: impl IntoIterator<Item = impl AsRef<[Sentence]>>,
+        dir: &Path,
+        speech: &Speech,
+        client: Option<Arc<Azure>>,
+        batch: &Arc<Batch>,
+        repaint: Repaint,
+    ) -> Result<(), String> {
+        let mut pool = Self::new(repaint.clone());
+        if pool.workers.is_empty() {
+            return Err("Cannot start the speech workers".into());
+        }
+        pool.set_client(client);
+        for chapter in chapters {
+            if batch.cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            pool.inner
+                .queue_chapter(chapter.as_ref(), dir, speech, batch);
+            repaint();
+        }
+        batch.listed.store(true, Ordering::Relaxed);
+        repaint();
+        while !batch.finished() && !batch.cancel.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Stop the queue, then let in-flight requests save any clips they
+        // obtained before allowing a retry of the export.
+        pool.stop();
+        for worker in pool.workers.drain(..) {
+            worker
+                .join()
+                .map_err(|_| "A speech worker stopped unexpectedly.")?;
+        }
+        if let Some(error) = batch.error.lock().unwrap().clone() {
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn set_client(&self, c: Option<Arc<Azure>>) {
@@ -195,9 +258,69 @@ impl Pool {
     fn busy(&self, key: u64) -> bool {
         self.inner.state.lock().unwrap().busy.contains(&key)
     }
+
+    fn stop(&self) {
+        let _state = self.inner.state.lock().unwrap();
+        self.inner.stop.store(true, Ordering::Relaxed);
+        self.inner.cv.notify_all();
+    }
 }
 
 impl PoolInner {
+    fn queue_chapter(
+        &self,
+        sentences: &[Sentence],
+        dir: &Path,
+        speech: &Speech,
+        batch: &Arc<Batch>,
+    ) {
+        let clips: Vec<Clip> = sentences
+            .iter()
+            .map(|sentence| {
+                let key = speech.key(&sentence.text);
+                let save = saved_clip(dir, key, speech.ext()).is_none();
+                batch.total.fetch_add(1, Ordering::Relaxed);
+                if save {
+                    batch.billed.fetch_add(
+                        azure::billed(&sentence.text, speech.rate),
+                        Ordering::Relaxed,
+                    );
+                } else {
+                    batch.cached.fetch_add(1, Ordering::Relaxed);
+                }
+                Clip {
+                    key,
+                    path: clip_path(dir, key, speech.ext()),
+                    text: sentence.text.clone(),
+                    para: sentence.para,
+                    save,
+                }
+            })
+            .collect();
+        // A sentence per Azure request. Local requests include saved
+        // sentences for context and write just the missing ones.
+        let groups = match &speech.local {
+            None => (0..clips.len()).map(|i| i..i + 1).collect(),
+            Some(l) => {
+                let lengths: Vec<_> = clips.iter().map(|c| c.text.chars().count()).collect();
+                let paragraphs: Vec<_> = clips.iter().map(|c| c.para).collect();
+                local::chunks(&lengths, &paragraphs, 0, |_| l.chunk_chars, usize::MAX)
+            }
+        };
+        self.background(
+            groups
+                .into_iter()
+                .filter(|g| clips[g.clone()].iter().any(|c| c.save))
+                .map(|g| Job {
+                    lead: speech.local.as_ref().and_then(|_| lead(&clips, g.start)),
+                    clips: clips[g].to_vec(),
+                    speech: speech.clone(),
+                    batch: Some(batch.clone()),
+                })
+                .collect(),
+        );
+    }
+
     fn background(&self, jobs: Vec<Job>) {
         let mut s = self.state.lock().unwrap();
         for mut j in jobs {
@@ -221,8 +344,7 @@ impl PoolInner {
 
 impl Drop for Pool {
     fn drop(&mut self) {
-        self.inner.stop.store(true, Ordering::Relaxed);
-        self.inner.cv.notify_all();
+        self.stop();
     }
 }
 
@@ -258,17 +380,7 @@ fn worker(p: &PoolInner) {
             continue;
         }
         let count = job.saving().count();
-        let result = if job.saving().all(|c| c.path.exists()) {
-            Ok(())
-        } else if let Some(l) = &job.speech.local {
-            make_local(l, &job)
-        } else {
-            let client = p.client.lock().unwrap().clone();
-            match client {
-                None => Err(Fail::Refused("Add your Azure key first".to_owned())),
-                Some(c) => make(&c, &job.clips[0], &job.speech),
-            }
-        };
+        let result = make_job(p, &job);
         let mut s = p.state.lock().unwrap();
         match result {
             Err(Fail::Throttled(after)) => {
@@ -293,11 +405,11 @@ fn worker(p: &PoolInner) {
             }
             Err(e) => {
                 if let Some(b) = &job.batch {
-                    b.failed.fetch_add(count, Ordering::Relaxed);
                     let mut err = b.error.lock().unwrap();
                     if err.is_none() {
                         *err = Some(e.to_string());
                     }
+                    b.failed.fetch_add(count, Ordering::Relaxed);
                     // A refused key fails every sentence: stop.
                     if matches!(e, Fail::Refused(_)) {
                         b.cancel.store(true, Ordering::Relaxed);
@@ -313,6 +425,26 @@ fn worker(p: &PoolInner) {
         }
         drop(s);
         (p.repaint)();
+    }
+}
+
+fn make_job(p: &PoolInner, job: &Job) -> Result<(), Fail> {
+    let Some(clip) = job.saving().find(|c| !c.path.exists()) else {
+        return Ok(());
+    };
+    let azure = p.client.lock().unwrap().clone();
+    if job.speech.local.is_none() && azure.is_none() {
+        return Err(Fail::Refused("Add your Azure key first".to_owned()));
+    }
+    if let Some(dir) = clip.path.parent() {
+        job.speech
+            .record(dir)
+            .map_err(|e| Fail::Other(format!("Cannot save the speech profile: {e}")))?;
+    }
+    if let Some(local) = &job.speech.local {
+        make_local(local, job)
+    } else {
+        make(azure.as_ref().unwrap(), clip, &job.speech)
     }
 }
 
@@ -357,14 +489,14 @@ fn lead(clips: &[Clip], start: usize) -> Option<local::Lead> {
 }
 
 /// Write `bytes` to `path` (via a temporary name: a clip is whole or absent).
-fn save(path: &std::path::Path, bytes: &[u8]) -> Result<(), Fail> {
+fn save(path: &Path, bytes: &[u8]) -> Result<(), Fail> {
     let save = || -> std::io::Result<()> {
-        if let Some(d) = path.parent() {
-            std::fs::create_dir_all(d)?;
-        }
-        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-        std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, path)
+        use std::io::Write;
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(dir)?;
+        let mut file = tempfile::NamedTempFile::new_in(dir)?;
+        file.write_all(bytes)?;
+        super::persist_clip(file, path)
     };
     save().map_err(|e| Fail::Other(format!("The audio can't be saved: {e}")))
 }
@@ -381,7 +513,16 @@ pub enum Cmd {
     Stop,
     Speech(Speech),
     Client(Option<Arc<Azure>>),
+    Availability(Availability),
     Pregenerate(Vec<usize>, Arc<Batch>),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Availability {
+    #[default]
+    Waiting,
+    Ready,
+    Setup(String),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -401,6 +542,7 @@ pub struct Now {
     /// The sentence heard (or waited for): chapter and its characters.
     pub at: Option<(usize, Range<u32>)>,
     pub error: Option<String>,
+    pub needs_setup: bool,
 }
 
 pub struct Engine {
@@ -463,6 +605,8 @@ struct Player {
     /// The cursor the urgent requests were made for.
     asked: Option<(usize, usize, Speech)>,
     error: Option<String>,
+    availability: Availability,
+    needs_setup: bool,
     sentences: HashMap<usize, Arc<Vec<Range<u32>>>>,
     paras: HashMap<usize, Arc<Vec<usize>>>,
     /// Stopped: the device closes at this time, once the sound faded out.
@@ -493,6 +637,8 @@ impl Player {
             heard: None,
             asked: None,
             error: None,
+            availability: Availability::Waiting,
+            needs_setup: false,
             sentences: HashMap::new(),
             paras: HashMap::new(),
             closing: None,
@@ -615,6 +761,7 @@ impl Player {
         match c {
             Cmd::Play { spine, src } => {
                 self.error = None;
+                self.needs_setup = false;
                 self.closing = None;
                 if !self.open_output() {
                     return;
@@ -669,6 +816,7 @@ impl Player {
                 self.cursor = None;
                 self.heard = None;
                 self.asked = None;
+                self.needs_setup = false;
                 self.state = State::Stopped;
             }
             Cmd::Speech(s) => {
@@ -693,6 +841,10 @@ impl Player {
             }
             Cmd::Client(c) => {
                 self.pool.set_client(c);
+                self.asked = None;
+            }
+            Cmd::Availability(availability) => {
+                self.availability = availability;
                 self.asked = None;
             }
             Cmd::Pregenerate(spines, batch) => self.pregenerate(spines, batch),
@@ -723,55 +875,7 @@ impl Player {
                         std::thread::sleep(Duration::from_millis(50));
                     };
                     let Some(ch) = ch else { break };
-                    let sents = sentences(&ch.chars);
-                    let paras = local::paragraphs(&ch.chars, &sents);
-                    let clips: Vec<Clip> = sents
-                        .iter()
-                        .zip(&paras)
-                        .map(|(r, &para)| {
-                            let text: String =
-                                ch.chars[r.start as usize..r.end as usize].iter().collect();
-                            let key = speech.key(&text);
-                            let save = saved_clip(&dir, key, speech.ext()).is_none();
-                            batch.total.fetch_add(1, Ordering::Relaxed);
-                            if save {
-                                batch.billed.fetch_add(
-                                    azure::billed(&text, speech.rate),
-                                    Ordering::Relaxed,
-                                );
-                            } else {
-                                batch.cached.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Clip {
-                                key,
-                                path: clip_path(&dir, key, speech.ext()),
-                                text,
-                                para,
-                                save,
-                            }
-                        })
-                        .collect();
-                    // A sentence each (Azure), or chunks of whole paragraphs
-                    // (the local voice: saved sentences stay in their chunk
-                    // for the flow, and aren't made again).
-                    let groups = match &speech.local {
-                        None => (0..clips.len()).map(|i| i..i + 1).collect(),
-                        Some(l) => {
-                            let lens: Vec<usize> = sents.iter().map(|r| r.len()).collect();
-                            local::chunks(&lens, &paras, 0, |_| l.chunk_chars, usize::MAX)
-                        }
-                    };
-                    let jobs: Vec<Job> = groups
-                        .into_iter()
-                        .map(|g| Job {
-                            lead: speech.local.as_ref().and_then(|_| lead(&clips, g.start)),
-                            clips: clips[g].to_vec(),
-                            speech: speech.clone(),
-                            batch: Some(batch.clone()),
-                        })
-                        .filter(|j| j.saving().next().is_some())
-                        .collect();
-                    pool.background(jobs);
+                    pool.queue_chapter(&chapter_sentences(&ch.chars), &dir, &speech, &batch);
                     repaint();
                 }
                 batch.listed.store(true, Ordering::Relaxed);
@@ -866,7 +970,9 @@ impl Player {
                 // Nothing playing: the sentence waited for is shown.
                 self.heard = Some(at);
             }
-            self.ask(at);
+            if self.availability == Availability::Ready && !self.pool.workers.is_empty() {
+                self.ask(at);
+            }
             if out.ahead() >= QUEUED_SECONDS || out.queued().len() >= 3 {
                 return;
             }
@@ -878,12 +984,7 @@ impl Player {
             if let Some(path) = &saved
                 && let Ok(bytes) = std::fs::read(path)
             {
-                let decoded = if self.speech.local.is_some() {
-                    opus::decode(bytes)
-                } else {
-                    audio::decode_mp3(bytes)
-                };
-                match decoded {
+                match self.speech.decode(bytes) {
                     Ok((samples, rate)) => {
                         let id = self.next_id;
                         self.next_id += 1;
@@ -905,6 +1006,21 @@ impl Player {
                 }
                 self.cursor = Some((at.0, at.1 + 1));
                 continue;
+            }
+            match &self.availability {
+                Availability::Waiting => return,
+                Availability::Ready if self.pool.workers.is_empty() => {
+                    self.error = Some("Cannot start the speech workers".into());
+                    self.cursor = None;
+                    return;
+                }
+                Availability::Ready => {}
+                Availability::Setup(note) => {
+                    self.error = Some(note.clone());
+                    self.cursor = None;
+                    self.needs_setup = true;
+                    return;
+                }
             }
             if let Some(f) = self.pool.failure(key) {
                 self.error = Some(f.to_string());
@@ -1070,6 +1186,7 @@ impl Player {
                 at
             },
             error: self.error.clone(),
+            needs_setup: self.needs_setup && self.state == State::Stopped,
         };
         let mut n = self.now.lock().unwrap();
         if *n != now {

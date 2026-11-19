@@ -2328,7 +2328,7 @@ dependencies = [
 
 [[package]]
 name = "hanstat"
-version = "2026.1119.5"
+version = "2026.1119.6"
 dependencies = [
  "aho-corasick",
  "candle-core",
@@ -2364,6 +2364,7 @@ dependencies = [
  "sudachi",
  "symphonia",
  "tar",
+ "tempfile",
  "unicode-general-category",
  "unicode-normalization",
  "unicode-script",

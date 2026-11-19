@@ -1,5 +1,12 @@
 # Changelog
 
+## [2026.11.19.06] - 2026-11-19
+
+### Added
+- **Export audiobook.** Choose **Export audiobook…** beside **Read** on a Chinese EPUB’s Overview. Select chapters and save a chaptered M4B or Opus file with optional sentence-timed SRT subtitles. Both formats embed the EPUB cover when available, scaling its longest edge down to 2,048 pixels if needed.
+- **Reuse saved speech.** The exporter picks the voice with the most complete selected chapters and generates any missing audio in that voice. With an empty cache, choose an Azure voice, a local preset or a saved local voice. **Open in Reader** uses the export voice for the session and plays saved audio with sentence highlighting, including offline playback.
+- **FFmpeg setup.** The exporter uses FFmpeg on PATH when available. On Windows, the dialog can download a checksum-verified copy into hanstat’s app data. On macOS and Linux, put your installed FFmpeg on hanstat’s PATH.
+
 ## [2026.11.19.05] - 2026-11-19
 
 ### Added

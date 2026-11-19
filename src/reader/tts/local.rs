@@ -1092,8 +1092,8 @@ fn request_body(
     body
 }
 
-/// The server takes standard padded base64 for the reference WAV.
-fn base64(bytes: &[u8]) -> String {
+/// Standard padded base64, also used for artwork in Ogg Opus.
+pub(super) fn base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let digit = |n| char::from(ALPHABET[n as usize]);
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);

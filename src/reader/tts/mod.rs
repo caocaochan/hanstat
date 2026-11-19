@@ -14,6 +14,7 @@
 //! - [`audio`]: decoding and the sound device; [`engine`]: the threads.
 
 pub mod audio;
+pub(in crate::reader) mod audiobook;
 pub mod azure;
 mod engine;
 pub mod key;
@@ -25,7 +26,7 @@ use crate::reader::tree::Chapter;
 use eframe::egui::{self, Color32, RichText};
 #[cfg(test)]
 pub use engine::State as PlayState;
-use engine::{Batch, Chapters, Cmd, Engine, Now, Repaint, State};
+use engine::{Availability, Batch, Chapters, Cmd, Engine, Now, Repaint, State};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -88,10 +89,40 @@ impl TtsSettings {
             v.clone()
         }
     }
+
+    fn speech(&self, source: Source, traditional: bool) -> Speech {
+        match source {
+            Source::Azure => Speech {
+                voice: self.voice(traditional),
+                rate: self.rate,
+                local: None,
+            },
+            Source::Local => Speech {
+                voice: String::new(),
+                rate: 0,
+                local: Some(self.local.clone()),
+            },
+        }
+    }
+
+    pub(super) fn use_speech(&mut self, speech: &Speech, traditional: bool) {
+        if let Some(local) = &speech.local {
+            self.source = Source::Local;
+            self.local = local.clone();
+        } else {
+            self.source = Source::Azure;
+            self.rate = speech.rate;
+            if traditional {
+                self.voice_trad = speech.voice.clone();
+            } else {
+                self.voice = speech.voice.clone();
+            }
+        }
+    }
 }
 
 /// How sentences are read: a clip made with one is not used for another.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Speech {
     pub voice: String,
     pub rate: i32,
@@ -117,6 +148,35 @@ impl Speech {
     /// Its clips' file extension.
     pub fn ext(&self) -> &'static str {
         if self.local.is_some() { OPUS } else { MP3 }
+    }
+
+    /// Save settings separately from the clips, whose names are one-way hashes.
+    fn record(&self, dir: &Path) -> std::io::Result<()> {
+        let profiles = dir.join("profiles");
+        let path = profiles.join(format!("{:016x}.json", self.key("")));
+        if path.is_file() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&profiles)?;
+        let mut file = tempfile::NamedTempFile::new_in(profiles)?;
+        serde_json::to_writer(&mut file, self)?;
+        persist_clip(file, &path)
+    }
+
+    fn decode(&self, bytes: Vec<u8>) -> Result<(Vec<f32>, u32), String> {
+        if self.local.is_some() {
+            opus::decode(bytes)
+        } else {
+            audio::decode_mp3(bytes)
+        }
+    }
+}
+
+fn persist_clip(file: tempfile::NamedTempFile, path: &Path) -> std::io::Result<()> {
+    match file.persist_noclobber(path) {
+        Ok(_) => Ok(()),
+        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists && path.is_file() => Ok(()),
+        Err(e) => Err(e.error),
     }
 }
 
@@ -187,7 +247,7 @@ pub fn saved_clip(dir: &Path, key: u64, ext: &str) -> Option<PathBuf> {
     if !old.exists() {
         return None;
     }
-    if std::fs::create_dir_all(dir).is_ok() && std::fs::rename(&old, &p).is_ok() {
+    if (std::fs::create_dir_all(dir).is_ok() && std::fs::rename(&old, &p).is_ok()) || p.exists() {
         Some(p)
     } else {
         Some(old)
@@ -374,8 +434,7 @@ pub struct Tts {
     /// What the engine was last told.
     sent_speech: Option<Speech>,
     sent_client: Option<(String, String)>,
-    /// Read when the key is known (asked before it was loaded).
-    pending: Option<(usize, u32)>,
+    sent_availability: Availability,
     batch: Option<Arc<Batch>>,
     /// This book's folder of saved audio.
     dir: PathBuf,
@@ -431,7 +490,7 @@ impl Tts {
             voices_region: String::new(),
             sent_speech: None,
             sent_client: None,
-            pending: None,
+            sent_availability: Availability::Waiting,
             batch: None,
             cache_size: None,
             cache_job: None,
@@ -450,18 +509,7 @@ impl Tts {
     }
 
     fn speech(&self, s: &TtsSettings) -> Speech {
-        match s.source {
-            Source::Azure => Speech {
-                voice: s.voice(self.traditional),
-                rate: s.rate,
-                local: None,
-            },
-            Source::Local => Speech {
-                voice: String::new(),
-                rate: 0,
-                local: Some(s.local.clone()),
-            },
-        }
+        s.speech(s.source, self.traditional)
     }
 
     fn the_key(&self) -> Option<&str> {
@@ -495,6 +543,7 @@ impl Tts {
             ));
             self.sent_speech = Some(self.speech(s));
             self.sent_client = None;
+            self.sent_availability = Availability::Waiting;
         }
         self.engine.as_ref().unwrap()
     }
@@ -541,7 +590,11 @@ impl Tts {
             self.cache_job = None;
         }
         let Some(engine) = &self.engine else { return };
-        self.now = engine.now();
+        let now = engine.now();
+        if now.needs_setup && !self.now.needs_setup {
+            self.panel_open = true;
+        }
+        self.now = now;
         let speech = self.speech(s);
         if self.sent_speech.as_ref() != Some(&speech) {
             engine.send(Cmd::Speech(speech.clone()));
@@ -549,6 +602,7 @@ impl Tts {
         }
         let client = self
             .the_key()
+            .filter(|_| azure::valid_region(s.region.trim()))
             .map(|k| (s.region.trim().to_owned(), k.to_owned()));
         if client != self.sent_client {
             engine.send(Cmd::Client(
@@ -558,24 +612,26 @@ impl Tts {
             ));
             self.sent_client = client;
         }
-        if self.pending.is_some()
-            && s.source == Source::Azure
-            && matches!(self.key, KeyState::Loaded(_))
-        {
-            let pending = self.pending.take();
-            if self.client_ready(s) {
-                if let (Some((spine, src)), Some(engine)) = (pending, &self.engine) {
-                    engine.send(Cmd::Play { spine, src });
-                    // Shown as loading until the player answers.
-                    self.now.state = State::Loading;
+        let availability = if self.client_ready(s) {
+            Availability::Ready
+        } else {
+            match s.source {
+                Source::Azure if matches!(self.key, KeyState::Loading(_) | KeyState::Unknown) => {
+                    Availability::Waiting
                 }
-            } else {
-                self.panel_open = true;
-                self.key_note = Some((
-                    false,
-                    "Add your Azure Speech key and its region to read aloud.".to_owned(),
-                ));
+                Source::Azure => Availability::Setup(
+                    "Add your Azure Speech key and region to generate the next sentence.".into(),
+                ),
+                Source::Local if self.design_making() => Availability::Waiting,
+                Source::Local if s.local.designed.is_some() => {
+                    Availability::Setup(local::DESIGN_NOT_DOWNLOADED.into())
+                }
+                Source::Local => Availability::Setup(local::NOT_DOWNLOADED.into()),
             }
+        };
+        if self.sent_availability != availability {
+            engine.send(Cmd::Availability(availability.clone()));
+            self.sent_availability = availability;
         }
     }
 
@@ -587,11 +643,7 @@ impl Tts {
     }
 
     pub fn state(&self) -> State {
-        if self.pending.is_some() {
-            State::Loading
-        } else {
-            self.now.state
-        }
+        self.now.state
     }
 
     #[cfg(test)]
@@ -612,50 +664,20 @@ impl Tts {
     /// Read from the sentence holding character `src` of chapter `spine`.
     pub fn play_from(&mut self, spine: usize, src: u32, s: &TtsSettings) {
         self.paused_by_popup = false;
-        if s.source == Source::Local {
-            self.last_visible = true;
-            self.last_at = None;
-            self.pending = None;
-            if self.design_making() {
-                return;
-            }
-            if !self.local.downloaded(&s.local) {
-                self.panel_open = true;
-                let note = if s.local.designed.is_some() {
-                    local::DESIGN_NOT_DOWNLOADED
-                } else {
-                    local::NOT_DOWNLOADED
-                };
-                self.key_note = Some((false, note.to_owned()));
-                return;
-            }
+        if s.source == Source::Azure {
+            self.load_key();
+        } else {
             self.stop_preview();
-            self.engine(s);
-            // The engine knows the current settings before it plays.
-            self.poll(s);
-            if let Some(e) = &self.engine {
-                e.send(Cmd::Play { spine, src });
-            }
-            self.now.state = State::Loading;
-            return;
         }
-        self.load_key();
         self.engine(s);
         self.last_visible = true;
         self.last_at = None;
-        if !matches!(self.key, KeyState::Loading(_)) && !self.client_ready(s) {
-            // Nothing to read with yet: the panel says what is missing.
-            self.panel_open = true;
-            self.pending = None;
-            self.key_note = Some((
-                false,
-                "Add your Azure Speech key and its region to read aloud.".to_owned(),
-            ));
-            return;
-        }
-        // Sent once the key is loaded and the engine knows it.
-        self.pending = Some((spine, src));
         self.poll(s);
+        if let Some(e) = &self.engine {
+            e.send(Cmd::Play { spine, src });
+        }
+        self.now.state = State::Loading;
+        self.now.needs_setup = false;
     }
 
     /// Once a frame, with whether the dictionary popup is open: it pauses
@@ -695,13 +717,13 @@ impl Tts {
     }
 
     pub fn stop(&mut self) {
-        self.pending = None;
         self.paused_by_popup = false;
         if let Some(e) = &self.engine {
             e.send(Cmd::Stop);
         }
         self.now.state = State::Stopped;
         self.now.at = None;
+        self.now.needs_setup = false;
     }
 
     fn fetch_voices(&mut self, s: &TtsSettings, refresh: bool) {
@@ -929,11 +951,7 @@ impl Tts {
                 ui.horizontal(|ui| {
                     match self.state() {
                         State::Stopped => {
-                            let can = match s.source {
-                                Source::Azure => ready || matches!(self.key, KeyState::Loading(_) | KeyState::Unknown),
-                                Source::Local => ready,
-                            };
-                            if ui.add_enabled(can, egui::Button::new("Read from this page")).clicked() {
+                            if ui.button("Read from this page").clicked() {
                                 action = Some(Action::PlayPage);
                             }
                         }

@@ -636,6 +636,7 @@ struct App {
     whats_new: Option<whats_new::WhatsNew>,
     /// The book open in the reader, which then fills the window.
     reader: Option<reader::Reader>,
+    audiobook: Option<reader::Audiobook>,
 }
 
 /// The floating windows, which the Close-window shortcut closes.
@@ -1274,6 +1275,7 @@ impl Default for App {
             window_stack: Vec::new(),
             whats_new: None,
             reader: None,
+            audiobook: None,
         }
     }
 }
@@ -2864,7 +2866,7 @@ impl eframe::App for App {
                 .filter(|p| !p.as_os_str().is_empty())
                 .collect()
         });
-        if self.reader.is_none() && !dropped.is_empty() {
+        if self.reader.is_none() && self.audiobook.is_none() && !dropped.is_empty() {
             self.open_files(dropped, &ctx);
         }
         // The reader fills the window while a book is open in it.
@@ -2877,7 +2879,9 @@ impl eframe::App for App {
             }
             return;
         }
-        self.handle_shortcuts(&ctx);
+        if self.audiobook.is_none() {
+            self.handle_shortcuts(&ctx);
+        }
 
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.add_space(4.0);
@@ -3264,6 +3268,16 @@ impl eframe::App for App {
             && !whats_new::window(&ctx, w)
         {
             self.whats_new = None;
+        }
+        if let Some(mut dialog) = self.audiobook.take() {
+            match dialog.show(&ctx) {
+                reader::AudiobookAction::Keep => self.audiobook = Some(dialog),
+                reader::AudiobookAction::Close => {}
+                reader::AudiobookAction::Read(reading) => match reading.open(&ctx) {
+                    Ok(reader) => self.reader = Some(reader),
+                    Err(error) => self.set_error("reader", error),
+                },
+            }
         }
         // Asked for but not drawn (no filter shown): not kept for later.
         self.focus_filter = false;
@@ -4354,8 +4368,10 @@ impl App {
             .map_or(0.0, |id| self.style_offset(id));
         let skip_hapax = self.settings.skip_hapax;
         let image_busy = self.image_busy();
+        let traditional_variant = r.variant == Variant::Traditional;
         let mut save_image = false;
         let mut read_book = false;
+        let mut export_audiobook = false;
         let out = egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             // The title, wrapped clear of the image button at the right.
             ui.horizontal_top(|ui| {
@@ -4369,6 +4385,9 @@ impl App {
                             read_book = ui
                                 .button(RichText::new("📕 Read").size(15.0))
                                 .on_hover_text("Read the book, with its layout and pictures")
+                                .clicked();
+                            export_audiobook = ui
+                                .button(RichText::new("Export audiobook…").size(15.0))
                                 .clicked();
                         }
                     });
@@ -4831,6 +4850,16 @@ impl App {
         let ctx = ui.ctx().clone();
         if save_image {
             self.export_image(&ctx, png_report::ImageExport::Book);
+        }
+        if export_audiobook && let Some(path) = self.path.clone() {
+            let cover = self.book.as_ref().and_then(|book| book.cover.clone());
+            self.audiobook = Some(reader::Audiobook::new(
+                path,
+                self.report_id.as_deref(),
+                traditional_variant,
+                cover,
+                &ctx,
+            ));
         }
         if read_book && let Some(path) = self.path.clone() {
             let traditional = self
