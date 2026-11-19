@@ -72,7 +72,8 @@ jobs:
           & "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -find '**\dumpbin.exe' | Select-Object -First 1 | ForEach-Object { & $_ /dependents pkg/tts-server.exe }
           Compress-Archive -Path pkg/* -DestinationPath $name
           $hash = (Get-FileHash $name -Algorithm SHA256).Hash.ToLower()
-          "$hash  $name" | Out-File -Encoding ascii "$name.sha256"
+          # LF, as sha256sum -c expects.
+          [IO.File]::WriteAllText("$PWD/$name.sha256", "$hash  $name`n")
           Get-Item $name | Format-List Name, Length
 
       - uses: actions/upload-artifact@v7

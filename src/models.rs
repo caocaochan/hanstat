@@ -440,6 +440,159 @@ pub const STYLE_LLM: Model = Model {
     }],
 };
 
+macro_rules! qwentts_url {
+    ($f:literal) => {
+        concat!(
+            "https://github.com/caocaochan/hanstat/releases/download/qwentts.cpp-2edb35f/",
+            $f
+        )
+    };
+}
+
+/// qwentts.cpp's `tts-server` at commit 2edb35f, which runs
+/// [`QWEN_TTS_MODEL`] for the reader's local read-aloud voice. Upstream
+/// publishes no binaries: hanstat's `.github/workflows/qwentts.yml` builds
+/// them (one static executable each: Vulkan on Windows and Linux, Metal on
+/// macOS) into a prerelease of this repository. Downloaded only when the
+/// user asks for the local voice.
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod qwentts_bin {
+    use super::*;
+    pub const SERVER: Option<&str> = Some("tts-server.exe");
+    pub const FILES: &[ModelFile] = &[ModelFile {
+        name: "qwentts-2edb35f-windows-x64-vulkan.zip",
+        url: qwentts_url!("qwentts-2edb35f-windows-x64-vulkan.zip"),
+        sha256: "bf9e9785bb8690c00e2426a69926293773e9aab4571d01bd7d603d1beb57cda9",
+        size: 14_012_224,
+        unpack: Unpack::Zip(&[
+            Member {
+                path: "tts-server.exe",
+                name: "tts-server.exe",
+                size: 44_676_608,
+            },
+            Member {
+                path: "LICENSE-qwentts.cpp.txt",
+                name: "LICENSE-qwentts.cpp.txt",
+                size: 1_087,
+            },
+            Member {
+                path: "LICENSE-ggml.txt",
+                name: "LICENSE-ggml.txt",
+                size: 1_099,
+            },
+        ]),
+    }];
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod qwentts_bin {
+    use super::*;
+    pub const SERVER: Option<&str> = Some("tts-server");
+    pub const FILES: &[ModelFile] = &[ModelFile {
+        name: "qwentts-2edb35f-linux-x86_64-vulkan.tar.gz",
+        url: qwentts_url!("qwentts-2edb35f-linux-x86_64-vulkan.tar.gz"),
+        sha256: "9b6b4924f94ba46a447319f2a702a5c17de507dc899c51add3576779daeb2a39",
+        size: 14_547_505,
+        unpack: Unpack::TarGz(&[
+            Member {
+                path: "tts-server",
+                name: "tts-server",
+                size: 45_806_272,
+            },
+            Member {
+                path: "LICENSE-qwentts.cpp.txt",
+                name: "LICENSE-qwentts.cpp.txt",
+                size: 1_087,
+            },
+            Member {
+                path: "LICENSE-ggml.txt",
+                name: "LICENSE-ggml.txt",
+                size: 1_078,
+            },
+        ]),
+    }];
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod qwentts_bin {
+    use super::*;
+    pub const SERVER: Option<&str> = Some("tts-server");
+    pub const FILES: &[ModelFile] = &[ModelFile {
+        name: "qwentts-2edb35f-macos-arm64-metal.tar.gz",
+        url: qwentts_url!("qwentts-2edb35f-macos-arm64-metal.tar.gz"),
+        sha256: "e6ca70ba1a42e2e402d255bc4ad2394291e438d8233717041378380bb19df80e",
+        size: 2_174_181,
+        unpack: Unpack::TarGz(&[
+            Member {
+                path: "tts-server",
+                name: "tts-server",
+                size: 8_213_384,
+            },
+            Member {
+                path: "LICENSE-qwentts.cpp.txt",
+                name: "LICENSE-qwentts.cpp.txt",
+                size: 1_087,
+            },
+            Member {
+                path: "LICENSE-ggml.txt",
+                name: "LICENSE-ggml.txt",
+                size: 1_078,
+            },
+        ]),
+    }];
+}
+
+#[cfg(not(any(
+    all(windows, target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "linux", target_arch = "x86_64")
+)))]
+mod qwentts_bin {
+    use super::*;
+    pub const SERVER: Option<&str> = None;
+    pub const FILES: &[ModelFile] = &[];
+}
+
+/// File name of qwentts.cpp's server in [`QWEN_TTS`]'s folder; `None` on
+/// platforms without a build of it.
+pub const QWEN_TTS_SERVER: Option<&str> = qwentts_bin::SERVER;
+
+pub const QWEN_TTS: Model = Model {
+    id: "qwentts.cpp-2edb35f",
+    title: "qwentts.cpp 2edb35f tts-server (ServeurpersoCom)",
+    licence: "MIT",
+    homepage: "https://github.com/ServeurpersoCom/qwentts.cpp",
+    files: qwentts_bin::FILES,
+};
+
+/// The local read-aloud voice: Qwen3-TTS 12Hz 1.7B CustomVoice (nine named
+/// speakers, style instructions) and its audio tokenizer, both Q8_0 GGUF as
+/// converted by qwentts.cpp's author, pinned to a commit. Q8_0 over BF16:
+/// on an RTX 5070 (Vulkan) it ran twice as fast (6.5× vs 3.3× real time)
+/// in 3.7 instead of 6.6 GB, with no difference the user preferred.
+pub const QWEN_TTS_MODEL: Model = Model {
+    id: "qwen3-tts-1.7b-customvoice-q8_0",
+    title: "Qwen3-TTS 12Hz 1.7B CustomVoice, Q8_0 (Alibaba Qwen; GGUF by Serveurperso)",
+    licence: "Apache-2.0",
+    homepage: "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    files: &[
+        ModelFile {
+            name: "qwen-talker-1.7b-customvoice-Q8_0.gguf",
+            url: "https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/b7ee2e8c7459c3bea99da23e3d178125a7d1713c/qwen-talker-1.7b-customvoice-Q8_0.gguf",
+            sha256: "cab2cff67a0a557310febe558dc83076b28ed790e491867eb2751759f4cd89fa",
+            size: 2_042_834_304,
+            unpack: Unpack::Keep,
+        },
+        ModelFile {
+            name: "qwen-tokenizer-12hz-Q8_0.gguf",
+            url: "https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/b7ee2e8c7459c3bea99da23e3d178125a7d1713c/qwen-tokenizer-12hz-Q8_0.gguf",
+            sha256: "1883beeed99348fc35e23dd225e9082f93f6f8c109330a33d935baa8acdbfd94",
+            size: 291_150_624,
+            unpack: Unpack::Keep,
+        },
+    ],
+};
+
 /// SudachiDict full 20261015 from its GitHub release, the dictionary of the
 /// Sudachi Japanese analyser (see `crate::japanese`). Full rather than core:
 /// it adds proper nouns and set phrases, so more names and nicknames stay

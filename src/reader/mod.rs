@@ -293,7 +293,24 @@ impl Reader {
                 .map_err(|e| e.to_string())?;
         }
         let toc_labels = toc_labels(&epub.toc);
-        let tts = tts::Tts::new(chapters.clone(), traditional, &epub.title, &book_id, ctx);
+        // Each chapter's first entry in the table of contents, for the
+        // "Generate locally" window's list.
+        let mut spine_labels = vec![String::new(); n];
+        for (e, label) in epub.toc.iter().zip(&toc_labels) {
+            if let Some(l) = spine_labels.get_mut(e.spine)
+                && l.is_empty()
+            {
+                *l = label.trim().to_owned();
+            }
+        }
+        let tts = tts::Tts::new(
+            chapters.clone(),
+            spine_labels,
+            traditional,
+            &epub.title,
+            &book_id,
+            ctx,
+        );
         let mut dict = popup::Popup::new(ctx, settings.freq_sort.clone());
         dict.cards.book = Arc::from(epub.title.as_str());
         dict.sync_cards(&settings.anki);
@@ -587,6 +604,7 @@ impl Reader {
         let menus_open = egui::Popup::is_any_open(&ctx)
             || self.settings_open
             || self.tts.panel_open
+            || self.tts.local_window_open()
             || self.dicts.open
             || self.dict.cards.setup_open;
         let dict_open = self.dict.is_open();
@@ -596,6 +614,9 @@ impl Reader {
         let esc_for_popup = popup_was_open && ctx.input(|i| i.key_pressed(Key::Escape));
         if esc_for_popup {
             self.settings_open = false;
+            if self.tts.local_window_open() && !self.tts.panel_open {
+                self.tts.close_local_window();
+            }
             self.tts.panel_open = false;
             if self.dict.cards.setup_open {
                 self.dict.cards.setup_open = false;
@@ -761,6 +782,7 @@ impl Reader {
             }
             self.page = self.page.min(l.pages.len().saturating_sub(1));
             self.page -= self.page % step;
+            self.tts.page_src = l.page_first_src(self.page).unwrap_or(0);
             if play_page {
                 let src = l.page_first_src(self.page).unwrap_or(0);
                 self.tts.play_from(self.spine, src, &self.settings.tts);

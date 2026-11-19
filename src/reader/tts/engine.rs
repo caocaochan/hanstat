@@ -1,7 +1,9 @@
 //! The read-aloud machinery, all off the UI thread:
 //!
-//! - a [`Pool`] of workers asks Azure for sentences and saves their MP3 in
-//!   the audio cache (what playback needs first, pre-generation after);
+//! - a [`Pool`] of workers asks Azure for sentences, or the local voice for
+//!   chunks of paragraphs ([`super::local`]), and saves one clip per
+//!   sentence in the audio cache (what playback needs first, pre-generation
+//!   after);
 //! - the player thread walks the book sentence by sentence (into the next
 //!   chapter at the end of one), decodes saved clips and queues them on the
 //!   sound device a few seconds ahead, and says which sentence is heard.
@@ -10,7 +12,7 @@
 
 use super::audio::{self, Output};
 use super::azure::{self, Azure, Fail};
-use super::{Speech, clip_path, saved_clip, sentence_at, sentences};
+use super::{Speech, clip_path, local, opus, saved_clip, sentence_at, sentences};
 use crate::reader::tree::Chapter;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
@@ -27,18 +29,42 @@ pub type Repaint = Arc<dyn Fn() + Send + Sync>;
 const WORKERS: usize = 4;
 /// Sentences asked for ahead of the one heard.
 const AHEAD: usize = 4;
+/// Local-voice chunks asked for ahead (each up to its chunk size).
+const LOCAL_AHEAD: usize = 3;
 /// Seconds of sound kept queued on the device.
 const QUEUED_SECONDS: f32 = 6.0;
 
-/// A sentence to have read: its cache key and text.
+/// A sentence of a job.
 #[derive(Clone)]
-struct Job {
+struct Clip {
     key: u64,
     /// Where its audio is saved (its book's folder).
     path: PathBuf,
     text: String,
+    /// Its paragraph (sentences of one are read run together).
+    para: usize,
+    /// Not saved yet and not being made elsewhere: this job saves it.
+    save: bool,
+}
+
+/// What one request makes: a sentence (Azure), or a chunk of paragraphs
+/// read at once and cut into its sentences (the local voice). Only clips
+/// with `save` are written; the others are there for the reading's flow.
+#[derive(Clone)]
+struct Job {
+    clips: Vec<Clip>,
     speech: Speech,
     batch: Option<Arc<Batch>>,
+}
+
+impl Job {
+    fn saving(&self) -> impl Iterator<Item = &Clip> {
+        self.clips.iter().filter(|c| c.save)
+    }
+
+    fn keys(&self) -> Vec<u64> {
+        self.saving().map(|c| c.key).collect()
+    }
 }
 
 /// A pre-generation (a chapter or the book) and how far it got.
@@ -125,17 +151,35 @@ impl Pool {
     /// Make these first, in this order (sentences about to be heard).
     fn want(&self, jobs: Vec<Job>) {
         let mut s = self.inner.state.lock().unwrap();
-        let keys: HashSet<u64> = jobs.iter().map(|j| j.key).collect();
-        s.urgent.retain(|j| !keys.contains(&j.key));
-        s.background.retain(|j| !keys.contains(&j.key));
+        let keys: HashSet<u64> = jobs.iter().flat_map(Job::keys).collect();
+        // Queued background jobs with these sentences: those sentences are
+        // made here now (a chunk keeps its others).
+        for j in s.background.iter_mut() {
+            let batch = j.batch.clone();
+            for c in j
+                .clips
+                .iter_mut()
+                .filter(|c| c.save && keys.contains(&c.key))
+            {
+                c.save = false;
+                if let Some(b) = &batch {
+                    b.done.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        s.background.retain(|j| j.saving().next().is_some());
         // Older urgent jobs are for sentences skipped since: drop them.
-        let stale: Vec<u64> = s.urgent.drain(..).map(|j| j.key).collect();
-        for k in stale {
-            s.busy.remove(&k);
+        let stale: Vec<Job> = s.urgent.drain(..).collect();
+        for j in stale {
+            for k in j.keys() {
+                s.busy.remove(&k);
+            }
         }
         for j in jobs {
-            s.failed.remove(&j.key);
-            s.busy.insert(j.key);
+            for k in j.keys() {
+                s.failed.remove(&k);
+                s.busy.insert(k);
+            }
             s.urgent.push_back(j);
         }
         self.inner.cv.notify_all();
@@ -153,12 +197,19 @@ impl Pool {
 impl PoolInner {
     fn background(&self, jobs: Vec<Job>) {
         let mut s = self.state.lock().unwrap();
-        for j in jobs {
-            if s.busy.insert(j.key) {
+        for mut j in jobs {
+            let batch = j.batch.clone();
+            for c in j.clips.iter_mut().filter(|c| c.save) {
+                if !s.busy.insert(c.key) {
+                    // Already being made for playback: counted as made.
+                    c.save = false;
+                    if let Some(b) = &batch {
+                        b.done.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            if j.saving().next().is_some() {
                 s.background.push_back(j);
-            } else if let Some(b) = &j.batch {
-                // Already being made for playback: counted as made.
-                b.done.fetch_add(1, Ordering::Relaxed);
             }
         }
         self.cv.notify_all();
@@ -197,17 +248,22 @@ fn worker(p: &PoolInner) {
         if let Some(b) = &job.batch
             && b.cancel.load(Ordering::Relaxed)
         {
-            p.state.lock().unwrap().busy.remove(&job.key);
+            let mut s = p.state.lock().unwrap();
+            for k in job.keys() {
+                s.busy.remove(&k);
+            }
             continue;
         }
-        let path = job.path.clone();
-        let result = if path.exists() {
+        let count = job.saving().count();
+        let result = if job.saving().all(|c| c.path.exists()) {
             Ok(())
+        } else if let Some(l) = &job.speech.local {
+            make_local(l, &job)
         } else {
             let client = p.client.lock().unwrap().clone();
             match client {
                 None => Err(Fail::Refused("Add your Azure key first".to_owned())),
-                Some(c) => make(&c, &job, &path),
+                Some(c) => make(&c, &job.clips[0], &job.speech),
             }
         };
         let mut s = p.state.lock().unwrap();
@@ -229,12 +285,12 @@ fn worker(p: &PoolInner) {
             Ok(()) => {
                 s.backoff = Duration::from_secs(2);
                 if let Some(b) = &job.batch {
-                    b.done.fetch_add(1, Ordering::Relaxed);
+                    b.done.fetch_add(count, Ordering::Relaxed);
                 }
             }
             Err(e) => {
                 if let Some(b) = &job.batch {
-                    b.failed.fetch_add(1, Ordering::Relaxed);
+                    b.failed.fetch_add(count, Ordering::Relaxed);
                     let mut err = b.error.lock().unwrap();
                     if err.is_none() {
                         *err = Some(e.to_string());
@@ -244,20 +300,24 @@ fn worker(p: &PoolInner) {
                         b.cancel.store(true, Ordering::Relaxed);
                     }
                 }
-                s.failed.insert(job.key, e);
+                for k in job.keys() {
+                    s.failed.insert(k, e.clone());
+                }
             }
         }
-        s.busy.remove(&job.key);
+        for k in job.keys() {
+            s.busy.remove(&k);
+        }
         drop(s);
         (p.repaint)();
     }
 }
 
-/// Ask Azure for `job` (a second and third try on network errors) and save it.
-fn make(c: &Azure, job: &Job, path: &std::path::Path) -> Result<(), Fail> {
+/// Ask Azure for `clip` (a second and third try on network errors) and save it.
+fn make(c: &Azure, clip: &Clip, speech: &Speech) -> Result<(), Fail> {
     let mut tries = 0;
     let audio = loop {
-        match c.synth(&job.text, &job.speech.voice, job.speech.rate) {
+        match c.synth(&clip.text, &speech.voice, speech.rate) {
             Ok(a) => break a,
             Err(Fail::Other(_)) if tries < 2 => {
                 tries += 1;
@@ -266,12 +326,31 @@ fn make(c: &Azure, job: &Job, path: &std::path::Path) -> Result<(), Fail> {
             Err(e) => return Err(e),
         }
     };
+    save(&clip.path, &audio)
+}
+
+/// Have the local voice read `job`'s chunk and save its sentences' clips.
+fn make_local(l: &local::LocalSettings, job: &Job) -> Result<(), Fail> {
+    let texts: Vec<String> = job.clips.iter().map(|c| c.text.clone()).collect();
+    let paras: Vec<usize> = job.clips.iter().map(|c| c.para).collect();
+    let pcm = local::make_chunk(&texts, &paras, l)?;
+    for (c, pcm) in job.clips.iter().zip(pcm) {
+        if c.save && !c.path.exists() {
+            let file = opus::encode(&pcm).map_err(Fail::Other)?;
+            save(&c.path, &file)?;
+        }
+    }
+    Ok(())
+}
+
+/// Write `bytes` to `path` (via a temporary name: a clip is whole or absent).
+fn save(path: &std::path::Path, bytes: &[u8]) -> Result<(), Fail> {
     let save = || -> std::io::Result<()> {
         if let Some(d) = path.parent() {
             std::fs::create_dir_all(d)?;
         }
         let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-        std::fs::write(&tmp, &audio)?;
+        std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, path)
     };
     save().map_err(|e| Fail::Other(format!("The audio can't be saved: {e}")))
@@ -369,6 +448,7 @@ struct Player {
     asked: Option<(usize, usize, Speech)>,
     error: Option<String>,
     sentences: HashMap<usize, Arc<Vec<Range<u32>>>>,
+    paras: HashMap<usize, Arc<Vec<usize>>>,
     /// Stopped: the device closes at this time, once the sound faded out.
     closing: Option<Instant>,
 }
@@ -397,6 +477,7 @@ impl Player {
             asked: None,
             error: None,
             sentences: HashMap::new(),
+            paras: HashMap::new(),
             closing: None,
         }
     }
@@ -422,6 +503,27 @@ impl Player {
         }
         self.sentences.insert(spine, s.clone());
         Some(s)
+    }
+
+    /// The paragraph of each sentence of chapter `spine` (the local voice
+    /// reads whole paragraphs).
+    fn paras(&mut self, spine: usize) -> Option<Arc<Vec<usize>>> {
+        if let Some(p) = self.paras.get(&spine) {
+            return Some(p.clone());
+        }
+        let s = self.sentences(spine)?;
+        let ch = self.chapter(spine)?;
+        let p = Arc::new(local::paragraphs(&ch.chars, &s));
+        if self.paras.len() > 8 {
+            self.paras.clear();
+        }
+        self.paras.insert(spine, p.clone());
+        Some(p)
+    }
+
+    /// The saved clip of `text` read the current way, if any.
+    fn saved(&self, text: &str) -> Option<PathBuf> {
+        saved_clip(&self.dir, self.speech.key(text), self.speech.ext())
     }
 
     fn text(&self, spine: usize, r: &Range<u32>) -> String {
@@ -597,27 +699,53 @@ impl Player {
                         std::thread::sleep(Duration::from_millis(50));
                     };
                     let Some(ch) = ch else { break };
-                    let mut jobs = Vec::new();
-                    for r in sentences(&ch.chars) {
-                        let text: String =
-                            ch.chars[r.start as usize..r.end as usize].iter().collect();
-                        let key = speech.key(&text);
-                        batch.total.fetch_add(1, Ordering::Relaxed);
-                        if saved_clip(&dir, key).is_some() {
-                            batch.cached.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            batch
-                                .billed
-                                .fetch_add(azure::billed(&text, speech.rate), Ordering::Relaxed);
-                            jobs.push(Job {
+                    let sents = sentences(&ch.chars);
+                    let paras = local::paragraphs(&ch.chars, &sents);
+                    let clips: Vec<Clip> = sents
+                        .iter()
+                        .zip(&paras)
+                        .map(|(r, &para)| {
+                            let text: String =
+                                ch.chars[r.start as usize..r.end as usize].iter().collect();
+                            let key = speech.key(&text);
+                            let save = saved_clip(&dir, key, speech.ext()).is_none();
+                            batch.total.fetch_add(1, Ordering::Relaxed);
+                            if save {
+                                batch.billed.fetch_add(
+                                    azure::billed(&text, speech.rate),
+                                    Ordering::Relaxed,
+                                );
+                            } else {
+                                batch.cached.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Clip {
                                 key,
-                                path: clip_path(&dir, key),
+                                path: clip_path(&dir, key, speech.ext()),
                                 text,
-                                speech: speech.clone(),
-                                batch: Some(batch.clone()),
-                            });
+                                para,
+                                save,
+                            }
+                        })
+                        .collect();
+                    // A sentence each (Azure), or chunks of whole paragraphs
+                    // (the local voice: saved sentences stay in their chunk
+                    // for the flow, and aren't made again).
+                    let groups = match &speech.local {
+                        None => (0..clips.len()).map(|i| i..i + 1).collect(),
+                        Some(l) => {
+                            let lens: Vec<usize> = sents.iter().map(|r| r.len()).collect();
+                            local::chunks(&lens, &paras, 0, |_| l.chunk_chars, usize::MAX)
                         }
-                    }
+                    };
+                    let jobs: Vec<Job> = groups
+                        .into_iter()
+                        .map(|g| Job {
+                            clips: clips[g].to_vec(),
+                            speech: speech.clone(),
+                            batch: Some(batch.clone()),
+                        })
+                        .filter(|j| j.saving().next().is_some())
+                        .collect();
                     pool.background(jobs);
                     repaint();
                 }
@@ -714,11 +842,16 @@ impl Player {
             let r = s[at.1].clone();
             let text = self.text(at.0, &r);
             let key = self.speech.key(&text);
-            let saved = saved_clip(&self.dir, key);
+            let saved = self.saved(&text);
             if let Some(path) = &saved
                 && let Ok(bytes) = std::fs::read(path)
             {
-                match audio::decode_mp3(bytes) {
+                let decoded = if self.speech.local.is_some() {
+                    opus::decode(bytes)
+                } else {
+                    audio::decode_mp3(bytes)
+                };
+                match decoded {
                     Ok((samples, rate)) => {
                         let id = self.next_id;
                         self.next_id += 1;
@@ -764,6 +897,10 @@ impl Player {
             return;
         }
         self.asked = Some((at.0, at.1, self.speech.clone()));
+        if let Some(l) = self.speech.local.clone() {
+            self.ask_local(at, &l);
+            return;
+        }
         let mut jobs = Vec::new();
         let mut pos = Some(at);
         // The next few sentences, saved or not.
@@ -774,17 +911,103 @@ impl Player {
             };
             let s = self.sentences(p.0).unwrap();
             let text = self.text(p.0, &s[p.1]);
-            let key = self.speech.key(&text);
-            if saved_clip(&self.dir, key).is_none() {
+            if self.saved(&text).is_none() {
+                let key = self.speech.key(&text);
                 jobs.push(Job {
-                    key,
-                    path: clip_path(&self.dir, key),
-                    text,
+                    clips: vec![Clip {
+                        key,
+                        path: clip_path(&self.dir, key, self.speech.ext()),
+                        text,
+                        para: 0,
+                        save: true,
+                    }],
                     speech: self.speech.clone(),
                     batch: None,
                 });
             }
             pos = Some((p.0, p.1 + 1));
+        }
+        if !jobs.is_empty() {
+            self.pool.want(jobs);
+        }
+    }
+
+    /// The local voice: from the first sentence at or after `at` that is
+    /// neither saved nor being made, a few chunks of whole paragraphs. When
+    /// the sentence at `at` itself is missing, the first chunks are short
+    /// (a quarter, then half the size), so sound starts within seconds and
+    /// each chunk is ready before the one before it has been heard.
+    fn ask_local(&mut self, at: (usize, usize), l: &local::LocalSettings) {
+        let full = l.chunk_chars.max(20);
+        // How far ahead to look, in characters.
+        let reach = full * LOCAL_AHEAD;
+        let mut jobs = Vec::new();
+        let mut cold = None;
+        let mut seen = 0;
+        let mut pos = at;
+        while jobs.len() < LOCAL_AHEAD && seen <= reach {
+            let Some(Some(p)) = self.normalise(pos) else {
+                break;
+            };
+            let sents = self.sentences(p.0).unwrap();
+            let paras = self.paras(p.0).unwrap();
+            // Past what is saved or on its way.
+            let mut i = p.1;
+            while i < sents.len() && seen <= reach {
+                let text = self.text(p.0, &sents[i]);
+                if self.saved(&text).is_none() && !self.pool.busy(self.speech.key(&text)) {
+                    break;
+                }
+                cold.get_or_insert(false);
+                seen += sents[i].len();
+                i += 1;
+            }
+            if i >= sents.len() || seen > reach {
+                pos = (p.0, i);
+                continue;
+            }
+            let cold = *cold.get_or_insert(true);
+            let lens: Vec<usize> = sents.iter().map(|r| r.len()).collect();
+            let done = jobs.len();
+            let limit = |k: usize| {
+                if cold {
+                    [full / 4, full / 2]
+                        .get(done + k)
+                        .copied()
+                        .unwrap_or(full)
+                        .max(20)
+                } else {
+                    full
+                }
+            };
+            let groups = local::chunks(&lens, &paras, i, limit, LOCAL_AHEAD - jobs.len());
+            let mut end = i;
+            for g in groups {
+                end = g.end;
+                seen += lens[g.clone()].iter().sum::<usize>();
+                let clips: Vec<Clip> = g
+                    .map(|k| {
+                        let text = self.text(p.0, &sents[k]);
+                        let key = self.speech.key(&text);
+                        let save = self.saved(&text).is_none() && !self.pool.busy(key);
+                        Clip {
+                            key,
+                            path: clip_path(&self.dir, key, self.speech.ext()),
+                            text,
+                            para: paras[k],
+                            save,
+                        }
+                    })
+                    .collect();
+                if clips.iter().any(|c| c.save) {
+                    jobs.push(Job {
+                        clips,
+                        speech: self.speech.clone(),
+                        batch: None,
+                    });
+                }
+            }
+            pos = (p.0, end.max(i + 1));
         }
         if !jobs.is_empty() {
             self.pool.want(jobs);

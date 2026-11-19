@@ -1,5 +1,21 @@
 # Changelog
 
+## [2026.11.19.03] - 2026-11-19
+
+### Added
+- **Read aloud with a voice on this computer.** **Read aloud → Read by** now offers **This computer** next to Azure: Qwen3-TTS 1.7B CustomVoice (Alibaba Qwen, Apache-2.0) runs on your GPU through qwentts.cpp's server (MIT). It is free, needs no key and works offline once downloaded. Everything else works as with Azure: the sentence heard is highlighted, the pages follow, a click reads from a word's sentence and the dictionary popup pauses it.
+  - **Nothing is downloaded until you ask.** **Download (2.3 GB)** in the panel fetches the model (Q8_0) and the server, pinned and checked by SHA-256, into the models folder. The button greys out once pressed. The server is built for Windows and Linux (Vulkan: NVIDIA, AMD and Intel GPUs) and for Apple Silicon Macs (Metal).
+  - **The model is loaded once.** It loads on first use, in a few seconds (the very first start also compiles the GPU's shaders and takes longer), and stays loaded until hanstat closes or you press **Unload**, which frees its GPU memory (about 4–5 GB with four requests at once).
+  - **Voices.** Nine voices, each described in the panel: Vivian, Serena, Uncle Fu, Dylan (Beijing), Eric (speaks Sichuanese), Ryan, Aiden, Ono Anna and Sohee. **Instructions** take free text in any language for tone, pace or emotion, for example 用温柔平稳的语气，语速稍慢. The speed slider is Azure's only: the local voice's pace comes from the instructions.
+  - **Preview** reads a few sentences from the page shown with the current settings, so you can hear them before making a chapter. It is not saved.
+  - **Advanced** has every setting the model takes: temperature, top-p, top-k and repetition penalty, the same for the fine detail, a seed (another number, another take), the chunk length and how many requests the GPU works on at once (1–4). **Reset to defaults** keeps the voice and instructions.
+  - **Steadier reading.** Whole paragraphs, up to 200 characters by default, are read in one request, so the voice keeps the same tone from sentence to sentence instead of starting afresh at each one. The audio is then cut at its pauses into one clip per sentence, so the highlight and click-to-read still go sentence by sentence. Reading from a sentence not made yet starts with a short chunk, so the sound comes within a second or two.
+  - **Generate locally…** (under **Ahead of time**) opens a window with the voices, instructions, preview and advanced settings, and the book's chapters by their table-of-contents names. Each chapter shows its sentences and about how long it lasts, with **All**, **None**, **This one** and **From this one on**. **Generate** makes the chosen chapters four requests at a time, about 20× faster than real time on an RTX 5070, skipping sentences already made, and switches reading aloud to the local voice.
+  - **Saved audio.** Each sentence is saved as Ogg Opus (about 30 kbit/s, an hour of speech in about 14 MB), next to the book's Azure MP3s. The two never replace each other: switching back to Azure keeps the local audio, and **Saved audio** has separate rows and **Delete** buttons for each. Each voice, instruction and setting is saved separately.
+  - Saved in `reader.json` under `tts` as `source` and `local`. Older versions ignore them.
+
+Every book is analysed again once: the audio codec brought new libraries into the build, and saved analyses are kept per set of libraries.
+
 ## [2026.11.19.02] - 2026-11-19
 
 ### Added

@@ -1384,11 +1384,12 @@ fn read_aloud() {
     let speech = tts::Speech {
         voice: s.voice(false),
         rate: s.rate,
+        local: None,
     };
     for rg in tts::sentences(&c.chars) {
         let t: String = c.chars[rg.start as usize..rg.end as usize].iter().collect();
         assert!(
-            tts::clip_path(r.tts.dir(), speech.key(&t)).exists(),
+            tts::clip_path(r.tts.dir(), speech.key(&t), tts::MP3).exists(),
             "saved in the book's folder: {t}"
         );
     }
@@ -1401,5 +1402,187 @@ fn read_aloud() {
     }
     d.idle(&mut r, 3);
     d.snap("tts-panel");
+    r.close(&d.ctx);
+}
+
+/// Reading aloud with the local voice (Qwen3-TTS on the GPU), the sound
+/// device open but silent. Run with `HANSTAT_MODEL_DIR` at a folder holding
+/// the model (`qwen3-tts-1.7b-customvoice-q8_0/`: the server, 14 MB, is
+/// downloaded from its pinned release if missing), `LOCALAPPDATA` at a
+/// scratch folder and `HANSTAT_NO_UPDATE=1`; `READER_SPINE` picks the
+/// chapter made ahead of time.
+///
+/// The panel and the "Generate locally" window are drawn; a preview is
+/// made; the chapter is made in chunks, every sentence saved as Ogg Opus
+/// with a plausible length (the cuts landed between sentences), and how
+/// fast is reported; reading from the next chapter (nothing made) starts
+/// within seconds and goes on without stalls; a click reads a saved
+/// sentence at once.
+#[test]
+#[ignore]
+fn read_aloud_local() {
+    use std::sync::atomic::Ordering::Relaxed;
+    use tts::PlayState;
+    let book = env("READER_EPUB").expect("set READER_EPUB");
+    tts::audio::MUTE.store(true, Relaxed);
+    tts::local::download(&|_, _| {}).expect("the server downloads");
+    assert!(
+        tts::local::downloaded(),
+        "the model is in HANSTAT_MODEL_DIR"
+    );
+    let mut d = Driver::new();
+    let mut r = d.open(&book);
+    r.settings.tts.source = tts::Source::Local;
+    r.spine = env("READER_SPINE")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
+    r.target = Some(Target::Offset(0));
+    d.ready(&mut r);
+    let spine = r.spine;
+    let wait =
+        |d: &mut Driver, r: &mut Reader, secs: u64, what: &str, ok: &dyn Fn(&Reader) -> bool| {
+            let t = Instant::now();
+            while !ok(r) {
+                d.frame(r, vec![]);
+                assert!(
+                    t.elapsed().as_secs() < secs,
+                    "{what}: state {:?}, at {:?}",
+                    r.tts.state(),
+                    r.tts.at()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+
+    // The panel and the window.
+    r.tts.panel_open = true;
+    d.idle(&mut r, 30);
+    d.snap("tts-local-panel");
+    r.tts.panel_open = false;
+    r.tts.open_local_window(spine);
+    d.idle(&mut r, 30);
+    d.snap("tts-local-window");
+    r.tts.close_local_window();
+    d.idle(&mut r, 2);
+
+    // A preview (loads the model the first time).
+    let s = r.settings.tts.local.clone();
+    let t = Instant::now();
+    let pcm = tts::local::preview("这是一段试听。我们听听现在的设置。", &s).unwrap();
+    eprintln!(
+        "preview: {:.1} s of audio in {:.1} s (model load included)",
+        pcm.len() as f64 / 24_000.0,
+        t.elapsed().as_secs_f64()
+    );
+    assert!(pcm.len() > 24_000);
+
+    // The chapter, ahead of time.
+    let tset = r.settings.tts.clone();
+    let t = Instant::now();
+    r.tts.pregenerate(&tset, vec![spine], "test chapter");
+    let b = r.tts.batch().unwrap();
+    wait(&mut d, &mut r, 1800, "made ahead", &|_| b.finished());
+    let secs = t.elapsed().as_secs_f64();
+    let (total, cached, done, failed) = (
+        b.total.load(Relaxed),
+        b.cached.load(Relaxed),
+        b.done.load(Relaxed),
+        b.failed.load(Relaxed),
+    );
+    assert_eq!(failed, 0, "{:?}", b.error.lock().unwrap());
+    let c = r.chapter(spine).unwrap();
+    let speech = tts::Speech {
+        voice: String::new(),
+        rate: 0,
+        local: Some(s.clone()),
+    };
+    let sents = tts::sentences(&c.chars);
+    let (mut audio, mut bytes, mut odd) = (0.0, 0u64, Vec::new());
+    for rg in &sents {
+        let text: String = c.chars[rg.start as usize..rg.end as usize].iter().collect();
+        let p = tts::clip_path(r.tts.dir(), speech.key(&text), tts::OPUS);
+        let file = std::fs::read(&p).unwrap_or_else(|_| panic!("saved: {text}"));
+        bytes += file.len() as u64;
+        let (samples, rate) = tts::opus::decode(file).unwrap();
+        let len = samples.len() as f64 / rate as f64;
+        audio += len;
+        // Expected about 3.8 characters a second; a cut in the wrong pause
+        // makes one clip far too long and a neighbour far too short.
+        let want = tts::local::seconds(rg.len());
+        if len > want * 2.5 + 1.5 || len < want * 0.35 - 0.3 {
+            odd.push(format!("{len:.1} s for {want:.1} s: {text}"));
+        }
+    }
+    eprintln!(
+        "chapter {spine}: {total} sentences ({cached} saved before, {done} made) in {secs:.1} s: \
+         {audio:.0} s of audio, {:.1}x real time, {:.0} kbit/s",
+        audio / secs,
+        bytes as f64 * 8.0 / audio / 1000.0
+    );
+    eprintln!("clips far from their expected length: {}", odd.len());
+    for o in &odd {
+        eprintln!("  {o}");
+    }
+    assert!(
+        odd.len() * 20 <= sents.len(),
+        "more than 1 in 20 clips implausibly long or short"
+    );
+
+    // Reading from where nothing is made: the next chapter with text.
+    let next = (spine + 1..r.epub.spine.len())
+        .find(|&i| {
+            r.chapter(i)
+                .is_some_and(|c| tts::sentences(&c.chars).len() > 20)
+        })
+        .expect("a later chapter");
+    let t = Instant::now();
+    r.tts.play_from(next, 0, &r.settings.tts);
+    wait(&mut d, &mut r, 120, "starts", &|r| {
+        r.tts.state() == PlayState::Playing
+    });
+    eprintln!(
+        "cold start: first audio after {:.1} s",
+        t.elapsed().as_secs_f32()
+    );
+    d.snap("tts-local-reading");
+    // A minute of reading: how long it waits for audio after starting.
+    let t = Instant::now();
+    let mut stalled = 0.0;
+    let mut last = Instant::now();
+    let first = r.tts.at();
+    while t.elapsed().as_secs() < 60 {
+        d.frame(&mut r, vec![]);
+        let dt = last.elapsed().as_secs_f64();
+        last = Instant::now();
+        if r.tts.state() == PlayState::Loading {
+            stalled += dt;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    eprintln!(
+        "a minute of reading: {stalled:.1} s waiting for audio; from {:?} to {:?}",
+        first.clone().map(|(s, rg)| (s, rg.start)),
+        r.tts.at().map(|(s, rg)| (s, rg.start))
+    );
+    assert_ne!(r.tts.at(), first, "the reading went on");
+    assert!(stalled < 10.0, "stalled {stalled:.1} s");
+
+    // A saved sentence plays at once.
+    let mid = sents.len() / 2;
+    let t = Instant::now();
+    r.tts.play_from(spine, sents[mid].start, &r.settings.tts);
+    // Still playing the other chapter for a frame or two: wait for this one.
+    let want = Some((spine, sents[mid].clone()));
+    wait(&mut d, &mut r, 10, "a saved sentence", &|r| {
+        r.tts.state() == PlayState::Playing && r.tts.at() == want
+    });
+    eprintln!(
+        "saved sentence: playing after {:.2} s",
+        t.elapsed().as_secs_f32()
+    );
+    assert_eq!(r.tts.at(), Some((spine, sents[mid].clone())));
+    r.tts.stop();
+    d.idle(&mut r, 20);
+    assert!(!r.tts.active());
     r.close(&d.ctx);
 }

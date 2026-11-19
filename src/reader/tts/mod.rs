@@ -1,18 +1,25 @@
-//! Read aloud: the book read sentence by sentence by an Azure neural voice,
-//! the sentence heard highlighted and the pages turned with it. While it
-//! reads, a click on a word reads from its sentence.
+//! Read aloud: the book read sentence by sentence by an Azure neural voice
+//! or a voice on this computer (Qwen3-TTS on the GPU), the sentence heard
+//! highlighted and the pages turned with it. While it reads, a click on a
+//! word reads from its sentence.
 //!
-//! Every sentence's audio is saved (an MP3 per sentence, keyed by voice,
-//! speed and text), so a passage is paid for once; a chapter or the whole
-//! book can be made ahead of time.
+//! Every sentence's audio is saved (Azure: an MP3 per sentence; the local
+//! voice: Ogg Opus), keyed by voice, settings and text, so a passage is made
+//! once; a chapter or the whole book can be made ahead of time. The two
+//! voices' clips never share a file.
 //!
 //! - [`azure`]: the REST API; [`key`]: the key, kept encrypted.
+//! - [`local`]: the local voice's server, chunks and cuts; [`opus`]: its
+//!   clips; `local_ui`: its settings and the "Generate locally" window.
 //! - [`audio`]: decoding and the sound device; [`engine`]: the threads.
 
 pub mod audio;
 pub mod azure;
 mod engine;
 pub mod key;
+pub mod local;
+mod local_ui;
+pub mod opus;
 
 use crate::reader::tree::Chapter;
 use eframe::egui::{self, Color32, RichText};
@@ -40,6 +47,18 @@ pub struct TtsSettings {
     pub rate: i32,
     /// The dictionary popup pauses reading while it is open.
     pub pause_for_popup: bool,
+    /// Who reads: Azure or the local voice.
+    pub source: Source,
+    pub local: local::LocalSettings,
+}
+
+/// Who reads aloud.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Source {
+    #[default]
+    Azure,
+    /// Qwen3-TTS on this computer ([`local`]).
+    Local,
 }
 
 impl Default for TtsSettings {
@@ -50,6 +69,8 @@ impl Default for TtsSettings {
             voice_trad: String::new(),
             rate: 0,
             pause_for_popup: true,
+            source: Source::Azure,
+            local: local::LocalSettings::default(),
         }
     }
 }
@@ -74,20 +95,34 @@ impl TtsSettings {
 pub struct Speech {
     pub voice: String,
     pub rate: i32,
+    /// The local voice and its settings (`voice` and `rate` unused); `None`: Azure.
+    pub local: Option<local::LocalSettings>,
 }
 
 impl Speech {
     /// The cache key of `text` read this way.
     pub fn key(&self, text: &str) -> u64 {
-        let s = format!(
-            "{}\u{1}{}\u{1}{}\u{1}{text}",
-            self.voice,
-            self.rate,
-            azure::FORMAT
-        );
+        let s = match &self.local {
+            None => format!(
+                "{}\u{1}{}\u{1}{}\u{1}{text}",
+                self.voice,
+                self.rate,
+                azure::FORMAT
+            ),
+            Some(l) => format!("{}\u{1}{text}", l.key_text()),
+        };
         hanstat::dict::xxh64::xxh64(s.as_bytes(), 0)
     }
+
+    /// Its clips' file extension.
+    pub fn ext(&self) -> &'static str {
+        if self.local.is_some() { OPUS } else { MP3 }
+    }
 }
+
+/// The two kinds of saved clip.
+pub const MP3: &str = "mp3";
+pub const OPUS: &str = "opus";
 
 /// Where saved audio is kept (it can be made again: the cache folder).
 pub fn cache_root() -> PathBuf {
@@ -120,9 +155,9 @@ pub fn book_dir(title: &str, book_id: &str) -> PathBuf {
     })
 }
 
-/// A sentence's audio in its book's folder.
-pub fn clip_path(dir: &Path, key: u64) -> PathBuf {
-    dir.join(format!("{key:016x}.mp3"))
+/// A sentence's audio in its book's folder: `ext` is [`MP3`] or [`OPUS`].
+pub fn clip_path(dir: &Path, key: u64, ext: &str) -> PathBuf {
+    dir.join(format!("{key:016x}.{ext}"))
 }
 
 /// Where 2026.11.19.02's build kept audio: 256 folders by the key's first
@@ -138,12 +173,15 @@ fn is_legacy(name: &str) -> bool {
     name.len() == 2 && name.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// The saved audio of `key` for the book in `dir`, if any; one saved in a
-/// legacy folder is moved into the book's.
-pub fn saved_clip(dir: &Path, key: u64) -> Option<PathBuf> {
-    let p = clip_path(dir, key);
+/// The saved audio of `key` for the book in `dir`, if any; an MP3 saved in
+/// a legacy folder is moved into the book's.
+pub fn saved_clip(dir: &Path, key: u64, ext: &str) -> Option<PathBuf> {
+    let p = clip_path(dir, key, ext);
     if p.exists() {
         return Some(p);
+    }
+    if ext != MP3 {
+        return None;
     }
     let old = legacy_path(key);
     if !old.exists() {
@@ -163,16 +201,42 @@ pub struct Usage {
     pub bytes: u64,
 }
 
-/// What a folder's files take.
-fn usage(dir: &Path) -> Usage {
-    let mut u = Usage::default();
+/// Saved audio by voice: Azure's MP3 and the local voice's Opus.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Kinds {
+    pub azure: Usage,
+    pub local: Usage,
+}
+
+impl Kinds {
+    fn add(&mut self, o: Kinds) {
+        for (a, b) in [(&mut self.azure, o.azure), (&mut self.local, o.local)] {
+            a.files += b.files;
+            a.bytes += b.bytes;
+        }
+    }
+
+    pub fn of(&self, local: bool) -> Usage {
+        if local { self.local } else { self.azure }
+    }
+}
+
+/// What a folder's clips take, by voice.
+fn usage(dir: &Path) -> Kinds {
+    let mut u = Kinds::default();
     if let Ok(files) = std::fs::read_dir(dir) {
         for f in files.flatten() {
+            let p = f.path();
+            let kind = match p.extension().and_then(|e| e.to_str()) {
+                Some(MP3) => &mut u.azure,
+                Some(OPUS) => &mut u.local,
+                _ => continue,
+            };
             if let Ok(m) = f.metadata()
                 && m.is_file()
             {
-                u.files += 1;
-                u.bytes += m.len();
+                kind.files += 1;
+                kind.bytes += m.len();
             }
         }
     }
@@ -180,23 +244,36 @@ fn usage(dir: &Path) -> Usage {
 }
 
 /// This book's saved audio and every book's; empty legacy folders go.
-fn measure(dir: &Path) -> (Usage, Usage) {
+fn measure(dir: &Path) -> (Kinds, Kinds) {
     let book = usage(dir);
-    let mut all = Usage::default();
+    let mut all = Kinds::default();
     if let Ok(dirs) = std::fs::read_dir(cache_root()) {
         for d in dirs.flatten() {
             if !d.path().is_dir() {
                 continue;
             }
             let u = usage(&d.path());
-            if u.files == 0 && is_legacy(&d.file_name().to_string_lossy()) {
+            if u.azure.files + u.local.files == 0 && is_legacy(&d.file_name().to_string_lossy()) {
                 let _ = std::fs::remove_dir(d.path());
             }
-            all.files += u.files;
-            all.bytes += u.bytes;
+            all.add(u);
         }
     }
     (book, all)
+}
+
+/// Delete one voice's clips in `dir` (the other voice's stay); the folder
+/// goes once empty.
+fn delete_clips(dir: &Path, ext: &str) {
+    if let Ok(files) = std::fs::read_dir(dir) {
+        for f in files.flatten() {
+            let p = f.path();
+            if p.extension().and_then(|e| e.to_str()) == Some(ext) {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
 }
 
 /// Past this many characters a sentence is split at a comma, past
@@ -303,8 +380,16 @@ pub struct Tts {
     /// This book's folder of saved audio.
     dir: PathBuf,
     /// Saved audio: this book's and every book's.
-    cache_size: Option<(Usage, Usage)>,
-    cache_job: Option<Receiver<(Usage, Usage)>>,
+    cache_size: Option<(Kinds, Kinds)>,
+    cache_job: Option<Receiver<(Kinds, Kinds)>>,
+    /// Each chapter's name in the table of contents (empty: none).
+    labels: Vec<String>,
+    /// The first character of the page shown (the preview reads from it).
+    pub page_src: u32,
+    /// The local voice's panel and window.
+    local: local_ui::State,
+    /// The chapter shown (the preview reads from it).
+    local_spine: usize,
     /// Sentences and billed characters: per chapter, and the book's.
     estimates: std::collections::HashMap<(usize, i32), (usize, usize)>,
     book_estimate: Option<(i32, usize, usize)>,
@@ -320,6 +405,7 @@ pub struct Tts {
 impl Tts {
     pub fn new(
         chapters: Arc<Mutex<Vec<Option<Arc<Chapter>>>>>,
+        labels: Vec<String>,
         traditional: bool,
         title: &str,
         book_id: &str,
@@ -347,6 +433,10 @@ impl Tts {
             batch: None,
             cache_size: None,
             cache_job: None,
+            labels,
+            page_src: 0,
+            local: local_ui::State::default(),
+            local_spine: 0,
             estimates: Default::default(),
             book_estimate: None,
             last_at: None,
@@ -357,9 +447,17 @@ impl Tts {
     }
 
     fn speech(&self, s: &TtsSettings) -> Speech {
-        Speech {
-            voice: s.voice(self.traditional),
-            rate: s.rate,
+        match s.source {
+            Source::Azure => Speech {
+                voice: s.voice(self.traditional),
+                rate: s.rate,
+                local: None,
+            },
+            Source::Local => Speech {
+                voice: String::new(),
+                rate: 0,
+                local: Some(s.local.clone()),
+            },
         }
     }
 
@@ -401,6 +499,7 @@ impl Tts {
     /// Once a frame: answers from the threads, and the engine told about
     /// changed settings.
     pub fn poll(&mut self, s: &TtsSettings) {
+        self.local_poll();
         if let KeyState::Loading(rx) = &self.key
             && let Ok(r) = rx.try_recv()
         {
@@ -456,7 +555,10 @@ impl Tts {
             ));
             self.sent_client = client;
         }
-        if self.pending.is_some() && matches!(self.key, KeyState::Loaded(_)) {
+        if self.pending.is_some()
+            && s.source == Source::Azure
+            && matches!(self.key, KeyState::Loaded(_))
+        {
             let pending = self.pending.take();
             if self.client_ready(s) {
                 if let (Some((spine, src)), Some(engine)) = (pending, &self.engine) {
@@ -475,7 +577,10 @@ impl Tts {
     }
 
     fn client_ready(&self, s: &TtsSettings) -> bool {
-        self.the_key().is_some() && azure::valid_region(s.region.trim())
+        match s.source {
+            Source::Azure => self.the_key().is_some() && azure::valid_region(s.region.trim()),
+            Source::Local => self.local.downloaded(),
+        }
     }
 
     pub fn state(&self) -> State {
@@ -499,6 +604,25 @@ impl Tts {
     /// Read from the sentence holding character `src` of chapter `spine`.
     pub fn play_from(&mut self, spine: usize, src: u32, s: &TtsSettings) {
         self.paused_by_popup = false;
+        if s.source == Source::Local {
+            self.last_visible = true;
+            self.last_at = None;
+            self.pending = None;
+            if !self.local.downloaded() {
+                self.panel_open = true;
+                self.key_note = Some((false, local::NOT_DOWNLOADED.to_owned()));
+                return;
+            }
+            self.stop_preview();
+            self.engine(s);
+            // The engine knows the current settings before it plays.
+            self.poll(s);
+            if let Some(e) = &self.engine {
+                e.send(Cmd::Play { spine, src });
+            }
+            self.now.state = State::Loading;
+            return;
+        }
         self.load_key();
         self.engine(s);
         self.last_visible = true;
@@ -619,8 +743,9 @@ impl Tts {
         self.cache_job = Some(rx);
     }
 
-    /// Delete this book's saved audio, or every book's.
-    fn delete_cache(&mut self, all: bool) {
+    /// Delete one voice's saved audio (`ext`: [`MP3`] or [`OPUS`]), this
+    /// book's or every book's; the other voice's stays.
+    fn delete_cache(&mut self, all: bool, ext: &'static str) {
         let (tx, rx) = channel();
         let repaint = self.repaint.clone();
         let dir = self.dir.clone();
@@ -632,12 +757,12 @@ impl Tts {
                         for d in dirs.flatten() {
                             // The audio folders; the voice lists stay.
                             if d.path().is_dir() {
-                                let _ = std::fs::remove_dir_all(d.path());
+                                delete_clips(&d.path(), ext);
                             }
                         }
                     }
                 } else {
-                    let _ = std::fs::remove_dir_all(&dir);
+                    delete_clips(&dir, ext);
                 }
                 let _ = tx.send(measure(&dir));
                 repaint();
@@ -723,7 +848,7 @@ impl Tts {
     pub fn bar(&mut self, ui: &mut egui::Ui) -> egui::Response {
         let b = ui
             .selectable_label(self.panel_open, RichText::new("Read aloud").size(14.0))
-            .on_hover_text("Have the book read to you by an Azure voice");
+            .on_hover_text("Have the book read to you by an Azure voice or one on this computer");
         if b.clicked() {
             self.panel_open = !self.panel_open;
             if self.panel_open {
@@ -758,6 +883,8 @@ impl Tts {
         spine: usize,
     ) -> Option<Action> {
         let mut action = None;
+        let mut close = false;
+        let ctx = button.ctx.clone();
         let mut open = self.panel_open;
         if open {
             self.load_key();
@@ -779,11 +906,17 @@ impl Tts {
             .show(|ui| {
                 ui.set_min_width(380.0);
                 ui.set_max_width(440.0);
+                let max_h = ui.ctx().content_rect().height() - 120.0;
+                egui::ScrollArea::vertical().max_height(max_h.max(200.0)).show(ui, |ui| {
                 // Playback.
                 ui.horizontal(|ui| {
                     match self.state() {
                         State::Stopped => {
-                            if ui.add_enabled(ready || matches!(self.key, KeyState::Loading(_) | KeyState::Unknown), egui::Button::new("Read from this page")).clicked() {
+                            let can = match s.source {
+                                Source::Azure => ready || matches!(self.key, KeyState::Loading(_) | KeyState::Unknown),
+                                Source::Local => ready,
+                            };
+                            if ui.add_enabled(can, egui::Button::new("Read from this page")).clicked() {
                                 action = Some(Action::PlayPage);
                             }
                         }
@@ -797,6 +930,13 @@ impl Tts {
                             }
                             ui.label(
                                 RichText::new(match st {
+                                    State::Loading if s.source == Source::Local => {
+                                        if local::status() == local::Status::Loaded {
+                                            "Making the audio…"
+                                        } else {
+                                            "Loading the voice…"
+                                        }
+                                    }
                                     State::Loading => "Waiting for Azure…",
                                     State::Paused => "Paused",
                                     _ => "Reading",
@@ -815,6 +955,16 @@ impl Tts {
                     ui.colored_label(Color32::from_rgb(0xdc, 0x32, 0x2f), e);
                 }
                 ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Read by");
+                    ui.selectable_value(&mut s.source, Source::Azure, "Azure")
+                        .on_hover_text("Microsoft's neural voices, over the internet (your key)");
+                    ui.selectable_value(&mut s.source, Source::Local, "This computer")
+                        .on_hover_text("Qwen3-TTS on your GPU: free and offline, after a one-time download");
+                });
+                if s.source == Source::Local {
+                    self.local_settings(ui, s);
+                } else {
                 egui::Grid::new("reader-tts-grid")
                     .num_columns(2)
                     .spacing([12.0, 8.0])
@@ -868,11 +1018,70 @@ impl Tts {
                     .size(12.0)
                     .weak(),
                 );
+                }
                 ui.separator();
-                self.ahead_of_time(ui, s, spine, ready);
+                if self.ahead_of_time(ui, s, spine, ready) {
+                    close = true;
+                }
+                });
             });
+        if close {
+            open = false;
+        }
         self.panel_open = open;
+        self.local_window(&ctx, s, spine);
         action
+    }
+
+    /// The pre-generation under way or last finished, with Cancel or Close.
+    fn batch_progress(&mut self, ui: &mut egui::Ui) {
+        if let Some(b) = self.batch.clone() {
+            let total = b.total.load(Ordering::Relaxed);
+            let cached = b.cached.load(Ordering::Relaxed);
+            let done = b.done.load(Ordering::Relaxed);
+            let failed = b.failed.load(Ordering::Relaxed);
+            let listed = b.listed.load(Ordering::Relaxed);
+            let cancelled = b.cancel.load(Ordering::Relaxed);
+            let finished = b.finished();
+            let frac = if total == 0 {
+                0.0
+            } else {
+                (cached + done + failed) as f32 / total as f32
+            };
+            ui.horizontal(|ui| {
+                let text = format!(
+                    "{}: {} of {}{}{}",
+                    b.what,
+                    group(cached + done),
+                    group(total),
+                    if listed { "" } else { "+" },
+                    if failed > 0 {
+                        format!(", {} failed", group(failed))
+                    } else {
+                        String::new()
+                    }
+                );
+                ui.add(egui::ProgressBar::new(frac).desired_width(220.0).text(text));
+                if !finished && !cancelled {
+                    if ui.small_button("Cancel").clicked() {
+                        b.cancel.store(true, Ordering::Relaxed);
+                    }
+                } else if ui.small_button("Close").clicked() {
+                    self.batch = None;
+                    self.cache_size = None;
+                }
+            });
+            if cancelled && !finished {
+                ui.label(RichText::new("Cancelled.").weak());
+            }
+            if let Some(e) = b.error.lock().unwrap().as_ref() {
+                ui.colored_label(Color32::from_rgb(0xdc, 0x32, 0x2f), e);
+            }
+            if !finished && !cancelled {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(250));
+            }
+        }
     }
 
     fn voice_choice(&mut self, ui: &mut egui::Ui, s: &mut TtsSettings) {
@@ -1000,13 +1209,40 @@ impl Tts {
         self.key_note = None;
     }
 
-    fn ahead_of_time(&mut self, ui: &mut egui::Ui, s: &TtsSettings, spine: usize, ready: bool) {
-        ui.label(RichText::new("Ahead of time").strong());
+    /// Making audio ahead of time, and the saved audio. True: close the
+    /// panel (the "Generate locally" window opens).
+    fn ahead_of_time(
+        &mut self,
+        ui: &mut egui::Ui,
+        s: &TtsSettings,
+        spine: usize,
+        ready: bool,
+    ) -> bool {
+        let mut close = false;
+        let local = s.source == Source::Local;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Ahead of time").strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("Generate locally…")
+                    .on_hover_text(
+                        "Choose chapters and make their audio with the voice on this computer",
+                    )
+                    .clicked()
+                {
+                    self.open_local_window(spine);
+                    close = true;
+                }
+            });
+        });
         ui.label(
-            RichText::new(
+            RichText::new(if local {
+                "Make the audio now, to listen without waiting. \
+                 Saved sentences are never made twice."
+            } else {
                 "Make the audio now, to listen without waiting or offline. \
-                 Saved sentences are never paid for twice.",
-            )
+                 Saved sentences are never paid for twice."
+            })
             .size(12.0)
             .weak(),
         );
@@ -1025,107 +1261,68 @@ impl Tts {
                 (0..n_spines).collect(),
             ),
         ];
-        egui::Grid::new("reader-tts-ahead")
-            .num_columns(3)
-            .spacing([12.0, 6.0])
-            .show(ui, |ui| {
-                for (what, est, spines) in rows {
-                    ui.label(what);
-                    match est {
-                        Some((n, billed)) => ui.label(
-                            RichText::new(format!(
-                                "{} sentences, ≤ {} characters billed",
-                                group(n),
-                                group(billed)
-                            ))
-                            .weak(),
-                        ),
-                        None => ui.label(RichText::new("counting…").weak()),
-                    }
-                    .on_hover_text(
-                        "Azure counts each Chinese character twice; sentences \
+        if !local {
+            egui::Grid::new("reader-tts-ahead")
+                .num_columns(3)
+                .spacing([12.0, 6.0])
+                .show(ui, |ui| {
+                    for (what, est, spines) in rows {
+                        ui.label(what);
+                        match est {
+                            Some((n, billed)) => ui.label(
+                                RichText::new(format!(
+                                    "{} sentences, ≤ {} characters billed",
+                                    group(n),
+                                    group(billed)
+                                ))
+                                .weak(),
+                            ),
+                            None => ui.label(RichText::new("counting…").weak()),
+                        }
+                        .on_hover_text(
+                            "Azure counts each Chinese character twice; sentences \
                          already saved cost nothing",
-                    );
-                    if ui
-                        .add_enabled(
-                            ready && !running && est.is_some(),
-                            egui::Button::new("Make"),
-                        )
-                        .clicked()
-                    {
-                        let w = what.to_lowercase();
-                        self.pregenerate(s, spines, &w);
+                        );
+                        if ui
+                            .add_enabled(
+                                ready && !running && est.is_some(),
+                                egui::Button::new("Make"),
+                            )
+                            .clicked()
+                        {
+                            let w = what.to_lowercase();
+                            self.pregenerate(s, spines, &w);
+                        }
+                        ui.end_row();
                     }
-                    ui.end_row();
-                }
-            });
-        if let Some(b) = self.batch.clone() {
-            let total = b.total.load(Ordering::Relaxed);
-            let cached = b.cached.load(Ordering::Relaxed);
-            let done = b.done.load(Ordering::Relaxed);
-            let failed = b.failed.load(Ordering::Relaxed);
-            let listed = b.listed.load(Ordering::Relaxed);
-            let cancelled = b.cancel.load(Ordering::Relaxed);
-            let finished = b.finished();
-            let frac = if total == 0 {
-                0.0
-            } else {
-                (cached + done + failed) as f32 / total as f32
-            };
-            ui.horizontal(|ui| {
-                let text = format!(
-                    "{}: {} of {}{}{}",
-                    b.what,
-                    group(cached + done),
-                    group(total),
-                    if listed { "" } else { "+" },
-                    if failed > 0 {
-                        format!(", {} failed", group(failed))
-                    } else {
-                        String::new()
-                    }
-                );
-                ui.add(egui::ProgressBar::new(frac).desired_width(220.0).text(text));
-                if !finished && !cancelled {
-                    if ui.small_button("Cancel").clicked() {
-                        b.cancel.store(true, Ordering::Relaxed);
-                    }
-                } else if ui.small_button("Close").clicked() {
-                    self.batch = None;
-                    self.cache_size = None;
-                }
-            });
-            if cancelled && !finished {
-                ui.label(RichText::new("Cancelled.").weak());
-            }
-            if let Some(e) = b.error.lock().unwrap().as_ref() {
-                ui.colored_label(Color32::from_rgb(0xdc, 0x32, 0x2f), e);
-            }
-            if !finished && !cancelled {
-                ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(250));
-            }
+                });
         }
+        self.batch_progress(ui);
         let sizes = self.cache_size;
         let mut delete = None;
         egui::Grid::new("reader-tts-saved")
             .num_columns(3)
             .spacing([12.0, 6.0])
             .show(ui, |ui| {
-                for (all, what, tip) in [
+                let (what, tip) = if local {
                     (
-                        false,
-                        "This book's audio",
-                        "Delete this book's saved sentences",
-                    ),
+                        "This book's local audio",
+                        "Delete this book's sentences made on this computer (Azure's stay)",
+                    )
+                } else {
                     (
-                        true,
-                        "Every book's",
-                        "Delete every saved sentence, of every book",
-                    ),
-                ] {
+                        "This book's Azure audio",
+                        "Delete this book's sentences from Azure (those made on this computer stay)",
+                    )
+                };
+                let every = if local {
+                    "Delete every book's sentences made on this computer"
+                } else {
+                    "Delete every book's sentences from Azure"
+                };
+                for (all, what, tip) in [(false, what, tip), (true, "Every book's", every)] {
                     ui.label(what);
-                    let u = sizes.map(|(b, a)| if all { a } else { b });
+                    let u = sizes.map(|(b, a)| if all { a } else { b }.of(local));
                     match u {
                         Some(u) => ui.label(
                             RichText::new(format!(
@@ -1151,13 +1348,14 @@ impl Tts {
                 }
             });
         if let Some(all) = delete {
-            self.delete_cache(all);
+            self.delete_cache(all, if local { OPUS } else { MP3 });
         }
         ui.label(
             RichText::new(format!("Kept in {}", self.dir.display()))
                 .size(12.0)
                 .weak(),
         );
+        close
     }
 }
 
@@ -1238,6 +1436,7 @@ mod tests {
         let a = Speech {
             voice: "zh-CN-XiaoxiaoNeural".into(),
             rate: 0,
+            local: None,
         };
         let b = Speech {
             rate: 10,
@@ -1246,5 +1445,29 @@ mod tests {
         assert_ne!(a.key("你好"), b.key("你好"));
         assert_eq!(a.key("你好"), a.clone().key("你好"));
         assert_ne!(a.key("你好"), a.key("你好。"));
+        // The local voice: its own keys and files, by every setting that
+        // changes the audio, but not by how many requests run at once.
+        let l = Speech {
+            voice: String::new(),
+            rate: 0,
+            local: Some(local::LocalSettings::default()),
+        };
+        assert_ne!(l.key("你好"), a.key("你好"));
+        assert_eq!((a.ext(), l.ext()), (MP3, OPUS));
+        let with = |f: &dyn Fn(&mut local::LocalSettings)| {
+            let mut s = local::LocalSettings::default();
+            f(&mut s);
+            Speech {
+                local: Some(s),
+                ..l.clone()
+            }
+            .key("你好")
+        };
+        assert_ne!(with(&|s| s.speaker = "serena".into()), l.key("你好"));
+        assert_ne!(with(&|s| s.instruct = "慢一点".into()), l.key("你好"));
+        assert_ne!(with(&|s| s.temperature = 0.7), l.key("你好"));
+        assert_ne!(with(&|s| s.seed = 1), l.key("你好"));
+        assert_ne!(with(&|s| s.chunk_chars = 120), l.key("你好"));
+        assert_eq!(with(&|s| s.parallel = 1), l.key("你好"));
     }
 }
