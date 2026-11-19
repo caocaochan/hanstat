@@ -98,7 +98,8 @@ jobs:
           curl -sSL --fail "https://sdk.lunarg.com/sdk/download/$v/linux/vulkansdk-linux-x86_64-$v.tar.xz" | tar xJ
           echo "VULKAN_SDK=$PWD/$v/x86_64" >> "$GITHUB_ENV"
           echo "$PWD/$v/x86_64/bin" >> "$GITHUB_PATH"
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build
+          # The SDK has headers and glslc but no loader: the system's libvulkan.
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build libvulkan-dev
 
       - name: Build
         run: |
