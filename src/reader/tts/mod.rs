@@ -1238,9 +1238,9 @@ impl Tts {
     ) -> bool {
         let mut close = false;
         let local = s.source == Source::Local;
-        ui.horizontal(|ui| {
+        ui.horizontal_top(|ui| {
             ui.label(RichText::new("Ahead of time").strong());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
                 if ui
                     .button("Generate locally…")
                     .on_hover_text(
@@ -1251,23 +1251,22 @@ impl Tts {
                     self.open_local_window(spine);
                     close = true;
                 }
-            });
-        });
-        if local {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled(
-                        !self.local_voice_busy(),
-                        egui::Button::new("Design a voice…"),
-                    )
-                    .on_hover_text("Describe a voice, hear a sample and keep it to read your books")
-                    .clicked()
+                if local
+                    && ui
+                        .add_enabled(
+                            !self.local_voice_busy(),
+                            egui::Button::new("Design a voice…"),
+                        )
+                        .on_hover_text(
+                            "Describe a voice, hear a sample and keep it to read your books",
+                        )
+                        .clicked()
                 {
                     self.open_design_window();
                     close = true;
                 }
             });
-        }
+        });
         ui.label(
             RichText::new(if local {
                 "Make the audio now, to listen without waiting. \
@@ -1407,6 +1406,72 @@ fn group(n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_action_buttons_are_stacked_without_extra_space() {
+        fn text_rect(shape: &egui::Shape, label: &str) -> Option<egui::Rect> {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| text_rect(s, label)),
+                egui::Shape::Text(text) if text.galley.text() == label => {
+                    Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                _ => None,
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let mut tts = Tts::new(
+            Arc::new(Mutex::new(Vec::new())),
+            Vec::new(),
+            false,
+            "",
+            "layout-test",
+            &ctx,
+        );
+        let settings = TtsSettings {
+            source: Source::Local,
+            ..Default::default()
+        };
+        let mut screen = crate::raster::Screen::new();
+        let size = egui::vec2(460.0, 600.0);
+        for _ in 0..30 {
+            let mut frame = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    ..Default::default()
+                },
+                |ui| {
+                    tts.ahead_of_time(ui, &settings, 0, false);
+                },
+            );
+            screen.absorb(&mut frame);
+            let rect = |label| {
+                frame
+                    .shapes
+                    .iter()
+                    .find_map(|s| text_rect(&s.shape, label))
+                    .unwrap()
+            };
+            let generate = rect("Generate locally…");
+            let design = rect("Design a voice…");
+            assert!(
+                (0.0..=12.0).contains(&(design.top() - generate.bottom())),
+                "{generate:?}, {design:?}"
+            );
+            assert!(
+                (design.right() - generate.right()).abs() < 1.0,
+                "right-aligned buttons"
+            );
+            if let Some(dir) = std::env::var_os("TTS_LAYOUT_OUT") {
+                let dir = PathBuf::from(dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                screen
+                    .picture(&ctx, &mut frame, size)
+                    .write_png(&dir.join("local-actions.png"))
+                    .unwrap();
+            }
+        }
+    }
 
     fn split(s: &str) -> Vec<String> {
         let c: Vec<char> = s.chars().collect();

@@ -7,6 +7,9 @@
 - **Keep the same voice across books.** Qwen3-TTS VoiceDesign makes the sample once, and Qwen3-TTS Base clones it to read. The sample sets the voice's tone and pace. Its WAV hash identifies its saved audio, so another voice gets its own clips. Samples live in the user's `voices` folder and survive clearing Saved audio.
 - **Download the voice models when asked.** The Design window's button downloads the pinned VoiceDesign and Base Q8_0 models, about 4.1 GB, plus any missing server and shared tokenizer. It greys out during downloading and after completion. The three model modes share one guarded server process, switching when needed. Designed voices buffer a few seconds at startup to keep short chapter headings flowing into the narration.
 
+### Fixed
+- **The local voice buttons sit directly together.** **Design a voice…** is immediately below **Generate locally…**, with the usual spacing between buttons.
+
 ## [2026.11.19.04] - 2026-11-19
 
 ### Changed
