@@ -255,16 +255,39 @@ impl Driver {
     }
 
     fn click(&mut self, r: &mut Reader, p: Pos2) -> bool {
-        let button = |pressed| egui::Event::PointerButton {
-            pos: p,
-            button: egui::PointerButton::Primary,
-            pressed,
-            modifiers: egui::Modifiers::NONE,
-        };
-        let a = self.frame(r, vec![egui::Event::PointerMoved(p), button(true)]);
-        let b = self.frame(r, vec![button(false)]);
+        let a = self.press(r, p, egui::PointerButton::Primary);
+        let b = self.release(r, p, egui::PointerButton::Primary);
         self.idle(r, 30);
         a && b
+    }
+
+    fn press(&mut self, r: &mut Reader, pos: Pos2, button: egui::PointerButton) -> bool {
+        self.frame(
+            r,
+            vec![
+                egui::Event::PointerMoved(pos),
+                pointer_button(pos, button, true),
+            ],
+        )
+    }
+
+    fn release(&mut self, r: &mut Reader, pos: Pos2, button: egui::PointerButton) -> bool {
+        self.frame(r, vec![pointer_button(pos, button, false)])
+    }
+
+    fn drag(&mut self, r: &mut Reader, from: Pos2, to: Pos2) {
+        self.press(r, from, egui::PointerButton::Primary);
+        self.frame(r, vec![egui::Event::PointerMoved(to)]);
+        self.release(r, to, egui::PointerButton::Primary);
+    }
+
+    fn text_menu(&mut self, r: &mut Reader, p: Pos2) -> [Pos2; 2] {
+        self.press(r, p, egui::PointerButton::Secondary);
+        self.release(r, p, egui::PointerButton::Secondary);
+        self.idle(r, 10);
+        r.probe
+            .text_menu
+            .map(|rect| rect.expect("text menu button").center())
     }
 
     fn key(&mut self, r: &mut Reader, key: Key) -> bool {
@@ -291,6 +314,334 @@ impl Driver {
         let scene = self.screen.picture(&self.ctx, &mut out, self.size);
         scene.write_png(&dir.join(format!("{name}.png"))).unwrap();
     }
+}
+
+fn pointer_button(pos: Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
+    egui::Event::PointerButton {
+        pos,
+        button,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+const RIGHT_PAGE: &str = "右页开头。另一个句子。";
+
+fn write_zip(path: &Path, files: &[(&str, &str)]) {
+    use std::io::Write;
+
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+    for &(name, body) in files {
+        zip.start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(body.as_bytes()).unwrap();
+    }
+    zip.finish().unwrap();
+}
+
+fn selection_book(d: &mut Driver, dir: &Path) -> (Reader, String) {
+    let path = dir.join("selection.epub");
+    let left = format!("{}第一句。", "山川日月".repeat(10));
+    let chapter = format!(
+        r#"<html><meta charset="utf-8"><body><p style="background:#eee">{left}<br>换行。<a href="second.xhtml">脚注。</a></p><p style="break-before:page">{RIGHT_PAGE}</p><p style="break-before:page">下一页。</p></body></html>"#
+    );
+    write_zip(
+        &path,
+        &[
+            (
+                "META-INF/container.xml",
+                r#"<container><rootfiles><rootfile full-path="book.opf"/></rootfiles></container>"#,
+            ),
+            (
+                "book.opf",
+                r#"<package><metadata><title>Text selection test</title></metadata><manifest><item id="a" href="first.xhtml" media-type="application/xhtml+xml"/><item id="b" href="second.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="a"/><itemref idref="b"/></spine></package>"#,
+            ),
+            ("first.xhtml", &chapter),
+            (
+                "second.xhtml",
+                r#"<html><meta charset="utf-8"><body><p>脚注内容。</p></body></html>"#,
+            ),
+        ],
+    );
+    let mut r = d.open(path.to_str().unwrap());
+    r.settings = Settings::default();
+    r.go_chapter(0, Target::Offset(0));
+    d.ready(&mut r);
+    assert_eq!(r.probe.sides.len(), 2, "fixture opens in a two-page spread");
+    (r, left)
+}
+
+fn displayed_char(r: &Reader, src: u32) -> Rect {
+    let layout = &r.layouts[&r.spine];
+    r.probe
+        .sides
+        .iter()
+        .find_map(|&(page, off)| {
+            layout
+                .char_rects(page, src..src + 1)
+                .first()
+                .map(|rect| rect.translate(off))
+        })
+        .expect("character on the visible spread")
+}
+
+fn clipboard_text(d: &Driver) -> Option<&str> {
+    d.last
+        .as_ref()
+        .unwrap()
+        .platform_output
+        .commands
+        .iter()
+        .find_map(|command| {
+            if let egui::OutputCommand::CopyText(text) = command {
+                Some(text.as_str())
+            } else {
+                None
+            }
+        })
+}
+
+#[test]
+#[ignore = "opens the reader with the system fonts and dictionary settings"]
+fn reader_text_selection() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut d = Driver::new();
+    let (mut r, left) = selection_book(&mut d, temp.path());
+    let layout = &r.layouts[&0];
+    assert!(layout.char_rects(0, 0..left.chars().count() as u32).len() > 1);
+    let ch = r.chapter(0).unwrap();
+    let sentences = tts::sentences(&ch.chars);
+    let target = sentences.last().unwrap();
+    let right_sentence = &sentences[sentences.len() - 2];
+    assert_eq!(ch.chars[right_sentence.start as usize], '另');
+    let start = displayed_char(&r, 0);
+    let end = displayed_char(&r, right_sentence.start - 1);
+    let from = pos2(start.left() + start.width() * 0.2, start.center().y);
+    let to = pos2(end.right() - end.width() * 0.2, end.center().y);
+    let expected = format!("{left}\n换行。脚注。\n右页开头。");
+    let selected = Some(0..right_sentence.start);
+    let primary = egui::PointerButton::Primary;
+
+    d.drag(&mut r, from, to);
+    assert_eq!(r.selection, selected);
+    assert_eq!((r.spine, r.page), (0, 0));
+    d.frame(&mut r, vec![egui::Event::Copy]);
+    assert_eq!(clipboard_text(&d), Some(expected.as_str()));
+
+    d.drag(&mut r, to, from);
+    assert_eq!(r.selection, selected);
+    let right_text = displayed_char(&r, right_sentence.start + 2).center();
+    let secondary = egui::PointerButton::Secondary;
+    d.press(&mut r, right_text, secondary);
+    d.frame(
+        &mut r,
+        vec![
+            pointer_button(right_text, secondary, false),
+            egui::Event::PointerMoved(from),
+        ],
+    );
+    d.idle(&mut r, 10);
+    assert_eq!(r.selection, selected);
+    let menu = r.text_menu.unwrap();
+    assert_eq!(menu.position, right_text);
+    let spot = menu.target.unwrap();
+    assert_eq!((spot.spine, spot.src), (0, right_sentence.start));
+    let copy = r.probe.text_menu[0].unwrap().center();
+    d.press(&mut r, copy, primary);
+    d.release(&mut r, copy, primary);
+    assert_eq!(clipboard_text(&d), Some(expected.as_str()));
+    assert_eq!(r.selection, selected);
+
+    let page = r.drawn.unwrap().pages[1];
+    let margin = pos2(page.right() - 10.0, page.center().y);
+    let [_, play] = d.text_menu(&mut r, margin);
+    assert!(r.text_menu.unwrap().target.is_none());
+    d.click(&mut r, play);
+    assert!(!r.tts.active());
+    let text_menu_id = egui::Id::unique("reader-text-menu");
+    if egui::Popup::is_id_open(&d.ctx, text_menu_id) {
+        assert!(d.key(&mut r, Key::Escape));
+    }
+
+    r.settings.size = 18.0;
+    d.idle(&mut r, 20);
+    assert!(r.drawn.unwrap().spread);
+    assert_eq!(r.params.as_ref().unwrap().base, 18.0);
+    assert_eq!(r.selection, selected, "reflow preserves chapter offsets");
+    let right_text = displayed_char(&r, right_sentence.start + 2).center();
+    d.text_menu(&mut r, right_text);
+    d.click(&mut r, margin);
+    assert_eq!(r.page, 0, "outside click only dismisses the menu");
+    assert_eq!(r.selection, selected);
+
+    d.click(&mut r, right_text);
+    assert_eq!(r.page, 0, "plain text click stays put with TTS stopped");
+    assert!(r.selection.is_none());
+    let [copy, _] = d.text_menu(&mut r, right_text);
+    d.press(&mut r, copy, primary);
+    d.release(&mut r, copy, primary);
+    assert_eq!(
+        clipboard_text(&d),
+        None,
+        "Copy is disabled without a selection"
+    );
+    if egui::Popup::is_id_open(&d.ctx, text_menu_id) {
+        assert!(d.key(&mut r, Key::Escape));
+    }
+
+    let link = r.layouts[&0].page_links(0).next().unwrap().rect;
+    let off = r.probe.sides[0].1;
+    d.drag(&mut r, link.translate(off).center(), right_text);
+    assert_eq!((r.spine, r.page), (0, 0), "dragging a link selects text");
+    assert!(r.selection.is_some());
+    d.click(&mut r, margin);
+    assert_eq!(r.page, 2);
+    assert!(r.selection.is_none());
+    assert!(r.layouts[&0].shows_text(r.page, target));
+    d.key(&mut r, Key::ArrowLeft);
+    assert_eq!(r.page, 0);
+    d.frame(
+        &mut r,
+        vec![egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: vec2(0.0, -2.0),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    assert_eq!(r.page, 2);
+    d.key(&mut r, Key::ArrowLeft);
+    d.click(&mut r, link.translate(off).center());
+    assert_eq!(r.spine, 1, "plain click follows the EPUB link");
+
+    use hanstat::dict::{import, manage};
+    let dict_zip = temp.path().join("test-dictionary.zip");
+    let root = temp.path().join("dictionaries");
+    let id = "0000000000000001";
+    write_zip(
+        &dict_zip,
+        &[
+            (
+                "index.json",
+                r#"{"title":"Test","revision":"1","format":3}"#,
+            ),
+            (
+                "term_bank_1.json",
+                r#"[["脚注","jiǎozhù","","",1,["footnote"],1,""]]"#,
+            ),
+        ],
+    );
+    import::import(
+        &dict_zip,
+        &manage::tmp_dir(&root, id),
+        &import::Progress::default(),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    manage::swap(&root, id).unwrap();
+    manage::add_to_manifest(&root, id).unwrap();
+    r.dict = popup::Popup::with_root(&d.ctx, None, root);
+
+    let footnote = displayed_char(&r, 0).center();
+    let since = Instant::now();
+    while !r.dict.is_open() {
+        d.frame_with(
+            &mut r,
+            vec![egui::Event::PointerMoved(footnote)],
+            egui::Modifiers::SHIFT,
+        );
+        assert!(
+            since.elapsed().as_secs() < 5,
+            "dictionary lookup did not open"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(r.dict.highlight(1), Some((0, 2)));
+    r.dict.unloader().unload(vec![id.into()]).unwrap();
+}
+
+#[test]
+#[ignore = "requires ffmpeg and a default audio output device"]
+fn reader_text_menu_playback() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut d = Driver::new();
+    let (mut r, left) = selection_book(&mut d, temp.path());
+    r.tts.set_test_cache_dir(temp.path().to_owned());
+    r.tts.use_key("");
+    r.settings.tts.voice = "zh-CN-YunxiNeural".into();
+    r.settings.tts.rate = -15;
+    let ch = r.chapter(0).unwrap();
+    let sentences = tts::sentences(&ch.chars);
+    let target = sentences[sentences.len() - 2].clone();
+    let selected_text: String = ch.chars[target.start as usize..target.end as usize]
+        .iter()
+        .collect();
+    assert_eq!(selected_text, "另一个句子。");
+    let clicked_text = displayed_char(&r, target.start + 2).center();
+    let old_text = displayed_char(&r, 0).center();
+
+    // These clips exist only for the voice and speed in effect when Play is pressed.
+    let speech = tts::Speech {
+        voice: r.settings.tts.voice.clone(),
+        rate: 23,
+        local: None,
+    };
+    let first_clip = tts::clip_path(r.tts.dir(), speech.key(&left), speech.ext());
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=24000:cl=mono",
+            "-t",
+            "6",
+            "-c:a",
+            "libmp3lame",
+        ])
+        .arg(&first_clip)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    std::fs::copy(
+        &first_clip,
+        tts::clip_path(r.tts.dir(), speech.key(&selected_text), speech.ext()),
+    )
+    .unwrap();
+
+    let [_, play] = d.text_menu(&mut r, clicked_text);
+    d.frame(&mut r, vec![egui::Event::PointerMoved(play)]);
+    r.settings.tts.rate = speech.rate;
+    d.click(&mut r, play);
+
+    let wait_for = |d: &mut Driver, r: &mut Reader, sentence: &Range<u32>| {
+        let since = Instant::now();
+        while r.tts.state() != tts::PlayState::Playing
+            || r.tts.at().as_ref().map(|(_, range)| range) != Some(sentence)
+        {
+            d.frame(r, vec![]);
+            assert!(
+                since.elapsed().as_secs() < 5,
+                "{sentence:?}, {:?}, {:?}",
+                r.tts.at(),
+                r.tts.error()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    };
+    wait_for(&mut d, &mut r, &target);
+
+    d.drag(&mut r, clicked_text, old_text);
+    d.idle(&mut r, 2);
+    assert!(r.selection.is_some());
+    assert_eq!((r.spine, r.page), (0, 0));
+    assert_eq!(r.tts.at(), Some((0, target)));
+    d.click(&mut r, old_text);
+    wait_for(&mut d, &mut r, &sentences[0]);
+    assert_eq!((r.spine, r.page), (0, 0));
+    assert!(r.selection.is_none());
 }
 
 /// The reader's own UI, driven frame by frame without a window: it opens,

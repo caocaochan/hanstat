@@ -266,15 +266,19 @@ const FAINT: Color32 = mocha::OVERLAY1;
 
 impl Popup {
     pub fn new(ctx: &egui::Context, freq_sort: Option<String>) -> Popup {
+        Self::with_root(ctx, freq_sort, hanstat::dict::root())
+    }
+
+    pub(super) fn with_root(
+        ctx: &egui::Context,
+        freq_sort: Option<String>,
+        root: std::path::PathBuf,
+    ) -> Popup {
         let c = ctx.clone();
         let c2 = ctx.clone();
         Popup {
             cards: Cards::new(Arc::new(move || c2.request_repaint())),
-            service: Service::start(
-                hanstat::dict::root(),
-                freq_sort,
-                Arc::new(move || c.request_repaint()),
-            ),
+            service: Service::start(root, freq_sort, Arc::new(move || c.request_repaint())),
             renderer: Renderer::new(),
             dicts: Vec::new(),
             scan_len: 0,

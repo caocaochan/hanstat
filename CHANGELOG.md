@@ -1,5 +1,11 @@
 # Changelog
 
+## [2026.11.20.00] - 2026-11-20
+
+### Added
+- **Select and copy EPUB text.** Drag across text, including across both visible pages, then choose **Copy** from the right-click menu or press Ctrl+C. Copied text keeps paragraph breaks and authored line breaks.
+- **Play from here.** Right-click a sentence to start reading aloud from it with the current TTS settings. A click on ordinary text clears the selection while TTS is stopped. During playback, clicking text still jumps to its sentence.
+
 ## [2026.11.19.06] - 2026-11-19
 
 ### Added

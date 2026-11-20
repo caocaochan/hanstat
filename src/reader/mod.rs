@@ -27,6 +27,7 @@ use epub::Epub;
 use layout::{ChapterLayout, Item, Params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -152,6 +153,8 @@ struct Probe {
     toc_item: Option<Rect>,
     /// The pages shown: (page, flow → screen offset).
     sides: Vec<(usize, Vec2)>,
+    #[cfg(test)]
+    text_menu: [Option<Rect>; 2],
 }
 
 /// Where to go once a chapter is laid out.
@@ -173,6 +176,12 @@ struct Geometry {
     /// Text area offset inside a page.
     inset: Vec2,
     content: Vec2,
+}
+
+#[derive(Clone, Copy)]
+struct TextMenu {
+    position: Pos2,
+    target: Option<popup::Spot>,
 }
 
 pub struct Reader {
@@ -225,6 +234,11 @@ pub struct Reader {
     dicts: dicts_ui::Manager,
     /// Reading aloud.
     tts: tts::Tts,
+    /// The primary press and the selected range, in chapter characters.
+    selection_anchor: Option<u32>,
+    selection: Option<Range<u32>>,
+    /// The click position and its sentence, fixed for the life of the menu.
+    text_menu: Option<TextMenu>,
 }
 
 impl Drop for Reader {
@@ -383,11 +397,15 @@ impl Reader {
             dict,
             dicts,
             tts,
+            selection_anchor: None,
+            selection: None,
+            text_menu: None,
         })
     }
 
     /// Restore the app's look and remember the place.
     pub fn close(mut self, ctx: &egui::Context) {
+        egui::Popup::close_id(ctx, egui::Id::unique("reader-text-menu"));
         self.save();
         if let Some((theme, style)) = self.prev_style.take() {
             ctx.set_style_of(theme, style);
@@ -484,7 +502,12 @@ impl Reader {
 
     fn go_chapter(&mut self, i: usize, target: Target) {
         self.turned_at = self.now;
-        self.spine = i.min(self.epub.spine.len() - 1);
+        let spine = i.min(self.epub.spine.len() - 1);
+        if self.spine != spine {
+            self.selection = None;
+            self.selection_anchor = None;
+        }
+        self.spine = spine;
         self.want.store(self.spine, Ordering::Relaxed);
         self.target = Some(target);
     }
@@ -606,6 +629,51 @@ impl Reader {
         (total > 0).then(|| (before + here) as f32 / total as f32)
     }
 
+    fn copy_selection(&self, ctx: &egui::Context) {
+        if let (Some(range), Some(ch)) = (&self.selection, self.chapter(self.spine)) {
+            ctx.copy_text(
+                ch.chars[range.start as usize..range.end as usize]
+                    .iter()
+                    .map(|&c| if c == '\0' { '\n' } else { c })
+                    .collect(),
+            );
+        }
+    }
+
+    fn show_text_menu(
+        &mut self,
+        response: &egui::Response,
+        id: egui::Id,
+        change: Option<egui::SetOpenCommand>,
+    ) {
+        let Some(menu) = self.text_menu else { return };
+        let play = egui::Popup::menu(response)
+            .id(id)
+            .open_memory(change)
+            .at_position(menu.position)
+            .show(|ui| {
+                let copy = ui.add_enabled(self.selection.is_some(), egui::Button::new("Copy"));
+                let play =
+                    ui.add_enabled(menu.target.is_some(), egui::Button::new("Play from here"));
+                #[cfg(test)]
+                {
+                    self.probe.text_menu = [Some(copy.rect), Some(play.rect)];
+                }
+                if copy.clicked() {
+                    self.copy_selection(ui.ctx());
+                    ui.close();
+                }
+                if play.clicked() {
+                    ui.close();
+                }
+                play.clicked()
+            })
+            .is_some_and(|menu| menu.inner);
+        if play && let Some(spot) = menu.target {
+            self.tts.play_from(spot.spine, spot.src, &self.settings.tts);
+        }
+    }
+
     /// Draw the reader. `false` once it is closed.
     pub fn ui(&mut self, ui: &mut egui::Ui) -> bool {
         let ctx = ui.ctx().clone();
@@ -643,6 +711,13 @@ impl Reader {
             || self.dict.cards.setup_open;
         let dict_open = self.dict.is_open();
         let popup_was_open = menus_open || dict_open;
+        let text_menu_id = egui::Id::unique("reader-text-menu");
+        let text_menu_open = egui::Popup::is_id_open(&ctx, text_menu_id);
+        let text_input_busy = text_menu_open || self.selection_anchor.is_some();
+        #[cfg(test)]
+        {
+            self.probe.text_menu = [None; 2];
+        }
         // Esc closes an open panel, menu or the dictionary popup (egui closes
         // its menus itself while drawing them), never the reader with it.
         let esc_for_popup = popup_was_open && ctx.input(|i| i.key_pressed(Key::Escape));
@@ -773,7 +848,9 @@ impl Reader {
                 rule: theme::BASE1,
             };
             // Not while a slider or the window edge is being dragged.
-            let settled = (now - self.resized_at > 0.15 && !ctx.input(|i| i.pointer.any_down()))
+            let settled = (now - self.resized_at > 0.15
+                && !text_input_busy
+                && !ctx.input(|i| i.pointer.any_down()))
                 || self.layouts.is_empty();
             if self.params.as_ref() != Some(&params) {
                 if settled {
@@ -824,15 +901,28 @@ impl Reader {
                 let src = l.page_first_src(self.page).unwrap_or(0);
                 self.tts.play_from(self.spine, src, &self.settings.tts);
             }
-            self.follow_reading(&l, step);
+            let resp = ui.interact(
+                area,
+                egui::Id::unique("reader-page"),
+                egui::Sense::click_and_drag(),
+            );
+            let primary_click = resp.clicked_by(egui::PointerButton::Primary);
+            let secondary_click = resp.clicked_by(egui::PointerButton::Secondary);
+            let spoken_chapter = if !text_input_busy
+                && !resp.is_pointer_button_down_on()
+                && !primary_click
+                && !secondary_click
+            {
+                self.follow_reading(&l, step)
+            } else {
+                None
+            };
             let reading = self
                 .tts
                 .at()
                 .filter(|(sp, _)| *sp == self.spine)
                 .map(|(_, r)| r);
             let label = self.toc_label().map(str::to_owned);
-            let resp = ui.interact(area, egui::Id::unique("reader-page"), egui::Sense::click());
-            let mut clicked_link = None;
             // Where each page's text is drawn: (page, flow → screen offset, clip).
             let sides: Vec<(usize, Vec2, Rect)> = (0..step)
                 .filter_map(|side| {
@@ -849,22 +939,142 @@ impl Reader {
                     Some((idx, off, Rect::from_min_size(origin, g.content).expand(4.0)))
                 })
                 .collect();
+            if self
+                .selection
+                .as_ref()
+                .is_some_and(|range| !sides.iter().any(|(idx, _, _)| l.shows_text(*idx, range)))
+            {
+                self.selection = None;
+            }
+            let hit_text = |p: Pos2| {
+                sides.iter().find_map(|&(idx, off, clip)| {
+                    clip.contains(p)
+                        .then(|| l.char_at(idx, p - off))
+                        .flatten()
+                        .map(|src| (src, idx, off))
+                })
+            };
+            let hit_link = |p: Pos2| {
+                sides.iter().find_map(|&(idx, off, _)| {
+                    l.page_links(idx)
+                        .find(|link| link.rect.translate(off).contains(p))
+                        .map(|link| link.target)
+                })
+            };
+            let primary = egui::PointerButton::Primary;
+            if !popup_was_open
+                && resp.is_pointer_button_down_on()
+                && let Some(p) = ctx.input(|i| {
+                    i.pointer
+                        .button_pressed(primary)
+                        .then(|| i.pointer.press_origin())
+                        .flatten()
+                })
+                && let Some((_, idx, off)) = hit_text(p)
+            {
+                self.selection_anchor = l.caret_near(idx, p - off);
+                resp.request_focus();
+            }
+            let dragged = resp.dragged_by(primary);
+            if let Some(anchor) = self.selection_anchor
+                && (dragged || resp.drag_stopped_by(primary))
+                && let Some(p) = resp.interact_pointer_pos()
+                && let Some((_, end)) = sides
+                    .iter()
+                    .filter_map(|&(idx, off, clip)| {
+                        let distance = (p.x - p.x.clamp(clip.left(), clip.right())).abs();
+                        l.caret_near(idx, p - off).map(|end| (distance, end))
+                    })
+                    .min_by(|a, b| a.0.total_cmp(&b.0))
+            {
+                self.selection = (anchor != end).then(|| anchor.min(end)..anchor.max(end));
+            }
+            if !ctx.input(|i| i.pointer.button_down(primary)) {
+                self.selection_anchor = None;
+            }
+            if primary_click && !popup_was_open {
+                self.selection = None;
+            }
+            let menu_position = if secondary_click && !menus_open && !text_input_busy {
+                ctx.input(|i| {
+                    i.events.iter().rev().find_map(|event| match event {
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Secondary,
+                            pressed: false,
+                            ..
+                        } => Some(*pos),
+                        _ => None,
+                    })
+                })
+                .filter(|&p| {
+                    hit_text(p).is_some()
+                        || (self.selection.is_some()
+                            && g.pages[..sides.len()].iter().any(|page| page.contains(p)))
+                })
+            } else {
+                None
+            };
+            if let Some(p) = menu_position {
+                self.dict.close();
+                let target = hit_text(p).and_then(|(src, _, _)| {
+                    let ch = self.chapter(self.spine)?;
+                    let sentences = tts::sentences(&ch.chars);
+                    let sentence = sentences.get(tts::sentence_at(&sentences, src))?;
+                    sentence.contains(&src).then_some(popup::Spot {
+                        spine: self.spine,
+                        src: sentence.start,
+                    })
+                });
+                self.text_menu = Some(TextMenu {
+                    position: p,
+                    target,
+                });
+            }
+            if menu_position.is_some() || text_menu_open {
+                let change = if menu_position.is_some() {
+                    Some(egui::SetOpenCommand::Bool(true))
+                } else if primary_click {
+                    Some(egui::SetOpenCommand::Bool(false))
+                } else {
+                    None
+                };
+                self.show_text_menu(&resp, text_menu_id, change);
+            } else if !popup_was_open
+                && resp.has_focus()
+                && !ctx.text_edit_focused()
+                && ctx.input(|i| i.events.contains(&egui::Event::Copy))
+            {
+                self.copy_selection(&ctx);
+            }
+            if self.text_menu.is_some() && !egui::Popup::is_id_open(&ctx, text_menu_id) {
+                self.text_menu = None;
+            }
+            if !popup_was_open && menu_position.is_none() {
+                if dragged && self.selection_anchor.is_some() {
+                    ctx.set_cursor_icon(egui::CursorIcon::Text);
+                } else if let Some(p) = resp.hover_pos() {
+                    if hit_link(p).is_some() {
+                        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                    } else if hit_text(p).is_some() {
+                        ctx.set_cursor_icon(egui::CursorIcon::Text);
+                    }
+                }
+            }
             // The word under the pointer, with the lookup key held: looked up
             // before the pages are drawn, so its highlight shows this frame.
             if key_held
                 && !menus_open
+                && menu_position.is_none()
+                && self.selection_anchor.is_none()
                 && let Some(h) = resp.hover_pos()
-                && let Some(spot) = sides.iter().find_map(|(idx, off, clip)| {
-                    clip.contains(h)
-                        .then(|| l.char_at(*idx, h - *off))
-                        .flatten()
-                        .map(|src| popup::Spot {
-                            spine: self.spine,
-                            src,
-                        })
-                })
+                && let Some((src, _, _)) = hit_text(h)
                 && let Some(ch) = self.chapter(self.spine)
             {
+                let spot = popup::Spot {
+                    spine: self.spine,
+                    src,
+                };
                 self.dict.point(spot, &ch.chars, lookup_key, now, &ctx);
             }
             self.probe.sides = sides.iter().map(|(i, o, _)| (*i, *o)).collect();
@@ -898,6 +1108,11 @@ impl Reader {
                 for i in items {
                     paint_item(&mut self.images, &painter, &l.items[i], off, ppp);
                 }
+                if let Some(range) = &self.selection {
+                    for r in l.char_rects(idx, range.clone()) {
+                        painter.rect_filled(r.translate(off), 2.0, ui.visuals().selection.bg_fill);
+                    }
+                }
                 // Running head and folio.
                 let small = egui::FontId::proportional((self.settings.size * 0.62).max(11.0));
                 if let Some(t) = &label {
@@ -916,54 +1131,24 @@ impl Reader {
                     small,
                     theme::BASE1,
                 );
-                if let Some(p) = resp.interact_pointer_pos()
-                    && resp.clicked()
-                {
-                    for link in l.page_links(idx) {
-                        if link.rect.translate(off).contains(p) {
-                            clicked_link = Some(link.target);
-                        }
-                    }
-                }
-                if l.page_links(idx).any(|k| {
-                    resp.hover_pos()
-                        .is_some_and(|h| k.rect.translate(off).contains(h))
-                }) {
-                    ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-                }
             }
-            // While reading aloud, a word under the pointer reads from its sentence.
-            let char_at = |p: Pos2| {
-                sides.iter().find_map(|(idx, off, clip)| {
-                    clip.contains(p)
-                        .then(|| l.char_at(*idx, p - *off))
-                        .flatten()
-                })
-            };
-            if self.tts.active() && !menus_open && resp.hover_pos().and_then(char_at).is_some() {
-                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            // Clicks: links, a word while reading aloud, else the left third
-            // back and the rest forward.
-            if resp.clicked() && popup_was_open {
-                self.settings_open = false;
-                self.tts.panel_open = false;
-                self.dict.close();
-            } else if resp.clicked()
-                && clicked_link.is_none()
-                && self.tts.active()
-                && let Some(src) = resp.interact_pointer_pos().and_then(char_at)
-            {
-                self.tts.play_from(self.spine, src, &self.settings.tts);
-            } else if resp.clicked() {
-                if let Some(t) = clicked_link {
+            if primary_click && let Some(p) = resp.interact_pointer_pos() {
+                if popup_was_open {
+                    self.settings_open = false;
+                    self.tts.panel_open = false;
+                    self.dict.close();
+                } else if let Some(t) = hit_link(p) {
                     if let Some(ch) = self.chapter(self.spine)
                         && let Some(tree::LinkTarget::Chapter { path, fragment }) =
                             ch.links.get(t as usize).cloned()
                     {
                         self.follow(&path, fragment);
                     }
-                } else if let Some(p) = resp.interact_pointer_pos() {
+                } else if let Some((src, _, _)) = hit_text(p) {
+                    if self.tts.active() {
+                        self.tts.play_from(self.spine, src, &self.settings.tts);
+                    }
+                } else {
                     let left = g.pages[0].left();
                     let right = if g.spread {
                         g.pages[1].right()
@@ -976,6 +1161,13 @@ impl Reader {
                         self.next(&g);
                     }
                 }
+            }
+            if let Some((spine, src)) = spoken_chapter {
+                self.forward = spine > self.spine;
+                self.go_chapter(spine, Target::Src(src));
+                self.save();
+                ctx.request_repaint();
+                return;
             }
             // Lay out the next chapter once the reader has been idle a moment,
             // so turning into it is instant and the work never delays a turn.
@@ -1003,6 +1195,8 @@ impl Reader {
             && !egui::Popup::is_any_open(&ctx)
             && !self.settings_open
             && !menus_open
+            && !text_input_busy
+            && self.selection_anchor.is_none()
             && !esc_for_popup
         {
             // With the popup open, ↑ and ↓ scroll it.
@@ -1117,40 +1311,38 @@ impl Reader {
 
     /// Turn to the sentence read aloud when it leaves the pages shown, if
     /// the one before was on them (pages turned away by hand stay).
-    fn follow_reading(&mut self, l: &ChapterLayout, step: usize) {
-        let Some((spine, r)) = self.tts.at() else {
-            return;
-        };
-        let first = l.page_of_src(r.start);
-        let visible = spine == self.spine
-            && first.is_some_and(|a| {
-                let z = l.page_of_src(r.end.saturating_sub(1)).unwrap_or(a);
-                a < self.page + step && z >= self.page
-            });
+    /// If it moves to another chapter, return its target to open after painting.
+    fn follow_reading(&mut self, l: &ChapterLayout, step: usize) -> Option<(usize, u32)> {
+        let (spine, r) = self.tts.at()?;
+        let first = (spine == self.spine)
+            .then(|| l.page_of_src(r.start))
+            .flatten();
+        let visible = first.is_some_and(|a| {
+            let z = l.page_of_src(r.end.saturating_sub(1)).unwrap_or(a);
+            a < self.page + step && z >= self.page
+        });
         let key = (spine, r.start);
         if self.tts.last_at == Some(key) {
             self.tts.last_visible = visible;
-            return;
+            return None;
         }
         self.tts.last_at = Some(key);
         if !self.tts.last_visible || visible {
             self.tts.last_visible = visible;
-            return;
+            return None;
         }
         // Followed: still "visible" while the turn happens.
         self.tts.last_visible = true;
         self.turned_at = self.now;
-        if spine == self.spine {
-            if let Some(p) = first {
-                self.forward = p > self.page;
-                self.page = p - p % step;
-                self.offset = l.page_offset(self.page);
-            }
-        } else {
-            self.forward = spine > self.spine;
-            self.go_chapter(spine, Target::Src(r.start));
-            self.save();
+        if spine != self.spine {
+            return Some((spine, r.start));
         }
+        if let Some(p) = first {
+            self.forward = p > self.page;
+            self.page = p - p % step;
+            self.offset = l.page_offset(self.page);
+        }
+        None
     }
 
     fn contents_menu(&mut self, ui: &mut egui::Ui) {

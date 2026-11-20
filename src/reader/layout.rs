@@ -224,6 +224,53 @@ impl ChapterLayout {
         (p.x < h.x[k] + h.w[k]).then_some(h.src[k])
     }
 
+    /// The chapter-text boundary nearest the pointer, including in the margins.
+    pub fn caret_near(&self, page: usize, p: Pos2) -> Option<u32> {
+        let h = &self.hits;
+        let lines = &h.lines[self.page_lines(page)];
+        let first = lines.first()?;
+        let last = lines.last()?;
+        if p.y < first.top {
+            return Some(h.src[first.start as usize]);
+        }
+        if p.y >= last.bottom {
+            return Some(h.src[(last.start + last.len - 1) as usize] + 1);
+        }
+        let i = lines.partition_point(|l| l.bottom <= p.y);
+        let mut line = &lines[i];
+        if i > 0 && p.y - lines[i - 1].bottom < line.top - p.y {
+            line = &lines[i - 1];
+        }
+        let a = line.start as usize;
+        let z = (line.start + line.len) as usize;
+        let k = a + h.x[a..z].partition_point(|x| *x <= p.x);
+        if k == a {
+            return Some(h.src[a]);
+        }
+        let prev = k - 1;
+        let right = h.x[prev] + h.w[prev];
+        if p.x < (h.x[prev] + right) * 0.5 {
+            return Some(h.src[prev]);
+        }
+        if k < z && h.x[k] - p.x < p.x - right {
+            return Some(h.src[k]);
+        }
+        Some(h.src[prev] + 1)
+    }
+
+    /// Whether the range includes any laid-out characters on this page.
+    pub fn shows_text(&self, page: usize, src: &Range<u32>) -> bool {
+        let h = &self.hits;
+        let lines = &h.lines[self.page_lines(page)];
+        let (Some(first), Some(last)) = (lines.first(), lines.last()) else {
+            return false;
+        };
+        let chars = &h.src[first.start as usize..(last.start + last.len) as usize];
+        chars
+            .get(chars.partition_point(|x| *x < src.start))
+            .is_some_and(|x| *x < src.end)
+    }
+
     /// The page holding character `src` of [`Chapter::chars`], or the first
     /// character laid out after it; `None` past the last one.
     pub fn page_of_src(&self, src: u32) -> Option<usize> {

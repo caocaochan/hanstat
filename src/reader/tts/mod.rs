@@ -867,6 +867,11 @@ impl Tts {
     }
 
     #[cfg(test)]
+    pub(super) fn set_test_cache_dir(&mut self, dir: PathBuf) {
+        self.dir = dir;
+    }
+
+    #[cfg(test)]
     pub fn batch(&self) -> Option<Arc<Batch>> {
         self.batch.clone()
     }
@@ -982,7 +987,7 @@ impl Tts {
                     }
                 });
                 ui.label(
-                    RichText::new("While reading, click a word to read from its sentence.")
+                    RichText::new("Right-click text and choose Play from here. While reading, you can also click a word to jump to its sentence.")
                         .size(12.0)
                         .weak(),
                 );
