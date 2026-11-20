@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.20.01] - 2026-11-20
+
+### Added
+- **Import and export designed voices.** In **Design a voice**, choose **Import voice…** beside **Kept voices**, or **Export…** next to a saved voice. A `.voice` file keeps the exact saved name, original recording, and transcript. Imported voices appear in Preview and Generate locally. Importing a voice you already have preserves its local name.
+
 ## [2026.11.20.00] - 2026-11-20
 
 ### Added

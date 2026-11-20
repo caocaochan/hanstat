@@ -5,7 +5,10 @@ use super::super::{Tts, TtsSettings};
 use super::{Output, RED, local, play};
 use eframe::egui::{self, RichText};
 use local::{SavedVoice, VoiceStore};
+use std::fs;
 use std::hash::{BuildHasher, RandomState};
+use std::io::ErrorKind;
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 const EXAMPLE: &str = "三十岁左右的男声，低沉温和，像深夜电台主持人";
@@ -28,6 +31,39 @@ struct Take {
 enum Edit {
     Rename { id: String, name: String },
     Delete { id: String, name: String },
+    ReplaceExport { id: String, path: PathBuf },
+}
+
+enum Transfer {
+    Imported(Option<String>),
+    Exported(PathBuf),
+}
+
+fn voice_dialog(title: &str) -> rfd::FileDialog {
+    rfd::FileDialog::new()
+        .set_title(title)
+        .add_filter("Hanstat voice", &["voice"])
+}
+
+fn export_filename(name: &str) -> String {
+    let stem: String = name
+        .chars()
+        .take(60)
+        .map(|ch| {
+            if ch.is_control() || "<>:\"/\\|?*".contains(ch) {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect();
+    let stem = stem.trim_matches([' ', '.']);
+    if stem.is_empty() {
+        "voice.voice".into()
+    } else {
+        // The prefix also rules out Windows device names such as CON and NUL.
+        format!("voice-{stem}.voice")
+    }
 }
 
 pub(super) struct State {
@@ -43,6 +79,8 @@ pub(super) struct State {
     pub voices: Vec<SavedVoice>,
     edit: Option<Edit>,
     error: Option<String>,
+    transfer: Option<Receiver<Result<Transfer, String>>>,
+    transfer_note: Option<Result<String, String>>,
 }
 
 impl Default for State {
@@ -59,6 +97,8 @@ impl Default for State {
             voices: Vec::new(),
             edit: None,
             error: None,
+            transfer: None,
+            transfer_note: None,
         }
     }
 }
@@ -81,6 +121,28 @@ impl State {
                     Ok(take) => self.take = Some(take),
                     Err(e) => self.error = Some(e),
                 }
+            }
+        }
+        if let Some(rx) = &self.transfer {
+            let answer = match rx.try_recv() {
+                Ok(answer) => Some(answer),
+                Err(TryRecvError::Disconnected) => Some(Err("The voice transfer stopped.".into())),
+                Err(TryRecvError::Empty) => None,
+            };
+            if let Some(answer) = answer {
+                self.transfer = None;
+                self.transfer_note = Some(answer.map(|result| match result {
+                    Transfer::Imported(name) => {
+                        self.refresh();
+                        match name {
+                            Some(name) => format!("Imported “{name}”."),
+                            None => "Already imported.".into(),
+                        }
+                    }
+                    Transfer::Exported(path) => {
+                        format!("Exported “{}”.", crate::file_name(&path))
+                    }
+                }));
             }
         }
         if self
@@ -228,6 +290,7 @@ impl Tts {
     fn make_sample_form(&mut self, ui: &mut egui::Ui, s: &mut TtsSettings, spine: usize) {
         let busy = self.local_voice_busy();
         let d = &mut self.local.designer;
+        let can_keep = !busy && d.transfer.is_none();
         let mut from_page = false;
         ui.add_enabled_ui(!d.making(), |ui| {
             ui.label("Description").on_hover_text(DESCRIPTION_TIP);
@@ -275,7 +338,7 @@ impl Tts {
                 if ui.button(if d.playing(None) { "Stop sample" } else { "Play sample" }).clicked() {
                     self.toggle_sample(None);
                 }
-                if ui.add_enabled(!busy, egui::Button::new("Keep…")).on_hover_text(SAMPLE_STYLE).clicked() {
+                if ui.add_enabled(can_keep, egui::Button::new("Keep…")).on_hover_text(SAMPLE_STYLE).clicked() {
                     self.local.designer.keep_name = Some(String::new());
                 }
             }
@@ -284,7 +347,7 @@ impl Tts {
         if let (Some(name), Some(take)) = (&mut d.keep_name, &d.take) {
             let mut keep = false;
             let mut cancel = false;
-            ui.add_enabled_ui(!busy, |ui| {
+            ui.add_enabled_ui(can_keep, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Name");
                     ui.text_edit_singleline(name);
@@ -319,17 +382,27 @@ impl Tts {
     fn kept_voices(&mut self, ui: &mut egui::Ui, s: &mut TtsSettings) {
         let busy = self.local_voice_busy();
         let d = &mut self.local.designer;
-        ui.label(RichText::new("Kept voices").strong())
-            .on_hover_text(SAMPLE_STYLE);
+        let transferring = d.transfer.is_some();
+        let mut import = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Kept voices").strong())
+                .on_hover_text(SAMPLE_STYLE);
+            import = ui
+                .add_enabled(!transferring, egui::Button::new("Import voice…").small())
+                .clicked();
+            if transferring {
+                ui.spinner();
+            }
+        });
         if d.voices.is_empty() {
             ui.label(RichText::new("No voices kept yet.").weak());
-            return;
         }
         let mut play_id = None;
+        let mut export = None;
         for voice in &d.voices {
             let playing = d.playing(Some(&voice.id));
             ui.push_id(&voice.id, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(&voice.info.name)
                         .on_hover_text(&voice.info.description);
                     if ui
@@ -342,7 +415,7 @@ impl Tts {
                     {
                         play_id = Some(voice.id.clone());
                     }
-                    ui.add_enabled_ui(!busy, |ui| {
+                    ui.add_enabled_ui(!busy && !transferring, |ui| {
                         if ui.small_button("Rename…").clicked() {
                             d.edit = Some(Edit::Rename {
                                 id: voice.id.clone(),
@@ -356,13 +429,94 @@ impl Tts {
                             });
                         }
                     });
+                    if ui
+                        .add_enabled(!transferring, egui::Button::new("Export…").small())
+                        .clicked()
+                    {
+                        export = Some((voice.id.clone(), voice.info.name.clone()));
+                    }
                 })
             });
         }
         if let Some(id) = play_id {
             self.toggle_sample(Some(&id));
         }
+        if import {
+            self.choose_voice_import();
+        } else if let Some((id, name)) = export {
+            self.choose_voice_export(id, &name);
+        }
         self.edit_voice(ui, s, busy);
+        match &self.local.designer.transfer_note {
+            Some(Ok(note)) => {
+                ui.label(note);
+            }
+            Some(Err(error)) => {
+                ui.colored_label(RED, error);
+            }
+            None => {}
+        }
+    }
+
+    fn choose_voice_import(&mut self) {
+        let Some(path) = voice_dialog("Import voice").pick_file() else {
+            return;
+        };
+        let d = &mut self.local.designer;
+        d.edit = None;
+        d.transfer_note = None;
+        d.transfer = Some(local::spawn(
+            "tts-voice-import",
+            self.repaint.clone(),
+            move || {
+                VoiceStore::default()
+                    .import_voice(&path)
+                    .map(Transfer::Imported)
+            },
+        ));
+    }
+
+    fn choose_voice_export(&mut self, id: String, name: &str) {
+        let Some(mut path) = voice_dialog("Export voice")
+            .set_file_name(export_filename(name))
+            .save_file()
+        else {
+            return;
+        };
+        if !path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("voice"))
+        {
+            path.as_mut_os_string().push(".voice");
+        }
+        let d = &mut self.local.designer;
+        d.edit = None;
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {
+                d.edit = Some(Edit::ReplaceExport { id, path });
+            }
+            Ok(_) => {
+                d.transfer_note = Some(Err("Choose a regular file to replace.".into()));
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => self.start_voice_export(id, path, false),
+            Err(e) => {
+                d.transfer_note = Some(Err(format!("Cannot check the export destination: {e}")));
+            }
+        }
+    }
+
+    fn start_voice_export(&mut self, id: String, path: PathBuf, replace: bool) {
+        let d = &mut self.local.designer;
+        d.edit = None;
+        d.transfer_note = None;
+        d.transfer = Some(local::spawn(
+            "tts-voice-export",
+            self.repaint.clone(),
+            move || {
+                VoiceStore::default().export_voice(&id, &path, replace)?;
+                Ok(Transfer::Exported(path))
+            },
+        ));
     }
 
     fn edit_voice(&mut self, ui: &mut egui::Ui, s: &mut TtsSettings, busy: bool) {
@@ -370,7 +524,8 @@ impl Tts {
         let Some(edit) = &mut d.edit else { return };
         let mut confirm = false;
         let mut cancel = false;
-        ui.add_enabled_ui(!busy, |ui| match edit {
+        let ready = d.transfer.is_none() && (!busy || matches!(edit, Edit::ReplaceExport { .. }));
+        ui.add_enabled_ui(ready, |ui| match edit {
             Edit::Rename { name, .. } => {
                 ui.horizontal(|ui| {
                     ui.label("New name");
@@ -390,22 +545,32 @@ impl Tts {
                     cancel = ui.button("Cancel").clicked();
                 });
             }
+            Edit::ReplaceExport { path, .. } => {
+                ui.label(format!("Replace the existing file at {}?", path.display()));
+                ui.horizontal(|ui| {
+                    confirm = ui.button("Replace file").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            }
         });
         if cancel {
             d.edit = None;
         } else if confirm {
             let store = VoiceStore::default();
-            let result = match edit {
-                Edit::Rename { id, name } => store.rename_voice(id, name),
+            let result = match d.edit.take().unwrap() {
+                Edit::Rename { id, name } => store.rename_voice(&id, &name),
                 Edit::Delete { id, .. } => {
-                    let result = store.delete_voice(id);
-                    if result.is_ok() && s.local.designed.as_ref() == Some(id) {
+                    let result = store.delete_voice(&id);
+                    if result.is_ok() && s.local.designed.as_ref() == Some(&id) {
                         s.local.designed = None;
                     }
                     result
                 }
+                Edit::ReplaceExport { id, path } => {
+                    self.start_voice_export(id, path, true);
+                    return;
+                }
             };
-            d.edit = None;
             d.error = result.err();
             d.refresh();
         }

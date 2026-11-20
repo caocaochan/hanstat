@@ -1,6 +1,8 @@
 //! Kept samples live with the user's settings so clearing the audio cache
 //! leaves the references available for the next book.
 
+mod bundle;
+
 use super::{FRAME_SAMPLES, Reference, wav_samples};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -25,6 +27,11 @@ pub struct SavedVoice {
 }
 
 pub struct VoiceStore(PathBuf);
+
+enum Publication {
+    Added,
+    AlreadyKept,
+}
 
 impl Default for VoiceStore {
     fn default() -> Self {
@@ -121,15 +128,6 @@ impl VoiceStore {
         if text.trim().is_empty() || wav_samples(wav).is_none_or(|s| s.is_empty()) {
             return Err("The sample needs a recording and its text.".into());
         }
-        let id = voice_id(wav);
-        let dir = self.0.join(&id);
-        let same_reference = || {
-            read_info(&dir).is_ok_and(|info| info.sample_text == text)
-                && fs::read(dir.join("sample.wav")).is_ok_and(|saved| saved == wav)
-        };
-        if same_reference() {
-            return Ok(id);
-        }
         let info = VoiceInfo {
             name,
             description: description.to_owned(),
@@ -140,21 +138,47 @@ impl VoiceStore {
                 .unwrap_or_default()
                 .as_secs(),
         };
-        let bytes = serde_json::to_vec_pretty(&info).map_err(|e| e.to_string())?;
-        let tmp = temporary(&self.0);
-        fs::create_dir_all(&self.0)
-            .and_then(|()| fs::create_dir(&tmp))
-            .map_err(|e| format!("Cannot create a folder for this voice: {e}"))?;
-        let written = fs::write(tmp.join("sample.wav"), wav)
-            .and_then(|()| fs::write(tmp.join("voice.json"), bytes))
-            .and_then(|()| fs::rename(&tmp, &dir));
-        if let Err(e) = written {
-            let _ = fs::remove_dir_all(&tmp);
-            if !same_reference() {
-                return Err(format!("Cannot keep this voice: {e}"));
-            }
-        }
+        let id = voice_id(wav);
+        self.publish(&id, &info, wav)?;
         Ok(id)
+    }
+
+    fn publish(&self, id: &str, info: &VoiceInfo, wav: &[u8]) -> Result<Publication, String> {
+        let dir = self.0.join(id);
+        let existing = || match fs::symlink_metadata(&dir) {
+            Ok(m) if m.is_dir() => {
+                let saved = self.wav(&dir, id)?;
+                if saved != wav {
+                    return Err("A different sample already has this voice ID.".into());
+                }
+                if read_info(&dir)?.sample_text != info.sample_text {
+                    return Err("This sample is already kept with a different transcript.".into());
+                }
+                Ok(Some(Publication::AlreadyKept))
+            }
+            Ok(_) => Err("A file already occupies the folder for this voice.".into()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("Cannot check for an existing voice: {e}")),
+        };
+        if let Some(kept) = existing()? {
+            return Ok(kept);
+        }
+        let bytes = serde_json::to_vec_pretty(info).map_err(|e| e.to_string())?;
+        // A complete directory becomes visible in one rename. The temporary
+        // directory cleans up on write failures and when another save wins.
+        fs::create_dir_all(&self.0)
+            .map_err(|e| format!("Cannot create a folder for this voice: {e}"))?;
+        let tmp = tempfile::Builder::new()
+            .prefix(".voice-")
+            .tempdir_in(&self.0)
+            .map_err(|e| format!("Cannot create a folder for this voice: {e}"))?;
+        fs::write(tmp.path().join("sample.wav"), wav)
+            .and_then(|()| fs::write(tmp.path().join("voice.json"), bytes))
+            .map_err(|e| format!("Cannot write this voice: {e}"))?;
+        match fs::rename(tmp.path(), &dir) {
+            Ok(()) => Ok(Publication::Added),
+            Err(e) => existing()?.ok_or_else(|| format!("Cannot keep this voice: {e}")),
+        }
     }
 
     pub fn rename_voice(&self, id: &str, name: &str) -> Result<(), String> {

@@ -1151,6 +1151,19 @@ fn at_budget(samples: usize, budget: usize) -> bool {
 
 /// The 16-bit mono samples of a RIFF/WAVE file at [`opus::RATE`].
 fn wav_samples(b: &[u8]) -> Option<Vec<i16>> {
+    let data = wav_data(b)?;
+    Some(
+        b[data.start..data.end.min(b.len())]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| i16::from_le_bytes(*c))
+            .collect(),
+    )
+}
+
+/// The range declared by the data chunk, even if the input ended early.
+fn wav_data(b: &[u8]) -> Option<std::ops::Range<usize>> {
     if b.len() < 12 || &b[..4] != b"RIFF" || &b[8..12] != b"WAVE" {
         return None;
     }
@@ -1159,7 +1172,9 @@ fn wav_samples(b: &[u8]) -> Option<Vec<i16>> {
     while i + 8 <= b.len() {
         let id = &b[i..i + 4];
         let n = u32::from_le_bytes(b[i + 4..i + 8].try_into().ok()?) as usize;
-        let body = &b[i + 8..(i + 8 + n).min(b.len())];
+        let start = i + 8;
+        let end = start.checked_add(n)?;
+        let body = &b[start..end.min(b.len())];
         if id == b"fmt " && body.len() >= 16 {
             let format = u16::from_le_bytes([body[0], body[1]]);
             let channels = u16::from_le_bytes([body[2], body[3]]);
@@ -1167,18 +1182,9 @@ fn wav_samples(b: &[u8]) -> Option<Vec<i16>> {
             let bits = u16::from_le_bytes([body[14], body[15]]);
             fmt_ok = format == 1 && channels == 1 && rate == opus::RATE && bits == 16;
         } else if id == b"data" {
-            if !fmt_ok {
-                return None;
-            }
-            return Some(
-                body.as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|c| i16::from_le_bytes(*c))
-                    .collect(),
-            );
+            return fmt_ok.then_some(start..end);
         }
-        i += 8 + n + (n & 1);
+        i = end.checked_add(n & 1)?;
     }
     None
 }
@@ -1674,7 +1680,7 @@ mod tests {
 
     pub(super) fn test_wav() -> Vec<u8> {
         let mut w = Vec::new();
-        w.extend_from_slice(b"RIFF\0\0\0\0WAVEfmt ");
+        w.extend_from_slice(b"RIFF\x28\0\0\0WAVEfmt ");
         w.extend_from_slice(&16u32.to_le_bytes());
         w.extend_from_slice(&1u16.to_le_bytes());
         w.extend_from_slice(&1u16.to_le_bytes());
