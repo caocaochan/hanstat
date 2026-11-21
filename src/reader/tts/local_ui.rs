@@ -247,25 +247,34 @@ impl Tts {
             if present {
                 ui.label(
                     RichText::new(if local::loaded(s.mode(), s.parallel) {
-                        "loaded on the GPU"
+                        if local::running_spilled() {
+                            "loaded, partly in the computer's memory (slower)"
+                        } else {
+                            "loaded on the GPU"
+                        }
                     } else {
                         "loads when needed"
                     })
                     .weak(),
                 );
                 if local::status() == local::Status::Loaded
+                    && let Some(n) = local::running_at_once()
                     && ui
                         .add_enabled(
                             !self.local_voice_busy() && !self.active(),
                             egui::Button::new("Unload").small(),
                         )
-                        .on_hover_text("Free the GPU memory it holds (about 4–5 GB)")
+                        .on_hover_text(format!(
+                            "Free the graphics memory it holds (about {})",
+                            local::gb(local::memory_needed(n))
+                        ))
                         .clicked()
                 {
                     local::unload();
                 }
             }
         });
+        memory_note(ui, s);
         if s.designed.is_none()
             && let Some(e) = &self.local.custom.error
         {
@@ -640,7 +649,8 @@ impl Tts {
         let audio = local::seconds(chars);
         // Measured on an RTX 5070 (Vulkan): 6.5× real time for one request,
         // 17.9× for four at once.
-        let speed = 6.5 + (17.9 - 6.5) * (s.local.parallel.clamp(1, 4) - 1) as f64 / 3.0;
+        let n = local::at_once_now(s.local.parallel).clamp(1, 4);
+        let speed = 6.5 + (17.9 - 6.5) * (n - 1) as f64 / 3.0;
         ui.label(if chosen.is_empty() {
             "No chapter chosen.".to_owned()
         } else {
@@ -703,6 +713,56 @@ impl Tts {
     }
 }
 
+/// What the graphics card holds, shown before downloading: the voice needs
+/// about 3.6 GB of graphics memory for one request at once.
+fn memory_note(ui: &mut egui::Ui, s: &LocalSettings) {
+    let Some(Some(g)) = local::gpu::known() else {
+        return;
+    };
+    let need = local::memory_needed(1);
+    let n = local::fitting(g.memory);
+    let card = if g.integrated {
+        format!(
+            "{} (shares the computer's memory, {})",
+            g.name,
+            local::gb(g.memory)
+        )
+    } else {
+        format!("{} ({} of graphics memory)", g.name, local::gb(g.memory))
+    };
+    if g.memory < need {
+        ui.colored_label(
+            RED,
+            format!(
+                "{card}: the local voice needs about {}, so here it will be slow, if it \
+                 loads at all. An Azure voice is the better choice on this computer.",
+                local::gb(need)
+            ),
+        );
+    } else if n == 1 {
+        ui.label(
+            RichText::new(format!(
+                "{card}: the local voice needs about {}, which leaves little to spare. \
+                 It reads one piece of text at a time here. If it runs out of memory, \
+                 close other programs that use the graphics card.",
+                local::gb(need)
+            ))
+            .size(12.0)
+            .weak(),
+        );
+    } else if n < s.parallel {
+        ui.label(
+            RichText::new(format!(
+                "{card}: reads {n} pieces of text at once here (memory for {n} of the {} \
+                 set in Advanced).",
+                s.parallel
+            ))
+            .size(12.0)
+            .weak(),
+        );
+    }
+}
+
 /// The settings few will change: sampling, seed, chunk size, parallel requests.
 fn advanced(ui: &mut egui::Ui, l: &mut LocalSettings, running: bool) {
     ui.label(
@@ -758,10 +818,18 @@ fn advanced(ui: &mut egui::Ui, l: &mut LocalSettings, running: bool) {
                 )
             });
             row(ui, "At once", TIP_PARALLEL, &mut |ui| {
-                ui.add_enabled(
-                    !running,
-                    egui::Slider::new(&mut l.parallel, 1..=4).suffix(" requests"),
-                )
+                ui.horizontal(|ui| {
+                    let r = ui.add_enabled(
+                        !running,
+                        egui::Slider::new(&mut l.parallel, 1..=4).suffix(" requests"),
+                    );
+                    let n = local::at_once_now(l.parallel);
+                    if n < l.parallel {
+                        ui.label(RichText::new(format!("{n} on this graphics card")).weak());
+                    }
+                    r
+                })
+                .inner
             });
         });
     if ui
@@ -832,9 +900,12 @@ Default 200. Reading from a new place starts within a few seconds either way.";
 
 const TIP_PARALLEL: &str = "How many pieces of text the graphics card reads at once \
 when making audio.\n\n\
-4 is the fastest (about 18 times faster than listening on an RTX 5070) and holds \
-about 5 GB of its memory; 1 is about a third as fast and holds about 3.7 GB. Lower it \
-if other programs need the graphics card.\n\n\
+4 is the fastest (about 18 times faster than listening on an RTX 5070) and needs \
+about 6.2 GB of graphics memory; 1 is about a third as fast and needs about 3.6 GB. \
+Each one more needs about 0.9 GB.\n\n\
+hanstat uses fewer when the graphics card has less memory, and one fewer each time it \
+runs out (until hanstat closes). Lower it yourself if other programs need the \
+graphics card.\n\n\
 It never changes how the audio sounds.";
 
 /// `pcm` (the clip rate) played on the default device.

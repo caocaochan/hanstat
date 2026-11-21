@@ -23,9 +23,11 @@ use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+pub mod gpu;
 mod voices;
 pub use voices::{SavedVoice, VoiceStore};
 
@@ -122,7 +124,8 @@ pub struct LocalSettings {
     pub seed: u32,
     /// Characters per request (whole paragraphs up to this).
     pub chunk_chars: usize,
-    /// Requests the GPU works on at once (memory: about 0.9 GB each).
+    /// Requests the GPU works on at once (memory: about 0.9 GB each), at
+    /// most what the card holds ([`at_once`]).
     pub parallel: usize,
 }
 
@@ -729,13 +732,125 @@ enum Voice<'a> {
     Base(&'a Reference),
 }
 
+const MIB: u64 = 1 << 20;
+/// Graphics memory the server needs for one request at once: the talker
+/// and codec weights (2185 MiB in its log), one KV cache set and the
+/// compute buffers. Peak measured with `nvidia-smi` on an RTX 5070
+/// (Vulkan, CustomVoice Q8_0, 2026-11-21): 3691 MiB.
+const MEMORY_ONE: u64 = 3700 * MIB;
+/// Each further request at once: another KV cache set (F32, 4096
+/// positions; "4 sets -> 3584 MB" in the server's log).
+const MEMORY_MORE: u64 = 896 * MIB;
+
+/// Graphics memory `n` requests at once need, in bytes.
+pub fn memory_needed(n: usize) -> u64 {
+    MEMORY_ONE + MEMORY_MORE * (n.max(1) as u64 - 1)
+}
+
+/// Most requests at once (up to 4) that fit a card with `memory` bytes,
+/// leaving a tenth to the desktop and other programs; 1 if none fits, to
+/// try anyway. A 4 GB card gets 1, 6 GB 3, 8 GB and more 4.
+pub fn fitting(memory: u64) -> usize {
+    let usable = memory / 10 * 9;
+    (1..=4)
+        .rev()
+        .find(|&n| memory_needed(n) <= usable)
+        .unwrap_or(1)
+}
+
+/// Lowered for the session each time the card ran out of memory with
+/// more requests at once (other programs may hold some of it).
+static CAP: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Set for the session when even one request at once ran out of graphics
+/// memory: the server then lets ggml put what doesn't fit on the card in
+/// the computer's memory (`GGML_VK_ALLOW_SYSMEM_FALLBACK`), buffer by
+/// buffer. Slower: with everything there (`GGML_VK_PREFER_HOST_MEMORY`) one
+/// request ran at 0.4× real time instead of 7.5× on an RTX 5070.
+static SPILL: AtomicBool = AtomicBool::new(false);
+
+/// Requests at once the server runs when `asked` for: no more than the
+/// card holds or than worked before. May ask Vulkan (once, briefly).
+pub fn at_once(asked: usize) -> usize {
+    let fit = gpu::gpu().map_or(usize::MAX, |g| fitting(g.memory));
+    asked.min(fit).min(CAP.load(Ordering::Relaxed)).max(1)
+}
+
+/// [`at_once`] without waiting for Vulkan, for the panel: `asked` until the
+/// card is known.
+pub fn at_once_now(asked: usize) -> usize {
+    let fit = gpu::known()
+        .flatten()
+        .map_or(usize::MAX, |g| fitting(g.memory));
+    asked.min(fit).min(CAP.load(Ordering::Relaxed)).max(1)
+}
+
+/// Requests at once of the server running now, if any.
+pub fn running_at_once() -> Option<usize> {
+    SERVER
+        .try_read()
+        .ok()?
+        .as_ref()
+        .filter(|s| s.alive())
+        .map(|s| s.parallel)
+}
+
+/// The running server may keep part of itself in the computer's memory
+/// ([`SPILL`]).
+pub fn running_spilled() -> bool {
+    SERVER
+        .try_read()
+        .is_ok_and(|g| g.as_ref().is_some_and(|s| s.spill && s.alive()))
+}
+
+/// "3.6 GB": graphics memory as Windows and card makers count it (GiB).
+pub fn gb(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / (1u64 << 30) as f64)
+}
+
+/// Begins the message of a request whose server died of too little
+/// graphics memory: [`make_chunk`] tries such a chunk again, with fewer
+/// requests at once.
+const RAN_OUT: &str = "The graphics card ran out of memory";
+
+/// The server's log says it couldn't get graphics memory.
+fn out_of_memory(log: &std::path::Path) -> bool {
+    std::fs::read(log).is_ok_and(|b| {
+        let t = String::from_utf8_lossy(&b);
+        t.contains("OutOfDeviceMemory")
+            || t.contains("failed to allocate")
+            || t.contains("allocation failed")
+    })
+}
+
+/// What to say when even one request at once doesn't fit.
+fn too_little_memory(tail: &str) -> String {
+    let card = match gpu::gpu() {
+        Some(g) => format!(" ({}, {})", g.name, gb(g.memory)),
+        None => String::new(),
+    };
+    format!(
+        "{RAN_OUT} loading the local voice, even reading one piece of text at a time \
+         with part of it in the computer's memory. The voice needs about {} of graphics \
+         memory free, and this graphics card{card} didn't have that much. Close other programs that use the graphics card \
+         (games, video or photo editors, other AI tools) and try again, or read \
+         aloud with an Azure voice instead.\n\nDetails:\n{tail}",
+        gb(memory_needed(1)),
+    )
+}
+
 /// qwentts.cpp's server with the model loaded, on a free local port.
 pub struct Server {
     child: Mutex<Child>,
     url: String,
     agent: ureq::Agent,
     mode: Mode,
+    /// Requests at once it runs ([`at_once`] of `asked`).
     parallel: usize,
+    /// Requests at once in the settings that started it.
+    asked: usize,
+    /// Started with [`SPILL`].
+    spill: bool,
     /// Check and register together so batch workers don't all upload the WAV.
     registry: Mutex<()>,
     /// Requests in flight, at most `parallel` (more would wait in the
@@ -770,9 +885,10 @@ pub fn status() -> Status {
 /// A different talker on the GPU still needs swapping out before this one
 /// can speak.
 pub fn loaded(mode: Mode, parallel: usize) -> bool {
+    let asked = asked(mode, parallel);
     SERVER.try_read().is_ok_and(|g| {
         g.as_ref()
-            .is_some_and(|s| s.mode == mode && s.parallel == parallel.max(1) && s.alive())
+            .is_some_and(|s| s.mode == mode && s.asked == asked && s.alive())
     })
 }
 
@@ -785,20 +901,35 @@ pub fn unload() {
     }
 }
 
+/// VoiceDesign makes one sample at a time.
+fn asked(mode: Mode, parallel: usize) -> usize {
+    if mode == Mode::Design {
+        1
+    } else {
+        parallel.max(1)
+    }
+}
+
 /// Use the server in the requested mode, starting it if necessary. Keep it
 /// alive through the request and any retries, even if another window needs
 /// a different model or batch size.
 pub fn server<T>(mode: Mode, parallel: usize, f: impl FnOnce(&Server) -> T) -> Result<T, String> {
-    let parallel = if mode == Mode::Design {
-        1
-    } else {
-        parallel.max(1)
-    };
-    let matches = |s: &&Server| s.mode == mode && s.parallel == parallel && s.alive();
+    let asked = asked(mode, parallel);
+    let matches = |s: &&Server| s.mode == mode && s.asked == asked && s.alive();
     loop {
         let g = SERVER.read().unwrap();
         if let Some(s) = g.as_ref().filter(matches) {
-            return Ok(f(s));
+            let r = f(s);
+            if !s.alive() && out_of_memory(&s.log) {
+                // Its first requests' compute buffers didn't fit beside the
+                // KV cache: the next start runs fewer at once, or spills.
+                if s.parallel > 1 {
+                    CAP.fetch_min(s.parallel - 1, Ordering::Relaxed);
+                } else {
+                    SPILL.store(true, Ordering::Relaxed);
+                }
+            }
+            return Ok(r);
         }
         drop(g);
         let mut g = SERVER.write().unwrap();
@@ -806,13 +937,56 @@ pub fn server<T>(mode: Mode, parallel: usize, f: impl FnOnce(&Server) -> T) -> R
             if let Some(s) = g.take() {
                 s.kill();
             }
-            *g = Some(Server::start(mode, parallel)?);
+            *g = Some(start_fitting(mode, asked)?);
         }
     }
 }
 
+/// Start the server with as many requests at once as the card holds,
+/// one fewer each time it runs out of graphics memory while loading, and
+/// at one, with what doesn't fit in the computer's memory ([`SPILL`]).
+fn start_fitting(mode: Mode, asked: usize) -> Result<Server, String> {
+    start_from(mode, asked, at_once(asked))
+}
+
+/// [`start_fitting`] trying `n` requests at once first.
+fn start_from(mode: Mode, asked: usize, mut n: usize) -> Result<Server, String> {
+    loop {
+        let spill = SPILL.load(Ordering::Relaxed);
+        match Server::start(mode, n, asked, spill) {
+            Ok(s) => return Ok(s),
+            Err(Start::OutOfMemory(_)) if n > 1 => {
+                n -= 1;
+                CAP.fetch_min(n, Ordering::Relaxed);
+            }
+            Err(Start::OutOfMemory(_)) if !spill => SPILL.store(true, Ordering::Relaxed),
+            Err(Start::OutOfMemory(tail)) => return Err(too_little_memory(&tail)),
+            Err(Start::Failed(e)) => return Err(e),
+        }
+    }
+}
+
+/// Why the server didn't start.
+enum Start {
+    /// It ran out of graphics memory loading: its log's last lines.
+    OutOfMemory(String),
+    Failed(String),
+}
+
+impl From<String> for Start {
+    fn from(e: String) -> Self {
+        Start::Failed(e)
+    }
+}
+
+impl From<&str> for Start {
+    fn from(e: &str) -> Self {
+        Start::Failed(e.into())
+    }
+}
+
 impl Server {
-    fn start(mode: Mode, parallel: usize) -> Result<Server, String> {
+    fn start(mode: Mode, parallel: usize, asked: usize, spill: bool) -> Result<Server, Start> {
         let talker = match mode {
             Mode::Custom if downloaded() => QWEN_TTS_MODEL.dir().join(QWEN_TTS_MODEL.files[0].name),
             Mode::Custom => return Err(NOT_DOWNLOADED.into()),
@@ -853,6 +1027,9 @@ impl Server {
             .stdin(Stdio::null())
             .stdout(out)
             .stderr(err);
+        if spill {
+            cmd.env("GGML_VK_ALLOW_SYSMEM_FALLBACK", "1");
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -864,7 +1041,7 @@ impl Server {
         if let Some(error) = guard_error {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(error);
+            return Err(error.into());
         }
         let s = Server {
             child: Mutex::new(child),
@@ -876,6 +1053,8 @@ impl Server {
                 .into(),
             mode,
             parallel,
+            asked,
+            spill,
             registry: Mutex::new(()),
             busy: Mutex::new(0),
             freed: Condvar::new(),
@@ -884,10 +1063,13 @@ impl Server {
         let t = Instant::now();
         loop {
             if let Ok(Some(st)) = s.child.lock().unwrap().try_wait() {
-                return Err(format!(
+                if out_of_memory(&s.log) {
+                    return Err(Start::OutOfMemory(s.log_tail()));
+                }
+                return Err(Start::Failed(format!(
                     "The local voice stopped while loading ({st}):\n{}",
                     s.log_tail()
-                ));
+                )));
             }
             if s.agent
                 .get(format!("{}/health", s.url))
@@ -898,10 +1080,10 @@ impl Server {
             }
             if t.elapsed() > Duration::from_secs(300) {
                 s.kill();
-                return Err(format!(
+                return Err(Start::Failed(format!(
                     "The local voice did not load in time:\n{}",
                     s.log_tail()
-                ));
+                )));
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -1032,8 +1214,20 @@ impl Server {
         let mut resp = match resp {
             Ok(r) => r,
             Err(e) => {
+                // A crash drops the connection a moment before the process
+                // is gone.
+                let t = Instant::now();
+                while self.alive() && t.elapsed() < Duration::from_secs(2) {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
                 return Err(if self.alive() {
                     format!("The local voice didn't answer: {e}")
+                } else if out_of_memory(&self.log) {
+                    format!(
+                        "{RAN_OUT} while reading {} pieces of text at once:\n{}",
+                        self.parallel,
+                        self.log_tail()
+                    )
                 } else {
                     format!("The local voice stopped:\n{}", self.log_tail())
                 });
@@ -1268,20 +1462,27 @@ pub fn make_chunk(
     let (own, _, _) = assemble(texts, paras, None);
     let base = hanstat::dict::xxh64::xxh64(own.as_bytes(), s.seed as u64);
     // If the server won't start, there is no use trying the next chunk.
-    let (pcm, stopped) = server(s.mode(), s.parallel, |server| {
-        let mut take = (Vec::new(), false);
-        for attempt in 0..2u64 {
-            take = server.synth_voice(&text, s, base.wrapping_add(attempt), voice)?;
-            let secs = take.0.len() as f64 / opus::RATE as f64;
-            let want = seconds(chars);
-            if !take.1 && secs < want * 3.0 + 4.0 && secs > want * 0.25 {
-                break;
+    let mut ran_out = 0;
+    let (pcm, stopped) = loop {
+        let r: Result<(Vec<i16>, bool), String> = server(s.mode(), s.parallel, |server| {
+            let mut take = (Vec::new(), false);
+            for attempt in 0..2u64 {
+                take = server.synth_voice(&text, s, base.wrapping_add(attempt), voice)?;
+                let secs = take.0.len() as f64 / opus::RATE as f64;
+                let want = seconds(chars);
+                if !take.1 && secs < want * 3.0 + 4.0 && secs > want * 0.25 {
+                    break;
+                }
             }
+            Ok(take)
+        })
+        .map_err(Fail::Refused)?;
+        match r {
+            // The server starts again with fewer requests at once.
+            Err(e) if e.starts_with(RAN_OUT) && ran_out < 3 => ran_out += 1,
+            r => break r.map_err(Fail::Other)?,
         }
-        Ok(take)
-    })
-    .map_err(Fail::Refused)?
-    .map_err(Fail::Other)?;
+    };
     if stopped {
         // Twice past its budget: cut into clips, the text it never reached
         // would put every highlight in the wrong place.
@@ -1378,6 +1579,88 @@ pub fn spawn<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requests_at_once_fit_the_card() {
+        const GIB: u64 = 1 << 30;
+        // The RTX 3050 Laptop (4 GB) that ran out with 4 at once.
+        assert_eq!(fitting(4 * GIB), 1);
+        assert_eq!(fitting(6 * GIB), 3);
+        assert_eq!(fitting(8 * GIB), 4);
+        assert_eq!(fitting(12 * GIB), 4);
+        // Too small for one: still try one.
+        assert_eq!(fitting(2 * GIB), 1);
+        assert_eq!(gb(memory_needed(1)), "3.6 GB");
+        assert_eq!(gb(memory_needed(4)), "6.2 GB");
+    }
+
+    /// Real out-of-memory errors: 24 requests at once want a 21 GB KV
+    /// cache, more than a card under 24 GB holds. The server steps down
+    /// until it loads; if the first request's compute buffers then don't
+    /// fit, it dies, and the next try starts it with fewer, as reading does
+    /// ([`make_chunk`]). RTX 5070 (12 GB, Windows, 2026-11-21): 24 to 23 failed
+    /// to load, 21 loaded (Windows lets a process's Vulkan memory go past
+    /// the card), died decoding the first request, and the next start used
+    /// the card's 4. Needs the CustomVoice model (`HANSTAT_MODEL_DIR`);
+    /// point `LOCALAPPDATA` at a scratch folder.
+    #[test]
+    #[ignore = "needs the model and a graphics card under 24 GB"]
+    fn steps_down_when_the_card_runs_out_of_memory() {
+        let t = Instant::now();
+        let first = start_from(Mode::Custom, 24, 24).expect("a start that fits");
+        let loaded = first.parallel;
+        println!(
+            "loaded with {loaded} at once in {:.1} s",
+            t.elapsed().as_secs_f64()
+        );
+        assert!(loaded < 24);
+        assert_eq!(CAP.load(Ordering::Relaxed), loaded);
+        *SERVER.write().unwrap() = Some(first);
+        let s = LocalSettings::default();
+        let mut errors = Vec::new();
+        let pcm = loop {
+            let r = server(Mode::Custom, 24, |server| {
+                (
+                    server.parallel,
+                    server.synth("他推开门，外面的雨已经停了。", &s, 1),
+                )
+            })
+            .unwrap();
+            println!(
+                "read with {} at once: {:?}",
+                r.0,
+                r.1.as_ref().map(|t| t.0.len())
+            );
+            match r.1 {
+                Err(e) if e.starts_with(RAN_OUT) && errors.len() < 3 => errors.push(e),
+                r => break r.unwrap().0,
+            }
+        };
+        assert!(pcm.len() > opus::RATE as usize);
+        println!(
+            "cap {}, {:.1} s",
+            CAP.load(Ordering::Relaxed),
+            t.elapsed().as_secs_f64()
+        );
+        unload();
+    }
+
+    #[test]
+    fn out_of_memory_is_read_from_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("tts-server.log");
+        // The report's lines (RTX 3050 Laptop, 2026-11-21).
+        std::fs::write(
+            &log,
+            "ggml_vulkan: Device memory allocation of size 805306368 failed.\n\
+             ggml_vulkan: vk::Device::allocateMemory: ErrorOutOfDeviceMemory\n\
+             [KVCache] FATAL: backend allocation failed\n",
+        )
+        .unwrap();
+        assert!(out_of_memory(&log));
+        std::fs::write(&log, "[Server] FATAL: cannot bind 127.0.0.1:8080\n").unwrap();
+        assert!(!out_of_memory(&log));
+    }
 
     #[test]
     fn paragraphs_follow_blocks_and_lines() {

@@ -1,5 +1,11 @@
 # Changelog
 
+## [2026.11.21.00] - 2026-11-21
+
+### Fixed
+- **The local voice fits graphics cards with less memory.** Reading four pieces of text at once (the default) needs about 6.2 GB of graphics memory, so on a 4 GB card such as an RTX 3050 Laptop the voice stopped while loading with `ErrorOutOfDeviceMemory`. hanstat now checks how much memory the graphics card has and reads fewer pieces at once when four won't fit: one on 4 GB, three on 6 GB, four on 8 GB and more. If the card still runs out, for example because another program holds part of its memory, the voice starts again with one fewer, and the sentences that failed are read again. If even one doesn't fit, what doesn't fit goes in the computer's memory, which is slower, and the panel says so. If that fails too, the message says how much memory the voice needs and what to close.
+- **See before downloading whether the card is big enough.** Under **Read aloud → This computer**, a note now shows the graphics card's name and memory when it is small for the local voice, and **Advanced → At once** shows how many pieces this card reads at once. The **Unload** tooltip gives the memory actually held.
+
 ## [2026.11.20.01] - 2026-11-20
 
 ### Added
