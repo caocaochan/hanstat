@@ -39,6 +39,10 @@ Open a book or drop it on the window. The language is detected and shown in the 
 
 **Writing style** (optional, Chinese only). Turn on **Rate writing style with a local AI model** in **⚙** to rate how hard each book's prose is beyond its words. The rating is shown against the other rated books of your Library (50% is their median, the plainest near 0%, the most literary near 100%), with a word for where it falls on its own: plain, typical, literary or very literary. It runs Qwen3.5-4B locally through llama.cpp (a 2.7 GB download; books never leave your computer) and counts toward the difficulty with the weight set in **⚙**.
 
+## Anki add-on
+
+[Hanstat TTS](https://ankiweb.net/shared/info/194815963) (code `194815963`) adds word and sentence audio to your Anki cards with hanstat's voices: the local Qwen3-TTS voice, including the voices you designed or imported, or Azure with the key saved in hanstat. Set up a voice in **Read aloud** first; hanstat doesn't need to be running.
+
 ## Command line
 
 ```
