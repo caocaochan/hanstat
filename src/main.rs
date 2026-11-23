@@ -152,6 +152,15 @@ fn main() -> eframe::Result {
     result
 }
 
+/// Inter 4.1 (SIL OFL 1.1; its licence is beside it): Latin text on macOS
+/// and Linux, which have no Segoe UI, in place of egui's Ubuntu Light, with
+/// its semibold for headings and figures. TrueType outlines, which egui
+/// draws correctly (not Apple's CFF ones; see `system_fonts`).
+#[cfg(not(windows))]
+static INTER: &[u8] = include_bytes!("../assets/fonts/Inter-Regular.ttf");
+#[cfg(not(windows))]
+static INTER_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/Inter-SemiBold.ttf");
+
 /// egui ships no CJK glyphs; use the system's fonts as fallbacks, in order.
 /// Characters none of them has still go to eframe's system font provider.
 fn install_fonts(ctx: &egui::Context) {
@@ -196,6 +205,22 @@ fn install_fonts(ctx: &egui::Context) {
             name.to_owned(),
             Arc::new(egui::FontData::from_blob(blob, index)),
         );
+        if regular {
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, name.to_owned());
+        } else {
+            bold.push(name.to_owned());
+        }
+    }
+    // macOS and Linux: the bundled Inter for Latin, likewise.
+    #[cfg(not(windows))]
+    for (name, bytes, regular) in [("inter", INTER, true), ("inter-semibold", INTER_SEMIBOLD, false)] {
+        fonts
+            .font_data
+            .insert(name.to_owned(), Arc::new(egui::FontData::from_static(bytes)));
         if regular {
             fonts
                 .families

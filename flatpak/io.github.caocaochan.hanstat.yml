@@ -88,6 +88,7 @@ modules:
       - install -Dm644 data/JLPT-LICENSE.txt /app/share/licenses/io.github.caocaochan.hanstat/LICENSE-JLPT-data.txt
       - install -Dm644 data/CEDICT-LICENSE.txt /app/share/licenses/io.github.caocaochan.hanstat/LICENSE-CEDICT-data.txt
       - install -Dm644 assets/fonts/LXGWWenKai-LICENSE.txt /app/share/licenses/io.github.caocaochan.hanstat/LICENSE-LXGWWenKai-font.txt
+      - install -Dm644 assets/fonts/Inter-LICENSE.txt /app/share/licenses/io.github.caocaochan.hanstat/LICENSE-Inter-font.txt
     sources:
       - type: dir
         path: ..

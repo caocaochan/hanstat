@@ -36,6 +36,7 @@ cp data/HSK-LICENSE.txt "$contents/Resources/LICENSE-HSK-data.txt"
 cp data/JLPT-LICENSE.txt "$contents/Resources/LICENSE-JLPT-data.txt"
 cp data/CEDICT-LICENSE.txt "$contents/Resources/LICENSE-CEDICT-data.txt"
 cp assets/fonts/LXGWWenKai-LICENSE.txt "$contents/Resources/LICENSE-LXGWWenKai-font.txt"
+cp assets/fonts/Inter-LICENSE.txt "$contents/Resources/LICENSE-Inter-font.txt"
 
 sed "s/@VERSION@/$version/g" macos/Info.plist > "$contents/Info.plist"
 plutil -lint "$contents/Info.plist"
