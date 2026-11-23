@@ -1,5 +1,11 @@
 # Changelog
 
+## [2026.11.23.00] - 2026-11-23
+
+### Changed
+- **A new look.** The window uses the [Catppuccin](https://catppuccin.com) colours: Mocha on the dark theme and Latte on the light one, following the system's setting as before. Figures sit on raised cards, the current tab is underlined, the toolbar is more compact and fits on one line at the usual window size, and word lengths are shown as bars. On the light theme, coloured text (difficulty, Anki status, warnings) is darkened enough to read easily. Exported images use the same colours.
+- **Clearer type.** On Windows, interface text is set in Segoe UI with Microsoft YaHei, the pair Windows itself uses, and headings and figures in their semibold. On macOS and Linux, hanstat bundles Inter for Latin text and its semibold for headings (SIL Open Font License; see `LICENSE-Inter-font.txt`).
+
 ## [2026.11.21.00] - 2026-11-21
 
 ### Fixed
