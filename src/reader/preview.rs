@@ -2417,3 +2417,257 @@ fn local_join_eval() {
     eprintln!("silence at joins, new: {gaps_new:.2?}");
     r.close(&d.ctx);
 }
+
+fn stats_book(d: &mut Driver, dir: &Path) -> Reader {
+    let path = dir.join("stats.epub");
+    let ch1 = format!(
+        r#"<html><meta charset="utf-8"><body><p>{}。</p><p style="break-before:page">{}。</p><p style="break-before:page">{}。</p></body></html>"#,
+        "甲乙丙丁".repeat(10),
+        "山川日月".repeat(5),
+        "天地".repeat(15)
+    );
+    let ch2 = format!(
+        r#"<html><meta charset="utf-8"><body><p>{} The end.</p></body></html>"#,
+        "终章文字".repeat(3)
+    );
+    write_zip(
+        &path,
+        &[
+            (
+                "META-INF/container.xml",
+                r#"<container><rootfiles><rootfile full-path="book.opf"/></rootfiles></container>"#,
+            ),
+            (
+                "book.opf",
+                r#"<package><metadata><title>Stats test</title></metadata><manifest><item id="a" href="one.xhtml" media-type="application/xhtml+xml"/><item id="b" href="two.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="a"/><itemref idref="b"/></spine></package>"#,
+            ),
+            ("one.xhtml", &ch1),
+            ("two.xhtml", &ch2),
+        ],
+    );
+    let mut r = d.open(path.to_str().unwrap());
+    r.settings = Settings {
+        spread: false,
+        ..Settings::default()
+    };
+    r.go_chapter(0, Target::Offset(0));
+    d.ready(&mut r);
+    r
+}
+
+/// The reading tracker in the real reader: page turns counted by their
+/// Chinese characters, back turns, P, a turn while paused, idle time, the
+/// end of the book, the line under the page and the Stats panel. With a
+/// clock set by hand; the stats stay in memory (`persist` is off).
+#[test]
+#[ignore = "opens the reader with the system fonts and dictionary settings"]
+fn reading_stats_tracker() {
+    use crate::reading_stats as rs;
+    use tracker::{Pause, State};
+    let temp = tempfile::tempdir().unwrap();
+    let t0 = 1_790_000_000.0;
+    rs::set_test_clock(Some(t0));
+    rs::reset_for_test(rs::ReadingStats::default());
+    let mut d = Driver::new();
+    let mut r = stats_book(&mut d, temp.path());
+    let chars = |r: &Reader| r.tracker.totals.read_chars;
+    let base = r.tracker.base().expect("place seen");
+    assert_eq!(
+        (base.spine, base.page, base.han, base.chapter_han),
+        (0, 0, 0, 90)
+    );
+    assert_eq!(r.chapter(0).unwrap().han_len, 90, "tree and layout agree");
+    assert_eq!(r.tracker.state(), State::Running);
+
+    rs::set_test_clock(Some(t0 + 30.0));
+    d.key(&mut r, Key::ArrowRight);
+    assert_eq!(r.page, 1);
+    assert_eq!(chars(&r), 40);
+    d.key(&mut r, Key::ArrowRight);
+    assert_eq!(chars(&r), 60);
+    d.key(&mut r, Key::ArrowLeft);
+    assert_eq!(chars(&r), 40, "back takes them off");
+    d.key(&mut r, Key::ArrowRight);
+    assert_eq!(chars(&r), 60);
+    d.snap("stats-line");
+    let line = r.stats_line(rs::now()).expect("line shown");
+    assert!(line.left.contains("60 chars"), "{}", line.left);
+    assert!(line.right.is_some(), "time left shown");
+
+    // Paused by hand: a turn into the next chapter only moves the place.
+    d.key(&mut r, Key::P);
+    assert_eq!(r.tracker.state(), State::Paused(Pause::Manual));
+    d.key(&mut r, Key::ArrowRight);
+    assert_eq!(r.spine, 1);
+    assert_eq!(chars(&r), 60);
+    let line = r.stats_line(rs::now()).unwrap();
+    assert!(line.left.starts_with("Paused"), "{}", line.left);
+    d.key(&mut r, Key::P);
+    assert_eq!(r.tracker.state(), State::Running);
+    d.key(&mut r, Key::ArrowLeft);
+    assert_eq!((r.spine, r.page), (0, 2));
+    assert_eq!(chars(&r), 30, "back over the last page of chapter one");
+    d.key(&mut r, Key::ArrowRight);
+    assert_eq!(chars(&r), 60);
+
+    // Ten minutes with no input: the tracker pauses, from the last input.
+    let before = r.tracker.totals.read_secs + r.tracker.open_secs(rs::now()).0;
+    rs::set_test_clock(Some(t0 + 630.0));
+    d.idle(&mut r, 2);
+    assert_eq!(r.tracker.state(), State::Paused(Pause::Idle));
+    assert_eq!(r.tracker.totals.read_secs, before);
+    d.snap("stats-idle");
+
+    // The end of the book: the last page counts, once.
+    rs::set_test_clock(Some(t0 + 640.0));
+    d.key(&mut r, Key::ArrowRight);
+    assert_eq!(r.tracker.state(), State::Running);
+    assert_eq!(chars(&r), 72);
+    assert!(r.take_finished());
+    d.key(&mut r, Key::ArrowRight);
+    assert!(!r.take_finished());
+    assert_eq!(chars(&r), 72);
+    let book = rs::with(|s| s.books["ui-test"].clone());
+    assert!(book.finished.is_some());
+    assert_eq!(book.han_total, 102);
+    assert_eq!(book.totals().read_chars, 72);
+    assert_eq!(book.sessions.len(), 1);
+
+    // The Stats panel: timing waits while it is open.
+    r.stats_open = true;
+    d.idle(&mut r, 5);
+    assert_eq!(r.tracker.state(), State::Paused(Pause::Menu));
+    d.snap("stats-panel");
+    r.stats_open = false;
+    d.idle(&mut r, 2);
+    assert_eq!(r.tracker.state(), State::Running);
+
+    // What the stats add to a frame, against a whole frame.
+    let n = 2000;
+    let t = Instant::now();
+    for _ in 0..n {
+        r.stats_frame(&d.ctx, false);
+        let l = r.layouts[&r.spine].clone();
+        r.stats_place(&l);
+        std::hint::black_box(r.stats_line(rs::now()));
+    }
+    let stats = t.elapsed() / n;
+    let t = Instant::now();
+    d.idle(&mut r, 200);
+    let frame = t.elapsed() / 200;
+    eprintln!("stats per frame {stats:?}, whole frame {frame:?}");
+    // A frame here is layout and painting without a GPU, so tens of µs.
+    assert!(stats.as_micros() < 20, "{stats:?} of {frame:?}");
+    rs::set_test_clock(None);
+}
+
+/// The reader's count of Chinese characters, chapter by chapter, against
+/// its layout's and against the Library's analysis. `READER_EPUBS`: books
+/// separated by `;`, or a folder of them.
+#[test]
+#[ignore]
+fn reading_han_counts() {
+    let spec = env("READER_EPUBS").expect("set READER_EPUBS");
+    let mut books: Vec<std::path::PathBuf> = Vec::new();
+    for p in spec.split(';').map(std::path::PathBuf::from) {
+        if p.is_dir() {
+            let mut v: Vec<_> = std::fs::read_dir(&p)
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("epub"))
+                })
+                .collect();
+            v.sort();
+            books.extend(v);
+        } else {
+            books.push(p);
+        }
+    }
+    let ctx = egui::Context::default();
+    let fams = loop {
+        if let Some(f) = fonts::families() {
+            break f;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let serif = fonts::default_choice(&fams, true, false);
+    let sans = fonts::default_choice(&fams, false, false);
+    let (defs, installed) = fonts::definitions(&fams, &serif, &sans, 1);
+    ctx.set_fonts(defs);
+    let _ = ctx.run_ui(Default::default(), |_| {});
+    let settings = Settings::default();
+    let g = geometry(
+        &settings,
+        Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 860.0)),
+    );
+    let th = &theme::THEMES[0];
+    let params = Params {
+        base: settings.size,
+        content_w: g.content.x,
+        page_h: g.content.y,
+        line_spacing: settings.line_spacing,
+        fonts: installed,
+        serif_default: true,
+        text: th.ink,
+        link: th.accent,
+        rule: th.muted,
+        page: th.page,
+        dark: th.dark,
+    };
+    let mut mismatched = 0;
+    for path in books {
+        let epub = Arc::new(Epub::open(&path).unwrap());
+        let mut sheets = tree::SheetCache::default();
+        let mut images = images::Images::new(epub.clone());
+        let (mut tree_han, mut laid_han) = (0u64, 0u64);
+        for (i, item) in epub.spine.iter().enumerate() {
+            let ch = tree::build(&epub, item, &mut sheets);
+            let mut l = None;
+            let _ = ctx.run_ui(Default::default(), |ui| {
+                l = Some(
+                    ui.ctx()
+                        .fonts_mut(|f| layout::layout(&ch, &params, f, &mut images)),
+                );
+            });
+            let l = l.unwrap();
+            // Every page's count leads up to the next one's, ending at the total.
+            for p in 0..l.pages.len() {
+                assert!(
+                    l.page_han(p) <= l.page_han(p + 1),
+                    "{}: chapter {i} page {p}",
+                    path.display()
+                );
+            }
+            if l.han_total != ch.han_len {
+                mismatched += 1;
+                eprintln!(
+                    "{} chapter {i} {item}: tree {} laid out {}",
+                    path.display(),
+                    ch.han_len,
+                    l.han_total
+                );
+            }
+            tree_han += ch.han_len as u64;
+            laid_han += l.han_total as u64;
+        }
+        let book = hanstat::extract::load(&path, hanstat::extract::EncodingChoice::Auto).unwrap();
+        let lib: u64 = book
+            .sections
+            .iter()
+            .filter(|s| s.default_included())
+            .flat_map(|s| s.paragraphs.iter())
+            .map(|p| p.chars().filter(|&c| hanstat::chars::is_han(c)).count() as u64)
+            .sum();
+        eprintln!(
+            "{}: reader {tree_han} (laid out {laid_han}), Library {lib}, {:+.3}%",
+            path.file_name().unwrap().to_string_lossy(),
+            (tree_han as f64 - lib as f64) * 100.0 / lib.max(1) as f64
+        );
+    }
+    assert_eq!(
+        mismatched, 0,
+        "chapters whose layout count differs from the tree's"
+    );
+}

@@ -21,8 +21,11 @@ pub struct Settings {
     pub skip_hapax: bool,
     /// Default reading speeds, for the Library and each book's Overview (where
     /// a book's speed can be changed on its own to try another).
-    /// Chinese: characters per minute.
+    /// Chinese: characters per minute. Used when `cpm_by_hand` is on, and
+    /// until a speed is measured in the reader otherwise.
     pub cpm: f32,
+    /// Use `cpm` instead of the Chinese speed measured in the reader.
+    pub cpm_by_hand: bool,
     /// Japanese: kanji and kana per minute.
     pub ja_cpm: f32,
     /// Korean: words per minute (as counted: content words).
@@ -39,6 +42,7 @@ impl Default for Settings {
             style_weight: crate::style::DEFAULT_WEIGHT,
             skip_hapax: false,
             cpm: 300.0,
+            cpm_by_hand: false,
             ja_cpm: 300.0,
             wpm: 100.0,
             shortcuts: BTreeMap::new(),
@@ -51,19 +55,13 @@ impl Settings {
         crate::models::app_dir().join("settings.json")
     }
 
+    /// Missing → defaults; unreadable → defaults, the file kept aside
+    /// ([`crate::saver::load_json`]).
     pub fn load() -> Self {
-        std::fs::read(Self::path())
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+        crate::saver::load_json(&Self::path()).unwrap_or_default()
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let p = Self::path();
-        if let Some(d) = p.parent() {
-            std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
-        }
-        std::fs::write(&p, serde_json::to_vec_pretty(self).unwrap())
-            .map_err(|e| format!("Cannot save {}: {e}", p.display()))
+        crate::saver::write(&Self::path(), serde_json::to_vec_pretty(self).unwrap())
     }
 }

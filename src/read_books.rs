@@ -370,8 +370,7 @@ impl App {
             .iter()
             .filter_map(|m| by_id.get(m.id.as_str()).copied())
             .collect();
-        let sp = &self.settings;
-        let speeds = (sp.cpm as f64, sp.ja_cpm as f64, sp.wpm as f64);
+        let speeds = self.speeds();
         let len = |s: &history::Stats| match lang {
             Language::Korean => s.words_total,
             _ => s.han_total,

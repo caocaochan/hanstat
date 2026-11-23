@@ -150,7 +150,7 @@ pub(crate) fn tile_grid(ui: &mut egui::Ui, tiles: Vec<Tile>) {
 }
 
 /// A titled frame around a chart.
-fn card(ui: &mut egui::Ui, title: &str, sub: &str, add: impl FnOnce(&mut egui::Ui)) {
+pub(crate) fn card(ui: &mut egui::Ui, title: &str, sub: &str, add: impl FnOnce(&mut egui::Ui)) {
     crate::palette::card().show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.label(crate::palette::bold_text(title, 16.0).color(crate::palette::strong()));
@@ -412,6 +412,8 @@ impl App {
                 ui.set_max_width(ui.available_width() - 10.0);
                 self.library_totals(ui);
                 ui.add_space(14.0);
+                self.reading_section(ui);
+                ui.add_space(14.0);
                 (pick_lang, toggle) = self.language_stats(ui);
             });
         // As + and − in the Words tab: the word joins the marked words, and
@@ -434,8 +436,7 @@ impl App {
 
     /// Every book of every language, from the History.
     fn library_totals(&self, ui: &mut egui::Ui) {
-        let sp = &self.settings;
-        let speeds = (sp.cpm as f64, sp.ja_cpm as f64, sp.wpm as f64);
+        let speeds = self.speeds();
         let mut by_lang: Vec<(Language, LangTotals)> = Language::ALL
             .iter()
             .map(|&l| (l, LangTotals::default()))
@@ -505,7 +506,7 @@ impl App {
                 RichText::new(fmt_time(minutes)),
                 format!("{:.0} days of reading 1 h a day", minutes / 60.0),
             )
-            .hover("At the reading speeds set on the Overview"),
+            .hover("Chinese at your speed measured in the reader (unless set by hand in Settings, ⚙); Japanese and Korean at the speeds in Settings"),
         ];
         if let Some(e) = self.history.entries.iter().max_by_key(|e| length(&e.stats)) {
             tiles.push(
@@ -534,7 +535,7 @@ impl App {
                     ("Kana", "Japanese books"),
                     ("Words", "Running words"),
                     ("Average book", "Characters per book (words for Korean)"),
-                    ("Reading", "At the speeds set on the Overview"),
+                    ("Reading", "Chinese at your measured speed (unless set by hand in Settings); the others at the speeds in Settings"),
                     ("Known", "Running words known at each book's last analysis, weighted by length; names left out"),
                 ] {
                     let r = ui.strong(h.0);

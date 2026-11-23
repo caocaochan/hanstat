@@ -17,10 +17,13 @@ mod popup;
 #[cfg(test)]
 mod preview;
 mod render;
+mod stats_ui;
 mod style;
 mod theme;
+mod tracker;
 mod tree;
 mod tts;
+pub(crate) use stats_ui::mins as stats_mins;
 pub(crate) use tts::audiobook::{Action as AudiobookAction, Audiobook};
 
 use eframe::egui::{self, Color32, Key, Pos2, Rect, RichText, Vec2, pos2, vec2};
@@ -61,7 +64,8 @@ struct Settings {
     spread: bool,
     /// The colour theme's id.
     theme: String,
-    /// Where each book was left, by its Library id.
+    /// Where each book was left, by its Library id: kept from before the
+    /// reading-stats database, and used again only if it can't be read.
     positions: HashMap<String, Position>,
     /// The key held to look up the word under the pointer.
     lookup_key: popup::LookupKey,
@@ -110,19 +114,13 @@ impl Settings {
     fn path() -> std::path::PathBuf {
         hanstat::models::app_dir().join("reader.json")
     }
+    /// Missing → defaults; unreadable → defaults, the file kept aside and
+    /// reported ([`hanstat::saver::load_json`]).
     fn load() -> Settings {
-        std::fs::read(Self::path())
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+        hanstat::saver::load_json(&Self::path()).unwrap_or_default()
     }
     fn save(&self) -> Result<(), String> {
-        let p = Self::path();
-        if let Some(d) = p.parent() {
-            std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
-        }
-        std::fs::write(&p, serde_json::to_vec_pretty(self).unwrap())
-            .map_err(|e| format!("Cannot save {}: {e}", p.display()))
+        hanstat::saver::write(&Self::path(), serde_json::to_vec_pretty(self).unwrap())
     }
 }
 
@@ -230,6 +228,16 @@ pub struct Reader {
     selection: Option<Range<u32>>,
     /// The click position and its sentence, fixed for the life of the menu.
     text_menu: Option<TextMenu>,
+    /// Reading stats: the tracker, the Stats panel and what they show.
+    tracker: tracker::Tracker,
+    stats_open: bool,
+    stats: stats_ui::Cache,
+    /// The app's reading speed (Chinese characters a minute: measured, or
+    /// set by hand in Settings), set by the app each frame.
+    pub cpm: f32,
+    pub cpm_by_hand: bool,
+    /// Paged past the book's last page for the first time.
+    finished: bool,
 }
 
 impl Drop for Reader {
@@ -276,11 +284,14 @@ impl Reader {
             settings.tts.use_speech(speech, traditional);
             (Position { spine, offset: 0 }, Some(previous))
         } else {
+            // The database first; reader.json has places saved before it.
+            let saved = crate::reading_stats::left_at(&book_id).map(|p| Position {
+                spine: p.spine as usize,
+                offset: p.offset as usize,
+            });
             (
-                settings
-                    .positions
-                    .get(&book_id)
-                    .copied()
+                saved
+                    .or_else(|| settings.positions.get(&book_id).copied())
                     .unwrap_or_default(),
                 None,
             )
@@ -350,7 +361,16 @@ impl Reader {
         let theme = ctx.theme();
         let prev = ctx.style_of(theme);
         apply_theme(ctx, theme, theme::index(&settings.theme));
+        let tracker = crate::reading_stats::with(|s| {
+            tracker::Tracker::new(&book_id, &epub.title, s, crate::reading_stats::now())
+        });
         Ok(Reader {
+            tracker,
+            stats_open: false,
+            stats: stats_ui::Cache::default(),
+            cpm: 300.0,
+            cpm_by_hand: false,
+            finished: false,
             images: images::Images::new(epub.clone()),
             epub,
             book_id,
@@ -395,6 +415,7 @@ impl Reader {
     /// Restore the app's look and remember the place.
     pub fn close(mut self, ctx: &egui::Context) {
         egui::Popup::close_id(ctx, egui::Id::unique("reader-text-menu"));
+        self.end_stats();
         self.save();
         if let Some((theme, style)) = self.prev_style.take() {
             ctx.set_style_of(theme, style);
@@ -406,13 +427,22 @@ impl Reader {
         if !self.persist {
             return;
         }
-        self.settings.positions.insert(
-            self.book_id.clone(),
-            Position {
-                spine: self.spine,
-                offset: self.offset,
-            },
-        );
+        // The place goes to the reading-stats database; to reader.json only
+        // while that can't be read (it is never written to then).
+        if crate::reading_stats::problem().is_none() {
+            crate::reading_stats::set_left_at(&self.book_id, self.spine, self.offset);
+            if let Err(e) = crate::reading_stats::save() {
+                self.error = Some(e);
+            }
+        } else {
+            self.settings.positions.insert(
+                self.book_id.clone(),
+                Position {
+                    spine: self.spine,
+                    offset: self.offset,
+                },
+            );
+        }
         let result = if let Some(default) = &self.session_tts_default {
             Settings {
                 tts: default.clone(),
@@ -501,9 +531,19 @@ impl Reader {
         self.target = Some(target);
     }
 
+    /// The book was just finished (paged past its end), the first time.
+    pub fn take_finished(&mut self) -> bool {
+        std::mem::take(&mut self.finished)
+    }
+
+    pub fn book_id(&self) -> &str {
+        &self.book_id
+    }
+
     fn next(&mut self, g: &Geometry) {
         self.forward = true;
         self.turned_at = self.now;
+        self.tracker.turned();
         let step = self.step(g);
         if let Some(l) = self.layouts.get(&self.spine)
             && self.page + step < l.pages.len()
@@ -515,12 +555,15 @@ impl Reader {
         if self.spine + 1 < self.epub.spine.len() {
             self.go_chapter(self.spine + 1, Target::Offset(0));
             self.save();
+        } else if self.layouts.contains_key(&self.spine) {
+            self.stats_finish();
         }
     }
 
     fn prev(&mut self, g: &Geometry) {
         self.forward = false;
         self.turned_at = self.now;
+        self.tracker.turned();
         let step = self.step(g);
         if self.page >= step {
             self.page -= step;
@@ -694,11 +737,13 @@ impl Reader {
         // A click that closes a popup doesn't also turn the page.
         let menus_open = egui::Popup::is_any_open(&ctx)
             || self.settings_open
+            || self.stats_open
             || self.tts.panel_open
             || self.tts.local_window_open()
             || self.tts.design_window_open()
             || self.dicts.open
             || self.dict.cards.setup_open;
+        self.stats_frame(&ctx, menus_open);
         let dict_open = self.dict.is_open();
         let popup_was_open = menus_open || dict_open;
         let text_menu_id = egui::Id::unique("reader-text-menu");
@@ -713,6 +758,7 @@ impl Reader {
         let esc_for_popup = popup_was_open && ctx.input(|i| i.key_pressed(Key::Escape));
         if esc_for_popup {
             self.settings_open = false;
+            self.stats_open = false;
             if self.tts.design_window_open() {
                 self.tts.close_design_window();
             } else if self.tts.local_window_open() && !self.tts.panel_open {
@@ -756,6 +802,7 @@ impl Reader {
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         self.settings_menu(ui);
+                        self.stats_menu(ui);
                         self.contents_menu(ui);
                         let n = self.dicts.updates();
                         let label = if self.dicts.working() {
@@ -885,6 +932,7 @@ impl Reader {
             }
             self.page = self.page.min(l.pages.len().saturating_sub(1));
             self.page -= self.page % step;
+            self.stats_place(&l);
             self.tts.page_src = l.page_first_src(self.page).unwrap_or(0);
             self.tts.page_end = l.page_first_src(self.page + step).unwrap_or(u32::MAX);
             if play_page {
@@ -1069,6 +1117,7 @@ impl Reader {
             }
             self.probe.sides = sides.iter().map(|(i, o, _)| (*i, *o)).collect();
             let highlight = self.dict.highlight(self.spine);
+            let stats_line = self.stats_line(crate::reading_stats::now());
             for side in 0..step {
                 let page_rect = g.pages[side];
                 draw_page(ui, th, page_rect, side, g.spread);
@@ -1122,9 +1171,33 @@ impl Reader {
                     th.muted,
                 );
             }
+            // Reading stats under the pages: the session (a click pauses or
+            // starts timing) and the time left.
+            if let Some(line) = &stats_line {
+                let small = egui::FontId::proportional((self.settings.size * 0.62).max(11.0));
+                let parts = Self::draw_stats_line(ui, th, &g, step, line, &small);
+                for (i, (r, hover, click)) in parts.into_iter().enumerate() {
+                    let sense = if click {
+                        egui::Sense::click()
+                    } else {
+                        egui::Sense::hover()
+                    };
+                    let id = egui::Id::unique(("reader-stats-line", i));
+                    let r = ui.interact(r.expand(3.0), id, sense).on_hover_text(hover);
+                    if click && !popup_was_open {
+                        if r.hovered() {
+                            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if r.clicked() {
+                            self.stats_toggle();
+                        }
+                    }
+                }
+            }
             if primary_click && let Some(p) = resp.interact_pointer_pos() {
                 if popup_was_open {
                     self.settings_open = false;
+                    self.stats_open = false;
                     self.tts.panel_open = false;
                     self.dict.close();
                 } else if let Some(t) = hit_link(p) {
@@ -1154,6 +1227,7 @@ impl Reader {
             }
             if let Some((spine, src)) = spoken_chapter {
                 self.forward = spine > self.spine;
+                self.tracker.turned();
                 self.go_chapter(spine, Target::Src(src));
                 self.save();
                 ctx.request_repaint();
@@ -1198,6 +1272,9 @@ impl Reader {
                     )
                 });
                 self.dict.scroll_lines += down as i32 - up as i32;
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::P)) {
+                self.stats_toggle();
             }
             let (fwd, back, home, end, esc, wheel) = ctx.input_mut(|i| {
                 let fwd = [Key::ArrowRight, Key::ArrowDown, Key::PageDown, Key::Space]
@@ -1329,6 +1406,7 @@ impl Reader {
         }
         if let Some(p) = first {
             self.forward = p > self.page;
+            self.tracker.turned();
             self.page = p - p % step;
             self.offset = l.page_offset(self.page);
         }

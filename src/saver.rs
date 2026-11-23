@@ -6,9 +6,14 @@
 //! on disk, so a file always reads as last written. Without [`defer`] (the
 //! command line, tests) [`write`] writes at once.
 //!
-//! Every file is written to a temporary name and renamed, so a crash never
-//! leaves half a file. [`flush`] waits for the queue to empty: call it
-//! before exiting, or before another process reads the files.
+//! Every file is written to a temporary name, flushed to the disk and
+//! renamed, so neither a crash nor a power cut leaves half a file. [`flush`]
+//! waits for the queue to empty: call it before exiting, or before another
+//! process reads the files.
+//!
+//! [`load_json`] reads a file written here. One that can't be read is
+//! renamed aside (never overwritten by the next save) and reported through
+//! [`take_notices`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -42,6 +47,81 @@ static SAVER: LazyLock<Saver> = LazyLock::new(|| Saver {
 
 fn lock() -> MutexGuard<'static, State> {
     SAVER.state.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Files set aside by [`load_json`], for the window to show.
+static NOTICES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Read JSON file `path`. `None` if it is missing, or can't be read: then
+/// it is renamed to `<name>.unreadable-<unix time>`, so that saving the
+/// defaults in its place destroys nothing, and a notice says so.
+pub fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    let bytes = match read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            notice(format!(
+                "Cannot read {}: {e}. Defaults are used for now.",
+                path.display()
+            ));
+            return None;
+        }
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            let name = |p: &Path| {
+                p.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let msg = match set_aside(path) {
+                Ok(kept) => format!(
+                    "{} couldn't be read ({e}): kept as {} in the same folder; defaults are used.",
+                    name(path),
+                    name(&kept)
+                ),
+                Err(e2) => format!(
+                    "{} couldn't be read ({e}) or kept aside ({e2}); defaults are used.",
+                    path.display()
+                ),
+            };
+            notice(msg);
+            None
+        }
+    }
+}
+
+fn notice(msg: String) {
+    NOTICES.lock().unwrap_or_else(|e| e.into_inner()).push(msg);
+}
+
+/// What [`load_json`] had to set aside since the last call.
+pub fn take_notices() -> Vec<String> {
+    std::mem::take(&mut *NOTICES.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Rename `path` to a free `<name>.unreadable-<unix time>[-n]` beside it.
+fn set_aside(path: &Path) -> std::io::Result<PathBuf> {
+    // A queued write would bring the file back over the one kept.
+    lock().pending.remove(path);
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    for n in 0.. {
+        let kept = path.with_file_name(if n == 0 {
+            format!("{name}.unreadable-{secs}")
+        } else {
+            format!("{name}.unreadable-{secs}-{n}")
+        });
+        if !kept.exists() {
+            std::fs::rename(path, &kept)?;
+            return Ok(kept);
+        }
+    }
+    unreachable!()
 }
 
 /// From now on, [`write`] queues instead of writing.
@@ -146,16 +226,68 @@ fn write_now(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(format!(".{}.tmp", std::process::id()));
     let tmp = path.with_file_name(name);
-    std::fs::write(&tmp, bytes).map_err(|e| format!("Cannot write {}: {e}", tmp.display()))?;
+    // On the disk before the rename: a power cut then leaves the old file
+    // or the new one, never an empty or half one.
+    let synced = (|| {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()
+    })();
+    synced.map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("Cannot write {}: {e}", tmp.display())
+    })?;
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("Cannot write {}: {e}", path.display())
-    })
+    })?;
+    // The rename itself, on systems where a directory is synced apart.
+    #[cfg(unix)]
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreadable_files_are_set_aside_not_lost() {
+        let dir = std::env::temp_dir().join(format!("hanstat-saver-json-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.json");
+        assert_eq!(load_json::<Vec<u32>>(&p), None);
+        write(&p, b"[1,2]".to_vec()).unwrap();
+        assert_eq!(load_json::<Vec<u32>>(&p), Some(vec![1, 2]));
+        std::fs::write(&p, b"{broken").unwrap();
+        let _ = take_notices();
+        assert_eq!(load_json::<Vec<u32>>(&p), None);
+        assert!(!p.exists(), "set aside");
+        let kept: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("s.json.unreadable-")
+            })
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(std::fs::read(kept[0].path()).unwrap(), b"{broken");
+        let notes = take_notices();
+        assert!(
+            notes.iter().any(|n| n.contains("couldn't be read")),
+            "{notes:?}"
+        );
+        // The defaults saved now don't touch the copy kept.
+        write(&p, b"[]".to_vec()).unwrap();
+        assert_eq!(std::fs::read(kept[0].path()).unwrap(), b"{broken");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn writes_now_unless_deferred() {

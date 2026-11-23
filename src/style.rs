@@ -227,28 +227,15 @@ impl Store {
 
     /// Missing file → empty; an unreadable one is reported (and replaced on the next save).
     pub fn load() -> (Store, Option<String>) {
-        let p = Self::path();
-        match std::fs::read(&p) {
-            Err(_) => (Store::default(), None),
-            Ok(b) => match serde_json::from_slice(&b) {
-                Ok(s) => (s, None),
-                Err(e) => (
-                    Store::default(),
-                    Some(format!("Ignoring unreadable {}: {e}", p.display())),
-                ),
-            },
-        }
+        // An unreadable file is kept aside and reported by the saver.
+        (
+            crate::saver::load_json(&Self::path()).unwrap_or_default(),
+            None,
+        )
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let p = Self::path();
-        if let Some(d) = p.parent() {
-            std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
-        }
-        let tmp = p.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self).unwrap())
-            .and_then(|()| std::fs::rename(&tmp, &p))
-            .map_err(|e| format!("Cannot save {}: {e}", p.display()))
+        crate::saver::write(&Self::path(), serde_json::to_vec_pretty(self).unwrap())
     }
 
     /// The book's rating, if made with the current [`method`].

@@ -94,6 +94,9 @@ pub struct Chapter {
     pub links: Vec<LinkTarget>,
     /// Characters of text, for the book's progress.
     pub text_len: usize,
+    /// Chinese characters ([`hanstat::chars::is_han`]) in [`Chapter::chars`]:
+    /// what reading stats count.
+    pub han_len: u32,
     /// Element ids and the characters of text before them.
     pub anchors: Vec<(String, usize)>,
     /// The text in layout order, `'\0'` between blocks and at line breaks:
@@ -266,11 +269,13 @@ pub fn build_doc(doc: &scraper::Html, ua: &RuleSet, author: &RuleSet, source: So
     }
     let mut chars = Vec::new();
     index_text(&mut root, &mut chars);
+    let han_len = chars.iter().filter(|&&c| hanstat::chars::is_han(c)).count() as u32;
     Chapter {
         styles: b.styles,
         root,
         links: b.links,
         text_len: b.text_len,
+        han_len,
         anchors: b.anchors,
         chars,
     }

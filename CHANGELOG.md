@@ -1,5 +1,31 @@
 # Changelog
 
+## [2026.11.23.02] - 2026-11-23
+
+### Added
+- **Reading stats in the EPUB reader.**
+  - The reader times your reading and counts the Chinese characters you page past. Paging back takes them off again, and jumps through the contents or links don't count.
+  - It pauses on its own after 5 minutes without input, leaving that idle time out. It also pauses when the window is in the background or a menu is open. **P**, or a click on the session time, pauses and starts it by hand.
+  - Under **Stats** in the reader's bar you can choose to start timing only by hand.
+  - While **Read aloud** plays, the time counts as listening, kept apart from reading.
+- **A line under the pages** shows the session's time, characters and speed, and the time left in the chapter and the book. You can hide it.
+- **The Stats panel** in the reader shows this session, today, this book and all books, your streak, and a daily goal in minutes and/or characters. **Discard this session…** takes a session back out.
+- **Paging past a book's last page** records it as finished and offers **Mark read**.
+- **Library Stats › Reading.** Totals, speed, streaks and books finished, for all time or a year, month, week or day, with ‹ › to step through them.
+  - The calendar shows minutes read each day, with goal days ringed and its own year ‹ ›.
+  - Charts show time or characters per day or month, and speed per week or day.
+  - The table of books read can be filtered the same way; right-click a title to remove its stats.
+- **Read so far** on each book's Overview: time, characters, speed, start and finish dates, and the time left at your speed.
+
+### Changed
+- **Chinese reading times use your own speed.** Once you've read 10 minutes in the reader, reading times in the Library, on the Overview and in the reader use your speed over the last 30 days. To use a fixed speed instead, turn on **Settings (⚙) › Reading speed › Chinese › Override**.
+- **Where you left each book** is kept in the reading-stats database (`reading-stats.sqlite`). Places saved before are still used.
+- The first start after updating refreshes each Library row's known-word shares from its saved data. No book is analysed again.
+
+### Fixed
+- **Settings and known words could be lost.** If settings, the reading path, Anki, writing-style, known-word or reader settings files couldn't be read, hanstat used to start from defaults and overwrite the file at the next save. Such a file is now kept as `<name>.unreadable-<time>`, and hanstat says so.
+- **Saved files survive a power cut.** Every file hanstat saves is now flushed to the disk before it replaces the old one. The settings, reading-path and reader settings files were written in place before.
+
 ## [2026.11.23.01] - 2026-11-23
 
 ### Added

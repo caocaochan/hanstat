@@ -24,7 +24,6 @@ pub mod opus;
 
 use crate::reader::tree::Chapter;
 use eframe::egui::{self, RichText};
-#[cfg(test)]
 pub use engine::State as PlayState;
 use engine::{Availability, Batch, Chapters, Cmd, Engine, Now, Repaint, State};
 use serde::{Deserialize, Serialize};

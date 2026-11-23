@@ -488,6 +488,121 @@ fn nice_ticks(max: f64) -> (f64, Vec<f64>) {
     (top, (0..=n).map(|i| i as f64 * step).collect())
 }
 
+/// A day of [`calendar`]: its shade (0: nothing; 1..=4 darker), a ring
+/// (the goal met) and its hover text.
+pub struct CalDay {
+    pub level: u8,
+    pub ring: bool,
+    pub hover: String,
+}
+
+/// The days a [`calendar`] shows and how.
+pub struct Calendar<'a> {
+    /// The first day's number and its weekday (0: Monday), and how many.
+    pub first: i32,
+    pub weekday: u32,
+    pub n: i32,
+    /// Month starts: day numbers and names.
+    pub months: &'a [(i32, &'a str)],
+    /// Empty, then light to dark.
+    pub shades: [Color32; 5],
+    pub ring: Color32,
+    /// Day numbers `a..b` in focus: the other days are dimmed.
+    pub focus: Option<(i32, i32)>,
+}
+
+/// A year as weeks across (Monday on top), one square a day, in one painter
+/// pass. `day(i)`: the `i`-th day, `None` with nothing in it.
+pub fn calendar(ui: &mut egui::Ui, cal: Calendar<'_>, day: &dyn Fn(i32) -> Option<CalDay>) {
+    let Calendar {
+        first,
+        weekday,
+        n,
+        months,
+        shades,
+        ring,
+        focus,
+    } = cal;
+    const GAP: f32 = 3.0;
+    const LABEL_W: f32 = 30.0;
+    const HEAD: f32 = 16.0;
+    let weeks = ((weekday as i32 + n + 6) / 7).max(1);
+    let avail = ui.available_width().max(200.0);
+    let cell = ((avail - LABEL_W) / weeks as f32 - GAP).clamp(6.0, 15.0);
+    let w = LABEL_W + weeks as f32 * (cell + GAP);
+    let h = HEAD + 7.0 * (cell + GAP);
+    let (response, painter) = ui.allocate_painter(Vec2::new(w, h), egui::Sense::hover());
+    let o = response.rect.min;
+    let weak = ui.visuals().weak_text_color();
+    let pos = |i: i32| {
+        let k = i + weekday as i32;
+        pos2(
+            o.x + LABEL_W + (k / 7) as f32 * (cell + GAP),
+            o.y + HEAD + (k % 7) as f32 * (cell + GAP),
+        )
+    };
+    for (row, name) in [(0, "Mon"), (2, "Wed"), (4, "Fri")] {
+        painter.text(
+            pos2(
+                o.x + LABEL_W - 6.0,
+                o.y + HEAD + row as f32 * (cell + GAP) + cell / 2.0,
+            ),
+            Align2::RIGHT_CENTER,
+            name,
+            small(),
+            weak,
+        );
+    }
+    let mut label_end = f32::MIN;
+    for &(d, name) in months {
+        let x = pos(d - first).x;
+        if x > label_end {
+            let g = painter.layout_no_wrap(name.to_owned(), small(), weak);
+            label_end = x + g.size().x + 4.0;
+            painter.galley(pos2(x, o.y), g, weak);
+        }
+    }
+    let hovered = response.hover_pos().and_then(|p| {
+        let k = ((p.x - o.x - LABEL_W) / (cell + GAP)).floor() as i32 * 7
+            + ((p.y - o.y - HEAD) / (cell + GAP)).floor() as i32;
+        let i = k - weekday as i32;
+        (p.x >= o.x + LABEL_W && p.y >= o.y + HEAD && (0..n).contains(&i)).then_some(i)
+    });
+    let mut hover_text = None;
+    for i in 0..n {
+        let d = day(i);
+        let r = Rect::from_min_size(pos(i), Vec2::splat(cell));
+        let level = d.as_ref().map_or(0, |d| d.level.min(4));
+        let dim = focus.is_some_and(|(a, b)| first + i < a || first + i >= b);
+        let fade = |c: Color32| if dim { c.gamma_multiply(0.3) } else { c };
+        painter.rect_filled(r, 2.0, fade(shades[level as usize]));
+        if let Some(d) = &d
+            && d.ring
+        {
+            painter.rect_stroke(
+                r.shrink(0.5),
+                2.0,
+                Stroke::new(1.5, fade(ring)),
+                StrokeKind::Inside,
+            );
+        }
+        if hovered == Some(i) {
+            painter.rect_stroke(
+                r.expand(1.0),
+                2.0,
+                Stroke::new(1.5, ui.visuals().text_color()),
+                StrokeKind::Outside,
+            );
+            hover_text = Some(d.map_or_else(String::new, |d| d.hover));
+        }
+    }
+    if let Some(t) = hover_text.filter(|t| !t.is_empty()) {
+        response.on_hover_ui_at_pointer(|ui| {
+            ui.label(t);
+        });
+    }
+}
+
 /// 950, 1.2k, 35k, 1.4M.
 pub fn compact(v: f64) -> String {
     let a = v.abs();
@@ -560,6 +675,25 @@ mod tests {
                     120.0,
                 );
                 stacked_bar(ui, &[(0, Color32::RED, "a".into())]);
+                let shades = [Color32::GRAY; 5];
+                for (wd, n) in [(0, 365), (6, 366), (3, 1)] {
+                    let cal = Calendar {
+                        first: 100,
+                        weekday: wd,
+                        n,
+                        months: &[(100, "Jan")],
+                        shades,
+                        ring: Color32::RED,
+                        focus: (wd == 6).then_some((105, 112)),
+                    };
+                    calendar(ui, cal, &|i| {
+                        (i % 3 == 0).then(|| CalDay {
+                            level: (i % 6) as u8,
+                            ring: i % 2 == 0,
+                            hover: "d".into(),
+                        })
+                    });
+                }
                 stacked_bar(
                     ui,
                     &[

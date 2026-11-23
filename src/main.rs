@@ -25,12 +25,14 @@ use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
 
 mod charts;
+mod library_reading;
 mod library_stats;
 mod palette;
 mod png_report;
 mod raster;
 mod read_books;
 mod reader;
+mod reading_stats;
 mod shortcuts;
 mod style_scale;
 mod whats_new;
@@ -649,6 +651,8 @@ struct App {
     auto: AutoRefresh,
     /// The Mark read window, while open.
     read_dialog: Option<read_books::ReadDialog>,
+    /// Library Stats › Reading.
+    reading_view: library_reading::ReadingView,
     /// Known words of the Library's languages that are neither in use nor
     /// set aside, read from their files for their books' read marks
     /// ([`App::load_read_marks`]).
@@ -1332,6 +1336,7 @@ impl Default for App {
             style: StyleState::load(),
             auto: AutoRefresh::default(),
             read_dialog: None,
+            reading_view: Default::default(),
             known_disk: HashMap::new(),
             library_hide_read: false,
             exists: Exists::default(),
@@ -2567,14 +2572,42 @@ impl App {
             );
             ui.separator();
             ui.strong("Reading speed");
+            let measured = reading_stats::measured_now();
             egui::Grid::new("speeds").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
                 let s = &mut self.settings;
                 let mut changed = false;
                 ui.label("Chinese");
-                changed |= ui
-                    .add(egui::DragValue::new(&mut s.cpm).range(50.0..=2000.0).speed(5.0).suffix(" chars/min"))
-                    .on_hover_text("Chinese characters per minute")
-                    .changed();
+                ui.horizontal(|ui| {
+                    // Measured in the reader unless overridden; the value set
+                    // here also stands in until a speed is measured.
+                    let by_hand = s.cpm_by_hand || measured.is_none();
+                    if by_hand {
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut s.cpm).range(50.0..=2000.0).speed(5.0).suffix(" chars/min"))
+                            .on_hover_text("Chinese characters per minute")
+                            .changed();
+                    } else {
+                        let mut v = measured.unwrap_or_default().round() as f32;
+                        ui.add_enabled(false, egui::DragValue::new(&mut v).suffix(" chars/min"))
+                            .on_disabled_hover_text("Measured in the reader: characters read ÷ minutes read over the last 30 days");
+                    }
+                    changed |= ui
+                        .checkbox(&mut s.cpm_by_hand, "Override")
+                        .on_hover_text(match measured {
+                            Some(v) => format!("Use a speed set here instead of the {v:.0} chars/min measured in the reader"),
+                            None => "Use the speed set here even once your speed is measured in the reader".to_owned(),
+                        })
+                        .changed();
+                });
+                ui.end_row();
+                ui.label("");
+                let note = match (s.cpm_by_hand, measured) {
+                    (false, Some(_)) => "Measured in the reader over the last 30 days".to_owned(),
+                    (false, None) => "Until you've read 10 minutes in the reader; then measured there".to_owned(),
+                    (true, Some(v)) => format!("Set by hand (measured: {v:.0} chars/min)"),
+                    (true, None) => "Set by hand".to_owned(),
+                };
+                ui.label(RichText::new(note).weak().small());
                 ui.end_row();
                 ui.label("Japanese");
                 changed |= ui
@@ -2594,7 +2627,7 @@ impl App {
             });
             ui.label(
                 RichText::new(
-                    "For the reading times in the Library and on each book's Overview, where a book's speed can be changed on its own to try another.",
+                    "For the reading times in the Library and on each book's Overview, where a book's speed can be changed on its own to try another, and for the time left in the reader.",
                 )
                 .weak()
                 .small(),
@@ -2869,10 +2902,12 @@ impl eframe::App for App {
 
     fn on_exit(&mut self) {
         if let Some(r) = &mut self.reader {
+            r.end_stats();
             r.save();
         }
         self.finish_removal();
         hanstat::saver::flush();
+        reading_stats::flush();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -2915,6 +2950,10 @@ impl eframe::App for App {
         if let Some(e) = hanstat::saver::take_error() {
             self.set_error("save", e);
         }
+        let set_aside = hanstat::saver::take_notices();
+        if !set_aside.is_empty() {
+            self.set_error("unreadable", set_aside.join("\n"));
+        }
         self.place_window(&ctx, now);
         if self.settings_unsaved && !ctx.input(|i| i.pointer.any_down()) {
             self.settings_unsaved = false;
@@ -2936,8 +2975,23 @@ impl eframe::App for App {
             self.open_files(dropped, &ctx);
         }
         // The reader fills the window while a book is open in it.
+        let (cpm, by_hand) = (self.cpm(), self.settings.cpm_by_hand);
         if let Some(r) = &mut self.reader {
-            if !r.ui(ui) {
+            r.cpm = cpm;
+            r.cpm_by_hand = by_hand;
+            let open = r.ui(ui);
+            let finished = r.take_finished().then(|| r.book_id().to_owned());
+            // A Library book read to the end: offer Mark read, unless it is.
+            if let Some(id) = finished
+                && self.history.entries.iter().any(|e| e.id == id)
+                && !self.read_dates().contains_key(&id)
+            {
+                self.open_read_dialog(&id);
+            }
+            if self.read_dialog.is_some() {
+                self.read_window(&ctx);
+            }
+            if !open {
                 if let Some(r) = self.reader.take() {
                     r.close(&ctx);
                 }
@@ -4457,6 +4511,7 @@ impl App {
             }
             ui.add_space(4.0);
         }
+        let default_cpm = self.cpm();
         let r = self.report.as_ref().unwrap();
         // A Korean book has word statistics only; a Japanese one has words
         // laid out like Korean, plus kanji.
@@ -4946,11 +5001,17 @@ impl App {
                     ui.end_row();
                     ui.label("Reading time");
                     ui.horizontal(|ui| {
-                        let mins = r.han_total as f64 / self.cpm.unwrap_or(self.settings.cpm) as f64;
+                        let default = default_cpm;
+                        let mins = r.han_total as f64 / self.cpm.unwrap_or(default) as f64;
                         ui.label(format!("{}h {:02}m at", (mins / 60.0) as u64, (mins % 60.0) as u64));
-                        speed_input(ui, &mut self.cpm, self.settings.cpm, 50.0..=2000.0, 5.0, " chars/min");
+                        speed_input(ui, &mut self.cpm, default, 50.0..=2000.0, 5.0, " chars/min");
                     });
                     ui.end_row();
+                    if let Some(id) = self.report_id.as_deref() {
+                        let cpm = self.cpm.unwrap_or(default_cpm);
+                        let by_hand = self.settings.cpm_by_hand || self.cpm.is_some();
+                        library_reading::book_rows(ui, id, r.han_total, cpm, by_hand);
+                    }
                 });
                 });
 
@@ -6100,9 +6161,8 @@ impl App {
             return;
         }
 
-        // Reading time at the speeds set on the Overview, as there.
-        let sp = &self.settings;
-        let (cpm, ja_cpm, wpm) = (sp.cpm as f64, sp.ja_cpm as f64, sp.wpm as f64);
+        // Reading time at the speeds the Overview uses, as there.
+        let (cpm, ja_cpm, wpm) = self.speeds();
         let minutes = |s: &history::Stats| match s.language {
             Language::Chinese => s.han_total as f64 / cpm,
             Language::Japanese => (s.han_total + s.kana_total) as f64 / ja_cpm,
@@ -7920,6 +7980,28 @@ impl App {
 
 /// A book's reading speed: `speed` where changed from `default` (the ⚙
 /// menu's), with a button to go back to it.
+/// The reading speeds estimates use: Chinese measured in the reader unless
+/// set by hand (see [`App::cpm`]), Japanese and Korean as set.
+impl App {
+    /// Chinese characters a minute: the speed measured in the reader, or
+    /// the one in Settings when it is set by hand or nothing is measured yet.
+    pub(crate) fn cpm(&self) -> f32 {
+        if self.settings.cpm_by_hand {
+            return self.settings.cpm;
+        }
+        reading_stats::measured_now().map_or(self.settings.cpm, |v| v as f32)
+    }
+
+    /// (Chinese, Japanese, Korean), for [`library_stats::reading_minutes`].
+    pub(crate) fn speeds(&self) -> (f64, f64, f64) {
+        (
+            self.cpm() as f64,
+            self.settings.ja_cpm as f64,
+            self.settings.wpm as f64,
+        )
+    }
+}
+
 fn speed_input(
     ui: &mut egui::Ui,
     speed: &mut Option<f32>,
@@ -7936,7 +8018,7 @@ fn speed_input(
                 .speed(step)
                 .suffix(suffix),
         )
-        .on_hover_text("This book only, to try another speed; the default is set in Settings (⚙)")
+        .on_hover_text("This book only, to try another speed. The default is your speed measured in the reader, or the one set in Settings (⚙)")
         .changed()
     {
         *speed = Some(v);
@@ -7944,9 +8026,7 @@ fn speed_input(
     if speed.is_some_and(|s| s != default)
         && ui
             .small_button("↺")
-            .on_hover_text(format!(
-                "Back to the default, {default:.0}{suffix} (Settings, ⚙)"
-            ))
+            .on_hover_text(format!("Back to the default, {default:.0}{suffix}"))
             .clicked()
     {
         *speed = None;

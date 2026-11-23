@@ -156,27 +156,15 @@ impl Settings {
 
     /// Missing → defaults; unreadable → defaults and a warning.
     pub fn load() -> (Settings, Option<String>) {
-        let p = Self::path();
-        match std::fs::read(&p) {
-            Err(_) => (Settings::default(), None),
-            Ok(b) => match serde_json::from_slice(&b) {
-                Ok(s) => (s, None),
-                Err(e) => (
-                    Settings::default(),
-                    Some(format!("Ignoring unreadable {}: {e}", p.display())),
-                ),
-            },
-        }
+        // An unreadable file is kept aside and reported by the saver.
+        (
+            crate::saver::load_json(&Self::path()).unwrap_or_default(),
+            None,
+        )
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let p = Self::path();
-        if let Some(d) = p.parent() {
-            std::fs::create_dir_all(d)
-                .map_err(|e| format!("Cannot create {}: {e}", d.display()))?;
-        }
-        std::fs::write(&p, serde_json::to_string_pretty(self).unwrap())
-            .map_err(|e| format!("Cannot write {}: {e}", p.display()))
+        crate::saver::write(&Self::path(), serde_json::to_vec_pretty(self).unwrap())
     }
 
     pub fn params(&self) -> Params {

@@ -789,8 +789,7 @@ impl App {
     }
 
     fn library_page(&self, ui: &mut egui::Ui, look: Look, covers: &Covers) {
-        let sp = &self.settings;
-        let speeds = (sp.cpm as f64, sp.ja_cpm as f64, sp.wpm as f64);
+        let speeds = self.speeds();
         let entries = &self.history.entries;
         let read_at = self.read_dates();
         let mut langs: Vec<(Language, usize)> = Language::ALL
@@ -1358,7 +1357,7 @@ impl App {
         // Reading speed as set on the Overview.
         let (minutes, speed) = match lang {
             Language::Chinese => {
-                let v = self.cpm.unwrap_or(self.settings.cpm) as f64;
+                let v = self.cpm.unwrap_or(self.cpm()) as f64;
                 (
                     r.han_total as f64 / v,
                     format!("{v:.0} characters a minute"),

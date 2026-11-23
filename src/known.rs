@@ -429,17 +429,10 @@ impl Settings {
         self.save_to(&Self::path_for(self.language))
     }
 
+    /// Missing → nothing known. An unreadable file is kept aside (never
+    /// overwritten by the next save) and reported by the saver.
     fn load_from(p: &Path) -> (Settings, Option<String>) {
-        match crate::saver::read(p) {
-            Err(_) => (Settings::default(), None),
-            Ok(b) => match serde_json::from_slice(&b) {
-                Ok(s) => (s, None),
-                Err(e) => (
-                    Settings::default(),
-                    Some(format!("Ignoring unreadable {}: {e}", p.display())),
-                ),
-            },
-        }
+        (crate::saver::load_json(p).unwrap_or_default(), None)
     }
 
     /// Through [`crate::saver`]: in the window, written in the background.
@@ -969,9 +962,21 @@ mod tests {
         assert_eq!(s.lists.len(), 1);
         s.save_to(&p).unwrap();
         assert_eq!(Settings::load_from(&p).0.lists[0].words, ["再见"]);
+        // An unreadable file is kept aside, so saving can't lose it.
         std::fs::write(&p, "{not json").unwrap();
-        let (bad, warn) = Settings::load_from(&p);
-        assert!(bad.is_empty() && warn.is_some());
+        let (bad, _) = Settings::load_from(&p);
+        assert!(bad.is_empty());
+        assert!(!p.exists());
+        let kept = std::fs::read_dir(p.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("known.json.unreadable-")
+            })
+            .expect("kept aside");
+        assert_eq!(std::fs::read(kept.path()).unwrap(), b"{not json");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

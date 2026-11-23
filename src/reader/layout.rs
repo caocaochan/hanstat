@@ -81,6 +81,8 @@ struct Unit {
     image_only: bool,
     /// Characters of the chapter before it.
     text: usize,
+    /// Chinese characters of the chapter before it (reading stats).
+    han: u32,
 }
 
 pub struct Page {
@@ -131,9 +133,20 @@ pub struct ChapterLayout {
     pub anchors: HashMap<String, usize>,
     pub links: Vec<Link>,
     pub hits: Hits,
+    /// Chinese characters laid out in the chapter.
+    pub han_total: u32,
 }
 
 impl ChapterLayout {
+    /// Chinese characters of the chapter before `page` (the whole chapter
+    /// past its last page).
+    pub fn page_han(&self, page: usize) -> u32 {
+        self.pages
+            .get(page)
+            .and_then(|p| self.units.get(p.units.start))
+            .map_or(self.han_total, |u| u.han)
+    }
+
     /// The page holding the text at `offset` characters.
     pub fn page_of_offset(&self, offset: usize) -> usize {
         self.pages
@@ -386,6 +399,7 @@ struct Flow<'a, 'f> {
     margin_neg: f32,
     break_next: bool,
     text: usize,
+    han: u32,
     pending_anchors: Vec<String>,
     anchors: HashMap<String, usize>,
     struts: HashMap<StyleId, (f32, f32)>,
@@ -414,6 +428,7 @@ pub fn layout(
         margin_neg: 0.0,
         break_next: false,
         text: 0,
+        han: 0,
         pending_anchors: Vec::new(),
         anchors: HashMap::new(),
         struts: HashMap::new(),
@@ -461,6 +476,7 @@ pub fn layout(
         anchors: f.anchors,
         links: f.links,
         hits: f.hits,
+        han_total: f.han,
     }
 }
 
@@ -534,6 +550,7 @@ impl Flow<'_, '_> {
         items: Range<usize>,
         image_only: bool,
         chars: usize,
+        han: u32,
     ) {
         let i = self.units.len();
         for a in std::mem::take(&mut self.pending_anchors) {
@@ -546,8 +563,10 @@ impl Flow<'_, '_> {
             break_before: std::mem::take(&mut self.break_next),
             image_only,
             text: self.text,
+            han: self.han,
         });
         self.text += chars;
+        self.han += han;
     }
 
     fn family(&self, s: &Style) -> (FontFamily, bool) {
@@ -889,7 +908,7 @@ impl Flow<'_, '_> {
         let n = self.items.len();
         let top = self.y;
         self.y += size.y;
-        self.push_unit(top, self.y, n - 1..n, true, 0);
+        self.push_unit(top, self.y, n - 1..n, true, 0, 0);
     }
 
     fn rule(&mut self, s: &Style, x0: f32, w: f32) {
@@ -928,7 +947,7 @@ impl Flow<'_, '_> {
         });
         let n = self.items.len();
         self.y += width;
-        self.push_unit(top, self.y, n - 1..n, false, 0);
+        self.push_unit(top, self.y, n - 1..n, false, 0, 0);
     }
 
     /// Lay out an inline box's content on one line, within `avail`:
@@ -1604,9 +1623,13 @@ impl Flow<'_, '_> {
             .iter()
             .filter(|a| a.kind == AKind::Char && a.ch != ' ')
             .count();
+        let han = atoms
+            .iter()
+            .filter(|a| a.kind == AKind::Char && a.src != NO_SRC && hanstat::chars::is_han(a.ch))
+            .count() as u32;
         let n = self.items.len();
         self.y = bottom;
-        self.push_unit(top, bottom, first_item..n, false, chars);
+        self.push_unit(top, bottom, first_item..n, false, chars, han);
     }
 }
 

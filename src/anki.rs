@@ -258,36 +258,20 @@ impl Settings {
         Self::load_for(Language::Chinese)
     }
 
-    /// Missing file → defaults. A corrupt file is reported, and defaults are used.
+    /// Missing file → defaults. An unreadable one is kept aside and
+    /// reported by the saver ([`crate::saver::load_json`]); defaults are used.
     pub fn load_for(lang: Language) -> (Settings, Option<String>) {
-        let p = Self::path_for(lang);
-        let (mut s, warn) = match std::fs::read(&p) {
-            Err(_) => (Settings::default(), None),
-            Ok(b) => match serde_json::from_slice(&b) {
-                Ok(s) => (s, None),
-                Err(e) => (
-                    Settings::default(),
-                    Some(format!("Ignoring unreadable {}: {e}", p.display())),
-                ),
-            },
-        };
+        let mut s: Settings = crate::saver::load_json(&Self::path_for(lang)).unwrap_or_default();
         s.language = lang;
-        (s, warn)
+        (s, None)
     }
 
     /// Saved to this language's file.
     pub fn save(&self) -> Result<(), String> {
-        let p = Self::path_for(self.language);
-        let dir = p.parent().unwrap();
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
-        let tmp = p.with_extension(format!("json.{}.tmp", std::process::id()));
-        std::fs::write(&tmp, serde_json::to_string_pretty(self).unwrap())
-            .map_err(|e| format!("Cannot write {}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, &p).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            format!("Cannot write {}: {e}", p.display())
-        })
+        crate::saver::write(
+            &Self::path_for(self.language),
+            serde_json::to_vec_pretty(self).unwrap(),
+        )
     }
 
     /// The stability threshold in days, if maturity is judged by stability.
