@@ -564,6 +564,8 @@ struct App {
     /// The "Force a word" text box, the Forced words window, and a load/save error.
     force_input: String,
     forced_window: bool,
+    /// The Suggested words tab lists every forced word, not just the newest few.
+    forced_expanded: bool,
     dict_error: Option<String>,
 
     book: Option<Arc<Book>>,
@@ -1294,6 +1296,7 @@ impl Default for App {
             user_words: Vec::new(),
             force_input: String::new(),
             forced_window: false,
+            forced_expanded: false,
             dict_error: None,
             book: None,
             prep: None,
@@ -2227,8 +2230,11 @@ impl App {
     }
 
     /// Forced words: add by typing, remove one by one or all. Shared by the
-    /// Suggested words tab and the Forced words window.
-    fn forced_words_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    /// Suggested words tab and the Forced words window. With `collapse`, only
+    /// the newest `FORCED_SHOWN` are listed until the "… N more" button is
+    /// clicked.
+    fn forced_words_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, collapse: bool) {
+        const FORCED_SHOWN: usize = 5;
         let busy = self.job.is_some();
         let mut words = self.user_words.clone();
         ui.horizontal(|ui| {
@@ -2266,8 +2272,15 @@ impl App {
         });
         if !self.user_words.is_empty() {
             ui.horizontal_wrapped(|ui| {
-                ui.label(format!("{} forced:", self.user_words.len()));
-                for w in &self.user_words {
+                let n = self.user_words.len();
+                ui.label(format!("{n} forced:"));
+                // Newest are appended last, so a collapsed list shows the tail.
+                let hidden = if collapse && !self.forced_expanded {
+                    n.saturating_sub(FORCED_SHOWN)
+                } else {
+                    0
+                };
+                for w in &self.user_words[hidden..] {
                     let b = egui::Button::new(format!("{w} ✖")).small();
                     if ui
                         .add_enabled(!busy, b)
@@ -2276,6 +2289,20 @@ impl App {
                     {
                         words.retain(|x| x != w);
                     }
+                }
+                if hidden > 0 {
+                    if ui
+                        .add(egui::Button::new(format!("… {hidden} more")).small())
+                        .on_hover_text("Show every forced word (the newest are shown)")
+                        .clicked()
+                    {
+                        self.forced_expanded = true;
+                    }
+                } else if collapse
+                    && n > FORCED_SHOWN
+                    && ui.add(egui::Button::new("Show fewer").small()).clicked()
+                {
+                    self.forced_expanded = false;
                 }
             });
         }
@@ -2297,7 +2324,7 @@ impl App {
                      segmenter splits or glues to its neighbours (蒋舸没, 蒋舸问). Saved between runs.",
                 );
                 ui.add_space(4.0);
-                self.forced_words_ui(ui, ctx);
+                self.forced_words_ui(ui, ctx, false);
             });
         self.forced_window &= open;
     }
@@ -5708,7 +5735,7 @@ impl App {
     }
 
     fn suggestions_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        self.forced_words_ui(ui, ctx);
+        self.forced_words_ui(ui, ctx, true);
         ui.separator();
         let Some(cands) = &self.suggestions else {
             ui.horizontal(|ui| {

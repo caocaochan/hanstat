@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.23.04] - 2026-11-23
+
+### Changed
+- **Suggested words lists only your 5 newest forced words.** **… N more** shows the rest, and **Show fewer** hides them again. The **Forced words** window still lists them all.
+
 ## [2026.11.23.03] - 2026-11-23
 
 ### Added
