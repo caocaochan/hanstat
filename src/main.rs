@@ -3662,7 +3662,7 @@ impl App {
         let (text, fill) = mode_badge(self.language, variant);
         let resp = ui
             .add(
-                egui::Button::new(palette::bold_text(text, 14.0).color(palette::cat().crust))
+                egui::Button::new(RichText::new(text).size(14.0).color(palette::cat().crust))
                     .fill(fill)
                     .corner_radius(egui::CornerRadius::same(11)),
             )
