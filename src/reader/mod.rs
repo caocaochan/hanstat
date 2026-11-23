@@ -8,7 +8,7 @@
 mod anki;
 mod css;
 mod dicts_ui;
-mod epub;
+pub(crate) mod epub;
 pub(crate) mod fonts;
 mod images;
 mod layout;
@@ -146,6 +146,13 @@ struct Probe {
     text_menu: [Option<Rect>; 2],
 }
 
+/// A line the app puts in the reader's bar, with an optional button.
+pub struct Notice {
+    pub text: String,
+    pub button: Option<&'static str>,
+    pub hover: String,
+}
+
 /// Where to go once a chapter is laid out.
 #[derive(Clone, Debug)]
 enum Target {
@@ -238,6 +245,10 @@ pub struct Reader {
     pub cpm_by_hand: bool,
     /// Paged past the book's last page for the first time.
     finished: bool,
+    /// A line the app shows in the bar (a DuChinese story's new chapters),
+    /// set by the app each frame, and its button clicked.
+    pub notice: Option<Notice>,
+    notice_clicked: bool,
 }
 
 impl Drop for Reader {
@@ -371,6 +382,8 @@ impl Reader {
             cpm: 300.0,
             cpm_by_hand: false,
             finished: false,
+            notice: None,
+            notice_clicked: false,
             images: images::Images::new(epub.clone()),
             epub,
             book_id,
@@ -538,6 +551,16 @@ impl Reader {
 
     pub fn book_id(&self) -> &str {
         &self.book_id
+    }
+
+    /// The last chapter is shown.
+    pub fn on_last_chapter(&self) -> bool {
+        self.spine + 1 >= self.epub.spine.len()
+    }
+
+    /// The notice's button was clicked (since last asked).
+    pub fn take_notice_click(&mut self) -> bool {
+        std::mem::take(&mut self.notice_clicked)
     }
 
     fn next(&mut self, g: &Geometry) {
@@ -800,6 +823,19 @@ impl Reader {
                             .color(th.text)
                             .strong(),
                     );
+                    if let Some(n) = &self.notice {
+                        ui.add_space(12.0);
+                        ui.label(RichText::new(&n.text).size(14.0).color(th.accent))
+                            .on_hover_text(&n.hover);
+                        if let Some(b) = n.button
+                            && ui
+                                .button(RichText::new(b).size(14.0))
+                                .on_hover_text(&n.hover)
+                                .clicked()
+                        {
+                            self.notice_clicked = true;
+                        }
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         self.settings_menu(ui);
                         self.stats_menu(ui);

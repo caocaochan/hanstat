@@ -33,6 +33,43 @@ pub struct Settings {
     /// Keyboard shortcuts changed from their defaults, by action, as
     /// `Ctrl+Shift+K` (empty: none). Read by the app's `shortcuts` module.
     pub shortcuts: BTreeMap<String, String>,
+    /// Importing DuChinese stories (the app's `duchinese` module).
+    pub duchinese: DuChinese,
+}
+
+/// How DuChinese stories are imported and kept up to date.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DuChinese {
+    /// Where imported books are saved; `None`: `DuChinese books` in the app folder
+    /// (`duchinese` there is the cache).
+    pub folder: Option<PathBuf>,
+    /// New imports in Traditional characters (DuChinese's own `tc_hanzi`).
+    pub traditional: bool,
+    /// Each paragraph followed by DuChinese's English translation of it.
+    pub translations: bool,
+    /// Check imported stories for new chapters and add them on their own.
+    pub auto_update: bool,
+}
+
+impl Default for DuChinese {
+    fn default() -> Self {
+        DuChinese {
+            folder: None,
+            traditional: false,
+            translations: false,
+            auto_update: true,
+        }
+    }
+}
+
+impl DuChinese {
+    /// The folder imported books go to.
+    pub fn folder(&self) -> PathBuf {
+        self.folder
+            .clone()
+            .unwrap_or_else(|| crate::models::app_dir().join("DuChinese books"))
+    }
 }
 
 impl Default for Settings {
@@ -46,6 +83,7 @@ impl Default for Settings {
             ja_cpm: 300.0,
             wpm: 100.0,
             shortcuts: BTreeMap::new(),
+            duchinese: DuChinese::default(),
         }
     }
 }

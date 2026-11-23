@@ -375,6 +375,8 @@ struct Store {
     removed: BTreeSet<String>,
     meta_dirty: bool,
     places_dirty: BTreeSet<String>,
+    /// Places of books whose id changed ([`rekey`]): deleted.
+    places_removed: BTreeSet<String>,
     /// Why the database couldn't be read; nothing is saved then. `bool`:
     /// said once.
     broken: Option<(String, bool)>,
@@ -391,6 +393,7 @@ static STORE: LazyLock<Mutex<Store>> = LazyLock::new(|| {
         removed: BTreeSet::new(),
         meta_dirty: false,
         places_dirty: BTreeSet::new(),
+        places_removed: BTreeSet::new(),
         broken: None,
         speed: None,
     })
@@ -469,6 +472,32 @@ pub fn remove_book(id: &str) {
     s.removed.insert(id.to_owned());
 }
 
+/// Book `old` is now book `new` (its file was rebuilt, so its Library id
+/// changed): its stats and its place move over, the place's chapter mapped
+/// with `spine` (chapters may have been added before it). [`save`] writes it.
+pub fn rekey(old: &str, new: &str, spine: impl Fn(u32) -> u32) {
+    if old == new {
+        return;
+    }
+    let mut s = store();
+    if let Some(b) = s.stats.books.remove(old) {
+        s.stats.books.insert(new.to_owned(), b);
+        s.dirty.remove(old);
+        s.removed.insert(old.to_owned());
+        s.removed.remove(new);
+        s.dirty.insert(new.to_owned());
+    }
+    if let Some(mut p) = s.stats.places.remove(old) {
+        p.spine = spine(p.spine);
+        s.stats.places.insert(new.to_owned(), p);
+        s.places_dirty.remove(old);
+        s.places_removed.insert(old.to_owned());
+        s.places_removed.remove(new);
+        s.places_dirty.insert(new.to_owned());
+    }
+    s.revision += 1;
+}
+
 /// Where the reader left book `id`, if it is saved here.
 pub fn left_at(id: &str) -> Option<LeftAt> {
     store().stats.places.get(id).copied()
@@ -528,7 +557,8 @@ pub fn save() -> Result<(), String> {
         || (s.dirty.is_empty()
             && s.removed.is_empty()
             && !s.meta_dirty
-            && s.places_dirty.is_empty())
+            && s.places_dirty.is_empty()
+            && s.places_removed.is_empty())
     {
         return writer::take_error().map_or(Ok(()), Err);
     }
@@ -545,6 +575,7 @@ pub fn save() -> Result<(), String> {
             .into_iter()
             .filter_map(|id| s.stats.places.get(&id).map(|p| (id, *p)))
             .collect(),
+        places_removed: std::mem::take(&mut s.places_removed).into_iter().collect(),
     };
     drop(s);
     writer::queue(path(), batch);
@@ -576,6 +607,7 @@ mod db {
         pub removed: Vec<String>,
         pub meta: Option<(TrackerSettings, Vec<Goal>)>,
         pub places: Vec<(String, LeftAt)>,
+        pub places_removed: Vec<String>,
     }
 
     pub fn open(path: &Path) -> Result<Connection, String> {
@@ -803,6 +835,9 @@ mod db {
                     v.listen_chars as i64
                 ])?;
             }
+        }
+        for id in &b.places_removed {
+            t.execute("DELETE FROM places WHERE book = ?1", [id])?;
         }
         for (id, p) in &b.places {
             t.execute(
@@ -1312,6 +1347,7 @@ mod tests {
             removed: vec![],
             meta: Some((s.settings.clone(), s.goals.clone())),
             places: s.places.clone().into_iter().collect(),
+            places_removed: vec![],
         }
     }
 
@@ -1332,6 +1368,7 @@ mod tests {
             removed: vec![],
             meta: None,
             places: vec![],
+            places_removed: vec![],
         };
         db::write(&mut c, &one).unwrap();
         assert_eq!(db::read(&c).unwrap(), s);
@@ -1341,9 +1378,54 @@ mod tests {
             removed: vec!["lib-1".into()],
             meta: None,
             places: vec![],
+            places_removed: vec![],
         };
         db::write(&mut c, &gone).unwrap();
         s.books.remove("lib-1");
+        assert_eq!(db::read(&c).unwrap(), s);
+    }
+
+    #[test]
+    fn a_rebuilt_book_keeps_its_stats_and_place() {
+        // Ids of its own: the store is shared with the other tests.
+        edit(|s| {
+            s.books
+                .insert("rekey-old".into(), sample().books["lib-1"].clone());
+            s.places.insert(
+                "rekey-old".into(),
+                LeftAt {
+                    spine: 3,
+                    offset: 70,
+                    saved: 1,
+                },
+            );
+        });
+        let before = with(|s| s.books["rekey-old"].clone());
+        rekey("rekey-old", "rekey-new", |spine| spine + 2);
+        with(|s| {
+            assert!(!s.books.contains_key("rekey-old"));
+            assert!(!s.places.contains_key("rekey-old"));
+            assert_eq!(s.books["rekey-new"], before);
+            assert_eq!(
+                (s.places["rekey-new"].spine, s.places["rekey-new"].offset),
+                (5, 70)
+            );
+        });
+        // In the database, the old id's place is deleted.
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = db::open(&dir.path().join("stats.sqlite")).unwrap();
+        let mut s = sample();
+        db::write(&mut c, &batch_all(&s)).unwrap();
+        let at = s.places.remove("lib-1").unwrap();
+        s.places.insert("lib-9".into(), at);
+        let moved = db::Batch {
+            books: vec![],
+            removed: vec![],
+            meta: None,
+            places: vec![("lib-9".into(), at)],
+            places_removed: vec!["lib-1".into()],
+        };
+        db::write(&mut c, &moved).unwrap();
         assert_eq!(db::read(&c).unwrap(), s);
     }
 
@@ -1361,6 +1443,7 @@ mod tests {
                 removed: vec![],
                 meta: None,
                 places: vec![],
+                places_removed: vec![],
             },
         );
         writer::flush();

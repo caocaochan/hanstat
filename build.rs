@@ -63,6 +63,8 @@ const NOT_ANALYSIS: &[&str] = &[
     "src/reader",
     "src/reading_stats.rs",
     "src/dict",
+    "src/duchinese",
+    "src/secret.rs",
 ];
 
 /// Bundled data that is not read by the analysis: licences and the

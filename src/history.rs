@@ -154,6 +154,30 @@ impl History {
         self.save()
     }
 
+    /// Book `old` is now book `new`: its file was rebuilt in place (a
+    /// DuChinese story that gained chapters). Its entry keeps its place and
+    /// takes the new id, with its cover and word data, until it is analysed
+    /// again. `false` if there is no such entry.
+    pub fn rekey(&mut self, old: &str, new: &str) -> Result<bool, String> {
+        if old == new || self.read_only || self.entries.iter().any(|e| e.id == new) {
+            return Ok(false);
+        }
+        let moves = [
+            (self.cover(old), self.cover(new)),
+            (self.profile(old), self.profile(new)),
+        ];
+        let Some(e) = self.entries.iter_mut().find(|e| e.id == old) else {
+            return Ok(false);
+        };
+        e.id = new.to_owned();
+        for (from, to) in moves {
+            if from.is_file() {
+                let _ = std::fs::rename(&from, &to);
+            }
+        }
+        self.save().map(|_| true)
+    }
+
     /// Where the cover thumbnail of book `id` is kept (it may not exist).
     pub fn cover(&self, id: &str) -> PathBuf {
         cover_in(&self.path, id)

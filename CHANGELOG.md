@@ -1,5 +1,19 @@
 # Changelog
 
+## [2026.11.23.03] - 2026-11-23
+
+### Added
+- **DuChinese stories as Library books.** **Library › Add from DuChinese…** lists DuChinese's graded stories and courses, with their covers, levels and chapters. Filter by stories or courses and by level, search them, and hide the ones already imported.
+- **How much of each story you'd know.** Each story shows the share of running words you know, worked out from its first chapter with your own segmenter and known words, the way the Library counts them. Sort by **Best fit for you** to see the easiest first. The first time, each first chapter is fetched once, which takes a few minutes for the whole list; after that it is instant. Imported stories show the figure for the whole book.
+- **Import** fetches a story's chapters and saves it as an EPUB, which is analysed into the Library and opens in the reader like any other book. The chapters are titled with their own Chinese headings. Choose **Simplified** or **Traditional** (DuChinese's own Traditional text, not a conversion), and optionally **Sentence translations**: each paragraph followed by DuChinese's English in small print. Books go to `DuChinese books` in the app folder; the 📂 button chooses another folder.
+- **Premium chapters.** **Sign in…** signs in to DuChinese. Your password goes to duchinese.net only and isn't saved. The session it hands back is kept encrypted for your Windows account (in the Keychain on macOS, the keyring on Linux). If you signed up with Apple or Google, you can paste the session from a browser signed in to duchinese.net instead. Signed out, a story with locked chapters is imported with its free ones and marked as such ("1 of 22 · 21 locked"). Signing in later with a subscription adds the rest.
+- **New chapters are added as they come out.** Imported stories still being released are checked twice a day (and when the window opens), and new chapters are added to the book. **Check for new chapters** in the window, or **Update** on a story, asks right away, and also picks up chapters DuChinese has edited. Turn off **Add new chapters on their own** to check only by hand.
+- **The Library row** of an imported story says where it stands: "DuChinese · 6 chapters", "4 of 10 · ongoing", and "2 new" for a few days after chapters arrive.
+- **In the reader**, a story that gets new chapters while it is open says "1 new chapter is out" with **Reload**, which closes the book, adds them and opens it again where you were; otherwise they are added once you close it. On the last chapter of a story still coming out, it says how many more are announced.
+
+### Changed
+- **An updated story stays the same book.** Its file changes when chapters are added, but its reading stats, where you left it (in the same chapter), its read mark, its place on the reading path and its writing-style rating all carry over. A read mark keeps the words it counted when you marked the book: new chapters don't add to your known words.
+
 ## [2026.11.23.02] - 2026-11-23
 
 ### Added

@@ -25,6 +25,7 @@ use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
 
 mod charts;
+mod duchinese;
 mod library_reading;
 mod library_stats;
 mod palette;
@@ -33,6 +34,7 @@ mod raster;
 mod read_books;
 mod reader;
 mod reading_stats;
+mod secret;
 mod shortcuts;
 mod style_scale;
 mod whats_new;
@@ -706,6 +708,8 @@ struct App {
     /// The book open in the reader, which then fills the window.
     reader: Option<reader::Reader>,
     audiobook: Option<reader::Audiobook>,
+    /// DuChinese stories: the window, imports and their updates.
+    du: duchinese::DuState,
 }
 
 /// The floating windows, which the Close-window shortcut closes.
@@ -717,16 +721,20 @@ enum Win {
     Settings,
     Read,
     WhatsNew,
+    DuChinese,
+    DuSignIn,
 }
 
 impl Win {
-    const ALL: [Win; 6] = [
+    const ALL: [Win; 8] = [
         Win::Anki,
         Win::Known,
         Win::Forced,
         Win::Settings,
         Win::Read,
         Win::WhatsNew,
+        Win::DuChinese,
+        Win::DuSignIn,
     ];
 
     /// Its layer: the id given to its `egui::Window`.
@@ -738,6 +746,8 @@ impl Win {
             Win::Settings => "settings-window",
             Win::Read => "read_dialog",
             Win::WhatsNew => whats_new::WINDOW_ID,
+            Win::DuChinese => "duchinese-window",
+            Win::DuSignIn => "duchinese-sign-in",
         });
         egui::LayerId::new(egui::Order::Middle, id)
     }
@@ -1362,6 +1372,7 @@ impl Default for App {
             whats_new: None,
             reader: None,
             audiobook: None,
+            du: duchinese::DuState::default(),
         }
     }
 }
@@ -2962,6 +2973,7 @@ impl eframe::App for App {
             }
         }
         self.style_tick(&ctx);
+        self.du_tick(&ctx);
 
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
@@ -2976,10 +2988,21 @@ impl eframe::App for App {
         }
         // The reader fills the window while a book is open in it.
         let (cpm, by_hand) = (self.cpm(), self.settings.cpm_by_hand);
+        let notice = self
+            .reader
+            .as_ref()
+            .and_then(|r| self.du_reader_notice(r.book_id(), r.on_last_chapter()));
         if let Some(r) = &mut self.reader {
             r.cpm = cpm;
             r.cpm_by_hand = by_hand;
+            r.notice = notice;
             let open = r.ui(ui);
+            if r.take_notice_click() {
+                self.du_reload(&ctx);
+                ctx.request_repaint();
+                return;
+            }
+            let Some(r) = &mut self.reader else { return };
             let finished = r.take_finished().then(|| r.book_id().to_owned());
             // A Library book read to the end: offer Mark read, unless it is.
             if let Some(id) = finished
@@ -3391,6 +3414,7 @@ impl eframe::App for App {
             self.settings_window(&ctx);
         }
         self.read_window(&ctx);
+        self.du_windows(&ctx);
         if let Some(w) = &self.whats_new
             && !whats_new::window(&ctx, w)
         {
@@ -3621,6 +3645,8 @@ impl App {
             Win::Settings => self.settings_window,
             Win::Read => self.read_dialog.is_some(),
             Win::WhatsNew => self.whats_new.is_some(),
+            Win::DuChinese => self.du.open,
+            Win::DuSignIn => self.du.signing_in(),
         }
     }
 
@@ -3639,6 +3665,8 @@ impl App {
             Some(Win::Settings) => self.settings_window = false,
             Some(Win::Read) => self.read_dialog = None,
             Some(Win::WhatsNew) => self.whats_new = None,
+            Some(Win::DuChinese) => self.du.open = false,
+            Some(Win::DuSignIn) => self.du.close_sign_in(),
             None => {}
         }
     }
@@ -6128,6 +6156,20 @@ impl App {
                 if r.clicked() {
                     self.recalculate_library(ctx);
                 }
+                if ui
+                    .selectable_label(self.du.open, "Add from DuChinese…")
+                    .on_hover_text(
+                        "Browse DuChinese's graded stories and courses, see how much of each you'd know, \
+                         and import them as books (premium chapters when signed in with a subscription)",
+                    )
+                    .clicked()
+                {
+                    if self.du.open {
+                        self.du.open = false;
+                    } else {
+                        self.du_open(ctx);
+                    }
+                }
             });
         });
         if let Some(e) = &self.history_error {
@@ -6185,6 +6227,17 @@ impl App {
             .collect();
         let read_at = self.read_dates();
         let hide_read = self.library_hide_read;
+        let du_now = history::now();
+        let du_tags: HashMap<&str, (String, u32)> = self
+            .history
+            .entries
+            .iter()
+            .filter_map(|e| {
+                self.du
+                    .library_tag(&e.path, du_now)
+                    .map(|t| (e.id.as_str(), t))
+            })
+            .collect();
         let hist = &self.history;
         let entries = &hist.entries;
         let covers = &mut self.covers;
@@ -6403,14 +6456,43 @@ impl App {
                                 fmt_int(s.words_for_98)
                             ));
                         }
-                        if exists.get(&e.path) {
-                            if ui.link(&e.title).on_hover_text(hover).clicked() {
-                                open = Some(e.path.clone());
+                        let du_tag = du_tags.get(e.id.as_str());
+                        ui.vertical(|ui| {
+                            if du_tag.is_some() {
+                                ui.add_space(6.0);
                             }
-                        } else {
-                            ui.label(RichText::new(&e.title).weak())
-                                .on_hover_text(format!("{hover}\n\nThe file is no longer there."));
-                        }
+                            if exists.get(&e.path) {
+                                if ui.link(&e.title).on_hover_text(hover).clicked() {
+                                    open = Some(e.path.clone());
+                                }
+                            } else {
+                                ui.label(RichText::new(&e.title).weak())
+                                    .on_hover_text(format!("{hover}\n\nThe file is no longer there."));
+                            }
+                            if let Some((progress, new)) = du_tag {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    ui.label(
+                                        RichText::new("DuChinese")
+                                            .small()
+                                            .color(palette::highlight()),
+                                    )
+                                    .on_hover_text("Imported from DuChinese: new chapters are added as they come out");
+                                    ui.label(
+                                        RichText::new(format!("· {progress}"))
+                                            .small()
+                                            .color(palette::weak()),
+                                    );
+                                    if *new > 0 {
+                                        ui.label(
+                                            RichText::new(format!("· {new} new"))
+                                                .small()
+                                                .color(palette::accent()),
+                                        );
+                                    }
+                                });
+                            }
+                        });
                     });
                     row.col(|ui| {
                         let variant = match s.variant.as_str() {
