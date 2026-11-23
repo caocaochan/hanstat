@@ -75,10 +75,9 @@ fn main() -> eframe::Result {
             paths.push(PathBuf::from(a));
         }
     }
-    // The window's size and place, and what UiState keeps, between runs.
+    // What UiState keeps between runs, the window's size among it (its
+    // place is not kept: it opens centred; see `App::place_window`).
     let window_file = hanstat::models::app_dir().join("window.ron");
-    // Centring would override the place kept from the last run.
-    let centered = !window_file.is_file();
     // History, profiles and known words are written in the background.
     hanstat::saver::defer();
     let options = eframe::NativeOptions {
@@ -105,8 +104,9 @@ fn main() -> eframe::Result {
             },
             ..Default::default()
         },
-        // Centre on the primary monitor at the first start.
-        centered,
+        // Centred on the primary monitor, then sized on the first frame.
+        centered: true,
+        persist_window: false,
         persistence_path: Some(window_file),
         ..Default::default()
     };
@@ -116,12 +116,10 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             install_fonts(&cc.egui_ctx);
             let saved: Option<UiState> = cc.storage.and_then(|s| eframe::get_value(s, UI_KEY));
-            let mut app = App {
-                // Only fit the window to the Overview until it has a size of its own.
-                auto_fit: saved.is_none(),
-                ..App::default()
-            };
+            let mut app = App::default();
             let ui = saved.unwrap_or_default();
+            app.window_size = ui.window_size.map(egui::Vec2::from);
+            app.window_maximized = ui.window_maximized;
             app.tab = tab.unwrap_or(ui.tab);
             app.history_tab = ui.history_tab;
             app.history_sort = ui.history_sort;
@@ -217,10 +215,14 @@ fn install_fonts(ctx: &egui::Context) {
     }
     // macOS and Linux: the bundled Inter for Latin, likewise.
     #[cfg(not(windows))]
-    for (name, bytes, regular) in [("inter", INTER, true), ("inter-semibold", INTER_SEMIBOLD, false)] {
-        fonts
-            .font_data
-            .insert(name.to_owned(), Arc::new(egui::FontData::from_static(bytes)));
+    for (name, bytes, regular) in [
+        ("inter", INTER, true),
+        ("inter-semibold", INTER_SEMIBOLD, false),
+    ] {
+        fonts.font_data.insert(
+            name.to_owned(),
+            Arc::new(egui::FontData::from_static(bytes)),
+        );
         if regular {
             fonts
                 .families
@@ -605,15 +607,8 @@ struct App {
     anki: AnkiState,
     anki_filter: AnkiFilter,
     known: KnownState,
-    /// Grow the window to fit the Overview next time it is drawn.
-    fit_pending: bool,
     /// Startup download of missing models.
     models: Option<Arc<ModelFetch>>,
-    /// Keep fitting until this time: late content (the suggestions banner,
-    /// the Anki section) can still push the Overview down after the first frame.
-    fit_until: f64,
-    /// Inner height last asked for, so a resize still in flight isn't requested again.
-    fit_requested: f32,
     updater: Updater,
     /// Saved analysis results; `None` when turned off (`HANSTAT_NO_CACHE`).
     cache: Option<Cache>,
@@ -674,9 +669,15 @@ struct App {
     word_rows: Option<(RowsKey<WordCol>, Arc<Vec<usize>>)>,
     /// Bumped whenever the report or its known-word statuses change.
     report_gen: u64,
-    /// Grow the window to fit the Overview: only until the window has a size
-    /// of its own (saved from an earlier run, or resized by hand).
-    auto_fit: bool,
+    /// The window's inner size once resized by hand, kept between runs;
+    /// `None`: three quarters of the screen.
+    window_size: Option<egui::Vec2>,
+    /// Maximised when last closed (kept between runs).
+    window_maximized: bool,
+    /// Sized and centred at startup.
+    window_placed: bool,
+    /// Until then, size changes are the startup sizing landing, not the user.
+    window_settle_until: f64,
     /// The window's inner size last frame, to notice a resize by hand.
     last_inner: Option<egui::Vec2>,
     /// [`App::lang_inputs`] by language, with a quick hash of what they were
@@ -839,6 +840,9 @@ struct UiState {
     library_hide_read: bool,
     char_sort: (CharCol, bool),
     word_sort: (WordCol, bool),
+    /// See [`App::window_size`].
+    window_size: Option<[f32; 2]>,
+    window_maximized: bool,
 }
 
 impl Default for UiState {
@@ -850,6 +854,8 @@ impl Default for UiState {
             library_hide_read: false,
             char_sort: (CharCol::Rank, false),
             word_sort: (WordCol::Rank, false),
+            window_size: None,
+            window_maximized: false,
         }
     }
 }
@@ -1207,16 +1213,30 @@ impl AnkiFilter {
 /// Text and colour of the mode badge at the right of the toolbar.
 fn mode_badge(lang: Language, variant: Option<Variant>) -> (&'static str, Color32) {
     match (lang, variant) {
-        (Language::Korean, _) => ("한국어", palette::pick(palette::MOCHA.blue, palette::ink::BLUE)),
-        (Language::Japanese, _) => ("日本語", palette::pick(palette::MOCHA.mauve, palette::ink::MAUVE)),
-        (Language::Chinese, Some(Variant::Simplified)) => {
-            ("简体中文", palette::pick(palette::MOCHA.red, palette::ink::RED))
-        }
-        (Language::Chinese, Some(Variant::Traditional)) => {
-            ("繁體中文", palette::pick(palette::MOCHA.peach, palette::ink::PEACH))
-        }
-        (Language::Chinese, Some(Variant::Mixed)) => ("简繁混合", palette::pick(palette::MOCHA.maroon, palette::ink::MAROON)),
-        (Language::Chinese, _) => ("中文", palette::pick(palette::MOCHA.flamingo, palette::ink::FLAMINGO)),
+        (Language::Korean, _) => (
+            "한국어",
+            palette::pick(palette::MOCHA.blue, palette::ink::BLUE),
+        ),
+        (Language::Japanese, _) => (
+            "日本語",
+            palette::pick(palette::MOCHA.mauve, palette::ink::MAUVE),
+        ),
+        (Language::Chinese, Some(Variant::Simplified)) => (
+            "简体中文",
+            palette::pick(palette::MOCHA.red, palette::ink::RED),
+        ),
+        (Language::Chinese, Some(Variant::Traditional)) => (
+            "繁體中文",
+            palette::pick(palette::MOCHA.peach, palette::ink::PEACH),
+        ),
+        (Language::Chinese, Some(Variant::Mixed)) => (
+            "简繁混合",
+            palette::pick(palette::MOCHA.maroon, palette::ink::MAROON),
+        ),
+        (Language::Chinese, _) => (
+            "中文",
+            palette::pick(palette::MOCHA.flamingo, palette::ink::FLAMINGO),
+        ),
     }
 }
 
@@ -1289,10 +1309,7 @@ impl Default for App {
             anki: AnkiState::default(),
             anki_filter: AnkiFilter::All,
             known: KnownState::default(),
-            fit_pending: false,
             models: None,
-            fit_until: 0.0,
-            fit_requested: 0.0,
             updater: Updater::default(),
             cache: Cache::open(),
             cache_usage: (0, 0),
@@ -1325,7 +1342,10 @@ impl Default for App {
             char_rows: None,
             word_rows: None,
             report_gen: 0,
-            auto_fit: true,
+            window_size: None,
+            window_maximized: false,
+            window_placed: false,
+            window_settle_until: 0.0,
             last_inner: None,
             inputs_memo: HashMap::new(),
             shortcuts: Shortcuts::default(),
@@ -1790,7 +1810,6 @@ impl App {
         let skip_hapax = self.settings.skip_hapax;
         let Some(r) = &mut self.report else { return };
         self.report_gen += 1;
-        let had = r.anki.is_some();
         r.anki = self.known.merged.as_ref().map(|k| {
             BookCoverage::compute(
                 k,
@@ -1803,9 +1822,6 @@ impl App {
         });
         if r.anki.is_none() {
             self.anki_filter = AnkiFilter::All;
-        } else if !had {
-            // The Anki section just appeared on the Overview.
-            self.fit_pending = true;
         }
         self.record_history(&names);
     }
@@ -2147,10 +2163,6 @@ impl App {
                     .filter(|c| c.recommended)
                     .map(|c| c.word.clone())
                     .collect();
-                // The Overview's "likely names" banner appears above the content.
-                if !self.selected.is_empty() {
-                    self.fit_pending = true;
-                }
                 self.suggestions = Some(v);
                 self.suggest_rx = None;
                 // The recommended ones are left out of the difficulty.
@@ -2822,7 +2834,6 @@ impl App {
                     // The book's language decides which dictionary, Anki selection and word lists apply.
                     self.set_language(lang, ctx);
                     self.rebuild_report();
-                    self.fit_pending = true;
                     // Anki sentences must be segmented like this book.
                     if self.anki.col.is_some()
                         && self.anki.built_with.as_ref() != Some(&self.anki_seg_config())
@@ -2850,6 +2861,8 @@ impl eframe::App for App {
                 library_hide_read: self.library_hide_read,
                 char_sort: self.char_sort,
                 word_sort: self.word_sort,
+                window_size: self.window_size.map(<[f32; 2]>::from),
+                window_maximized: self.window_maximized,
             },
         );
     }
@@ -2902,15 +2915,7 @@ impl eframe::App for App {
         if let Some(e) = hanstat::saver::take_error() {
             self.set_error("save", e);
         }
-        // A window resized by hand keeps its size: the Overview stops fitting it.
-        let inner = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size()));
-        if let (Some(was), Some(is)) = (self.last_inner, inner)
-            && (was - is).length() > 1.0
-            && now >= self.fit_until
-        {
-            self.auto_fit = false;
-        }
-        self.last_inner = inner;
+        self.place_window(&ctx, now);
         if self.settings_unsaved && !ctx.input(|i| i.pointer.any_down()) {
             self.settings_unsaved = false;
             if let Err(e) = self.settings.save() {
@@ -3246,72 +3251,78 @@ impl eframe::App for App {
         });
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::symmetric(18, 12)))
+            .frame(
+                egui::Frame::central_panel(ui.style())
+                    .inner_margin(egui::Margin::symmetric(18, 12)),
+            )
             .show(ui, |ui| {
-            if !self.errors.is_empty() {
-                let mut dismiss = None;
-                for (i, (_, e)) in self.errors.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        if ui.small_button("✖").on_hover_text("Dismiss").clicked() {
-                            dismiss = Some(i);
-                        }
-                        ui.colored_label(palette::error(), format!("⚠ {e}"));
+                if !self.errors.is_empty() {
+                    let mut dismiss = None;
+                    for (i, (_, e)) in self.errors.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            if ui.small_button("✖").on_hover_text("Dismiss").clicked() {
+                                dismiss = Some(i);
+                            }
+                            ui.colored_label(palette::error(), format!("⚠ {e}"));
+                        });
+                    }
+                    if let Some(i) = dismiss {
+                        self.errors.remove(i);
+                    }
+                    ui.separator();
+                }
+                if self.show_history {
+                    self.history_view(ui, &ctx);
+                    return;
+                }
+                if self.report.is_none() {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            RichText::new(if self.job.is_some() || self.batch.is_some() {
+                                "Analysing…"
+                            } else if drop_works() {
+                                "Drop .epub or .txt files here, or click Open…"
+                            } else {
+                                "Click Open… to choose .epub or .txt files"
+                            })
+                            .size(22.0)
+                            .weak(),
+                        );
                     });
+                    return;
                 }
-                if let Some(i) = dismiss {
-                    self.errors.remove(i);
+                if self.tab_hidden(self.tab) {
+                    self.tab = Tab::Overview;
                 }
-                ui.separator();
-            }
-            if self.show_history {
-                self.history_view(ui, &ctx);
-                return;
-            }
-            if self.report.is_none() {
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        RichText::new(if self.job.is_some() || self.batch.is_some() {
-                            "Analysing…"
-                        } else if drop_works() {
-                            "Drop .epub or .txt files here, or click Open…"
-                        } else {
-                            "Click Open… to choose .epub or .txt files"
-                        })
-                        .size(22.0)
-                        .weak(),
-                    );
+                let tab_before = self.tab;
+                let shown: Vec<_> = TABS
+                    .into_iter()
+                    .filter(|(t, _)| !self.tab_hidden(*t))
+                    .collect();
+                let shortcuts = &self.shortcuts;
+                palette::tabs(ui, &mut self.tab, shown, 15.0, |t, r| {
+                    if let Some(k) = shortcuts.text(&ctx, t.action()) {
+                        r.on_hover_text(k);
+                    }
                 });
-                return;
-            }
-            if self.tab_hidden(self.tab) {
-                self.tab = Tab::Overview;
-            }
-            let tab_before = self.tab;
-            let shown: Vec<_> = TABS.into_iter().filter(|(t, _)| !self.tab_hidden(*t)).collect();
-            let shortcuts = &self.shortcuts;
-            palette::tabs(ui, &mut self.tab, shown, 15.0, |t, r| {
-                if let Some(k) = shortcuts.text(&ctx, t.action()) {
-                    r.on_hover_text(k);
+                // Marking words or importing lists changes how the book is
+                // segmented; it's redone on returning to the Overview, not per click.
+                if self.tab == Tab::Overview
+                    && tab_before != Tab::Overview
+                    && self.known_resegment_due()
+                {
+                    self.rerun(&ctx, false);
+                }
+                ui.add_space(6.0);
+                match self.tab {
+                    Tab::Overview => self.overview(ui),
+                    Tab::Characters => self.char_table(ui),
+                    Tab::Words => self.word_table(ui),
+                    Tab::Sections => self.sections(ui),
+                    Tab::Suggestions => self.suggestions_tab(ui, &ctx),
+                    Tab::Notes => self.notes(ui),
                 }
             });
-            // Marking words or importing lists changes how the book is
-            // segmented; it's redone on returning to the Overview, not per click.
-            if self.tab == Tab::Overview
-                && tab_before != Tab::Overview
-                && self.known_resegment_due()
-            {
-                self.rerun(&ctx, false);
-            }
-            ui.add_space(6.0);
-            match self.tab {
-                Tab::Overview => self.overview(ui),
-                Tab::Characters => self.char_table(ui),
-                Tab::Words => self.word_table(ui),
-                Tab::Sections => self.sections(ui),
-                Tab::Suggestions => self.suggestions_tab(ui, &ctx),
-                Tab::Notes => self.notes(ui),
-            }
-        });
 
         if self.anki.window {
             self.anki_window(&ctx);
@@ -3348,6 +3359,58 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// At startup, centre the window on the screen at the size chosen by hand
+    /// (or three quarters of the screen), or maximise it as it was; then
+    /// remember a size or maximised state the user picks. Its place is not
+    /// kept: it always opens centred.
+    fn place_window(&mut self, ctx: &egui::Context, now: f64) {
+        let (inner, outer, monitor, maxed, full) = ctx.input(|i| {
+            let v = i.viewport();
+            (
+                v.inner_rect,
+                v.outer_rect,
+                v.monitor_size,
+                v.maximized == Some(true),
+                v.fullscreen == Some(true),
+            )
+        });
+        let (Some(inner), Some(outer), Some(monitor)) = (inner, outer, monitor) else {
+            return;
+        };
+        if !self.window_placed {
+            self.window_placed = true;
+            self.window_settle_until = now + 1.5;
+            let chrome = (outer.size() - inner.size()).max(egui::Vec2::ZERO);
+            let fits = (monitor - chrome).max(egui::vec2(200.0, 200.0));
+            let size = self
+                .window_size
+                .unwrap_or(monitor * 0.75 - chrome)
+                .min(fits);
+            // Centred on the primary monitor, where eframe opened it (origin 0, 0).
+            let pos = ((monitor - size - chrome) * 0.5).max(egui::Vec2::ZERO);
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos.to_pos2()));
+            // Restoring it later gives that size, centred.
+            if self.window_maximized {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            }
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(1.6));
+            return;
+        }
+        let size = inner.size();
+        if now >= self.window_settle_until {
+            self.window_maximized = maxed;
+            if !maxed
+                && !full
+                && let Some(was) = self.last_inner
+                && (was - size).length() > 1.0
+            {
+                self.window_size = Some(size);
+            }
+        }
+        self.last_inner = Some(size);
+    }
+
     /// At startup: open the What's new window if this version is newer than
     /// the one started last, and record this one.
     fn whats_new_at_start(&mut self) {
@@ -4157,55 +4220,6 @@ impl App {
     }
 }
 
-/// Grow the window's inner height to `want` points, without going past the
-/// bottom of the screen (minus the taskbar). Never shrinks; does nothing when
-/// maximised or full-screen.
-fn grow_window(ctx: &egui::Context, want: f32) {
-    /// Windows' taskbar at 100–200% scaling is 40–48 points tall. On macOS the
-    /// menu bar (24–37 points with a notch) and the default Dock (about 70)
-    /// are both taken from the screen height.
-    const TASKBAR: f32 = if cfg!(target_os = "macos") {
-        110.0
-    } else {
-        48.0
-    };
-    let (inner, outer, monitor, maxed) = ctx.input(|i| {
-        let v = i.viewport();
-        (
-            v.inner_rect,
-            v.outer_rect,
-            v.monitor_size,
-            v.maximized == Some(true) || v.fullscreen == Some(true),
-        )
-    });
-    let (Some(inner), Some(outer), Some(monitor)) = (inner, outer, monitor) else {
-        return;
-    };
-    if maxed {
-        return;
-    }
-    let chrome = (outer.height() - inner.height()).max(0.0);
-    let usable = monitor.y - TASKBAR;
-    let target = want.min(usable - chrome);
-    if target <= inner.height() + 1.0 {
-        return;
-    }
-    // Move the window up if growing would push it below the usable area. Only
-    // when its position looks like it is on the primary monitor (origin 0,0);
-    // otherwise just grow.
-    let bottom = outer.top() + chrome + target;
-    if outer.top() >= 0.0 && outer.top() < monitor.y && bottom > usable {
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
-            outer.left(),
-            (usable - chrome - target).max(0.0),
-        )));
-    }
-    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-        inner.width(),
-        target,
-    )));
-}
-
 fn anki_filter_combo(ui: &mut egui::Ui, f: &mut AnkiFilter, available: bool) {
     if !available {
         return;
@@ -4334,7 +4348,12 @@ fn stat_tile_info(
                     }
                 });
                 ui.add_space(2.0);
-                ui.label(value.size(30.0).family(egui::FontFamily::Name(palette::BOLD.into())).strong());
+                ui.label(
+                    value
+                        .size(30.0)
+                        .family(egui::FontFamily::Name(palette::BOLD.into()))
+                        .strong(),
+                );
                 ui.add_space(2.0);
                 ui.label(RichText::new(sub).color(palette::weak()));
             });
@@ -4360,7 +4379,13 @@ fn share_bar(ui: &mut egui::Ui, label: &str, f: f32) {
         let (r, _) = ui.allocate_exact_size(egui::vec2(64.0, h), egui::Sense::hover());
         let font = egui::TextStyle::Body.resolve(ui.style());
         let color = ui.visuals().text_color();
-        ui.painter().text(r.left_center(), egui::Align2::LEFT_CENTER, label, font, color);
+        ui.painter().text(
+            r.left_center(),
+            egui::Align2::LEFT_CENTER,
+            label,
+            font,
+            color,
+        );
         let w = (ui.available_width() - 64.0).clamp(80.0, 320.0);
         let (bar, _) = ui.allocate_exact_size(egui::vec2(w, 10.0), egui::Sense::hover());
         let c = palette::cat();
@@ -4478,7 +4503,7 @@ impl App {
         let mut save_image = false;
         let mut read_book = false;
         let mut export_audiobook = false;
-        let out = egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             // The title, wrapped clear of the image button at the right.
             ui.horizontal_top(|ui| {
                 let w = (ui.available_width() - 160.0).max(120.0);
@@ -4976,27 +5001,6 @@ impl App {
             match reader::Reader::open(&path, self.report_id.as_deref(), traditional, &ctx) {
                 Ok(r) => self.reader = Some(r),
                 Err(e) => self.set_error("reader", e),
-            }
-        }
-        let now = ctx.input(|i| i.time);
-        if std::mem::take(&mut self.fit_pending) {
-            self.fit_until = now + 3.0;
-            self.fit_requested = 0.0;
-        }
-        // Measure only on frames egui will actually show (not sizing passes).
-        if self.auto_fit && now < self.fit_until && !ctx.will_discard() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
-            let overflow = out.content_size.y - out.inner_rect.height();
-            let inner_h = ctx.input(|i| i.viewport().inner_rect.map(|r| r.height()));
-            if overflow > 0.5
-                && let Some(h) = inner_h
-            {
-                let want = h + overflow.ceil() + 4.0;
-                // A resize already requested may not have landed yet.
-                if want > self.fit_requested + 1.0 {
-                    self.fit_requested = want;
-                    grow_window(&ctx, want);
-                }
             }
         }
     }

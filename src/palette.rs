@@ -200,7 +200,9 @@ pub(crate) fn bold(size: f32) -> FontId {
 
 /// `s` in the semibold face.
 pub(crate) fn bold_text(s: impl Into<String>, size: f32) -> RichText {
-    RichText::new(s).family(FontFamily::Name(BOLD.into())).size(size)
+    RichText::new(s)
+        .family(FontFamily::Name(BOLD.into()))
+        .size(size)
 }
 
 /// The window's style on both themes.
@@ -299,7 +301,10 @@ pub(crate) fn card() -> egui::Frame {
     let f = cat();
     egui::Frame::NONE
         .fill(f.base)
-        .stroke(Stroke::new(1.0, pick(f.surface0, mix(f.surface0, f.base, 0.7))))
+        .stroke(Stroke::new(
+            1.0,
+            pick(f.surface0, mix(f.surface0, f.base, 0.7)),
+        ))
         .corner_radius(12)
         .inner_margin(Margin::symmetric(16, 14))
         .shadow(Shadow {
@@ -313,13 +318,11 @@ pub(crate) fn card() -> egui::Frame {
 /// The bars above and below the window's content.
 pub(crate) fn bar(top: bool) -> egui::Frame {
     let f = cat();
-    egui::Frame::NONE
-        .fill(f.crust)
-        .inner_margin(if top {
-            Margin::symmetric(10, 7)
-        } else {
-            Margin::symmetric(10, 4)
-        })
+    egui::Frame::NONE.fill(f.crust).inner_margin(if top {
+        Margin::symmetric(10, 7)
+    } else {
+        Margin::symmetric(10, 4)
+    })
 }
 
 /// Smaller text and tighter spacing, for the toolbar.
@@ -359,10 +362,7 @@ pub(crate) fn tab(ui: &mut Ui, selected: bool, name: &str, size: f32) -> Respons
             p.rect_filled(rect.shrink2(vec2(0.0, 2.0)), 6, f.surface0);
         }
         let color = if selected || hovered { f.text } else { weak() };
-        let pos = egui::pos2(
-            rect.center().x - galley.size().x / 2.0,
-            rect.top() + pad.y,
-        );
+        let pos = egui::pos2(rect.center().x - galley.size().x / 2.0, rect.top() + pad.y);
         p.galley(pos, galley, color);
         if selected {
             let line = egui::Rect::from_min_max(
@@ -444,8 +444,18 @@ mod tests {
         }
         let m = &MOCHA;
         let dark = [
-            m.red, m.peach, m.yellow, m.green, m.teal, m.sapphire, m.blue, m.lavender, m.mauve,
-            ink::WEAK_DARK, m.subtext1, m.text,
+            m.red,
+            m.peach,
+            m.yellow,
+            m.green,
+            m.teal,
+            m.sapphire,
+            m.blue,
+            m.lavender,
+            m.mauve,
+            ink::WEAK_DARK,
+            m.subtext1,
+            m.text,
         ];
         for c in dark {
             for bg in [m.mantle, m.base, m.crust] {

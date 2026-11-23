@@ -126,9 +126,15 @@ pub(crate) fn tile_grid(ui: &mut egui::Ui, tiles: Vec<Tile>) {
                             ui.spacing_mut().item_spacing.y = 2.0;
                             let weak = crate::palette::weak();
                             let bold = egui::FontFamily::Name(crate::palette::BOLD.into());
-                            ui.add(egui::Label::new(RichText::new(t.title).size(12.5).color(weak)).truncate());
+                            ui.add(
+                                egui::Label::new(RichText::new(t.title).size(12.5).color(weak))
+                                    .truncate(),
+                            );
                             ui.add_space(2.0);
-                            ui.add(egui::Label::new(t.value.size(30.0).family(bold).strong()).truncate());
+                            ui.add(
+                                egui::Label::new(t.value.size(30.0).family(bold).strong())
+                                    .truncate(),
+                            );
                             ui.add_space(2.0);
                             ui.add(egui::Label::new(RichText::new(t.sub).color(weak)).truncate());
                         });
@@ -145,16 +151,15 @@ pub(crate) fn tile_grid(ui: &mut egui::Ui, tiles: Vec<Tile>) {
 
 /// A titled frame around a chart.
 fn card(ui: &mut egui::Ui, title: &str, sub: &str, add: impl FnOnce(&mut egui::Ui)) {
-    crate::palette::card()
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(crate::palette::bold_text(title, 16.0).color(crate::palette::strong()));
-            if !sub.is_empty() {
-                ui.label(RichText::new(sub).weak().small());
-            }
-            ui.add_space(6.0);
-            add(ui);
-        });
+    crate::palette::card().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(crate::palette::bold_text(title, 16.0).color(crate::palette::strong()));
+        if !sub.is_empty() {
+            ui.label(RichText::new(sub).weak().small());
+        }
+        ui.add_space(6.0);
+        add(ui);
+    });
     ui.add_space(10.0);
 }
 
@@ -754,13 +759,7 @@ impl App {
                     Difficulty::VeryHard,
                 ]
                 .into_iter()
-                .map(|d| {
-                    (
-                        counts[d as usize],
-                        difficulty_fill(d),
-                        d.label().to_owned(),
-                    )
-                })
+                .map(|d| (counts[d as usize], difficulty_fill(d), d.label().to_owned()))
                 .collect();
                 ui.label(RichText::new("Difficulty now").weak());
                 charts::stacked_bar(ui, &parts);

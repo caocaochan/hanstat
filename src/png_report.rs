@@ -61,7 +61,11 @@ impl Look {
         Look {
             bg: f.mantle,
             card: f.base,
-            border: if dark { f.surface0 } else { mix(f.surface0, f.base, 0.7) },
+            border: if dark {
+                f.surface0
+            } else {
+                mix(f.surface0, f.base, 0.7)
+            },
             text: f.text,
             weak,
             faint: f.surface0,
