@@ -664,6 +664,9 @@ impl Popup {
         entry_params.text = mocha::TEXT;
         entry_params.link = mocha::BLUE;
         entry_params.rule = mocha::SURFACE2;
+        // Dictionaries' colours as they are (as before themes).
+        entry_params.page = mocha::BASE;
+        entry_params.dark = false;
         let result = self.levels[level].result.clone();
         // The word a child popup was opened for: (group, part, src, len).
         let child_hl = self.levels.get(level + 1).and_then(|c| match c.origin {
@@ -826,6 +829,8 @@ impl Popup {
                                     for item in &e.layout.items {
                                         super::paint_item(
                                             &mut renderer.images,
+                                            // Its fallbacks as before themes.
+                                            &super::theme::THEMES[0],
                                             &painter,
                                             item,
                                             off,

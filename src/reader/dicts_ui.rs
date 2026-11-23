@@ -4,7 +4,7 @@
 
 use super::Settings;
 use super::popup::{LookupKey, Popup};
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
 use hanstat::dict::format::{CheckResult, Entry, Meta, VERSION};
 use hanstat::dict::jobs::{Jobs, State, Task, check_updates};
 use hanstat::dict::manage;
@@ -370,7 +370,7 @@ impl Manager {
                             "No dictionaries yet. Import Yomitan dictionaries (.zip files): term dictionaries for the \
                              popup's definitions, frequency lists for its ranks.",
                         )
-                        .color(super::theme::BASE00),
+                        .color(crate::reader::theme::get(ui.ctx()).subtle),
                     );
                 }
                 egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
@@ -382,7 +382,7 @@ impl Manager {
                             let n = self.rows.len();
                             if n > 0 {
                                 let head = |ui: &mut egui::Ui, t: &str| {
-                                    ui.label(RichText::new(t).size(12.0).color(super::theme::BASE1));
+                                    ui.label(RichText::new(t).size(12.0).color(crate::reader::theme::get(ui.ctx()).muted));
                                 };
                                 for t in ["On", "", "Dictionary", "Kind", "Entries", "Size", "Updates", "Collapsed", ""] {
                                     head(ui, t);
@@ -422,14 +422,14 @@ impl Manager {
                                         // Update status.
                                         let busy_here = self.jobs.list.iter().find(|j| j.label == m.title && !matches!(j.state(), State::Done(_)));
                                         if busy_here.is_some() {
-                                            ui.label(RichText::new("Updating…").color(super::theme::BASE00));
+                                            ui.label(RichText::new("Updating…").color(crate::reader::theme::get(ui.ctx()).subtle));
                                         } else if m.version != VERSION {
                                             if m.update.is_some() {
                                                 if ui.button("Import again").on_hover_text("Made by another version of hanstat: downloaded again from its site").clicked() {
                                                     action = Some(Action::Update(e.id.clone()));
                                                 }
                                             } else {
-                                                ui.label(RichText::new("Import its zip again").color(Color32::from_rgb(0xcb, 0x4b, 0x16)))
+                                                ui.label(RichText::new("Import its zip again").color(crate::reader::theme::get(ui.ctx()).orange))
                                                     .on_hover_text("Made by another version of hanstat");
                                             }
                                         } else {
@@ -444,13 +444,13 @@ impl Manager {
                                                     }
                                                 }
                                                 Some(CheckResult::UpToDate) => {
-                                                    ui.label(RichText::new("Up to date").color(super::theme::BASE1));
+                                                    ui.label(RichText::new("Up to date").color(crate::reader::theme::get(ui.ctx()).muted));
                                                 }
                                                 Some(CheckResult::Failed(err)) => {
-                                                    ui.label(RichText::new("Check failed").color(Color32::from_rgb(0xcb, 0x4b, 0x16))).on_hover_text(err);
+                                                    ui.label(RichText::new("Check failed").color(crate::reader::theme::get(ui.ctx()).orange)).on_hover_text(err);
                                                 }
                                                 None if m.update.is_none() => {
-                                                    ui.label(RichText::new("No updates").color(super::theme::BASE1))
+                                                    ui.label(RichText::new("No updates").color(crate::reader::theme::get(ui.ctx()).muted))
                                                         .on_hover_text("This dictionary doesn't say where updates are published");
                                                 }
                                                 None => {
@@ -460,7 +460,7 @@ impl Manager {
                                         }
                                     }
                                     None => {
-                                        ui.label(RichText::new("Unreadable").color(Color32::from_rgb(0xcb, 0x4b, 0x16)));
+                                        ui.label(RichText::new("Unreadable").color(crate::reader::theme::get(ui.ctx()).orange));
                                         ui.label("");
                                         ui.label("");
                                         ui.label("");
@@ -481,7 +481,7 @@ impl Manager {
                                 }
                                 if self.confirm_delete.as_deref() == Some(&e.id) {
                                     ui.horizontal(|ui| {
-                                        if ui.button(RichText::new("Delete").color(Color32::from_rgb(0xdc, 0x32, 0x2f))).clicked() {
+                                        if ui.button(RichText::new("Delete").color(crate::reader::theme::get(ui.ctx()).red)).clicked() {
                                             action = Some(Action::Delete(e.id.clone()));
                                         }
                                         if ui.button("Keep").clicked() {
@@ -515,10 +515,10 @@ impl Manager {
                     });
                 }
                 for (ok, n) in self.notes.iter().rev().take(4) {
-                    ui.label(RichText::new(n).color(if *ok { super::theme::BASE00 } else { Color32::from_rgb(0xdc, 0x32, 0x2f) }));
+                    ui.label(RichText::new(n).color(if *ok { crate::reader::theme::get(ui.ctx()).subtle } else { crate::reader::theme::get(ui.ctx()).red }));
                 }
                 for e in &popup.errors {
-                    ui.label(RichText::new(e).color(Color32::from_rgb(0xdc, 0x32, 0x2f)));
+                    ui.label(RichText::new(e).color(crate::reader::theme::get(ui.ctx()).red));
                 }
                 ui.separator();
                 egui::Grid::new("dict-settings").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
@@ -588,7 +588,7 @@ impl Manager {
                             } else {
                                 "Not set up".to_owned()
                             })
-                            .color(super::theme::BASE00),
+                            .color(crate::reader::theme::get(ui.ctx()).subtle),
                         );
                     });
                     ui.end_row();
@@ -599,7 +599,7 @@ impl Manager {
                         ui.label(
                             RichText::new("Checks ask each dictionary's own site (most are on GitHub) for its latest revision.")
                                 .size(12.0)
-                                .color(super::theme::BASE1),
+                                .color(crate::reader::theme::get(ui.ctx()).muted),
                         );
                     });
                     ui.end_row();

@@ -1,5 +1,15 @@
 # Changelog
 
+## [2026.11.23.01] - 2026-11-23
+
+### Added
+- **Colour themes for the EPUB reader.** Choose one under **Aa → Theme**: six light themes (Solarized Light, Ecru, Paper, Catppuccin Latte, Rosé Pine Dawn, Gruvbox Light) and ten dark ones (Solarized Dark, Catppuccin Frappé, Macchiato and Mocha, Rosé Pine, Rosé Pine Moon, Gruvbox Dark, Nord, Tokyo Night, Black). The list shows each theme in its own colours. The theme colours the pages, the reader's bar and menus, and the Dictionaries, Anki and Read aloud windows, and is remembered for every book. Each theme uses its palette's own colours, unchanged.
+- **Books stay readable on dark pages.** On a dark theme, text a book sets in a dark colour (dark grey, navy) is shown light, and light boxes behind text turn dark. Images are shown as they are.
+
+### Changed
+- **Solarized Light uses Solarized's own text colour.** Body text is Solarized's base00, a little lighter than the darker ink the reader used before.
+- **Links take the theme's link colour**, in the dictionary popup too, instead of always Solarized blue.
+
 ## [2026.11.23.00] - 2026-11-23
 
 ### Changed

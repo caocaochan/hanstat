@@ -33,6 +33,10 @@ pub struct Params {
     pub text: Color32,
     pub link: Color32,
     pub rule: Color32,
+    /// The page the text is drawn on; on a `dark` one the book's colours
+    /// that would be hard to read there are turned light.
+    pub page: Color32,
+    pub dark: bool,
 }
 
 pub enum Item {
@@ -595,13 +599,16 @@ impl Flow<'_, '_> {
                 let [r, g, b, a] = c.to_srgba_unmultiplied();
                 if a == 0 {
                     Color32::TRANSPARENT
+                } else if c == super::style::UA_LINK {
+                    self.p.link
                 } else if (r as u32 + g as u32 + b as u32) < 3 * 70
                     && r.abs_diff(g) < 30
                     && g.abs_diff(b) < 30
                 {
-                    self.p.text
+                    let [r, g, b, _] = self.p.text.to_srgba_unmultiplied();
+                    Color32::from_rgba_unmultiplied(r, g, b, a)
                 } else {
-                    c
+                    super::theme::book_text(c, self.p.page, self.p.dark)
                 }
             }
         }
@@ -736,6 +743,7 @@ impl Flow<'_, '_> {
         if let Some(slot) = deco_slot {
             let rect = Rect::from_min_max(pos2(left, top), pos2(left + total, bottom));
             if let Some(bg) = s.background.filter(|c| !near_white(*c)) {
+                let bg = super::theme::book_fill(bg, self.p.dark);
                 let bg = if s.opacity < 1.0 {
                     bg.gamma_multiply(s.opacity)
                 } else {
@@ -1062,6 +1070,7 @@ impl Flow<'_, '_> {
         let rect = Rect::from_min_size(pos2(at.x, at.y - base), size);
         let radius = (s.radius * self.p.base).min(size.y / 2.0);
         if let Some(bg) = s.background {
+            let bg = super::theme::book_fill(bg, self.p.dark);
             let bg = if s.opacity < 1.0 {
                 bg.gamma_multiply(s.opacity)
             } else {
@@ -1671,6 +1680,8 @@ mod tests {
             text: Color32::BLACK,
             link: Color32::BLUE,
             rule: Color32::GRAY,
+            page: Color32::WHITE,
+            dark: false,
         };
         let mut images = Images::with_source("test", Arc::new(|_: &str| None));
         let l = ctx.fonts_mut(|f| layout(&ch, &p, f, &mut images));

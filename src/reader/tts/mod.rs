@@ -23,7 +23,7 @@ mod local_ui;
 pub mod opus;
 
 use crate::reader::tree::Chapter;
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
 #[cfg(test)]
 pub use engine::State as PlayState;
 use engine::{Availability, Batch, Chapters, Cmd, Engine, Now, Repaint, State};
@@ -992,7 +992,7 @@ impl Tts {
                         .weak(),
                 );
                 if let Some(e) = &self.now.error {
-                    ui.colored_label(Color32::from_rgb(0xdc, 0x32, 0x2f), e);
+                    ui.colored_label(crate::reader::theme::get(ui.ctx()).red, e);
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -1042,12 +1042,12 @@ impl Tts {
                     });
                 if !s.region.is_empty() && !azure::valid_region(&s.region) {
                     ui.colored_label(
-                        Color32::from_rgb(0xdc, 0x32, 0x2f),
+                        crate::reader::theme::get(ui.ctx()).red,
                         "A region is a name such as eastus or westeurope.",
                     );
                 }
                 if let Some((ok, note)) = &self.key_note {
-                    let c = if *ok { ui.visuals().weak_text_color() } else { Color32::from_rgb(0xdc, 0x32, 0x2f) };
+                    let c = if *ok { ui.visuals().weak_text_color() } else { crate::reader::theme::get(ui.ctx()).red };
                     ui.colored_label(c, note);
                 }
                 ui.label(
@@ -1116,7 +1116,7 @@ impl Tts {
                 ui.label(RichText::new("Cancelled.").weak());
             }
             if let Some(e) = b.error.lock().unwrap().as_ref() {
-                ui.colored_label(Color32::from_rgb(0xdc, 0x32, 0x2f), e);
+                ui.colored_label(crate::reader::theme::get(ui.ctx()).red, e);
             }
             if !finished && !cancelled {
                 ui.ctx()

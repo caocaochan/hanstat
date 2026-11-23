@@ -8,8 +8,8 @@
 //!
 //! `READER_PAGES` is `chapter:page` pairs (spine indices, linear items only);
 //! `READER_SIZE`, `READER_W`/`READER_H` (window points), `READER_SPREAD=0`, `READER_SERIF` /
-//! `READER_SANS` (family names), `READER_SANS_DEFAULT=1` and `READER_TRAD=1`
-//! change the setup.
+//! `READER_SANS` (family names), `READER_SANS_DEFAULT=1`, `READER_TRAD=1` and
+//! `READER_THEME` (a theme id, e.g. `catppuccin-mocha`) change the setup.
 
 use super::*;
 use std::time::Instant;
@@ -49,6 +49,7 @@ fn render_pages() {
         settings.spread = v != "0";
     }
     let trad = env("READER_TRAD").is_some();
+    let th = &theme::THEMES[theme::index(&env("READER_THEME").unwrap_or_default())];
 
     let window = egui::Context::default();
     crate::install_fonts(&window);
@@ -96,18 +97,20 @@ fn render_pages() {
             line_spacing: settings.line_spacing,
             fonts: installed.clone(),
             serif_default: !settings.sans_default,
-            text: theme::INK,
-            link: theme::BLUE,
-            rule: theme::BASE1,
+            text: th.ink,
+            link: th.accent,
+            rule: th.muted,
+            page: th.page,
+            dark: th.dark,
         };
         let mut info = String::new();
         let scene = crate::raster::lay_out(
             &window,
             w,
             2.0,
-            theme::DESK,
+            th.desk,
             |d| *d = defs.clone(),
-            |s| s.visuals = visuals(),
+            |s| s.visuals = th.visuals(),
             |_| (),
             |ui, _| {
                 let ctx = ui.ctx().clone();
@@ -123,11 +126,11 @@ fn render_pages() {
                     l.pages.len(),
                     ch.text_len
                 );
-                ui.painter().rect_filled(area, 0.0, theme::DESK);
+                ui.painter().rect_filled(area, 0.0, th.desk);
                 let first = page - page % step;
                 for side in 0..step {
                     let page_rect = g.pages[side];
-                    draw_page(ui, page_rect, side, g.spread);
+                    draw_page(ui, th, page_rect, side, g.spread);
                     let idx = first + side;
                     if idx >= l.pages.len() {
                         continue;
@@ -152,7 +155,7 @@ fn render_pages() {
                         }
                     }
                     for i in items {
-                        paint_item(&mut images, &painter, &l.items[i], off, 2.0);
+                        paint_item(&mut images, th, &painter, &l.items[i], off, 2.0);
                     }
                     let small = egui::FontId::proportional((settings.size * 0.62).max(11.0));
                     ui.painter().text(
@@ -160,7 +163,7 @@ fn render_pages() {
                         egui::Align2::CENTER_CENTER,
                         format!("{} / {}", idx + 1, l.pages.len()),
                         small,
-                        theme::BASE1,
+                        th.muted,
                     );
                 }
                 ui.allocate_rect(area, egui::Sense::hover());
@@ -735,6 +738,87 @@ fn settings_panel_clicks() {
         "Esc with the panel open keeps the reader"
     );
     assert!(r.probe.serif_box.is_none(), "Esc closes the panel");
+    r.close(&d.ctx);
+}
+
+/// The theme chooser: the Aa panel's theme box lists every theme, a click
+/// on one applies it to the bar and menus and lays the pages out again in its
+/// ink.
+#[test]
+#[ignore = "opens the reader with the system fonts and dictionary settings"]
+fn theme_chooser() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut d = Driver::new();
+    let (mut r, _) = selection_book(&mut d, temp.path());
+    let first = &theme::THEMES[0];
+    assert_eq!(theme::get(&d.ctx).id, first.id);
+    assert!(!d.ctx.style_of(d.ctx.theme()).visuals.dark_mode);
+    d.snap("theme-0-default");
+    let aa = r.probe.aa.expect("Aa drawn");
+    d.click(&mut r, aa.center());
+    let theme_box = r.probe.theme_box.expect("Aa opens the panel");
+    d.click(&mut r, theme_box.center());
+    assert_eq!(
+        r.probe.theme_items.len(),
+        theme::THEMES.len(),
+        "the list shows every theme"
+    );
+    let mocha = theme::index("catppuccin-mocha");
+    d.idle(&mut r, 10);
+    assert!(
+        r.probe.theme_items.iter().all(|(_, _, shown)| *shown),
+        "the whole list shows without scrolling: {:?}",
+        r.probe.theme_items
+    );
+    let (item, _, _) = *r
+        .probe
+        .theme_items
+        .iter()
+        .find(|(_, i, _)| *i == mocha)
+        .unwrap();
+    d.snap("theme-1-list");
+    d.click(&mut r, item.center());
+    assert_eq!(r.settings.theme, "catppuccin-mocha");
+    assert!(r.probe.theme_items.is_empty(), "the list closes");
+    assert!(r.probe.theme_box.is_some(), "the panel stays open");
+    let th = theme::get(&d.ctx);
+    assert_eq!(th.id, "catppuccin-mocha");
+    assert!(
+        d.ctx.style_of(d.ctx.theme()).visuals.dark_mode,
+        "the bar and menus go dark"
+    );
+    d.idle(&mut r, 20);
+    d.snap("theme-2-chosen");
+    // The page is laid out again in the theme's ink.
+    let l = r.layouts[&0].clone();
+    let ink: Vec<Color32> = l
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Text { galley, .. } => Some(galley.job.sections[0].format.color),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !ink.is_empty() && ink.iter().all(|c| *c == th.ink),
+        "{ink:?}"
+    );
+    let fills: Vec<Color32> = l
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Fill { color, rect, .. } if rect.is_positive() => Some(*color),
+            _ => None,
+        })
+        .collect();
+    // (The fixture's #eee box is near white, left out on every page.)
+    assert!(
+        fills.iter().all(|c| c.r() < 0x30),
+        "no light boxes on a dark page: {fills:?}"
+    );
+    d.key(&mut r, Key::Escape);
+    d.idle(&mut r, 10);
+    d.snap("theme-3-pages");
     r.close(&d.ctx);
 }
 

@@ -829,8 +829,8 @@ impl Cards {
             return false;
         }
         let before = s.clone();
-        let faint = super::theme::BASE1;
-        let red = egui::Color32::from_rgb(0xdc, 0x32, 0x2f);
+        let th = super::theme::get(ctx);
+        let (faint, red) = (th.muted, th.red);
         // Fields arrived for the chosen note type: its list, templates kept
         // for fields of the same name, guessed for the others.
         if let Some((m, Ok(names))) = &self.fields_of
@@ -868,7 +868,7 @@ impl Cards {
                          with the AnkiConnect add-on (2055492159) or one that works like it installed. \
                          The + is greyed out when the word is already in Anki.",
                     )
-                    .color(super::theme::BASE00),
+                    .color(super::theme::get(ui.ctx()).subtle),
                 );
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
@@ -957,7 +957,7 @@ impl Cards {
                     for (m, what) in MARKERS {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(RichText::new(*m).monospace());
-                            ui.label(RichText::new(*what).color(super::theme::BASE00));
+                            ui.label(RichText::new(*what).color(super::theme::get(ui.ctx()).subtle));
                         });
                     }
                 });

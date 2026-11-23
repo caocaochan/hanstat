@@ -827,6 +827,9 @@ fn font_size(v: &str, parent: f32, root: f32) -> Option<f32> {
     Some(k)
 }
 
+/// The links' colour in [`UA_SHEET`]; drawn in the theme's link colour.
+pub const UA_LINK: Color32 = Color32::from_rgb(0x26, 0x8b, 0xd2);
+
 /// A CSS length; `em` and `rem` are the element's and the root's font size.
 /// The ink `currentColor` means where a style leaves the colour to the theme.
 pub const THEME_INK: Color32 = Color32::from_rgb(0x1f, 0x3c, 0x46);

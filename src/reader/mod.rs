@@ -1,5 +1,5 @@
 //! The EPUB reader: a paginated view of a Chinese book with its own layout,
-//! styles and images, in a Solarized Light page.
+//! styles and images, on a page in the colour theme chosen (`theme.rs`).
 //!
 //! Chapters are parsed and styled on a background thread (the open one
 //! first); the open chapter is laid out on the UI thread when it is shown,
@@ -18,6 +18,7 @@ mod popup;
 mod preview;
 mod render;
 mod style;
+mod theme;
 mod tree;
 mod tts;
 pub(crate) use tts::audiobook::{Action as AudiobookAction, Audiobook};
@@ -34,25 +35,7 @@ use std::sync::{Arc, Mutex};
 use style::LineStyle;
 use tree::Chapter;
 
-/// Solarized (Ethan Schoonover), light.
-mod theme {
-    use eframe::egui::Color32;
-    pub const BASE01: Color32 = Color32::from_rgb(0x58, 0x6e, 0x75);
-    pub const BASE00: Color32 = Color32::from_rgb(0x65, 0x7b, 0x83);
-    pub const BASE1: Color32 = Color32::from_rgb(0x93, 0xa1, 0xa1);
-    pub const BASE2: Color32 = Color32::from_rgb(0xee, 0xe8, 0xd5);
-    pub const BASE3: Color32 = Color32::from_rgb(0xfd, 0xf6, 0xe3);
-    pub const BLUE: Color32 = Color32::from_rgb(0x26, 0x8b, 0xd2);
-    /// Body text: between base02 and base01, darker than Solarized's own
-    /// base00 so thin serif strokes stay crisp.
-    pub const INK: Color32 = Color32::from_rgb(0x1f, 0x3c, 0x46);
-    /// The desk around the pages.
-    pub const DESK: Color32 = Color32::from_rgb(0xe4, 0xdd, 0xc7);
-    /// The word looked up: Solarized yellow, see-through.
-    pub const HIGHLIGHT: Color32 = Color32::from_rgba_premultiplied(0x4a, 0x38, 0x00, 0x48);
-    /// The sentence read aloud: Solarized cyan, see-through.
-    pub const READING: Color32 = Color32::from_rgba_premultiplied(0x09, 0x23, 0x21, 0x38);
-}
+use theme::Theme;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct Position {
@@ -76,6 +59,8 @@ struct Settings {
     margins: f32,
     /// Two pages side by side when the window is wide enough.
     spread: bool,
+    /// The colour theme's id.
+    theme: String,
     /// Where each book was left, by its Library id.
     positions: HashMap<String, Position>,
     /// The key held to look up the word under the pointer.
@@ -107,6 +92,7 @@ impl Default for Settings {
             line_spacing: 1.75,
             margins: 1.0,
             spread: true,
+            theme: theme::THEMES[0].id.to_owned(),
             positions: HashMap::new(),
             lookup_key: popup::LookupKey::Shift,
             freq_sort: None,
@@ -144,6 +130,11 @@ impl Settings {
 #[derive(Default)]
 struct Probe {
     aa: Option<Rect>,
+    /// The theme box, while the panel is open.
+    theme_box: Option<Rect>,
+    /// The theme list is open: its entries, their themes and whether each
+    /// is in full view (not scrolled away).
+    theme_items: Vec<(Rect, usize, bool)>,
     /// The serif font box, while the panel is open.
     serif_box: Option<Rect>,
     /// The serif list is open: one of its entries and its family.
@@ -358,9 +349,7 @@ impl Reader {
         // The reader's colours for every widget and popup while it is open.
         let theme = ctx.theme();
         let prev = ctx.style_of(theme);
-        let mut style = (*prev).clone();
-        style.visuals = visuals();
-        ctx.set_style_of(theme, style);
+        apply_theme(ctx, theme, theme::index(&settings.theme));
         Ok(Reader {
             images: images::Images::new(epub.clone()),
             epub,
@@ -679,6 +668,7 @@ impl Reader {
         let ctx = ui.ctx().clone();
         let now = ctx.input(|i| i.time);
         self.now = now;
+        let th = theme::get(&ctx);
         self.images.next_frame();
         self.images.poll(&ctx);
         let mut open = true;
@@ -745,7 +735,7 @@ impl Reader {
         egui::Panel::top("reader-bar")
             .frame(
                 egui::Frame::new()
-                    .fill(theme::BASE2)
+                    .fill(th.bar)
                     .inner_margin(egui::Margin::symmetric(10, 6)),
             )
             .show(ui, |ui| {
@@ -761,7 +751,7 @@ impl Reader {
                     ui.label(
                         RichText::new(&self.epub.title)
                             .size(15.0)
-                            .color(theme::BASE01)
+                            .color(th.text)
                             .strong(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -812,10 +802,8 @@ impl Reader {
                         }
                         ui.separator();
                         if let Some(p) = self.progress() {
-                            ui.label(
-                                RichText::new(format!("{:.0}%", p * 100.0)).color(theme::BASE1),
-                            )
-                            .on_hover_text("Of the book's text, before this page");
+                            ui.label(RichText::new(format!("{:.0}%", p * 100.0)).color(th.muted))
+                                .on_hover_text("Of the book's text, before this page");
                         }
                     });
                 });
@@ -823,7 +811,7 @@ impl Reader {
 
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let area = ui.max_rect();
-            ui.painter().rect_filled(area, 0.0, theme::DESK);
+            ui.painter().rect_filled(area, 0.0, th.desk);
             let g = self.geometry(area);
             geom_for_keys = Some(g);
             // While the window is being resized, the pages laid out before stay
@@ -843,9 +831,11 @@ impl Reader {
                 line_spacing: self.settings.line_spacing,
                 fonts,
                 serif_default: !self.settings.sans_default,
-                text: theme::INK,
-                link: theme::BLUE,
-                rule: theme::BASE1,
+                text: th.ink,
+                link: th.accent,
+                rule: th.muted,
+                page: th.page,
+                dark: th.dark,
             };
             // Not while a slider or the window edge is being dragged.
             let settled = (now - self.resized_at > 0.15
@@ -1081,7 +1071,7 @@ impl Reader {
             let highlight = self.dict.highlight(self.spine);
             for side in 0..step {
                 let page_rect = g.pages[side];
-                draw_page(ui, page_rect, side, g.spread);
+                draw_page(ui, th, page_rect, side, g.spread);
                 let idx = self.page + side;
                 let Some(&(_, off, clip)) = sides.iter().find(|s| s.0 == idx) else {
                     continue;
@@ -1094,19 +1084,19 @@ impl Reader {
                         painter.rect_filled(
                             r.translate(off).expand2(vec2(1.0, 0.0)),
                             3.0,
-                            theme::READING,
+                            th.reading(),
                         );
                     }
                 }
                 if let Some((src, n)) = highlight {
                     for r in l.char_rects(idx, src..src + n as u32) {
                         let r = r.translate(off);
-                        painter.rect_filled(r.expand2(vec2(1.0, 0.0)), 3.0, theme::HIGHLIGHT);
+                        painter.rect_filled(r.expand2(vec2(1.0, 0.0)), 3.0, th.highlight());
                         self.dict.anchor = Some(self.dict.anchor.map_or(r, |a| a.union(r)));
                     }
                 }
                 for i in items {
-                    paint_item(&mut self.images, &painter, &l.items[i], off, ppp);
+                    paint_item(&mut self.images, th, &painter, &l.items[i], off, ppp);
                 }
                 if let Some(range) = &self.selection {
                     for r in l.char_rects(idx, range.clone()) {
@@ -1121,7 +1111,7 @@ impl Reader {
                         egui::Align2::CENTER_CENTER,
                         t,
                         small.clone(),
-                        theme::BASE1,
+                        th.muted,
                     );
                 }
                 painter_free(ui).text(
@@ -1129,7 +1119,7 @@ impl Reader {
                     egui::Align2::CENTER_CENTER,
                     format!("{} / {}", idx + 1, l.pages.len()),
                     small,
-                    theme::BASE1,
+                    th.muted,
                 );
             }
             if primary_click && let Some(p) = resp.interact_pointer_pos() {
@@ -1398,6 +1388,7 @@ impl Reader {
             .min(480.0);
         let numbers_col = number_w.iter().copied().fold(0.0, f32::max);
         let text = ui.visuals().text_color();
+        let muted = theme::get(ui.ctx()).muted;
         let menu = ui.menu_button(RichText::new("☰ Contents").size(15.0), |ui| {
             egui::ScrollArea::vertical()
                 .max_height(ui.ctx().content_rect().height() * 0.7)
@@ -1418,7 +1409,7 @@ impl Reader {
                             gap,
                             egui::TextFormat {
                                 valign: egui::Align::Center,
-                                ..egui::TextFormat::simple(small.clone(), theme::BASE1)
+                                ..egui::TextFormat::simple(small.clone(), muted)
                             },
                         );
                         let r = ui
@@ -1464,6 +1455,8 @@ impl Reader {
             self.settings_open = !self.settings_open;
         }
         self.probe.aa = Some(button.rect);
+        self.probe.theme_box = None;
+        self.probe.theme_items.clear();
         self.probe.serif_box = None;
         self.probe.serif_item = None;
         let mut open = self.settings_open;
@@ -1475,6 +1468,47 @@ impl Reader {
             ui.set_min_width(300.0);
             let fams = fonts::families();
             egui::Grid::new("reader-settings").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                ui.label("Theme");
+                let current = theme::index(&self.settings.theme);
+                let mut chosen = None;
+                let mut items = Vec::new();
+                // Each theme shown in its own colours, light and dark side by
+                // side: one column of 16 would scroll (egui sizes a new popup
+                // at most 400 points tall).
+                let button = ui.add(
+                    egui::Button::new(theme::THEMES[current].name)
+                        .right_text("⏷")
+                        .min_size(vec2(220.0, 0.0)),
+                );
+                egui::Popup::menu(&button)
+                    .id(egui::Id::unique("reader-theme-list"))
+                    .show(|ui| {
+                        let muted = theme::get(ui.ctx()).muted;
+                        ui.horizontal_top(|ui| {
+                            for dark in [false, true] {
+                                ui.vertical(|ui| {
+                                    ui.set_width(210.0);
+                                    ui.label(RichText::new(if dark { "Dark" } else { "Light" }).size(12.0).color(muted));
+                                    for (i, t) in theme::THEMES.iter().enumerate().filter(|(_, t)| t.dark == dark) {
+                                        let r = theme::swatch(ui, t, i == current);
+                                        if r.clicked() {
+                                            chosen = Some(i);
+                                            ui.close();
+                                        }
+                                        items.push((r.rect, i, ui.clip_rect().contains_rect(r.rect)));
+                                    }
+                                });
+                            }
+                        });
+                    });
+                self.probe.theme_box = Some(button.rect);
+                self.probe.theme_items = items;
+                if let Some(i) = chosen {
+                    self.settings.theme = theme::THEMES[i].id.to_owned();
+                    let egui_theme = self.prev_style.as_ref().map_or(ui.ctx().theme(), |p| p.0);
+                    apply_theme(ui.ctx(), egui_theme, i);
+                }
+                ui.end_row();
                 for serif in [true, false] {
                     ui.label(if serif { "Serif" } else { "Sans-serif" });
                     let current = if serif { self.settings.serif.clone() } else { self.settings.sans.clone() };
@@ -1641,6 +1675,7 @@ fn geometry(settings: &Settings, area: Rect) -> Geometry {
 
 fn paint_item(
     images: &mut images::Images,
+    th: &Theme,
     painter: &egui::Painter,
     item: &Item,
     off: Vec2,
@@ -1648,9 +1683,9 @@ fn paint_item(
 ) {
     match item {
         Item::Text { pos, galley, faux } => {
-            painter.galley(*pos + off, galley.clone(), theme::INK);
+            painter.galley(*pos + off, galley.clone(), th.ink);
             if let Some((g, dx)) = faux {
-                painter.galley(*pos + off + vec2(*dx, 0.0), g.clone(), theme::INK);
+                painter.galley(*pos + off + vec2(*dx, 0.0), g.clone(), th.ink);
             }
         }
         Item::Image { rect, path } => {
@@ -1669,7 +1704,7 @@ fn paint_item(
                     );
                 }
                 None => {
-                    painter.rect_filled(r, 2.0, theme::BASE2);
+                    painter.rect_filled(r, 2.0, th.bar);
                     painter
                         .ctx()
                         .request_repaint_after(std::time::Duration::from_millis(50));
@@ -1748,21 +1783,23 @@ fn centered_note(ui: &egui::Ui, area: Rect, text: &str) {
         egui::Align2::CENTER_CENTER,
         text,
         egui::FontId::proportional(18.0),
-        theme::BASE00,
+        theme::get(ui.ctx()).subtle,
     );
 }
 
 /// A sheet of paper on the desk; in a spread, a soft fold at the spine.
-fn draw_page(ui: &egui::Ui, r: Rect, side: usize, spread: bool) {
+fn draw_page(ui: &egui::Ui, th: &Theme, r: Rect, side: usize, spread: bool) {
     let p = ui.painter();
     let shadow = egui::epaint::Shadow {
         offset: [0, 2],
         blur: 14,
         spread: 0,
-        color: Color32::from_black_alpha(34),
+        color: Color32::from_black_alpha(if th.dark { 90 } else { 34 }),
     };
     p.add(shadow.as_shape(r, 3));
-    p.rect_filled(r, 3.0, theme::BASE3);
+    p.rect_filled(r, 3.0, th.page);
+    let (fold, strength) = th.fold();
+    let [fr, fg, fb, _] = fold.to_array();
     if spread {
         // Shade toward the fold.
         let fold_w = 26.0;
@@ -1774,51 +1811,20 @@ fn draw_page(ui: &egui::Ui, r: Rect, side: usize, spread: bool) {
         let steps = 10;
         for k in 0..steps {
             let t0 = k as f32 / steps as f32;
-            let a = ((1.0 - t0) * (1.0 - t0) * 16.0) as u8;
+            let a = ((1.0 - t0) * (1.0 - t0) * strength) as u8;
             let x0 = x_fold + dir * fold_w * t0;
             let x1 = x_fold + dir * fold_w * (t0 + 1.0 / steps as f32);
             let rr = Rect::from_x_y_ranges(x0.min(x1)..=x0.max(x1), r.y_range());
-            p.rect_filled(
-                rr,
-                0.0,
-                Color32::from_rgba_unmultiplied(0x58, 0x4e, 0x30, a),
-            );
+            p.rect_filled(rr, 0.0, Color32::from_rgba_unmultiplied(fr, fg, fb, a));
         }
     }
 }
 
-/// Solarized Light for the reader's bar, menus and popups.
-fn visuals() -> egui::Visuals {
-    let mut v = egui::Visuals::light();
-    let fill = Color32::from_rgb(0xe6, 0xdf, 0xc8);
-    let hover = Color32::from_rgb(0xdc, 0xd4, 0xbb);
-    let active = Color32::from_rgb(0xd2, 0xc9, 0xae);
-    v.panel_fill = theme::BASE2;
-    v.window_fill = theme::BASE3;
-    v.extreme_bg_color = theme::BASE3;
-    v.faint_bg_color = Color32::from_rgb(0xf5, 0xef, 0xdc);
-    v.code_bg_color = theme::BASE2;
-    v.hyperlink_color = theme::BLUE;
-    v.override_text_color = Some(theme::BASE01);
-    v.window_stroke = egui::Stroke::new(1.0, Color32::from_rgb(0xd6, 0xce, 0xb5));
-    v.selection.bg_fill = Color32::from_rgba_unmultiplied(0x26, 0x8b, 0xd2, 90);
-    v.selection.stroke = egui::Stroke::new(1.0, theme::BLUE);
-    v.widgets.noninteractive.bg_fill = theme::BASE3;
-    v.widgets.noninteractive.weak_bg_fill = theme::BASE3;
-    v.widgets.noninteractive.bg_stroke =
-        egui::Stroke::new(1.0, Color32::from_rgb(0xdd, 0xd5, 0xbd));
-    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, theme::BASE01);
-    for (w, c) in [
-        (&mut v.widgets.inactive, fill),
-        (&mut v.widgets.hovered, hover),
-        (&mut v.widgets.active, active),
-        (&mut v.widgets.open, hover),
-    ] {
-        w.bg_fill = c;
-        w.weak_bg_fill = c;
-        w.bg_stroke = egui::Stroke::NONE;
-        w.fg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(0x07, 0x36, 0x42));
-    }
-    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, theme::BASE1);
-    v
+/// Use theme `i` in `ctx`: its colours for the reader's bar, menus and
+/// popups (in egui's `theme` style, the one in use).
+fn apply_theme(ctx: &egui::Context, egui_theme: egui::Theme, i: usize) {
+    theme::set(ctx, i);
+    let mut style = (*ctx.style_of(egui_theme)).clone();
+    style.visuals = theme::get(ctx).visuals();
+    ctx.set_style_of(egui_theme, style);
 }
