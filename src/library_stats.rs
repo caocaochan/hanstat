@@ -3,7 +3,7 @@
 //! known now, with charts.
 
 use crate::charts::{self, Band, Bar, Point};
-use crate::{App, LibKey, difficulty_color, fmt_int, mode_badge};
+use crate::{App, LibKey, difficulty_color, difficulty_fill, fmt_int, mode_badge};
 use eframe::egui::{self, Color32, RichText};
 use hanstat::anki::{Difficulty, Knowledge};
 use hanstat::history;
@@ -118,14 +118,19 @@ pub(crate) fn tile_grid(ui: &mut egui::Ui, tiles: Vec<Tile>) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = GAP;
             for t in tiles.by_ref().take(cols) {
-                let r = egui::Frame::group(ui.style())
+                let r = crate::palette::card()
                     .inner_margin(MARGIN)
                     .show(ui, |ui| {
                         ui.set_width(inner);
                         ui.vertical(|ui| {
-                            ui.add(egui::Label::new(RichText::new(t.title).weak()).truncate());
-                            ui.add(egui::Label::new(t.value.size(30.0).strong()).truncate());
-                            ui.add(egui::Label::new(t.sub).truncate());
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            let weak = crate::palette::weak();
+                            let bold = egui::FontFamily::Name(crate::palette::BOLD.into());
+                            ui.add(egui::Label::new(RichText::new(t.title).size(12.5).color(weak)).truncate());
+                            ui.add_space(2.0);
+                            ui.add(egui::Label::new(t.value.size(30.0).family(bold).strong()).truncate());
+                            ui.add_space(2.0);
+                            ui.add(egui::Label::new(RichText::new(t.sub).color(weak)).truncate());
                         });
                     })
                     .response;
@@ -140,11 +145,10 @@ pub(crate) fn tile_grid(ui: &mut egui::Ui, tiles: Vec<Tile>) {
 
 /// A titled frame around a chart.
 fn card(ui: &mut egui::Ui, title: &str, sub: &str, add: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::group(ui.style())
-        .inner_margin(12.0)
+    crate::palette::card()
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(title).strong().size(15.0));
+            ui.label(crate::palette::bold_text(title, 16.0).color(crate::palette::strong()));
             if !sub.is_empty() {
                 ui.label(RichText::new(sub).weak().small());
             }
@@ -753,7 +757,7 @@ impl App {
                 .map(|d| {
                     (
                         counts[d as usize],
-                        difficulty_color(d),
+                        difficulty_fill(d),
                         d.label().to_owned(),
                     )
                 })
@@ -823,7 +827,7 @@ impl App {
                             "\n{p:.1}% of running words known now · {}",
                             d.label()
                         ));
-                        difficulty_color(d)
+                        difficulty_fill(d)
                     }
                     None => crate::palette::accent(),
                 };
@@ -860,7 +864,7 @@ impl App {
                 Some(Point {
                     x: len.max(1) as f64,
                     y: p,
-                    color: difficulty_color(d),
+                    color: difficulty_fill(d),
                     hover: format!(
                         "{}\n{} {} · {p:.1}% known · {}",
                         e.title,
@@ -879,7 +883,7 @@ impl App {
             bands.push(Band {
                 lo,
                 hi,
-                color: difficulty_color(d),
+                color: difficulty_fill(d),
                 label: d.label(),
             });
             hi = lo;
@@ -887,7 +891,7 @@ impl App {
         bands.push(Band {
             lo: 0.0,
             hi,
-            color: difficulty_color(Difficulty::VeryHard),
+            color: difficulty_fill(Difficulty::VeryHard),
             label: Difficulty::VeryHard.label(),
         });
         card(

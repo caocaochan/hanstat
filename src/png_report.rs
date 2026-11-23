@@ -6,7 +6,7 @@
 use crate::charts::{self, Band, Point};
 use crate::library_stats::{Counted, fmt_time, length, pct, reading_minutes, unit};
 use crate::raster;
-use crate::{App, difficulty_color, file_name, fmt_int, mode_badge, palette};
+use crate::{App, difficulty_color, difficulty_fill, file_name, fmt_int, mode_badge, palette};
 use eframe::egui::{
     self, Align2, Color32, FontFamily, FontId, Rect, RichText, Sense, Stroke, StrokeKind,
     TextureHandle, epaint::Mesh, pos2, text::LayoutJob, vec2,
@@ -51,26 +51,20 @@ struct Look {
 }
 
 impl Look {
+    /// The window's Catppuccin flavour.
     fn new(dark: bool) -> Look {
-        let c = Color32::from_rgb;
-        if dark {
-            Look {
-                bg: c(16, 18, 23),
-                card: c(26, 29, 36),
-                border: c(41, 45, 55),
-                text: c(236, 238, 242),
-                weak: c(148, 155, 168),
-                faint: c(37, 41, 50),
-            }
+        let (f, weak) = if dark {
+            (&palette::MOCHA, palette::ink::WEAK_DARK)
         } else {
-            Look {
-                bg: c(242, 243, 246),
-                card: Color32::WHITE,
-                border: c(224, 227, 233),
-                text: c(22, 24, 30),
-                weak: c(100, 106, 118),
-                faint: c(236, 238, 242),
-            }
+            (&palette::LATTE, palette::ink::WEAK)
+        };
+        Look {
+            bg: f.mantle,
+            card: f.base,
+            border: if dark { f.surface0 } else { mix(f.surface0, f.base, 0.7) },
+            text: f.text,
+            weak,
+            faint: f.surface0,
         }
     }
 
@@ -490,7 +484,7 @@ fn difficulty_bar(ui: &mut egui::Ui, look: Look, counts: &[(Difficulty, usize)])
             pos2(x, r.top()),
             pos2(x + r.width() * n as f32 / total as f32, r.bottom()),
         );
-        p.rect_filled(seg.shrink2(vec2(1.5, 0.0)), 8.0, difficulty_color(d));
+        p.rect_filled(seg.shrink2(vec2(1.5, 0.0)), 8.0, difficulty_fill(d));
         if seg.width() > 28.0 {
             p.text(
                 seg.center(),
@@ -508,7 +502,7 @@ fn difficulty_bar(ui: &mut egui::Ui, look: Look, counts: &[(Difficulty, usize)])
     let mut x = r.left();
     for &(d, n) in counts {
         let dot = Rect::from_center_size(pos2(x + 5.0, r.center().y), vec2(10.0, 10.0));
-        p.rect_filled(dot, 3.0, difficulty_color(d));
+        p.rect_filled(dot, 3.0, difficulty_fill(d));
         let t = p.text(
             pos2(x + 16.0, r.center().y),
             Align2::LEFT_CENTER,
@@ -556,7 +550,7 @@ fn gauge(ui: &mut egui::Ui, look: Look, p_known: f64, counted: f64) {
         p.rect_filled(
             seg.shrink2(vec2(1.0, 0.0)),
             4.0,
-            mix(difficulty_color(d), look.card, 0.85),
+            mix(difficulty_fill(d), look.card, 0.85),
         );
         if seg.width() > 70.0 {
             p.text(
@@ -589,7 +583,7 @@ fn gauge(ui: &mut egui::Ui, look: Look, p_known: f64, counted: f64) {
         pos2(mx, track.center().y),
         9.0,
         look.card,
-        Stroke::new(4.0, difficulty_color(d)),
+        Stroke::new(4.0, difficulty_fill(d)),
     );
 }
 
@@ -662,7 +656,7 @@ fn variant_of(s: &history::Stats) -> Option<Variant> {
 /// White text on the language's colour.
 fn lang_pill(lang: Language, variant: Option<Variant>) -> (String, Color32, Color32) {
     let (badge, color) = mode_badge(lang, variant);
-    (badge.to_owned(), Color32::WHITE, color)
+    (badge.to_owned(), palette::cat().crust, color)
 }
 
 /// `(percent, n)` points of a frequency list's cumulative coverage, at
@@ -1145,7 +1139,7 @@ impl App {
                             Some(Point {
                                 x: length(&e.stats).max(1) as f64,
                                 y: p,
-                                color: difficulty_color(d),
+                                color: difficulty_fill(d),
                                 hover: String::new(),
                             })
                         })
@@ -1158,7 +1152,7 @@ impl App {
                         bands.push(Band {
                             lo,
                             hi,
-                            color: difficulty_color(d),
+                            color: difficulty_fill(d),
                             label: d.label(),
                         });
                         hi = lo;
@@ -1166,7 +1160,7 @@ impl App {
                     bands.push(Band {
                         lo: 0.0,
                         hi,
-                        color: difficulty_color(Difficulty::VeryHard),
+                        color: difficulty_fill(Difficulty::VeryHard),
                         label: Difficulty::VeryHard.label(),
                     });
                     chart_card(
@@ -1257,7 +1251,7 @@ impl App {
         // Language, difficulty, read, writing style.
         let y = top + title_h + 16.0;
         let mut x = left;
-        x += pill(p, pos2(x, y), badge, 11.5, Color32::WHITE, lang_color) + 6.0;
+        x += pill(p, pos2(x, y), badge, 11.5, palette::cat().crust, lang_color) + 6.0;
         if let Some(k) = &s.known {
             let counted = k.running_words - self.style_offset(&e.id);
             let d = Difficulty::from_percent(counted);
@@ -1409,7 +1403,7 @@ impl App {
                                 .color(look.text),
                         );
                         ui.add_space(12.0);
-                        let mut items = vec![(badge.to_owned(), Color32::WHITE, lang_color)];
+                        let mut items = vec![(badge.to_owned(), palette::cat().crust, lang_color)];
                         items.push((r.format.to_owned(), look.weak, look.faint));
                         items.push((r.segmenter.label().to_owned(), look.weak, look.faint));
                         items.push((

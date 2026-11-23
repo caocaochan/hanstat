@@ -172,8 +172,47 @@ fn install_fonts(ctx: &egui::Context) {
             }
         }
     }
+    let proportional = fonts
+        .families
+        .get(&egui::FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    // The semibold family (headings, figures): the faces below, then the
+    // regular ones for whatever they lack.
+    let mut bold = Vec::new();
+    // Windows: Segoe UI for Latin, ahead of egui's Ubuntu, as Windows itself
+    // pairs it with YaHei; their semibold and bold faces for the bold family.
+    #[cfg(windows)]
+    for (name, file, index, regular) in [
+        ("segoe-ui", "segoeui.ttf", 0, true),
+        ("segoe-ui-semibold", "seguisb.ttf", 0, false),
+        ("yahei-bold", "msyhbd.ttc", 0, false),
+    ] {
+        let Ok(bytes) = std::fs::read(dir.join(file)) else {
+            continue;
+        };
+        let blob = Arc::new(bytes) as egui::epaint::text::Blob;
+        fonts.font_data.insert(
+            name.to_owned(),
+            Arc::new(egui::FontData::from_blob(blob, index)),
+        );
+        if regular {
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, name.to_owned());
+        } else {
+            bold.push(name.to_owned());
+        }
+    }
+    bold.extend(proportional);
+    fonts
+        .families
+        .insert(egui::FontFamily::Name(palette::BOLD.into()), bold);
     reader::fonts::set_base(fonts.clone());
     ctx.set_fonts(fonts);
+    palette::install(ctx);
 }
 
 /// A fallback font: its name for egui, its file in the font folder, and the
@@ -1143,16 +1182,16 @@ impl AnkiFilter {
 /// Text and colour of the mode badge at the right of the toolbar.
 fn mode_badge(lang: Language, variant: Option<Variant>) -> (&'static str, Color32) {
     match (lang, variant) {
-        (Language::Korean, _) => ("한국어", Color32::from_rgb(0, 86, 168)),
-        (Language::Japanese, _) => ("日本語", Color32::from_rgb(120, 60, 150)),
+        (Language::Korean, _) => ("한국어", palette::pick(palette::MOCHA.blue, palette::ink::BLUE)),
+        (Language::Japanese, _) => ("日本語", palette::pick(palette::MOCHA.mauve, palette::ink::MAUVE)),
         (Language::Chinese, Some(Variant::Simplified)) => {
-            ("简体中文", Color32::from_rgb(196, 43, 43))
+            ("简体中文", palette::pick(palette::MOCHA.red, palette::ink::RED))
         }
         (Language::Chinese, Some(Variant::Traditional)) => {
-            ("繁體中文", Color32::from_rgb(186, 110, 16))
+            ("繁體中文", palette::pick(palette::MOCHA.peach, palette::ink::PEACH))
         }
-        (Language::Chinese, Some(Variant::Mixed)) => ("简繁混合", Color32::from_rgb(160, 70, 40)),
-        (Language::Chinese, _) => ("中文", Color32::from_rgb(150, 60, 60)),
+        (Language::Chinese, Some(Variant::Mixed)) => ("简繁混合", palette::pick(palette::MOCHA.maroon, palette::ink::MAROON)),
+        (Language::Chinese, _) => ("中文", palette::pick(palette::MOCHA.flamingo, palette::ink::FLAMINGO)),
     }
 }
 
@@ -1165,18 +1204,15 @@ fn language_label(lang: Language) -> &'static str {
 }
 
 fn status_colour(s: Status) -> Color32 {
-    let (dark, light) = match s {
-        Status::Mature => ((80, 170, 100), (28, 125, 55)),
-        Status::Young => ((140, 200, 120), (70, 125, 30)),
-        Status::Listed => ((90, 180, 190), (0, 118, 135)),
-        Status::Learning => ((220, 170, 60), (160, 95, 0)),
-        Status::New => ((100, 150, 220), (35, 95, 190)),
-        Status::NotInAnki => ((160, 160, 160), (110, 110, 110)),
-    };
-    palette::pick(
-        Color32::from_rgb(dark.0, dark.1, dark.2),
-        Color32::from_rgb(light.0, light.1, light.2),
-    )
+    use palette::{MOCHA as M, ink};
+    match s {
+        Status::Mature => palette::pick(M.green, ink::GREEN),
+        Status::Young => palette::pick(M.teal, ink::TEAL),
+        Status::Listed => palette::pick(M.lavender, ink::LAVENDER),
+        Status::Learning => palette::pick(M.yellow, ink::YELLOW),
+        Status::New => palette::pick(M.blue, ink::BLUE),
+        Status::NotInAnki => palette::weak(),
+    }
 }
 
 fn status_text(s: Status) -> RichText {
@@ -2883,9 +2919,9 @@ impl eframe::App for App {
             self.handle_shortcuts(&ctx);
         }
 
-        egui::Panel::top("toolbar").show(ui, |ui| {
-            ui.add_space(4.0);
+        egui::Panel::top("toolbar").frame(palette::bar(true)).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
+                palette::compact(ui);
                 if ui
                     .button("📂 Open…")
                     .on_hover_text(self.shortcuts.hint(&ctx, Action::Open, "Open a book, or select several: each is analysed and added to the Library, and the last one is shown"))
@@ -3072,14 +3108,17 @@ impl eframe::App for App {
                     self.show_history = !self.show_history;
                 }
 
+                // The badge on this row when it fits beside the rest, else on the next.
+                if ui.max_rect().right() - ui.cursor().min.x < 90.0 {
+                    ui.end_row();
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     self.mode_badge_ui(ui, &ctx);
                 });
             });
-            ui.add_space(4.0);
         });
 
-        egui::Panel::bottom("status").show(ui, |ui| {
+        egui::Panel::bottom("status").frame(palette::bar(false)).show(ui, |ui| {
             // The version, ⚙ and messages at the right; the rest fills the
             // space left of them, on more lines when it doesn't fit on one.
             // Both start as one row's height: a layout given the panel's whole
@@ -3181,7 +3220,9 @@ impl eframe::App for App {
             });
         });
 
-        egui::CentralPanel::default().show(ui, |ui| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::symmetric(18, 12)))
+            .show(ui, |ui| {
             if !self.errors.is_empty() {
                 let mut dismiss = None;
                 for (i, (_, e)) in self.errors.iter().enumerate() {
@@ -3221,15 +3262,11 @@ impl eframe::App for App {
                 self.tab = Tab::Overview;
             }
             let tab_before = self.tab;
-            ui.horizontal(|ui| {
-                for (t, name) in TABS {
-                    if self.tab_hidden(t) {
-                        continue;
-                    }
-                    let r = ui.selectable_value(&mut self.tab, t, RichText::new(name).size(15.0));
-                    if let Some(k) = self.shortcuts.text(&ctx, t.action()) {
-                        r.on_hover_text(k);
-                    }
+            let shown: Vec<_> = TABS.into_iter().filter(|(t, _)| !self.tab_hidden(*t)).collect();
+            let shortcuts = &self.shortcuts;
+            palette::tabs(ui, &mut self.tab, shown, 15.0, |t, r| {
+                if let Some(k) = shortcuts.text(&ctx, t.action()) {
+                    r.on_hover_text(k);
                 }
             });
             // Marking words or importing lists changes how the book is
@@ -3240,7 +3277,7 @@ impl eframe::App for App {
             {
                 self.rerun(&ctx, false);
             }
-            ui.separator();
+            ui.add_space(6.0);
             match self.tab {
                 Tab::Overview => self.overview(ui),
                 Tab::Characters => self.char_table(ui),
@@ -3625,9 +3662,9 @@ impl App {
         let (text, fill) = mode_badge(self.language, variant);
         let resp = ui
             .add(
-                egui::Button::new(RichText::new(text).color(Color32::WHITE).strong().size(15.0))
+                egui::Button::new(palette::bold_text(text, 14.0).color(palette::cat().crust))
                     .fill(fill)
-                    .corner_radius(egui::CornerRadius::same(6)),
+                    .corner_radius(egui::CornerRadius::same(11)),
             )
             .on_hover_text(
                 "Language mode, detected from the book: Korean when Hangul outnumbers Chinese characters, Japanese when kana are at least a tenth as many as kanji. \
@@ -4260,22 +4297,56 @@ fn stat_tile_info(
     sub: &str,
     info: Option<&dyn Fn(&mut egui::Ui)>,
 ) -> egui::Response {
-    egui::Frame::group(ui.style())
-        .inner_margin(12.0)
+    palette::card()
         .show(ui, |ui| {
-            ui.set_min_width(230.0);
+            ui.set_min_width(222.0);
             ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(title).weak());
+                    ui.label(RichText::new(title).size(12.5).color(palette::weak()));
                     if let Some(f) = info {
                         info_button(ui, |ui| f(ui));
                     }
                 });
-                ui.label(value.size(30.0).strong());
-                ui.label(sub);
+                ui.add_space(2.0);
+                ui.label(value.size(30.0).family(egui::FontFamily::Name(palette::BOLD.into())).strong());
+                ui.add_space(2.0);
+                ui.label(RichText::new(sub).color(palette::weak()));
             });
         })
         .response
+}
+
+/// A card with a title over `body`, filling the width it is given.
+fn section_card(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
+    palette::card().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(palette::bold_text(title, 16.0).color(palette::strong()));
+        ui.add_space(4.0);
+        body(ui);
+    });
+    ui.add_space(12.0);
+}
+
+/// A label, a rounded bar filled to `f` (0–1) and the percentage after it.
+fn share_bar(ui: &mut egui::Ui, label: &str, f: f32) {
+    ui.horizontal(|ui| {
+        let h = ui.spacing().interact_size.y;
+        let (r, _) = ui.allocate_exact_size(egui::vec2(64.0, h), egui::Sense::hover());
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let color = ui.visuals().text_color();
+        ui.painter().text(r.left_center(), egui::Align2::LEFT_CENTER, label, font, color);
+        let w = (ui.available_width() - 64.0).clamp(80.0, 320.0);
+        let (bar, _) = ui.allocate_exact_size(egui::vec2(w, 10.0), egui::Sense::hover());
+        let c = palette::cat();
+        ui.painter().rect_filled(bar, 5, c.surface0);
+        if f > 0.0 {
+            let mut fill = bar;
+            fill.set_width((bar.width() * f.clamp(0.0, 1.0)).max(bar.height()));
+            ui.painter().rect_filled(fill, 5, c.mauve);
+        }
+        ui.label(RichText::new(format!("{:.1}%", f * 100.0)).color(palette::weak()));
+    });
 }
 
 /// The Overview's explanation of the writing-style rating.
@@ -4297,17 +4368,27 @@ impl App {
 }
 
 fn difficulty_color(d: Difficulty) -> Color32 {
-    let (dark, light) = match d {
-        Difficulty::Easy => ((90, 190, 110), (28, 125, 55)),
-        Difficulty::Moderate => ((170, 200, 80), (95, 115, 0)),
-        Difficulty::Challenging => ((220, 170, 60), (160, 95, 0)),
-        Difficulty::Hard => ((230, 120, 60), (190, 70, 10)),
-        Difficulty::VeryHard => ((220, 80, 80), (195, 40, 40)),
-    };
-    palette::pick(
-        Color32::from_rgb(dark.0, dark.1, dark.2),
-        Color32::from_rgb(light.0, light.1, light.2),
-    )
+    use palette::{MOCHA as M, ink};
+    match d {
+        Difficulty::Easy => palette::pick(M.green, ink::GREEN),
+        Difficulty::Moderate => palette::pick(M.teal, ink::TEAL),
+        Difficulty::Challenging => palette::pick(M.yellow, ink::YELLOW),
+        Difficulty::Hard => palette::pick(M.peach, ink::PEACH),
+        Difficulty::VeryHard => palette::pick(M.red, ink::RED),
+    }
+}
+
+/// Difficulty as a fill (bars, points, bands): on the light theme Latte's
+/// own accents, brighter than the text colours of [`difficulty_color`].
+pub(crate) fn difficulty_fill(d: Difficulty) -> Color32 {
+    let f = palette::cat();
+    match d {
+        Difficulty::Easy => f.green,
+        Difficulty::Moderate => f.teal,
+        Difficulty::Challenging => f.yellow,
+        Difficulty::Hard => f.peach,
+        Difficulty::VeryHard => f.red,
+    }
 }
 
 impl App {
@@ -4671,7 +4752,7 @@ impl App {
                 // Korean: words only. Japanese: words, plus kanji.
                 ui.columns(2, |cols| {
                     let ui = &mut cols[0];
-                    ui.heading("Composition");
+                    section_card(ui, "Composition", |ui| {
                     egui::Grid::new("comp").striped(true).num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
                         let mut rows: Vec<(String, u64)> = vec![
                             (format!("{lang_name} words (total)"), r.words_total),
@@ -4691,8 +4772,8 @@ impl App {
                             ui.end_row();
                         }
                     });
-                    ui.add_space(10.0);
-                    ui.heading("Structure");
+                    });
+                    section_card(ui, "Structure", |ui| {
                     egui::Grid::new("struct").striped(true).num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
                         ui.label("Paragraphs");
                         ui.label(fmt_int(r.paragraphs));
@@ -4735,9 +4816,10 @@ impl App {
                         });
                         ui.end_row();
                     });
+                    });
 
                     let ui = &mut cols[1];
-                    ui.heading("Coverage");
+                    section_card(ui, "Coverage", |ui| {
                     if japanese {
                         ui.label(RichText::new("How many of the most frequent words (kanji) you must know to recognise X% of the running words (kanji).").weak());
                         egui::Grid::new("cov").striped(true).num_columns(3).spacing([32.0, 4.0]).show(ui, |ui| {
@@ -4765,12 +4847,13 @@ impl App {
                             }
                         });
                     }
+                    });
                 });
                 return;
             }
             ui.columns(2, |cols| {
                 let ui = &mut cols[0];
-                ui.heading("Composition");
+                section_card(ui, "Composition", |ui| {
                 egui::Grid::new("comp").striped(true).num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
                     let rows: [(&str, u64); 10] = [
                         ("All non-whitespace characters", r.nonspace_total),
@@ -4793,8 +4876,8 @@ impl App {
                     ui.label(fmt_int(r.foreign_words_unique as u64));
                     ui.end_row();
                 });
-                ui.add_space(10.0);
-                ui.heading("Structure");
+                });
+                section_card(ui, "Structure", |ui| {
                 egui::Grid::new("struct").striped(true).num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
                     ui.label("Paragraphs");
                     ui.label(fmt_int(r.paragraphs));
@@ -4819,9 +4902,10 @@ impl App {
                     });
                     ui.end_row();
                 });
+                });
 
                 let ui = &mut cols[1];
-                ui.heading("Coverage");
+                section_card(ui, "Coverage", |ui| {
                 ui.label(RichText::new("How many of the most frequent items you must know to recognise X% of the running text.").weak());
                 egui::Grid::new("cov").striped(true).num_columns(3).spacing([32.0, 4.0]).show(ui, |ui| {
                     ui.strong("Coverage");
@@ -4835,16 +4919,14 @@ impl App {
                         ui.end_row();
                     }
                 });
-                ui.add_space(10.0);
-                ui.heading("Word length (share of running words)");
+                });
+                section_card(ui, "Word length (share of running words)", |ui| {
                 let total = r.words_total.max(1) as f32;
                 for (i, n) in r.word_length_tokens.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(if i == 4 { "5+ chars".to_owned() } else { format!("{} char{}", i + 1, if i == 0 { " " } else { "s" }) });
-                        let f = *n as f32 / total;
-                        ui.add(egui::ProgressBar::new(f).desired_width(220.0).text(format!("{:.1}%", f * 100.0)));
-                    });
+                    let label = if i == 4 { "5+ chars".to_owned() } else { format!("{} char{}", i + 1, if i == 0 { "" } else { "s" }) };
+                    share_bar(ui, &label, *n as f32 / total);
                 }
+                });
             });
         });
         let ctx = ui.ctx().clone();
@@ -5879,14 +5961,22 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             ui.heading("Library");
             ui.add_space(8.0);
-            ui.selectable_value(&mut self.history_tab, HistTab::Books, "Books")
-                .on_hover_text("Every book analysed, with its statistics");
-            ui.selectable_value(&mut self.history_tab, HistTab::Path, "Reading path")
-                .on_hover_text(
-                    "An order to read the books in, where the words you study for one book make the next ones easier",
-                );
-            ui.selectable_value(&mut self.history_tab, HistTab::Stats, "Stats")
-                .on_hover_text("The library as a whole: its size, its vocabulary and how much of it you know");
+            let items = [
+                (HistTab::Books, "Books"),
+                (HistTab::Path, "Reading path"),
+                (HistTab::Stats, "Stats"),
+            ];
+            for (t, name) in items {
+                let r = palette::tab(ui, self.history_tab == t, name, 14.0);
+                if r.clicked() {
+                    self.history_tab = t;
+                }
+                r.on_hover_text(match t {
+                    HistTab::Books => "Every book analysed, with its statistics",
+                    HistTab::Path => "An order to read the books in, where the words you study for one book make the next ones easier",
+                    HistTab::Stats => "The library as a whole: its size, its vocabulary and how much of it you know",
+                });
+            }
             ui.add_space(8.0);
             if self.history_tab != HistTab::Stats {
                 let r = ui.add(
