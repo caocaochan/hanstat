@@ -14,7 +14,7 @@ use hanstat::known::{self, ReadBook};
 use hanstat::profile::Profile;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 /// New words listed in the dialog, most frequent first.
 const SHOW_NEW: usize = 80;
@@ -59,7 +59,7 @@ pub(crate) struct ReadDialog {
     id: String,
     title: String,
     /// The book's word counts, most frequent first (its profile).
-    words: Vec<(String, u32)>,
+    words: Arc<Vec<(String, u32)>>,
     running: u64,
     percent: u8,
     min_count: u32,
@@ -70,11 +70,15 @@ pub(crate) struct ReadDialog {
     /// Why "not known yet" may count too many.
     note: Option<String>,
     /// The other books read, as [`known::across_books`] takes them.
-    others: Vec<(Counts, Vec<String>)>,
+    others: Arc<Vec<(Counts, Vec<String>)>>,
     /// The words they teach together now, and what this mark would add:
     /// worked out for (percent, min_count).
-    across_now: HashSet<String>,
+    across_now: Arc<HashSet<String>>,
     across_new: Option<((u8, u32), usize)>,
+    /// Working that out in the background, for (percent, min_count): it
+    /// takes a while with many books read, so one at a time, for the rule
+    /// as it is when the last one finishes (not every step of a drag).
+    across_job: Option<((u8, u32), Receiver<usize>)>,
     /// Traditional and Simplified spellings count as one word.
     fold: bool,
 }
@@ -148,7 +152,7 @@ impl App {
         self.read_dialog = Some(ReadDialog {
             id: id.to_owned(),
             title,
-            words: p.words,
+            words: Arc::new(p.words),
             running,
             percent: mark
                 .as_ref()
@@ -159,9 +163,10 @@ impl App {
             before,
             marked: mark.map(|m| m.read),
             note,
-            others,
-            across_now,
+            others: Arc::new(others),
+            across_now: Arc::new(across_now),
             across_new: None,
+            across_job: None,
             fold: self.anki.settings.match_across_scripts,
         });
     }
@@ -219,32 +224,42 @@ impl App {
                 // with these words): worked out again when the rule changes.
                 if !d.others.is_empty() {
                     let rule = (d.percent, d.min_count);
-                    if d.across_new.is_none_or(|(r, _)| r != rule) {
-                        let taken: Vec<String> = sel.iter().map(|(w, _)| w.clone()).collect();
-                        let mut books: Vec<known::ReadCounts> = d
-                            .others
-                            .iter()
-                            .map(|(c, t)| (&c[..], &t[..]))
-                            .collect();
-                        books.push((&d.words[..], &taken[..]));
-                        let n = known::across_books(&books, d.min_count, d.fold)
-                            .into_iter()
-                            .filter(|w| !d.across_now.contains(w) && !known(w))
-                            .count();
-                        d.across_new = Some((rule, n));
+                    if let Some((r, rx)) = &d.across_job {
+                        match rx.try_recv() {
+                            Ok(n) => {
+                                d.across_new = Some((*r, n));
+                                d.across_job = None;
+                            }
+                            Err(TryRecvError::Empty) => {}
+                            Err(TryRecvError::Disconnected) => d.across_job = None,
+                        }
                     }
-                    if let Some((_, n)) = d.across_new {
-                        ui.label(format!(
-                            "With the {} other books read: {} more words met {}+ times across books.",
-                            fmt_int(d.others.len() as u64),
-                            fmt_int(n as u64),
-                            d.min_count,
-                        ))
-                        .on_hover_text(
-                            "A word none of the books took counts as known once it occurs in two or more books read, \
-                             this many times in all. The reading path's Learn while reading mode counts the same way.",
-                        );
+                    if d.across_job.is_none() && d.across_new.is_none_or(|(r, _)| r != rule) {
+                        d.across_job = Some((rule, d.across_count(rule, ui.ctx())));
                     }
+                    let working = d.across_new.is_none_or(|(r, _)| r != rule);
+                    let hover = "A word none of the books took counts as known once it occurs in two or more books read, \
+                                 this many times in all. The reading path's Learn while reading mode counts the same way.";
+                    ui.horizontal_wrapped(|ui| {
+                        if working {
+                            ui.spinner();
+                        }
+                        match d.across_new {
+                            // The last figure, for the rule it was worked out for.
+                            Some((r, n)) => ui.label(format!(
+                                "With the {} other books read: {} more words met {}+ times across books.",
+                                fmt_int(d.others.len() as u64),
+                                fmt_int(n as u64),
+                                r.1,
+                            )),
+                            None => ui.label(format!(
+                                "With the {} other books read: counting the words met {}+ times across books…",
+                                fmt_int(d.others.len() as u64),
+                                d.min_count,
+                            )),
+                        }
+                        .on_hover_text(hover);
+                    });
                 }
                 if let Some(n) = &d.note {
                     ui.colored_label(crate::palette::warn(), format!("⚠ {n}"));
@@ -378,10 +393,19 @@ impl App {
         if self.across.key == Some(key) {
             return;
         }
-        if let Some((k, rx)) = &self.across.job
-            && *k == key
-        {
-            let Ok(done) = rx.try_recv() else { return };
+        if let Some((k, rx)) = &self.across.job {
+            let current = *k == key;
+            let done = match rx.try_recv() {
+                Ok(done) if current => done,
+                Err(TryRecvError::Disconnected) if current => return,
+                // One at a time: dragging the rule starts no thread per step.
+                Err(TryRecvError::Empty) => return,
+                // Worked out for marks or a rule changed since: again, below.
+                Ok(_) | Err(TryRecvError::Disconnected) => {
+                    self.across.job = None;
+                    return self.poll_across(ctx);
+                }
+            };
             self.across.job = None;
             self.across.key = Some(key);
             self.across.counts = Arc::new(done.counts);
@@ -544,6 +568,41 @@ impl App {
                     ui.end_row();
                 }
             });
+    }
+}
+
+impl ReadDialog {
+    /// Start working out, in the background, how many more words marking
+    /// the book under `rule` (percent, min_count) adds across the books
+    /// read: words none of them takes, met `min_count`+ times in two or more,
+    /// not counted across books now and not known.
+    fn across_count(&self, rule: (u8, u32), ctx: &egui::Context) -> Receiver<usize> {
+        let (percent, min_count) = rule;
+        let (words, others, now) = (
+            self.words.clone(),
+            self.others.clone(),
+            self.across_now.clone(),
+        );
+        let (before, fold) = (self.before.clone(), self.fold);
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let taken: Vec<String> = known::read_selection(&words, percent, min_count)
+                .iter()
+                .map(|(w, _)| w.clone())
+                .collect();
+            let mut books: Vec<known::ReadCounts> =
+                others.iter().map(|(c, t)| (&c[..], &t[..])).collect();
+            books.push((&words[..], &taken[..]));
+            let known = |w: &str| before.as_ref().is_some_and(|k| k.word(w).is_known());
+            let n = known::across_books(&books, min_count, fold)
+                .into_iter()
+                .filter(|w| !now.contains(w) && !known(w))
+                .count();
+            let _ = tx.send(n);
+            ctx.request_repaint();
+        });
+        rx
     }
 }
 

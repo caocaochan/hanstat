@@ -1,5 +1,11 @@
 # Changelog
 
+## [2026.11.24.07] - 2026-11-24
+
+### Fixed
+- **The Mark read window no longer freezes while you change its rule.** "With the N other books read: … more words met 10+ times across books" was worked out again for every step while dragging the % or the times, and with many books marked read each took a noticeable moment, so the window stuttered. It is now worked out in the background: the last figure stays shown, with a spinner, until the new one is ready.
+- **Changing "times" on the Reading path no longer piles up work.** The words met across books were worked out again for every step of a drag, each in its own background task, and all of them ran to the end. Now one runs at a time, and once it's done the next is for the value you ended on.
+
 ## [2026.11.24.06] - 2026-11-24
 
 ### Fixed
