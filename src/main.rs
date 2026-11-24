@@ -4,6 +4,7 @@ use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 use hanstat::analyze::{self, Prepared, Report};
 use hanstat::anki::{self, BookCoverage, ByStatus, Difficulty, Status};
+use hanstat::books;
 use hanstat::cache::Cache;
 use hanstat::discover::{self, Candidate};
 use hanstat::extract::{self, Book, EncodingChoice, SectionKind};
@@ -21,7 +22,7 @@ use hanstat::update::{self, Release};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 
 mod charts;
@@ -136,6 +137,7 @@ fn main() -> eframe::Result {
             app.whats_new_at_start();
             app.anki_init(&cc.egui_ctx);
             (app.history, app.history_error) = History::load();
+            app.move_books(&cc.egui_ctx);
             (app.plan.settings, app.plan.error) = plan::Settings::load();
             if let Some(t) = history_tab {
                 app.show_history = true;
@@ -349,6 +351,20 @@ struct Loaded {
     prep: Arc<Prepared>,
     /// SHA-256 of the file, which identifies the book in the history.
     file_id: Option<String>,
+    /// The book's copy in the Library's folder, used from now on; the file
+    /// opened if it could not be copied.
+    path: PathBuf,
+    /// Why it could not be copied.
+    copy_error: Option<String>,
+}
+
+/// Library books added before it kept copies of its books, being copied
+/// into its folder ([`App::move_books`]): each id with its copy.
+struct BookMoves {
+    rx: Receiver<Result<(String, PathBuf), String>>,
+    done: Arc<AtomicUsize>,
+    total: usize,
+    failed: Vec<String>,
 }
 
 enum JobMsg {
@@ -624,6 +640,8 @@ struct App {
     /// Books analysed before (history.json).
     history: History,
     history_error: Option<String>,
+    /// Books being copied into the Library's folder.
+    moves: Option<BookMoves>,
     /// The History view replaces the book's tabs.
     show_history: bool,
     history_sort: (HistCol, bool),
@@ -803,6 +821,14 @@ impl Inputs {
     fn analysis_of(entry: &str) -> Option<&str> {
         entry.split_once('/').map(|(a, _)| a)
     }
+}
+
+/// The book the toolbar's 📕 Reader opens ([`App::last_read`]).
+struct LastRead {
+    id: String,
+    path: PathBuf,
+    title: String,
+    traditional: bool,
 }
 
 /// A book taken out of the Library with ✖: its place and entry, until when
@@ -1095,6 +1121,8 @@ enum BatchMsg {
     Book(Box<history::Entry>, bool),
     /// Label, file, error.
     Failed(String, PathBuf, String),
+    /// A book analysed but not copied into the Library's folder: why.
+    CopyFailed(String),
     Finished,
 }
 
@@ -1332,6 +1360,7 @@ impl Default for App {
             cache_usage: (0, 0),
             history: History::default(),
             history_error: None,
+            moves: None,
             show_history: false,
             history_sort: (HistCol::Analysed, true),
             library_filter: String::new(),
@@ -1426,6 +1455,7 @@ impl App {
             .book
             .clone()
             .filter(|_| self.path.as_deref() == Some(path.as_path()));
+        let books_dir = self.history.books();
         std::thread::spawn(move || {
             let res = (|| {
                 let book = match cached {
@@ -1476,7 +1506,18 @@ impl App {
                     },
                     &c3,
                 )?;
-                let file_id = history::file_id(&path).ok();
+                // The Library's own copy, read from now on.
+                let (path, file_id, copy_error) = match books::import(&books_dir, &path, None) {
+                    Ok(i) => {
+                        if i.copied && c3.load(Ordering::Relaxed) {
+                            // Replaced by another analysis meanwhile: not kept.
+                            books::delete(&books_dir, &i.id);
+                            return Err(analyze::CANCELLED.to_owned());
+                        }
+                        (i.path, Some(i.id), None)
+                    }
+                    Err(e) => (path.clone(), history::file_id(&path).ok(), Some(e)),
+                };
                 // The cover's thumbnail for the History view; the same file always has the same cover.
                 if let (Some(id), Some(cover)) = (&file_id, &book.cover) {
                     let dest = history::cover_path(id);
@@ -1488,6 +1529,8 @@ impl App {
                     book,
                     prep: Arc::new(prep),
                     file_id,
+                    path,
+                    copy_error,
                 })
             })();
             let _ = tx.send(JobMsg::Done(res));
@@ -2901,6 +2944,11 @@ impl App {
                     self.report = None;
                     self.report_id = None;
                     self.book_id = l.file_id;
+                    self.path = Some(l.path);
+                    match l.copy_error {
+                        Some(e) => self.set_error("copy", e),
+                        None => self.clear_error("copy"),
+                    }
                     self.history_touch = true;
                     // The book's language decides which dictionary, Anki selection and word lists apply.
                     self.set_language(lang, ctx);
@@ -2964,6 +3012,7 @@ impl eframe::App for App {
             self.refresh_stats(&ctx);
         }
         self.poll_batch(&ctx);
+        self.poll_moves(&ctx);
         self.auto_refresh(&ctx);
         if self.show_history {
             let hist = &self.history;
@@ -3241,6 +3290,21 @@ impl eframe::App for App {
                 {
                     self.show_history = !self.show_history;
                 }
+                let last = self.last_read();
+                let reader_button = ui.add_enabled(last.is_some(), egui::Button::new("📕 Reader"));
+                if let Some(b) = last {
+                    if reader_button
+                        .on_hover_text(format!("Go back to {} where you left it", b.title))
+                        .clicked()
+                    {
+                        match reader::Reader::open(&b.path, Some(&b.id), b.traditional, &ctx) {
+                            Ok(r) => self.reader = Some(r),
+                            Err(e) => self.set_error("reader", e),
+                        }
+                    }
+                } else {
+                    reader_button.on_disabled_hover_text("No Library book read in the reader yet");
+                }
 
                 // The badge on this row when it fits beside the rest, else on the next.
                 if ui.max_rect().right() - ui.cursor().min.x < 90.0 {
@@ -3291,6 +3355,19 @@ impl eframe::App for App {
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true), |ui| {
                 if self.batch.is_some() {
                     self.batch_status(ui);
+                    ui.separator();
+                }
+                if let Some(m) = &self.moves {
+                    ui.spinner();
+                    ui.label(format!(
+                        "Copying books into the Library: {} of {}",
+                        (m.done.load(Ordering::Relaxed) + 1).min(m.total),
+                        m.total
+                    ))
+                    .on_hover_text(
+                        "The Library now keeps its own copy of each book, so the files you added them from can be moved or deleted. \
+                         Books added before are copied once; the originals are not touched",
+                    );
                     ui.separator();
                 }
                 if let Some(job) = &self.job {
@@ -6339,13 +6416,14 @@ impl App {
         }
         let now = history::now();
         let mut open: Option<PathBuf> = None;
+        let mut read: Option<(PathBuf, String, bool)> = None;
         let mut remove: Option<String> = None;
         let mut mark_read: Option<String> = None;
         let mut sort = None;
         let dash = || RichText::new("–").weak();
         // The other columns, and the ✕ column's least width.
         let others = [
-            90.0, 100.0, 100.0, 100.0, 80.0, 100.0, 80.0, 92.0, 36.0, 36.0,
+            READ_COL, 90.0, 100.0, 100.0, 100.0, 80.0, 100.0, 80.0, 92.0, 36.0, 36.0,
         ];
         let style_col = if style_on { 130.0 } else { 0.0 };
         let book_w = title_column_width(
@@ -6360,6 +6438,7 @@ impl App {
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .striped(true)
             .column(Column::exact(book_w).clip(true))
+            .column(Column::exact(READ_COL))
             .column(Column::exact(90.0))
             .columns(Column::exact(100.0), 3)
             .column(Column::exact(80.0))
@@ -6372,6 +6451,7 @@ impl App {
             .header(24.0, |mut h| {
                 let mut heads: Vec<(Option<HistCol>, &str, &str)> = vec![
                     (Some(HistCol::Title), "Book", "The book's title, or its file name"),
+                    (None, "", ""),
                     (Some(HistCol::Language), "Language", "Language, and script for Chinese"),
                     (
                         Some(HistCol::Chars),
@@ -6397,7 +6477,7 @@ impl App {
                 ];
                 if style_on {
                     heads.insert(
-                        7,
+                        8,
                         (
                             Some(HistCol::Style),
                             "Writing style",
@@ -6522,6 +6602,23 @@ impl App {
                         });
                     });
                     row.col(|ui| {
+                        // As on the Overview: the reader takes Chinese EPUBs.
+                        if s.language == Language::Chinese
+                            && s.format == "EPUB"
+                            && ui
+                                .add_enabled(exists.get(&e.path), egui::Button::new("📕 Read"))
+                                .on_hover_text("Read the book, with its layout and pictures")
+                                .on_disabled_hover_text("The file is no longer there")
+                                .clicked()
+                        {
+                            read = Some((
+                                e.path.clone(),
+                                e.id.clone(),
+                                s.variant == "Traditional",
+                            ));
+                        }
+                    });
+                    row.col(|ui| {
                         let variant = match s.variant.as_str() {
                             "Simplified" => Some(Variant::Simplified),
                             "Traditional" => Some(Variant::Traditional),
@@ -6640,7 +6737,7 @@ impl App {
                         if ui
                             .small_button("✖")
                             .on_hover_text(
-                                "Remove from the library (the book itself is not touched); it can be put back for a few seconds",
+                                "Remove from the Library, with hanstat's copy of the book (the file you added it from is not touched); it can be put back for a few seconds",
                             )
                             .clicked()
                         {
@@ -6661,6 +6758,117 @@ impl App {
         if let Some(p) = open {
             self.open(p, ctx);
         }
+        if let Some((path, id, traditional)) = read {
+            match reader::Reader::open(&path, Some(&id), traditional, ctx) {
+                Ok(r) => self.reader = Some(r),
+                Err(e) => self.set_error("reader", e),
+            }
+        }
+    }
+
+    /// Copy the Library's books still read from elsewhere (added before it
+    /// kept copies) into its folder, in the background, one at a time.
+    fn move_books(&mut self, ctx: &egui::Context) {
+        let books_dir = self.history.books();
+        let todo = self.history.outside();
+        if todo.is_empty() {
+            std::thread::spawn(move || books::clean_incoming(&books_dir));
+            return;
+        }
+        let (tx, rx) = channel();
+        let done = Arc::new(AtomicUsize::new(0));
+        let total = todo.len();
+        let (d2, ctx) = (done.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            books::clean_incoming(&books_dir);
+            for (id, path) in todo {
+                // Gone: nothing to copy. Changed since it was analysed: not
+                // this book any more (opened again, it is a new one).
+                if path.is_file() {
+                    match books::import(&books_dir, &path, None) {
+                        Ok(i) if i.id == id => {
+                            let _ = tx.send(Ok((id, i.path)));
+                        }
+                        Ok(i) => {
+                            if i.copied {
+                                books::delete(&books_dir, &i.id);
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(e));
+                        }
+                    }
+                }
+                d2.fetch_add(1, Ordering::Relaxed);
+                ctx.request_repaint();
+            }
+        });
+        self.moves = Some(BookMoves {
+            rx,
+            done,
+            total,
+            failed: Vec::new(),
+        });
+    }
+
+    /// Point the Library's entries at the copies [`Self::move_books`] made.
+    fn poll_moves(&mut self, ctx: &egui::Context) {
+        let Some(m) = &mut self.moves else { return };
+        let mut moved = Vec::new();
+        let finished = loop {
+            match m.rx.try_recv() {
+                Ok(Ok(x)) => moved.push(x),
+                Ok(Err(e)) => m.failed.push(e),
+                Err(TryRecvError::Empty) => break false,
+                Err(TryRecvError::Disconnected) => break true,
+            }
+        };
+        if !moved.is_empty() {
+            // A book removed meanwhile (and not to be put back) keeps no copy.
+            let books_dir = self.history.books();
+            for (id, _) in &moved {
+                let kept = self.history.entries.iter().any(|e| e.id == *id)
+                    || self.removed.as_ref().is_some_and(|r| r.entry.id == *id);
+                if !kept {
+                    books::delete(&books_dir, id);
+                }
+            }
+            if let Err(e) = self.history.relocate(&moved) {
+                self.history_error = Some(e);
+            }
+        }
+        if !finished {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            return;
+        }
+        let Some(m) = self.moves.take() else { return };
+        if let Some(first) = m.failed.first() {
+            self.set_error(
+                "copy",
+                format!(
+                    "{} of the Library's books could not be copied into its folder; they are read where they are, and copied next time hanstat starts. {first}",
+                    m.failed.len()
+                ),
+            );
+        }
+    }
+
+    /// The Library book last read in the reader (its place moved last), for
+    /// the toolbar's 📕 Reader.
+    fn last_read(&self) -> Option<LastRead> {
+        let entries = &self.history.entries;
+        let id = reading_stats::last_read(|id| {
+            entries
+                .iter()
+                .any(|e| e.id == id && e.stats.format == "EPUB")
+        })?;
+        let e = entries.iter().find(|e| e.id == id)?;
+        Some(LastRead {
+            id,
+            path: e.path.clone(),
+            title: e.title.clone(),
+            traditional: e.stats.variant == "Traditional",
+        })
     }
 
     /// Take a book out of the Library; its cover and word data are deleted
@@ -7235,6 +7443,18 @@ impl App {
         let skip_hapax = self.settings.skip_hapax;
         let fold_chars = self.fold_chars();
         let history_path = History::path();
+        let books_dir = self.history.books();
+        // Books opened again keep the sections chosen for them, found by id
+        // (the entry's path is the Library's copy, not the file opened).
+        let saved_sections: HashMap<String, Vec<bool>> = if mode == BatchMode::Open {
+            self.history
+                .entries
+                .iter()
+                .filter_map(|e| e.sections.clone().map(|s| (e.id.clone(), s)))
+                .collect()
+        } else {
+            HashMap::new()
+        };
         let (tx, rx) = channel();
         let done = Arc::new(AtomicUsize::new(0));
         let current = Arc::new(Mutex::new(String::new()));
@@ -7256,6 +7476,13 @@ impl App {
                 } = item;
                 *cur2.lock().unwrap() = label.clone();
                 ctx.request_repaint();
+                let sections = sections.or_else(|| {
+                    if saved_sections.is_empty() {
+                        return None;
+                    }
+                    let id = history::file_id(&path).ok()?;
+                    saved_sections.get(&id).cloned()
+                });
                 if let Some(e) = refresh.and_then(|e| {
                     coverage_only(&e, &knowledge, skip_hapax, &history_path, &thread_inputs)
                 }) {
@@ -7312,10 +7539,22 @@ impl App {
                     if changed {
                         p.save(&p_path)?;
                     }
+                    // A book opened is copied into the Library's folder; the
+                    // Library's own books are copied there at start
+                    // (`App::move_books`).
+                    let mut stored = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
+                    if mode == BatchMode::Open {
+                        match books::import(&books_dir, &path, Some(&id)) {
+                            Ok(i) => stored = i.path,
+                            Err(e) => {
+                                let _ = tx.send(BatchMsg::CopyFailed(e));
+                            }
+                        }
+                    }
                     Ok((
                         history::Entry {
                             id,
-                            path: std::path::absolute(&path).unwrap_or_else(|_| path.clone()),
+                            path: stored,
                             title: r
                                 .title
                                 .clone()
@@ -7360,6 +7599,7 @@ impl App {
             return;
         };
         let mut finished = false;
+        let mut copy_failed = None;
         while let Ok(m) = b.rx.try_recv() {
             match m {
                 BatchMsg::Book(e, changed) => {
@@ -7389,8 +7629,12 @@ impl App {
                     }
                     b.failed.push(format!("{label}: {e}"));
                 }
+                BatchMsg::CopyFailed(e) => copy_failed = Some(e),
                 BatchMsg::Finished => finished = true,
             }
+        }
+        if let Some(e) = copy_failed {
+            self.set_error("copy", e);
         }
         if !finished {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
@@ -8248,6 +8492,8 @@ fn title_column_width<'a>(
 /// Size cover thumbnails are drawn at in the History table (points), and its row height.
 const COVER_SIZE: (f32, f32) = (32.0, 44.0);
 const COVER_ROW: f32 = 50.0;
+/// The Library's 📕 Read column.
+const READ_COL: f32 = 76.0;
 
 /// A saved cover thumbnail as a texture; `None` if there is none (or it can't be read).
 fn load_cover(ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {

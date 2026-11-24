@@ -6,6 +6,8 @@
 //! A book is identified by the SHA-256 of its file, so a renamed or moved
 //! copy is still the same book; a file changed in place is recognised by its
 //! path. Recording a book replaces any entry that matches either way.
+//! An entry's path is normally the Library's own copy of the book
+//! ([`crate::books`]); a copy is deleted with its entry.
 //!
 //! An entry holds what the Overview showed when it was recorded: the
 //! sections included then, the segmenter used, and the known-word coverage
@@ -87,7 +89,8 @@ impl History {
     /// Add `entry`, replacing any entry for the same file or the same path,
     /// and save. Nothing is written if the book's entry already has these
     /// statistics, unless `touch` (a fresh analysis, which moves it to the top).
-    pub fn record(&mut self, entry: Entry, touch: bool) -> Result<bool, String> {
+    pub fn record(&mut self, mut entry: Entry, touch: bool) -> Result<bool, String> {
+        self.keep_own_path(&mut entry);
         let same = |e: &Entry| e.id == entry.id || same_path(&e.path, &entry.path);
         if !touch
             && let Some(e) = self.entries.iter().find(|e| same(e))
@@ -103,8 +106,7 @@ impl History {
         // A replaced entry of another file (same path, changed contents) takes
         // its cover and vocabulary profile with it.
         for old in self.entries.iter().filter(|e| same(e) && e.id != entry.id) {
-            let _ = std::fs::remove_file(self.cover(&old.id));
-            let _ = std::fs::remove_file(self.profile(&old.id));
+            self.delete_files(&old.id);
         }
         self.entries.retain(|e| !same(e));
         self.entries.insert(0, entry);
@@ -115,6 +117,7 @@ impl History {
     /// it is: the entry keeps its place and the time it was analysed. Nothing
     /// happens if the book is no longer in the list (removed meanwhile).
     pub fn refresh(&mut self, mut entry: Entry) -> Result<bool, String> {
+        self.keep_own_path(&mut entry);
         let same = |e: &Entry| e.id == entry.id || same_path(&e.path, &entry.path);
         let Some(i) = self.entries.iter().position(same) else {
             return Ok(false);
@@ -134,8 +137,7 @@ impl History {
         });
         if !self.read_only {
             for id in &stale {
-                let _ = std::fs::remove_file(self.cover(id));
-                let _ = std::fs::remove_file(self.profile(id));
+                self.delete_files(id);
             }
         }
         // Only the first match is left, so it is still the first.
@@ -148,8 +150,7 @@ impl History {
     pub fn remove(&mut self, id: &str) -> Result<(), String> {
         self.entries.retain(|e| e.id != id);
         if !self.read_only {
-            let _ = std::fs::remove_file(self.cover(id));
-            let _ = std::fs::remove_file(self.profile(id));
+            self.delete_files(id);
         }
         self.save()
     }
@@ -236,8 +237,57 @@ impl History {
         if self.read_only || self.entries.iter().any(|e| e.id == id) {
             return;
         }
+        self.delete_files(id);
+    }
+
+    /// Delete book `id`'s cover, word data and copy.
+    fn delete_files(&self, id: &str) {
         let _ = std::fs::remove_file(self.cover(id));
         let _ = std::fs::remove_file(self.profile(id));
+        crate::books::delete(&self.books(), id);
+    }
+
+    /// The Library's own copies of its books ([`crate::books`]).
+    pub fn books(&self) -> PathBuf {
+        crate::books::dir_in(&self.path)
+    }
+
+    /// A book recorded from elsewhere (its copy could not be made, or an
+    /// analysis started before the copy was) keeps the copy its entry has.
+    fn keep_own_path(&self, entry: &mut Entry) {
+        let app = self.path.parent().unwrap_or(&self.path);
+        if let Some(e) = self.entries.iter().find(|e| e.id == entry.id)
+            && crate::books::is_own_in(app, &e.path)
+            && !crate::books::is_own_in(app, &entry.path)
+        {
+            entry.path = e.path.clone();
+        }
+    }
+
+    /// The books whose entries point outside hanstat's folder (added before
+    /// the Library kept copies): id and path. None while the file is not saved.
+    pub fn outside(&self) -> Vec<(String, PathBuf)> {
+        if self.read_only {
+            return Vec::new();
+        }
+        let app = self.path.parent().unwrap_or(&self.path);
+        self.entries
+            .iter()
+            .filter(|e| !crate::books::is_own_in(app, &e.path))
+            .map(|e| (e.id.clone(), e.path.clone()))
+            .collect()
+    }
+
+    /// Books copied into the Library: each id's entry now points at its copy.
+    pub fn relocate(&mut self, moved: &[(String, PathBuf)]) -> Result<(), String> {
+        let mut changed = false;
+        for (id, path) in moved {
+            if let Some(e) = self.entries.iter_mut().find(|e| e.id == *id) {
+                e.path = path.clone();
+                changed = true;
+            }
+        }
+        if changed { self.save() } else { Ok(()) }
     }
 }
 
@@ -483,6 +533,45 @@ mod tests {
         assert!(w.is_some());
         h.record(entry("a", "a", 1, 1), true).unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "not json");
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn entries_keep_and_lose_their_copies() {
+        let p = temp().with_file_name("copies.json");
+        let (mut h, _) = History::load_from(p.clone());
+        let books = h.books();
+        // Outside hanstat's folder (the history file's).
+        let src = p.parent().unwrap().with_extension("source");
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let (a, b) = (src.join("a.epub"), src.join("b.epub"));
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(&b, "b").unwrap();
+        let ia = crate::books::import(&books, &a, None).unwrap();
+        let ib_id = file_id(&b).unwrap();
+        // One recorded at its copy, one added before the Library kept copies.
+        h.record(entry(&ia.id, ia.path.to_str().unwrap(), 1, 1), true)
+            .unwrap();
+        h.record(entry(&ib_id, b.to_str().unwrap(), 1, 2), true)
+            .unwrap();
+        assert_eq!(h.outside(), [(ib_id.clone(), b.clone())]);
+        // A background analysis of the original keeps the copy.
+        h.refresh(entry(&ia.id, a.to_str().unwrap(), 5, 9)).unwrap();
+        let e = h.entries.iter().find(|e| e.id == ia.id).unwrap();
+        assert_eq!((e.path.clone(), e.stats.words_total), (ia.path.clone(), 5));
+        // Copied at start: the entry follows.
+        let ib = crate::books::import(&books, &b, Some(&ib_id)).unwrap();
+        h.relocate(&[(ib_id.clone(), ib.path.clone())]).unwrap();
+        assert!(h.outside().is_empty());
+        // The originals don't matter any more; removing a book deletes its copy.
+        std::fs::remove_dir_all(&src).unwrap();
+        assert!(ib.path.is_file());
+        h.take(&ib_id).unwrap();
+        h.forget(&ib_id);
+        assert!(!ib.path.exists());
+        h.remove(&ia.id).unwrap();
+        assert!(!ia.path.exists());
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 

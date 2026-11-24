@@ -503,6 +503,17 @@ pub fn left_at(id: &str) -> Option<LeftAt> {
     store().stats.places.get(id).copied()
 }
 
+/// The book among those `keep` accepts whose place moved last: the one last read.
+pub fn last_read(keep: impl Fn(&str) -> bool) -> Option<String> {
+    store()
+        .stats
+        .places
+        .iter()
+        .filter(|(id, _)| keep(id))
+        .max_by_key(|(_, p)| p.saved)
+        .map(|(id, _)| id.clone())
+}
+
 /// The reader left book `id` at `spine`, `offset`; [`save`] writes it.
 pub fn set_left_at(id: &str, spine: usize, offset: usize) {
     let mut s = store();

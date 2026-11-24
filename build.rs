@@ -33,6 +33,7 @@ const NOT_ANALYSIS: &[&str] = &[
     "src/lib.rs",
     "src/bin",
     "src/history.rs",
+    "src/books.rs",
     "src/history",
     "src/profile.rs",
     "src/plan.rs",

@@ -1,5 +1,17 @@
 # Changelog
 
+## [2026.11.24.00] - 2026-11-24
+
+### Added
+- **📕 Read on each Library book** opens it in the reader straight from the Library, where you left it (Chinese EPUBs, as on the Overview).
+- **📕 Reader** next to **Library** goes back to the Library book you last read in the reader, where you left it.
+
+### Changed
+- **The Library keeps its own copy of each book.** A book you open or add is copied into the `books` folder in the app folder, and the Library, the reader and everything else read that copy, so the file you added it from can be moved, renamed or deleted. Each book has a folder there with the file under its own name; the same book added twice is stored once. Its reading stats, place, cover, read mark and writing-style rating are the copy's, unchanged.
+- **Books already in the Library are copied over once**, in the background, the first time this version starts ("Copying books into the Library" in the status bar); the originals are not touched. A book whose file is gone, or has changed since it was analysed, stays as it was. A book that cannot be copied (a full disk) is read where it is and copied next time.
+- **Removing a book from the Library deletes hanstat's copy** once it can no longer be put back; the file you added it from is not touched.
+- **Opening a file you edited since adding it adds it as a new book**, instead of replacing the old one, since the Library's copy is the old file.
+
 ## [2026.11.23.04] - 2026-11-23
 
 ### Changed

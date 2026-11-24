@@ -56,7 +56,7 @@ hanstat-cli --plan [--lang zh|ko|ja] [--target 95] [--study-lists DIR]
 
 ## Data
 
-Settings, the Library and your known words are in `%LOCALAPPDATA%\hanstat` (macOS: `~/Library/Application Support/hanstat`, Linux: `~/.local/share/hanstat`, Flatpak: `~/.var/app/io.github.caocaochan.hanstat/data/hanstat`); the models and saved analyses are there too on Windows and macOS, and in `~/.cache/hanstat` on Linux. [CHANGELOG.md](CHANGELOG.md) describes every feature and change in detail.
+Settings, the Library (with its own copy of each book, in `books`) and your known words are in `%LOCALAPPDATA%\hanstat` (macOS: `~/Library/Application Support/hanstat`, Linux: `~/.local/share/hanstat`, Flatpak: `~/.var/app/io.github.caocaochan.hanstat/data/hanstat`); the models and saved analyses are there too on Windows and macOS, and in `~/.cache/hanstat` on Linux. [CHANGELOG.md](CHANGELOG.md) describes every feature and change in detail.
 
 ## Licence
 
