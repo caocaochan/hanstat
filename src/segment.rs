@@ -3,10 +3,6 @@
 //! * CKIP BERT (bert-tiny-chinese-ws, ASBC standard) — most accurate, slowest.
 //! * LTP legacy (HIT-SCIR averaged perceptron, PKU-style standard) — fast, default.
 //! * jieba (dictionary DAG + max-probability path, HMM off).
-//! * Kiwi, for Korean books only: returns dictionary forms instead of slices
-//!   (see [`Segmenter::lemmas_many`] and [`crate::kiwi`]).
-//! * Sudachi, for Japanese books only: returns normalized forms with the
-//!   book's spelling (see [`Segmenter::japanese_words_many`] and [`crate::japanese`]).
 //!
 //! Every back-end gets whitespace-free chunks of the *original* text and returns
 //! slices of it. Script folding needed by a model (T→S for LTP/jieba, S→T for
@@ -21,15 +17,11 @@
 //! glue names to them (白柳若/有所思 → 白柳/若有所思).
 
 use crate::ckip::Ckip;
-use crate::japanese;
-use crate::kiwi;
-use crate::lang::Language;
 use crate::models;
 use crate::script::{self, Variant};
-use rayon::prelude::*;
 use serde::Serialize;
 use std::io::BufReader;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 // Only successful loads are memoised, so a failed download can be retried.
 static LTP_MODEL: OnceLock<ltp::CWSModel> = OnceLock::new();
@@ -65,8 +57,6 @@ pub fn model_for(kind: SegmenterKind) -> Option<&'static models::Model> {
         SegmenterKind::Ltp | SegmenterKind::Auto => Some(&models::LTP),
         SegmenterKind::Ckip => Some(&models::CKIP),
         SegmenterKind::Jieba => None,
-        SegmenterKind::Kiwi => Some(&models::KIWI),
-        SegmenterKind::Sudachi => Some(models::sudachi()),
     }
 }
 
@@ -78,9 +68,6 @@ pub fn model_identity(kind: SegmenterKind) -> String {
         // Its dictionary is part of the jieba-rs crate, whose version is in
         // the cache's build fingerprint.
         SegmenterKind::Jieba => "jieba".to_owned(),
-        // The id has the dictionary's release date; a dictionary found on
-        // disk has no checksum to add.
-        SegmenterKind::Sudachi => models::sudachi().id.to_owned(),
         // Pinned downloads: the id and the checksum of every file.
         k => model_for(k).map_or_else(String::new, |m| {
             let mut s = m.id.to_owned();
@@ -98,7 +85,6 @@ pub fn model_identity(kind: SegmenterKind) -> String {
 fn folding(kind: SegmenterKind, variant: Variant) -> (bool, bool) {
     let trad_like = matches!(variant, Variant::Traditional | Variant::Mixed);
     match kind {
-        SegmenterKind::Kiwi | SegmenterKind::Sudachi => (false, false),
         SegmenterKind::Ckip => (false, variant != Variant::Traditional),
         _ => (trad_like, false),
     }
@@ -126,10 +112,6 @@ pub enum SegmenterKind {
     Ckip,
     Ltp,
     Jieba,
-    /// Korean morphological analysis; used for every Korean book.
-    Kiwi,
-    /// Japanese morphological analysis; used for every Japanese book.
-    Sudachi,
 }
 
 impl SegmenterKind {
@@ -141,8 +123,6 @@ impl SegmenterKind {
             Self::Ckip => "CKIP BERT",
             Self::Ltp => "LTP perceptron",
             Self::Jieba => "jieba",
-            Self::Kiwi => "Kiwi",
-            Self::Sudachi => "Sudachi",
         }
     }
     pub fn description(self) -> &'static str {
@@ -159,12 +139,6 @@ impl SegmenterKind {
             Self::Jieba => {
                 "jieba dictionary segmentation (HMM off). Fastest, least accurate (SIGHAN F1 81–84); merges many compounds."
             }
-            Self::Kiwi => {
-                "Kiwi Korean morphological analyser (CoNg model). Counts words as dictionary forms (먹었어요 → 먹다); used for every Korean book."
-            }
-            Self::Sudachi => {
-                "Sudachi Japanese morphological analyser (SudachiDict full, long units). Counts words in dictionary form, merging spellings (わかった, 分かる → 分かる); used for every Japanese book."
-            }
         }
     }
     /// The concrete model `Auto` stands for, given the detected script.
@@ -175,24 +149,12 @@ impl SegmenterKind {
             k => k,
         }
     }
-
-    /// The segmenter for a book in `lang`: Kiwi for Korean, Sudachi for
-    /// Japanese, otherwise the chosen Chinese one with `Auto` resolved by script.
-    pub fn resolve_in(self, lang: Language, variant: Variant) -> SegmenterKind {
-        match lang {
-            Language::Korean => Self::Kiwi,
-            Language::Japanese => Self::Sudachi,
-            Language::Chinese => self.resolve(variant),
-        }
-    }
 }
 
 enum Backend {
     Ltp(&'static ltp::CWSModel),
     Jieba(Box<jieba_rs::Jieba>),
     Ckip(&'static Ckip),
-    Kiwi(Arc<kiwi::Kiwi>),
-    Sudachi(Arc<japanese::Analyzer>),
 }
 
 pub struct Segmenter {
@@ -221,28 +183,6 @@ impl Segmenter {
             SegmenterKind::Ltp | SegmenterKind::Auto => Backend::Ltp(ltp_model()?),
             SegmenterKind::Ckip => Backend::Ckip(ckip_model()?),
             SegmenterKind::Jieba => Backend::Jieba(Box::new(jieba_rs::Jieba::new())),
-            // Kiwi takes the user dictionary itself (as proper nouns).
-            SegmenterKind::Kiwi => {
-                return Ok(Segmenter {
-                    kind,
-                    backend: Backend::Kiwi(kiwi::shared(user_words)?),
-                    forced: None,
-                    known: None,
-                    fold_t2s: false,
-                    fold_s2t: false,
-                });
-            }
-            // Sudachi takes the user dictionary itself (as proper nouns).
-            SegmenterKind::Sudachi => {
-                return Ok(Segmenter {
-                    kind,
-                    backend: Backend::Sudachi(japanese::shared(user_words)?),
-                    forced: None,
-                    known: None,
-                    fold_t2s: false,
-                    fold_s2t: false,
-                });
-            }
         };
         let words: Vec<&str> = user_words
             .iter()
@@ -274,12 +214,7 @@ impl Segmenter {
     /// starts and ends on the model's own boundaries: 想/到 becomes 想到, while
     /// 研究/生命 stays as it is although 研究生 is known. Each word is also
     /// matched in its other script (T↔S), as known words are elsewhere.
-    /// Kiwi (Korean) and Sudachi (Japanese) return dictionary forms, not
-    /// slices, so they ignore them.
     pub fn with_known(mut self, words: &[String]) -> Result<Self, String> {
-        if matches!(self.backend, Backend::Kiwi(_) | Backend::Sudachi(_)) {
-            return Ok(self);
-        }
         let mut pats: Vec<String> = words
             .iter()
             .filter(|w| w.chars().count() > 1)
@@ -366,9 +301,7 @@ impl Segmenter {
     /// Make every idiom one token (see the module docs). Matched leftmost-longest
     /// on the text folded to Simplified, which keeps the characters in place.
     fn idioms<'a>(&self, s: &'a str, toks: Vec<&'a str>) -> Vec<&'a str> {
-        if matches!(self.backend, Backend::Kiwi(_) | Backend::Sudachi(_))
-            || s.chars().nth(3).is_none()
-        {
+        if s.chars().nth(3).is_none() {
             return toks;
         }
         let folded = script::fold_t2s(s);
@@ -398,54 +331,13 @@ impl Segmenter {
         make_tokens(s, toks, spans.into_iter())
     }
 
-    /// The model this segmenter loaded, as [`model_identity`] names it. It
-    /// differs from the expected one only when Sudachi fell back to its
-    /// tested dictionary.
-    pub fn model_identity(&self) -> String {
-        match &self.backend {
-            Backend::Sudachi(a) => a.dictionary_id().to_owned(),
-            _ => model_identity(self.kind),
-        }
-    }
-
-    /// Japanese (Sudachi): the words of each text with their spellings and
-    /// parts, analysed in parallel. Other segmenters: each token as a word
-    /// spelled as itself.
-    pub fn japanese_words_many(&self, texts: &[&str]) -> Result<Vec<Vec<japanese::Word>>, String> {
-        match &self.backend {
-            Backend::Sudachi(a) => Ok(a.words_many(texts)),
-            _ => Ok(self
-                .lemmas_many(texts)?
-                .into_iter()
-                .map(|v| {
-                    v.into_iter()
-                        .map(|w| japanese::Word {
-                            spelling: w.clone(),
-                            key: w,
-                            parts: Vec::new(),
-                        })
-                        .collect()
-                })
-                .collect()),
-        }
-    }
-
-    /// Korean (Kiwi): the dictionary-form words of each text, analysed in
-    /// parallel; Japanese (Sudachi): their keys. Other segmenters return their tokens.
+    /// The tokens of each text, owned.
     pub fn lemmas_many(&self, texts: &[&str]) -> Result<Vec<Vec<String>>, String> {
-        match &self.backend {
-            Backend::Kiwi(k) => texts.par_iter().map(|t| k.lemmas(t)).collect(),
-            Backend::Sudachi(a) => Ok(a
-                .words_many(texts)
-                .into_iter()
-                .map(|v| v.into_iter().map(|w| w.key).collect())
-                .collect()),
-            _ => Ok(self
-                .cut_many(texts)
-                .into_iter()
-                .map(|v| v.into_iter().map(str::to_owned).collect())
-                .collect()),
-        }
+        Ok(self
+            .cut_many(texts)
+            .into_iter()
+            .map(|v| v.into_iter().map(str::to_owned).collect())
+            .collect())
     }
 
     /// Segment many whitespace-free chunks; result `i` tiles `chunks[i]`.
@@ -505,8 +397,6 @@ impl Segmenter {
                 .segment_many(&[s], self.fold_s2t)
                 .pop()
                 .unwrap_or_default(),
-            // Kiwi and Sudachi output is lemmas, not slices (see `lemmas_many`).
-            Backend::Kiwi(_) | Backend::Sudachi(_) => s.split_inclusive(|_| true).collect(),
         };
         if covers(s, &toks) {
             toks

@@ -1,19 +1,18 @@
-//! The image exports: the whole Library as one long PNG (its totals, each
-//! language's vocabulary and every book), and one book's Overview. Laid
+//! The image exports: the whole Library as one long PNG (its totals, its
+//! vocabulary and every book), and one book's Overview. Laid
 //! out with egui in an offscreen context in the window's theme and drawn
 //! by [`crate::raster`] on a background thread.
 
 use crate::charts::{self, Band, Point};
-use crate::library_stats::{Counted, fmt_time, length, pct, reading_minutes, unit};
+use crate::library_stats::{Counted, fmt_time, length, pct, reading_minutes};
 use crate::raster;
-use crate::{App, difficulty_color, difficulty_fill, file_name, fmt_int, mode_badge, palette};
+use crate::{App, difficulty_color, difficulty_fill, file_name, fmt_int, palette, script_badge};
 use eframe::egui::{
     self, Align2, Color32, FontFamily, FontId, Rect, RichText, Sense, Stroke, StrokeKind,
     TextureHandle, epaint::Mesh, pos2, text::LayoutJob, vec2,
 };
 use hanstat::anki::Difficulty;
 use hanstat::history;
-use hanstat::lang::Language;
 use hanstat::script::Variant;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -605,7 +604,7 @@ fn texture(ctx: &egui::Context, name: &str, img: image::DynamicImage) -> Texture
 }
 
 /// The cover fitted in `bx`, centred, with rounded corners and a shadow;
-/// without one, the title's first letter on the language's colour.
+/// without one, the title's first letter on the script's colour.
 fn cover(
     ui: &egui::Ui,
     look: Look,
@@ -657,12 +656,6 @@ fn variant_of(s: &history::Stats) -> Option<Variant> {
     }
 }
 
-/// White text on the language's colour.
-fn lang_pill(lang: Language, variant: Option<Variant>) -> (String, Color32, Color32) {
-    let (badge, color) = mode_badge(lang, variant);
-    (badge.to_owned(), palette::cat().crust, color)
-}
-
 /// `(percent, n)` points of a frequency list's cumulative coverage, at
 /// about 160 ranks spread evenly on a log scale.
 fn coverage_points(counts: &[u32]) -> Vec<(usize, f64)> {
@@ -707,7 +700,6 @@ impl App {
         else {
             return;
         };
-        self.load_read_marks();
         let look = Look::new(ctx.theme() == egui::Theme::Dark);
         let scene = raster::lay_out(
             ctx,
@@ -792,40 +784,23 @@ impl App {
         let speeds = self.speeds();
         let entries = &self.history.entries;
         let read_at = self.read_dates();
-        let mut langs: Vec<(Language, usize)> = Language::ALL
-            .iter()
-            .map(|&l| (l, entries.iter().filter(|e| e.stats.language == l).count()))
-            .filter(|x| x.1 > 0)
-            .collect();
-        langs.sort_by_key(|x| std::cmp::Reverse(x.1));
 
         page(ui, look, |ui| {
             let books = entries.len();
-            let lang_list = langs
-                .iter()
-                .map(|(l, n)| format!("{n} {}", l.name()))
-                .collect::<Vec<_>>()
-                .join(" · ");
             header(
                 ui,
                 look,
                 "hanstat · Library",
                 "My reading library",
                 &format!(
-                    "{} {} · {lang_list}",
+                    "{} {}",
                     fmt_int(books as u64),
                     if books == 1 { "book" } else { "books" }
                 ),
             );
 
-            section(
-                ui,
-                look,
-                "At a glance",
-                "Every book's last analysis, all languages together",
-            );
+            section(ui, look, "At a glance", "Every book's last analysis");
             let han: u64 = entries.iter().map(|e| e.stats.han_total).sum();
-            let kana: u64 = entries.iter().map(|e| e.stats.kana_total).sum();
             let words: u64 = entries.iter().map(|e| e.stats.words_total).sum();
             let minutes: f64 = entries
                 .iter()
@@ -837,20 +812,15 @@ impl App {
                 .count();
             let mut t = vec![
                 tile(
-                    "Books",
-                    fmt_int(books as u64),
-                    format!("{} languages", langs.len()),
-                ),
-                tile(
                     "Characters",
                     fmt_int(han),
-                    if kana > 0 {
-                        format!("Chinese characters and kanji, + {} kana", fmt_int(kana))
-                    } else {
-                        "Chinese characters".to_owned()
-                    },
+                    format!("{} per book", fmt_int(han / books.max(1) as u64)),
                 ),
-                tile("Words", fmt_int(words), "running words, as segmented"),
+                tile(
+                    "Words",
+                    fmt_int(words),
+                    format!("{} per book", fmt_int(words / books.max(1) as u64)),
+                ),
                 tile(
                     "Reading time",
                     fmt_time(minutes),
@@ -859,7 +829,11 @@ impl App {
                 tile(
                     "Books read",
                     fmt_int(read as u64),
-                    format!("{:.0}% of the library", pct(read, books)),
+                    format!(
+                        "{:.0}% of the {} books",
+                        pct(read, books),
+                        fmt_int(books as u64)
+                    ),
                 )
                 .color(if read > 0 { palette::good() } else { look.text }),
             ];
@@ -868,128 +842,40 @@ impl App {
                     tile(
                         "Longest book",
                         e.title.clone(),
-                        format!("{} {}", fmt_int(length(&e.stats)), unit(e.stats.language)),
+                        format!("{} characters", fmt_int(length(&e.stats))),
                     )
                     .book(),
                 );
             }
             tiles(ui, look, 3, &t);
 
-            for &(lang, _) in &langs {
-                self.language_block(ui, look, lang, covers, &read_at, speeds);
-            }
+            self.vocabulary_block(ui, look, covers, &read_at, speeds);
         });
     }
 
-    fn language_block(
+    /// The books' vocabulary against what is known now, then every book.
+    fn vocabulary_block(
         &self,
         ui: &mut egui::Ui,
         look: Look,
-        lang: Language,
         covers: &Covers,
         read_at: &HashMap<String, u64>,
-        speeds: (f64, f64, f64),
+        speeds: f64,
     ) {
-        let books: Vec<&history::Entry> = self
-            .history
-            .entries
-            .iter()
-            .filter(|e| e.stats.language == lang)
-            .collect();
-        let counted: Option<&Counted> = self.stats.shown.get(&lang);
+        let books: Vec<&history::Entry> = self.history.entries.iter().collect();
+        let counted: Option<&Counted> = self.stats.shown.as_ref();
         let source = counted.and_then(|c| c.source.as_deref());
 
-        // The language's heading: its badge and name.
-        ui.add_space(46.0);
-        let (r, _) = ui.allocate_exact_size(vec2(CONTENT, 44.0), Sense::hover());
-        let p = ui.painter();
-        // The script's badge when every book has the same, else the language's.
-        let first = books.first().and_then(|e| variant_of(&e.stats));
-        let variant = books
-            .iter()
-            .all(|e| variant_of(&e.stats) == first)
-            .then_some(first)
-            .flatten();
-        let (_, fg, bg) = lang_pill(lang, variant);
-        let w = pill(
-            p,
-            r.left_center(),
-            mode_badge(lang, variant).0,
-            18.0,
-            fg,
-            bg,
+        section(
+            ui,
+            look,
+            "Vocabulary",
+            &match source {
+                Some(s) => format!("The books' words; known now: {s}"),
+                None => "The books' words".to_owned(),
+            },
         );
-        p.text(
-            pos2(r.left() + w + 14.0, r.center().y),
-            Align2::LEFT_CENTER,
-            lang.name(),
-            bold(30.0),
-            look.text,
-        );
-        p.text(
-            r.right_center(),
-            Align2::RIGHT_CENTER,
-            format!(
-                "{} {}",
-                books.len(),
-                if books.len() == 1 { "book" } else { "books" }
-            ),
-            regular(16.0),
-            look.weak,
-        );
-        ui.add_space(6.0);
-        if let Some(s) = source {
-            ui.label(
-                RichText::new(format!("Known now: {s}"))
-                    .size(14.0)
-                    .color(look.weak),
-            );
-        }
-        ui.add_space(16.0);
-
-        // Size, then vocabulary.
-        let han: u64 = books.iter().map(|e| e.stats.han_total).sum();
-        let kana: u64 = books.iter().map(|e| e.stats.kana_total).sum();
-        let words: u64 = books.iter().map(|e| e.stats.words_total).sum();
-        let minutes: f64 = books
-            .iter()
-            .map(|e| reading_minutes(&e.stats, speeds))
-            .sum();
-        let read = books.iter().filter(|e| read_at.contains_key(&e.id)).count();
         let mut t = Vec::new();
-        if lang != Language::Korean {
-            t.push(tile(
-                if lang == Language::Japanese {
-                    "Kanji"
-                } else {
-                    "Characters"
-                },
-                fmt_int(han),
-                if lang == Language::Japanese {
-                    format!("+ {} kana", fmt_int(kana))
-                } else {
-                    format!("{} per book", fmt_int(han / books.len() as u64))
-                },
-            ));
-        }
-        t.push(tile(
-            "Words",
-            fmt_int(words),
-            format!("{} per book", fmt_int(words / books.len() as u64)),
-        ));
-        t.push(tile(
-            "Reading time",
-            fmt_time(minutes),
-            "at the speeds set in hanstat",
-        ));
-        t.push(
-            tile(
-                "Read",
-                format!("{read} of {}", books.len()),
-                "books marked read",
-            )
-            .color(if read > 0 { palette::good() } else { look.text }),
-        );
         if let Some(c) = counted {
             let w = &c.words;
             t.push(tile(
@@ -1000,17 +886,11 @@ impl App {
                     fmt_int(w.spread.first().copied().unwrap_or(0) as u64)
                 ),
             ));
-            if lang != Language::Korean {
-                t.push(tile(
-                    if lang == Language::Japanese {
-                        "Distinct kanji"
-                    } else {
-                        "Distinct characters"
-                    },
-                    fmt_int(c.chars.unique as u64),
-                    format!("{} in all", fmt_int(c.chars.total)),
-                ));
-            }
+            t.push(tile(
+                "Distinct characters",
+                fmt_int(c.chars.unique as u64),
+                format!("{} in all", fmt_int(c.chars.total)),
+            ));
             t.push(tile(
                 "Words for 98%",
                 fmt_int(w.cover_at[3] as u64),
@@ -1035,24 +915,20 @@ impl App {
                         fmt_int(w.vocab as u64)
                     ),
                 ));
-                if lang != Language::Korean {
-                    t.push(tile(
-                        if lang == Language::Japanese {
-                            "Kanji known"
-                        } else {
-                            "Characters known"
-                        },
-                        format!("{:.1}%", pct(c.chars.known, c.chars.unique)),
-                        format!(
-                            "{} of {}",
-                            fmt_int(c.chars.known as u64),
-                            fmt_int(c.chars.unique as u64)
-                        ),
-                    ));
-                }
+                t.push(tile(
+                    "Characters known",
+                    format!("{:.1}%", pct(c.chars.known, c.chars.unique)),
+                    format!(
+                        "{} of {}",
+                        fmt_int(c.chars.known as u64),
+                        fmt_int(c.chars.unique as u64)
+                    ),
+                ));
             }
         }
-        tiles(ui, look, cols_for(t.len()), &t);
+        if !t.is_empty() {
+            tiles(ui, look, cols_for(t.len()), &t);
+        }
 
         // How hard the books are now.
         let known_now: HashMap<&str, f64> = match (counted, source.is_some()) {
@@ -1129,7 +1005,7 @@ impl App {
                     chart_card(
                         &mut cols[1],
                         look,
-                        &format!("Book lengths ({})", unit(lang)),
+                        "Book lengths (characters)",
                         "Longest first",
                         |ui| charts::columns(ui, &lens, None, CHART_HEIGHT, &charts::compact),
                     );
@@ -1170,10 +1046,7 @@ impl App {
                         &mut cols[1],
                         look,
                         "Length and difficulty",
-                        &format!(
-                            "Running words known now against length in {} (log scale)",
-                            unit(lang)
-                        ),
+                        "Running words known now against length in characters (log scale)",
                         |ui| charts::scatter(ui, &points, &bands, (y_lo, 100.0), CHART_HEIGHT),
                     );
                 }
@@ -1183,12 +1056,7 @@ impl App {
         // Every book.
         ui.add_space(26.0);
         let (r, _) = ui.allocate_exact_size(vec2(CONTENT, 16.0), Sense::hover());
-        caps(
-            ui.painter(),
-            r.left_top(),
-            &format!("{} books", lang.name()),
-            look.weak,
-        );
+        caps(ui.painter(), r.left_top(), "Books", look.weak);
         ui.add_space(12.0);
         let style_on = self.style_on();
         let scores: HashMap<&str, f32> = if style_on {
@@ -1234,13 +1102,13 @@ impl App {
         tex: Option<&TextureHandle>,
         read: Option<u64>,
         style: Option<String>,
-        speeds: (f64, f64, f64),
+        speeds: f64,
     ) {
         let p = ui.painter();
         card(p, r, look);
         let s = &e.stats;
         let variant = variant_of(s);
-        let (badge, lang_color) = mode_badge(s.language, variant);
+        let (badge, lang_color) = script_badge(variant);
         let bx = Rect::from_min_size(r.min + vec2(18.0, 18.0), vec2(86.0, r.height() - 36.0));
         cover(ui, look, bx, tex, &e.title, lang_color);
 
@@ -1251,7 +1119,7 @@ impl App {
         let title_h = g.size().y;
         p.galley(pos2(left, top), g, look.text);
 
-        // Language, difficulty, read, writing style.
+        // Script, difficulty, read, writing style.
         let y = top + title_h + 16.0;
         let mut x = left;
         x += pill(p, pos2(x, y), badge, 11.5, palette::cat().crust, lang_color) + 6.0;
@@ -1279,28 +1147,12 @@ impl App {
         }
 
         // Figures along the bottom.
-        let figures: Vec<(&str, String)> = if s.language == Language::Korean {
-            vec![
-                ("Words", fmt_int(s.words_total)),
-                ("Unique", fmt_int(s.words_unique)),
-                ("For 98%", fmt_int(s.words_for_98)),
-                ("Reading", fmt_time(reading_minutes(s, speeds))),
-            ]
-        } else {
-            vec![
-                (
-                    if s.language == Language::Japanese {
-                        "Kanji"
-                    } else {
-                        "Characters"
-                    },
-                    fmt_int(s.han_total),
-                ),
-                ("Words", fmt_int(s.words_total)),
-                ("Unique words", fmt_int(s.words_unique)),
-                ("Reading", fmt_time(reading_minutes(s, speeds))),
-            ]
-        };
+        let figures: Vec<(&str, String)> = vec![
+            ("Characters", fmt_int(s.han_total)),
+            ("Words", fmt_int(s.words_total)),
+            ("Unique words", fmt_int(s.words_unique)),
+            ("Reading", fmt_time(reading_minutes(s, speeds))),
+        ];
         let col = width / figures.len() as f32;
         let bottom = r.bottom() - 18.0;
         for (i, (label, value)) in figures.iter().enumerate() {
@@ -1326,20 +1178,18 @@ impl App {
         let Some(r) = self.report.as_ref() else {
             return;
         };
-        let lang = r.language;
-        let chinese = lang == Language::Chinese;
-        let japanese = lang == Language::Japanese;
         let title = r
             .title
             .clone()
             .or_else(|| self.path.as_deref().map(crate::file_stem))
             .unwrap_or_default();
-        let (badge, lang_color) = mode_badge(lang, chinese.then_some(r.variant));
+        let (badge, lang_color) = script_badge(Some(r.variant));
         let style_off = self
             .report_id
             .as_deref()
             .map_or(0.0, |id| self.style_offset(id));
-        let style_rating = (chinese && self.style_on())
+        let style_rating = self
+            .style_on()
             .then(|| {
                 let id = self.report_id.as_deref()?;
                 let s = self.style.store.get(id)?;
@@ -1355,25 +1205,12 @@ impl App {
             self.included.len(),
         );
         // Reading speed as set on the Overview.
-        let (minutes, speed) = match lang {
-            Language::Chinese => {
-                let v = self.cpm.unwrap_or(self.cpm()) as f64;
-                (
-                    r.han_total as f64 / v,
-                    format!("{v:.0} characters a minute"),
-                )
-            }
-            Language::Japanese => {
-                let v = self.ja_cpm.unwrap_or(self.settings.ja_cpm) as f64;
-                (
-                    (r.han_total + r.kana_total) as f64 / v,
-                    format!("{v:.0} characters a minute"),
-                )
-            }
-            Language::Korean => {
-                let v = self.wpm.unwrap_or(self.settings.wpm) as f64;
-                (r.words_total as f64 / v, format!("{v:.0} words a minute"))
-            }
+        let (minutes, speed) = {
+            let v = self.cpm.unwrap_or(self.cpm()) as f64;
+            (
+                r.han_total as f64 / v,
+                format!("{v:.0} characters a minute"),
+            )
         };
         let cover_at = |cov: &[hanstat::analyze::Coverage], p: f64| {
             cov.iter()
@@ -1450,25 +1287,15 @@ impl App {
 
             // The text.
             section(ui, look, "The text", "");
-            let mut t = Vec::new();
-            if chinese || japanese {
-                t.push(tile(
-                    if japanese { "Kanji" } else { "Characters" },
-                    fmt_int(r.han_total),
-                    format!(
-                        "{} unique · {} once",
-                        fmt_int(r.han_unique as u64),
-                        fmt_int(r.han_hapax as u64)
-                    ),
-                ));
-            }
-            if japanese {
-                t.push(tile(
-                    "Kana",
-                    fmt_int(r.kana_total),
-                    "counted with the kanji for reading time",
-                ));
-            }
+            let mut t = vec![tile(
+                "Characters",
+                fmt_int(r.han_total),
+                format!(
+                    "{} unique · {} once",
+                    fmt_int(r.han_unique as u64),
+                    fmt_int(r.han_hapax as u64)
+                ),
+            )];
             t.push(tile(
                 "Words",
                 fmt_int(r.words_total),
@@ -1478,17 +1305,11 @@ impl App {
                     fmt_int(r.words_hapax as u64)
                 ),
             ));
-            if chinese || japanese {
-                t.push(tile(
-                    if japanese {
-                        "Kanji for 99%"
-                    } else {
-                        "Characters for 99%"
-                    },
-                    fmt_int(cover_at(&r.char_coverage, 99.0)),
-                    format!("{} for 95%", fmt_int(cover_at(&r.char_coverage, 95.0))),
-                ));
-            }
+            t.push(tile(
+                "Characters for 99%",
+                fmt_int(cover_at(&r.char_coverage, 99.0)),
+                format!("{} for 95%", fmt_int(cover_at(&r.char_coverage, 95.0))),
+            ));
             t.push(tile(
                 "Words for 98%",
                 fmt_int(cover_at(&r.word_coverage, 98.0)),
@@ -1502,28 +1323,18 @@ impl App {
             t.push(tile(
                 "Sentences",
                 fmt_int(r.sentences),
-                if chinese {
-                    format!("{:.1} characters each", r.avg_sentence_han)
-                } else {
-                    format!("{:.1} words each", r.avg_sentence_words.unwrap_or(0.0))
-                },
+                format!("{:.1} characters each", r.avg_sentence_han),
             ));
             t.push(tile(
                 "Paragraphs",
                 fmt_int(r.paragraphs),
-                if chinese {
-                    format!("{:.1} characters each", r.avg_paragraph_han)
-                } else {
-                    format!("{:.1} words each", r.avg_paragraph_words.unwrap_or(0.0))
-                },
+                format!("{:.1} characters each", r.avg_paragraph_han),
             ));
-            if chinese {
-                t.push(tile(
-                    "Average word",
-                    format!("{:.2}", r.avg_word_len),
-                    "characters long",
-                ));
-            }
+            t.push(tile(
+                "Average word",
+                format!("{:.2}", r.avg_word_len),
+                "characters long",
+            ));
             tiles(ui, look, cols_for(t.len()), &t);
 
             // What is known.
@@ -1568,21 +1379,15 @@ impl App {
                         ),
                     ),
                 ];
-                if chinese || japanese {
-                    t.push(tile(
-                        if japanese {
-                            "Kanji known"
-                        } else {
-                            "Characters known"
-                        },
-                        format!("{:.1}%", c.unique_chars.percent()),
-                        format!(
-                            "{} of {}",
-                            fmt_int(c.unique_chars.known),
-                            fmt_int(c.unique_chars.total)
-                        ),
-                    ));
-                }
+                t.push(tile(
+                    "Characters known",
+                    format!("{:.1}%", c.unique_chars.percent()),
+                    format!(
+                        "{} of {}",
+                        fmt_int(c.unique_chars.known),
+                        fmt_int(c.unique_chars.total)
+                    ),
+                ));
                 t.push(tile("Difficulty", d.label(), d.description()).color(difficulty_color(d)));
                 tiles(ui, look, cols_for(t.len()), &t);
             }
@@ -1607,7 +1412,7 @@ impl App {
                     look,
                     "Words to know",
                     "The most frequent items needed to recognise a share of the running text",
-                    |ui| coverage_table(ui, look, r, chinese || japanese, japanese),
+                    |ui| coverage_table(ui, look, r),
                 );
                 sized_card(
                     &mut cols[0],
@@ -1632,14 +1437,8 @@ impl App {
     }
 }
 
-/// Rows of coverage: percent, characters (if any), words.
-fn coverage_table(
-    ui: &mut egui::Ui,
-    look: Look,
-    r: &hanstat::analyze::Report,
-    chars: bool,
-    japanese: bool,
-) {
+/// Rows of coverage: percent, characters, words.
+fn coverage_table(ui: &mut egui::Ui, look: Look, r: &hanstat::analyze::Report) {
     let rows = r.word_coverage.len();
     let row_h = 28.0;
     let (rect, _) = ui.allocate_exact_size(
@@ -1647,15 +1446,11 @@ fn coverage_table(
         Sense::hover(),
     );
     let p = ui.painter();
-    let cols: Vec<f32> = if chars {
-        vec![
-            rect.left() + 8.0,
-            rect.left() + rect.width() * 0.55,
-            rect.right() - 8.0,
-        ]
-    } else {
-        vec![rect.left() + 8.0, rect.right() - 8.0]
-    };
+    let cols = [
+        rect.left() + 8.0,
+        rect.left() + rect.width() * 0.55,
+        rect.right() - 8.0,
+    ];
     let head_y = rect.top() + row_h / 2.0;
     p.text(
         pos2(cols[0], head_y),
@@ -1664,17 +1459,15 @@ fn coverage_table(
         bold(11.0),
         look.weak,
     );
-    if chars {
-        p.text(
-            pos2(cols[1], head_y),
-            Align2::RIGHT_CENTER,
-            if japanese { "KANJI" } else { "CHARACTERS" },
-            bold(11.0),
-            look.weak,
-        );
-    }
     p.text(
-        pos2(*cols.last().unwrap(), head_y),
+        pos2(cols[1], head_y),
+        Align2::RIGHT_CENTER,
+        "CHARACTERS",
+        bold(11.0),
+        look.weak,
+    );
+    p.text(
+        pos2(cols[2], head_y),
         Align2::RIGHT_CENTER,
         "WORDS",
         bold(11.0),
@@ -1694,21 +1487,19 @@ fn coverage_table(
             bold(14.0),
             look.text,
         );
-        if chars {
-            let c = r
-                .char_coverage
-                .get(i)
-                .map_or("–".into(), |c| fmt_int(c.items as u64));
-            p.text(
-                pos2(cols[1], y),
-                Align2::RIGHT_CENTER,
-                c,
-                regular(14.0),
-                look.text,
-            );
-        }
+        let c = r
+            .char_coverage
+            .get(i)
+            .map_or("–".into(), |c| fmt_int(c.items as u64));
         p.text(
-            pos2(*cols.last().unwrap(), y),
+            pos2(cols[1], y),
+            Align2::RIGHT_CENTER,
+            c,
+            regular(14.0),
+            look.text,
+        );
+        p.text(
+            pos2(cols[2], y),
             Align2::RIGHT_CENTER,
             fmt_int(w.items as u64),
             regular(14.0),

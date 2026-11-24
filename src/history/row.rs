@@ -4,7 +4,6 @@
 
 use super::Known;
 use crate::analyze::Report;
-use crate::lang::Language;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -23,7 +22,7 @@ pub struct Entry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sections: Option<Vec<bool>>,
     /// What else the row was computed from: the build, the user dictionary,
-    /// the known words and the settings for its language (`App::lang_inputs`
+    /// the known words and the analysis settings (`App::lang_inputs`
     /// in the window). Empty if unknown. A row whose inputs differ from the
     /// current ones is analysed again in the background.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -42,18 +41,18 @@ impl Entry {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Stats {
     pub format: String,
-    pub language: Language,
+    /// Always Chinese now; rows of Korean and Japanese books, recorded by
+    /// earlier builds, are dropped when the Library is read
+    /// (`History::load_from`).
+    #[serde(default)]
+    pub language: RowLanguage,
     /// Simplified, Traditional, Mixed or Unknown (Chinese only).
     pub variant: String,
     pub segmenter: String,
     pub sections_included: usize,
     pub sections_total: usize,
-    /// Chinese characters, or kanji in a Japanese book; zero for Korean.
     pub han_total: u64,
     pub han_unique: u64,
-    /// Japanese: kana, counted with the kanji for reading time.
-    #[serde(default)]
-    pub kana_total: u64,
     pub words_total: u64,
     pub words_unique: u64,
     /// Most frequent words needed to cover 98% of the running words.
@@ -62,20 +61,37 @@ pub struct Stats {
     pub known: Option<Known>,
 }
 
+/// The language a row was recorded in: `"Chinese"`, or `"Korean"` or
+/// `"Japanese"` in a row from a build that still analysed them. Still
+/// written, so the file stays readable by those builds.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RowLanguage(String);
+
+impl Default for RowLanguage {
+    fn default() -> Self {
+        RowLanguage("Chinese".to_owned())
+    }
+}
+
+impl RowLanguage {
+    pub fn is_chinese(&self) -> bool {
+        self.0 == "Chinese"
+    }
+}
+
 impl Stats {
     /// From the report the Overview shows.
     pub fn from_report(r: &Report) -> Stats {
         let known = r.anki.as_ref().map(Known::from_coverage);
         Stats {
             format: r.format.to_owned(),
-            language: r.language,
+            language: RowLanguage::default(),
             variant: format!("{:?}", r.variant),
             segmenter: r.segmenter.label().to_owned(),
             sections_included: r.sections.iter().filter(|s| s.included).count(),
             sections_total: r.sections.len(),
             han_total: r.han_total,
             han_unique: r.han_unique as u64,
-            kana_total: r.kana_total,
             words_total: r.words_total,
             words_unique: r.words_unique as u64,
             words_for_98: r

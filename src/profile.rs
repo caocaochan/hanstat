@@ -1,6 +1,6 @@
 //! A book's vocabulary, kept for the reading path ([`crate::plan`]): its
 //! word counts over the included sections, the names left out of its
-//! difficulty, and (Japanese) how its words are spelled and split. Unlike
+//! difficulty. Unlike
 //! the analysis cache, which is trimmed to a size and keyed by everything the
 //! analysis depends on, a profile lasts as long as the book's History entry.
 //!
@@ -8,9 +8,7 @@
 //! the History entry's id (the SHA-256 of the book's file).
 
 use crate::analyze::Report;
-use crate::lang::Language;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Layout of a profile; one of another layout is treated as missing.
@@ -21,7 +19,6 @@ pub struct Profile {
     pub format: u32,
     /// The History entry's id.
     pub id: String,
-    pub language: Language,
     /// Simplified, Traditional, Mixed or Unknown (Chinese only).
     pub variant: String,
     /// The segmenter's label, e.g. "LTP perceptron".
@@ -34,13 +31,7 @@ pub struct Profile {
     /// more characters) is left out of the running words unless known.
     #[serde(default)]
     pub names: Vec<String>,
-    /// Japanese: the short-unit parts of long-unit words (冒険者 → 冒険, 者).
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub parts: HashMap<String, Vec<String>>,
-    /// Japanese: how the book spells a word key, where it differs (為る → する).
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub display: HashMap<String, String>,
-    /// Character (kanji) counts over the included sections, as
+    /// Character counts over the included sections, as
     /// `Report::char_freq`: with them a Library row's coverage is computed
     /// again from the profile alone when only the known words change.
     /// `None` in a profile written before they were kept.
@@ -62,13 +53,10 @@ impl Profile {
         Profile {
             format: FORMAT,
             id: id.to_owned(),
-            language: r.language,
             variant: format!("{:?}", r.variant),
             segmenter: r.segmenter.label().to_owned(),
             words: r.word_freq.clone(),
             names,
-            parts: r.word_parts.clone(),
-            display: r.word_display.clone(),
             chars: Some(r.char_freq.clone()),
         }
     }
@@ -78,24 +66,12 @@ impl Profile {
         use std::hash::{Hash, Hasher};
         let mut h = std::hash::DefaultHasher::new();
         self.id.hash(&mut h);
-        self.language.hash(&mut h);
         self.variant.hash(&mut h);
         self.segmenter.hash(&mut h);
         self.words.hash(&mut h);
         self.names.hash(&mut h);
-        let mut parts: Vec<_> = self.parts.iter().collect();
-        parts.sort_unstable();
-        parts.hash(&mut h);
-        let mut display: Vec<_> = self.display.iter().collect();
-        display.sort_unstable();
-        display.hash(&mut h);
         self.chars.hash(&mut h);
         h.finish()
-    }
-
-    /// The word as this book spells it (Japanese keys may be normalised forms).
-    pub fn shown<'a>(&'a self, w: &'a str) -> &'a str {
-        self.display.get(w).map_or(w, String::as_str)
     }
 
     /// Gzip-compressed JSON, through [`crate::saver`] (in the window,
@@ -128,7 +104,7 @@ pub fn path_in(history: &Path, id: &str) -> PathBuf {
 /// in the background. `included`: the sections to include (the book's
 /// defaults if `None` or not of its length). `words` and
 /// `known` give the user dictionary and the known words passed to the
-/// segmenter for a language. `fold_chars`: see [`analyze::build_report`].
+/// segmenter. `fold_chars`: see [`analyze::build_report`].
 /// Downloads the segmenter's model if missing.
 pub struct Analysed {
     pub book: crate::extract::Book,
@@ -142,23 +118,21 @@ pub fn analyse_file(
     path: &Path,
     kind: crate::segment::SegmenterKind,
     included: Option<&[bool]>,
-    words: &dyn Fn(Language) -> Vec<String>,
-    known: &dyn Fn(Language) -> Vec<String>,
+    words: &[String],
+    known: &[String],
     cache: Option<&crate::cache::Cache>,
     fold_chars: bool,
 ) -> Result<Analysed, String> {
     use crate::{analyze, discover, extract};
     let book = extract::load(path, extract::EncodingChoice::Auto)?;
-    let lang = analyze::detect_language(&book);
     let (tr, si) = analyze::detect_variant(&book);
-    if let Some(m) =
-        crate::segment::model_for(kind.resolve_in(lang, crate::script::classify(tr, si)))
+    if let Some(m) = crate::segment::model_for(kind.resolve(crate::script::classify(tr, si)))
         && !m.is_cached()
     {
         m.ensure(&|_, _| {})?;
     }
-    let user = words(lang);
-    let prep = analyze::analyze_book_cached(&book, kind, &user, &known(lang), cache, &|_, _| {})?;
+    let user = words.to_vec();
+    let prep = analyze::analyze_book_cached(&book, kind, &user, known, cache, &|_, _| {})?;
     let included: Vec<bool> = match included {
         Some(inc) if inc.len() == book.sections.len() => inc.to_vec(),
         _ => book.sections.iter().map(|s| s.default_included()).collect(),
@@ -197,23 +171,19 @@ mod tests {
         let p = Profile {
             format: FORMAT,
             id: "abc".into(),
-            language: Language::Japanese,
-            variant: "Unknown".into(),
-            segmenter: "Sudachi".into(),
-            words: vec![("為る".into(), 9), ("冒険者".into(), 3)],
-            names: vec!["アリス".into()],
-            parts: HashMap::from([("冒険者".into(), vec!["冒険".into(), "者".into()])]),
-            display: HashMap::from([("為る".into(), "する".into())]),
-            chars: Some(vec![('冒', 3), ('険', 3)]),
+            variant: "Simplified".into(),
+            segmenter: "LTP perceptron".into(),
+            words: vec![("我们".into(), 9), ("冒险者".into(), 3)],
+            names: vec!["爱丽丝".into()],
+            chars: Some(vec![('冒', 3), ('险', 3)]),
         };
         let path = path_in(&dir.join("history.json"), &p.id);
         p.save(&path).unwrap();
         let q = Profile::load(&path).unwrap();
         assert_eq!(q.words, p.words);
         assert_eq!(q.digest(), p.digest());
-        assert_eq!(q.shown("為る"), "する");
         let mut r = q.clone();
-        r.names.push("ボブ".into());
+        r.names.push("鲍勃".into());
         assert_ne!(r.digest(), p.digest());
         std::fs::write(&path, b"junk").unwrap();
         assert!(Profile::load(&path).is_none());

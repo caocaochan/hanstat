@@ -10,10 +10,7 @@ pub mod dict;
 pub mod discover;
 pub mod extract;
 pub mod history;
-pub mod japanese;
-pub mod kiwi;
 pub mod known;
-pub mod lang;
 pub mod lexicon;
 pub mod models;
 pub mod plan;
@@ -41,17 +38,17 @@ pub fn read_user_dict(path: &std::path::Path) -> Result<Vec<String>, String> {
         .collect())
 }
 
-/// Where the app keeps `lang`'s forced words: `dictionary.txt` (Chinese),
-/// `dictionary-ko.txt`, `dictionary-ja.txt` in the app folder, in the format
-/// [`read_user_dict`] reads, so the file also works with `hanstat-cli --dict`.
-pub fn user_dict_path(lang: lang::Language) -> std::path::PathBuf {
-    models::app_dir().join(format!("dictionary{}.txt", lang.file_suffix()))
+/// Where the app keeps the forced words: `dictionary.txt` in the app folder,
+/// in the format [`read_user_dict`] reads, so the file also works with
+/// `hanstat-cli --dict`.
+pub fn user_dict_path() -> std::path::PathBuf {
+    models::app_dir().join("dictionary.txt")
 }
 
-/// The app's saved forced words for `lang` (none if the file doesn't exist),
-/// with a warning if it exists but can't be read.
-pub fn load_user_dict(lang: lang::Language) -> (Vec<String>, Option<String>) {
-    load_user_dict_from(&user_dict_path(lang))
+/// The app's saved forced words (none if the file doesn't exist), with a
+/// warning if it exists but can't be read.
+pub fn load_user_dict() -> (Vec<String>, Option<String>) {
+    load_user_dict_from(&user_dict_path())
 }
 
 fn load_user_dict_from(p: &std::path::Path) -> (Vec<String>, Option<String>) {
@@ -68,9 +65,9 @@ fn load_user_dict_from(p: &std::path::Path) -> (Vec<String>, Option<String>) {
     }
 }
 
-/// Save `lang`'s forced words (an empty list removes the file).
-pub fn save_user_dict(lang: lang::Language, words: &[String]) -> Result<(), String> {
-    save_user_dict_to(&user_dict_path(lang), words)
+/// Save the forced words (an empty list removes the file).
+pub fn save_user_dict(words: &[String]) -> Result<(), String> {
+    save_user_dict_to(&user_dict_path(), words)
 }
 
 fn save_user_dict_to(p: &std::path::Path, words: &[String]) -> Result<(), String> {

@@ -21,15 +21,11 @@ pub struct Settings {
     pub skip_hapax: bool,
     /// Default reading speeds, for the Library and each book's Overview (where
     /// a book's speed can be changed on its own to try another).
-    /// Chinese: characters per minute. Used when `cpm_by_hand` is on, and
-    /// until a speed is measured in the reader otherwise.
+    /// Characters per minute. Used when `cpm_by_hand` is on, and until a
+    /// speed is measured in the reader otherwise.
     pub cpm: f32,
-    /// Use `cpm` instead of the Chinese speed measured in the reader.
+    /// Use `cpm` instead of the speed measured in the reader.
     pub cpm_by_hand: bool,
-    /// Japanese: kanji and kana per minute.
-    pub ja_cpm: f32,
-    /// Korean: words per minute (as counted: content words).
-    pub wpm: f32,
     /// Keyboard shortcuts changed from their defaults, by action, as
     /// `Ctrl+Shift+K` (empty: none). Read by the app's `shortcuts` module.
     pub shortcuts: BTreeMap<String, String>,
@@ -80,8 +76,6 @@ impl Default for Settings {
             skip_hapax: false,
             cpm: 300.0,
             cpm_by_hand: false,
-            ja_cpm: 300.0,
-            wpm: 100.0,
             shortcuts: BTreeMap::new(),
             duchinese: DuChinese::default(),
         }

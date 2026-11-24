@@ -886,13 +886,10 @@ pub fn known_share(text: &Text, inputs: &EstimateInputs) -> Result<f64, String> 
         decode_errors: 0,
         cover: None,
     };
-    let lang = analyze::detect_language(&book);
     let (tr, si) = analyze::detect_variant(&book);
-    if let Some(m) = hanstat::segment::model_for(
-        inputs
-            .kind
-            .resolve_in(lang, hanstat::script::classify(tr, si)),
-    ) && !m.is_cached()
+    if let Some(m) =
+        hanstat::segment::model_for(inputs.kind.resolve(hanstat::script::classify(tr, si)))
+        && !m.is_cached()
     {
         m.ensure(&|_, _| {})?;
     }
@@ -924,7 +921,6 @@ pub fn known_share(text: &Text, inputs: &EstimateInputs) -> Result<f64, String> 
         &report.char_freq,
         &report.word_freq,
         &names,
-        &report.word_parts,
         false,
     );
     Ok(cov.running_words.percent())

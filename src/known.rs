@@ -7,22 +7,6 @@
 //! and the TOCFL levels of SC-TOP's 華語八千詞表 (2024-09 edition,
 //! Traditional), in `data/TOCFL-2024.tsv`.
 //!
-//! Korean: levels 1급–6급 of 국립국어원's 국제 통용 한국어 표준 교육과정
-//! vocabulary, bundled in `data/KO-standard-2020.tsv`. TOPIK has no official
-//! word list; this is the list TOPIK level vocabularies are built from. It
-//! lists most 하다/되다 verbs only through their noun plus the 2급 affixes
-//! -하다/-되다, so a book's X하다 or X되다 counts as known when X is listed
-//! at a ticked level, or at a lower one if 2급 is ticked (see
-//! [`Settings::apply`]).
-//!
-//! Japanese: JLPT N5–N1 from Jonathan Waller's lists (via
-//! stephenmk/yomitan-jlpt-vocab), bundled in `data/JLPT-waller.tsv`. The JLPT
-//! publishes no word list; these are the lists jisho.org uses. Optionally the
-//! words of the Kaishi 1.5k Anki deck (`data/Kaishi-1.5k.tsv`), for readers who
-//! studied it outside the collection hanstat reads. Entries are keyed by
-//! Sudachi's normalized form, as the book's words are, and imported Japanese
-//! lists are run through Sudachi the same way (see [`Settings::apply`]).
-//!
 //! Books marked read in the Library count too: the most frequent of their
 //! words, taken when the book was marked ([`ReadBook`], [`read_selection`]).
 //!
@@ -32,40 +16,18 @@
 //! and each change would mean segmenting every Chinese book again.
 //!
 //! The ticked levels and the imported lists (copied in, so the source files
-//! may move) are saved per language: `%LOCALAPPDATA%\hanstat\known.json` for
-//! Chinese, `known-ko.json` for Korean and `known-ja.json` for Japanese.
+//! may move) are saved in `%LOCALAPPDATA%\hanstat\known.json`.
 
 use crate::anki::{self, Knowledge};
 use crate::chars;
-use crate::lang::Language;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 static HSK_TSV: &str = include_str!("../data/HSK30-2025.tsv");
 static HSK2_TSV: &str = include_str!("../data/HSK20-2012.tsv");
 static TOCFL_TSV: &str = include_str!("../data/TOCFL-2024.tsv");
-static KO_TSV: &str = include_str!("../data/KO-standard-2020.tsv");
-static JLPT_TSV: &str = include_str!("../data/JLPT-waller.tsv");
-static KAISHI_TSV: &str = include_str!("../data/Kaishi-1.5k.tsv");
-
-/// The Kaishi 1.5k deck's words as (key, headword), in deck order.
-static KAISHI: LazyLock<Vec<(&'static str, &'static str)>> = LazyLock::new(|| {
-    KAISHI_TSV
-        .lines()
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|l| l.split_once('\t').expect("key<TAB>headword"))
-        .collect()
-});
-
-/// The name shown for the Kaishi deck.
-pub const KAISHI_NAME: &str = "Kaishi 1.5k";
-
-/// Distinct words (keys) of the Kaishi 1.5k deck.
-pub fn kaishi_count() -> usize {
-    KAISHI.len()
-}
 
 /// HSK bands: 1–6, and 7 for the shared 7–9 list.
 pub const BANDS: [u8; 7] = [1, 2, 3, 4, 5, 6, 7];
@@ -181,15 +143,6 @@ pub fn tocfl_label(levels: &[u8]) -> String {
     format!("TOCFL {}", parts.join(", "))
 }
 
-/// Korean levels 1급–6급.
-pub const KO_LEVELS: [u8; 6] = [1, 2, 3, 4, 5, 6];
-
-/// JLPT levels, easiest first: 5 is N5.
-pub const JLPT_LEVELS: [u8; 5] = [5, 4, 3, 2, 1];
-
-/// The level at which the Korean affixes -하다 and -되다 are introduced.
-const KO_HADA_LEVEL: u8 = 2;
-
 /// `level<TAB>word[<TAB>note]` lines, each word once, at its lowest level.
 fn parse_levels(tsv: &'static str) -> Vec<(u8, &'static str)> {
     tsv.lines()
@@ -206,103 +159,37 @@ fn parse_levels(tsv: &'static str) -> Vec<(u8, &'static str)> {
 static HSK: LazyLock<Vec<(u8, &'static str)>> = LazyLock::new(|| parse_levels(HSK_TSV));
 static HSK2: LazyLock<Vec<(u8, &'static str)>> = LazyLock::new(|| parse_levels(HSK2_TSV));
 static TOCFL: LazyLock<Vec<(u8, &'static str)>> = LazyLock::new(|| parse_levels(TOCFL_TSV));
-static KO: LazyLock<Vec<(u8, &'static str)>> = LazyLock::new(|| parse_levels(KO_TSV));
-static JLPT: LazyLock<Vec<(u8, &'static str)>> = LazyLock::new(|| parse_levels(JLPT_TSV));
-/// JLPT key → the list's headword (会う, 為る → する), for the kanji it teaches.
-static JLPT_HEAD: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
-    JLPT_TSV
-        .lines()
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter_map(|l| {
-            let mut f = l.split('\t').skip(1);
-            Some((f.next()?, f.next()?))
-        })
-        .collect()
-});
-
-fn table(lang: Language) -> &'static [(u8, &'static str)] {
-    match lang {
-        Language::Chinese => &HSK,
-        Language::Korean => &KO,
-        Language::Japanese => &JLPT,
+/// "HSK 3", "HSK 7–9".
+pub fn band_label(band: u8) -> String {
+    match band {
+        7 => "HSK 7–9".to_owned(),
+        b => format!("HSK {b}"),
     }
-}
-
-/// The levels that can be ticked in `lang`.
-pub fn bands(lang: Language) -> &'static [u8] {
-    match lang {
-        Language::Chinese => &BANDS,
-        Language::Korean => &KO_LEVELS,
-        Language::Japanese => &JLPT_LEVELS,
-    }
-}
-
-/// "HSK 3", "HSK 7–9", "3급", "N5".
-pub fn band_label(lang: Language, band: u8) -> String {
-    match (lang, band) {
-        (Language::Chinese, 7) => "HSK 7–9".to_owned(),
-        (Language::Chinese, b) => format!("HSK {b}"),
-        (Language::Korean, b) => format!("{b}급"),
-        (Language::Japanese, b) => format!("N{b}"),
-    }
-}
-
-/// Words introduced at `band` in `lang`.
-pub fn band_words(lang: Language, band: u8) -> impl Iterator<Item = &'static str> {
-    table(lang)
-        .iter()
-        .filter(move |(b, _)| *b == band)
-        .map(|(_, w)| *w)
-}
-
-pub fn band_count(lang: Language, band: u8) -> usize {
-    band_words(lang, band).count()
 }
 
 /// Words introduced at HSK `band`.
 pub fn hsk_words(band: u8) -> impl Iterator<Item = &'static str> {
-    band_words(Language::Chinese, band)
+    HSK.iter().filter(move |(b, _)| *b == band).map(|(_, w)| *w)
 }
 
 pub fn hsk_count(band: u8) -> usize {
-    band_count(Language::Chinese, band)
+    hsk_words(band).count()
 }
 
-/// "HSK 1–3", "HSK 1, 3, 5–6", "HSK 1–9"; Korean "1–3급", "1, 3, 5–6급";
-/// Japanese "N5–N3", "N5, N3".
-pub fn bands_label(lang: Language, bands: &[u8]) -> String {
+/// "HSK 1–3", "HSK 1, 3, 5–6", "HSK 1–9".
+pub fn bands_label(bands: &[u8]) -> String {
     let mut b: Vec<u8> = bands.to_vec();
     b.sort_unstable();
     b.dedup();
-    if lang == Language::Japanese {
-        // Easiest (N5) first.
-        b.reverse();
-        let mut parts = Vec::new();
-        let mut i = 0;
-        while i < b.len() {
-            let mut j = i;
-            while j + 1 < b.len() && b[j + 1] + 1 == b[j] {
-                j += 1;
-            }
-            parts.push(if i == j {
-                format!("N{}", b[i])
-            } else {
-                format!("N{}–N{}", b[i], b[j])
-            });
-            i = j + 1;
-        }
-        return parts.join(", ");
-    }
-    let hsk_top = lang == Language::Chinese;
     let num = |x: u8| {
-        if hsk_top && x == 7 {
+        if x == 7 {
             "9".to_owned()
         } else {
             x.to_string()
         }
     };
     let first = |x: u8| {
-        if hsk_top && x == 7 {
+        if x == 7 {
             "7–9".to_owned()
         } else {
             x.to_string()
@@ -322,11 +209,7 @@ pub fn bands_label(lang: Language, bands: &[u8]) -> String {
         });
         i = j + 1;
     }
-    match lang {
-        Language::Chinese => format!("HSK {}", parts.join(", ")),
-        Language::Korean => format!("{}급", parts.join(", ")),
-        Language::Japanese => unreachable!("handled above"),
-    }
+    format!("HSK {}", parts.join(", "))
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -358,9 +241,6 @@ pub struct ReadBook {
     pub words: Vec<String>,
     /// How many of them were not known yet when the book was marked.
     pub added: usize,
-    /// Japanese: how the book spells a word key, where it differs (為る → する).
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub display: HashMap<String, String>,
 }
 
 /// The words a read book teaches: of its words occurring at least
@@ -378,55 +258,36 @@ pub fn read_selection(words: &[(String, u32)], percent: u8, min_count: u32) -> V
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Ticked levels (see [`bands`]): HSK bands for Chinese, 급 for Korean, N for Japanese.
-    /// Saved as `hsk` before Korean levels existed.
+    /// Ticked HSK 3.0 bands (see [`BANDS`]). Saved as `hsk` in old files.
     #[serde(alias = "hsk")]
     pub levels: Vec<u8>,
     pub lists: Vec<WordList>,
     /// Words marked known one by one with + in the Words tab, as the book wrote them.
     pub marked: Vec<String>,
-    /// Japanese: the words of the Kaishi 1.5k Anki deck count as known.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub kaishi: bool,
-    /// Chinese: ticked HSK 2.0 levels (see [`HSK2_LEVELS`]), alongside the HSK 3.0 ones.
+    /// Ticked HSK 2.0 levels (see [`HSK2_LEVELS`]), alongside the HSK 3.0 ones.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub hsk2: Vec<u8>,
-    /// Chinese: ticked TOCFL levels (see [`TOCFL_LEVELS`]), alongside the HSK ones.
+    /// Ticked TOCFL levels (see [`TOCFL_LEVELS`]), alongside the HSK ones.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tocfl: Vec<u8>,
     /// Books marked read in the Library, in the order they were marked.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub read: Vec<ReadBook>,
-    /// Which language's file these settings belong to (not stored in it).
-    #[serde(skip)]
-    pub language: Language,
 }
 
 impl Settings {
-    /// The Chinese file (`known.json`).
+    /// `known.json`.
     pub fn path() -> PathBuf {
-        Self::path_for(Language::Chinese)
+        crate::models::app_dir().join("known.json")
     }
 
-    /// `known.json` (Chinese), `known-ko.json` (Korean) or `known-ja.json` (Japanese).
-    pub fn path_for(lang: Language) -> PathBuf {
-        lang.settings_path("known")
-    }
-
-    /// The Chinese settings. Missing file → nothing known. A corrupt file is reported and ignored.
+    /// Missing file → nothing known. A corrupt file is reported and ignored.
     pub fn load() -> (Settings, Option<String>) {
-        Self::load_for(Language::Chinese)
+        Self::load_from(&Self::path())
     }
 
-    pub fn load_for(lang: Language) -> (Settings, Option<String>) {
-        let (mut s, warn) = Self::load_from(&Self::path_for(lang));
-        s.language = lang;
-        (s, warn)
-    }
-
-    /// Saved to this language's file.
     pub fn save(&self) -> Result<(), String> {
-        self.save_to(&Self::path_for(self.language))
+        self.save_to(&Self::path())
     }
 
     /// Missing → nothing known. An unreadable file is kept aside (never
@@ -444,9 +305,8 @@ impl Settings {
         self.levels.is_empty()
             && self.lists.iter().all(|l| l.words.is_empty())
             && self.marked.is_empty()
-            && !self.kaishi_on()
-            && self.hsk2_levels().is_empty()
-            && self.tocfl_levels().is_empty()
+            && self.hsk2.is_empty()
+            && self.tocfl.is_empty()
             && self.read.iter().all(|b| b.words.is_empty())
     }
 
@@ -470,20 +330,6 @@ impl Settings {
         self.read.len() != n
     }
 
-    /// The Kaishi 1.5k words are marked known (Japanese only).
-    pub fn kaishi_on(&self) -> bool {
-        self.kaishi && self.language == Language::Japanese
-    }
-
-    /// The ticked HSK 2.0 levels that apply (Chinese only).
-    pub fn hsk2_levels(&self) -> &[u8] {
-        if self.language == Language::Chinese {
-            &self.hsk2
-        } else {
-            &[]
-        }
-    }
-
     pub fn hsk2_on(&self, level: u8) -> bool {
         self.hsk2.contains(&level)
     }
@@ -493,15 +339,6 @@ impl Settings {
         if on {
             self.hsk2.push(level);
             self.hsk2.sort_unstable();
-        }
-    }
-
-    /// The ticked TOCFL levels that apply (Chinese only).
-    pub fn tocfl_levels(&self) -> &[u8] {
-        if self.language == Language::Chinese {
-            &self.tocfl
-        } else {
-            &[]
         }
     }
 
@@ -554,17 +391,17 @@ impl Settings {
 
     /// Every word marked known (may repeat).
     pub fn words(&self) -> impl Iterator<Item = &str> {
-        let levels = table(self.language)
+        let levels = HSK
             .iter()
             .filter(|(b, _)| self.levels.contains(b))
             .map(|(_, w)| *w);
         let hsk2 = HSK2
             .iter()
-            .filter(|(b, _)| self.hsk2_levels().contains(b))
+            .filter(|(b, _)| self.hsk2.contains(b))
             .map(|(_, w)| *w);
         let tocfl = TOCFL
             .iter()
-            .filter(|(b, _)| self.tocfl_levels().contains(b))
+            .filter(|(b, _)| self.tocfl.contains(b))
             .map(|(_, w)| *w);
         levels
             .chain(hsk2)
@@ -582,19 +419,6 @@ impl Settings {
             )
     }
 
-    /// Korean words X whose X하다 and X되다 count as known: X is at a level L
-    /// such that the later of L and 2급 (where -하다/-되다 are taught) is
-    /// ticked. Empty for Chinese.
-    pub fn hada_stems(&self) -> HashSet<&'static str> {
-        if self.language != Language::Korean {
-            return HashSet::new();
-        }
-        KO.iter()
-            .filter(|(b, _)| self.levels.contains(&(*b).max(KO_HADA_LEVEL)))
-            .map(|(_, w)| *w)
-            .collect()
-    }
-
     /// The words given to the segmenter: the imported lists' (not the levels,
     /// the marked words or the words of books read), sorted and deduplicated
     /// so two sets compare equal.
@@ -610,22 +434,18 @@ impl Settings {
         w
     }
 
-    /// "HSK 1–3 + 2 word lists + 15 marked", "HSK 2.0 1–4", "TOCFL Novice 1–Level 2",
-    /// "N5–N4 + Kaishi 1.5k".
+    /// "HSK 1–3 + 2 word lists + 15 marked", "HSK 2.0 1–4", "TOCFL Novice 1–Level 2".
     pub fn label(&self) -> String {
         let n = self.lists.iter().filter(|l| !l.words.is_empty()).count();
         let mut parts = Vec::new();
         if !self.levels.is_empty() {
-            parts.push(bands_label(self.language, &self.levels));
+            parts.push(bands_label(&self.levels));
         }
-        if !self.hsk2_levels().is_empty() {
-            parts.push(hsk2_label(self.hsk2_levels()));
+        if !self.hsk2.is_empty() {
+            parts.push(hsk2_label(&self.hsk2));
         }
-        if !self.tocfl_levels().is_empty() {
-            parts.push(tocfl_label(self.tocfl_levels()));
-        }
-        if self.kaishi_on() {
-            parts.push(KAISHI_NAME.to_owned());
+        if !self.tocfl.is_empty() {
+            parts.push(tocfl_label(&self.tocfl));
         }
         match n {
             0 => {}
@@ -644,111 +464,31 @@ impl Settings {
     }
 
     /// `base` (Anki, if on) plus these words; `None` if there is neither.
-    /// `fold`: match Traditional ↔ Simplified, used when there is no `base`
-    /// (Chinese only).
+    /// `fold`: match Traditional ↔ Simplified, used when there is no `base`.
     pub fn apply(&self, base: Option<&Knowledge>, fold: bool) -> Option<Knowledge> {
         if self.is_empty() {
             return base.cloned();
         }
         let mut k = match base {
             Some(b) => b.clone(),
-            None => Knowledge::empty(fold && self.language == Language::Chinese),
+            None => Knowledge::empty(fold),
         };
-        if self.language == Language::Japanese {
-            let words = self.japanese_words();
-            k.add_listed_spelled(
-                words.iter().map(|(w, s)| (w.as_str(), s.as_str())),
-                self.label(),
-            );
-        } else {
-            k.add_listed(self.words(), self.label());
-        }
-        k.hada_stems = self.hada_stems().into_iter().map(str::to_owned).collect();
+        k.add_listed(self.words(), self.label());
         Some(k)
     }
-
-    /// Japanese: every word marked known as (key, spelling). JLPT and Kaishi
-    /// entries are keyed already; list entries are run through Sudachi, so 分かる, わかる
-    /// and わかった all mark 分かる (each word of an entry such as 勉強する
-    /// counts); marked words are the book's own keys. The spelling gives the
-    /// kanji a word teaches (する, not its key 為る).
-    fn japanese_words(&self) -> Vec<(String, String)> {
-        let mut out: Vec<(String, String)> = JLPT
-            .iter()
-            .filter(|(b, _)| self.levels.contains(b))
-            .map(|(_, w)| (w.to_string(), JLPT_HEAD.get(w).unwrap_or(w).to_string()))
-            .collect();
-        if self.kaishi_on() {
-            out.extend(KAISHI.iter().map(|(k, h)| (k.to_string(), h.to_string())));
-        }
-        let listed: Vec<&str> = self
-            .lists
-            .iter()
-            .flat_map(|l| l.words.iter().map(String::as_str))
-            .collect();
-        for (w, keys) in listed.iter().zip(japanese_keys(&listed)) {
-            out.extend(keys.into_iter().map(|k| (k, w.to_string())));
-        }
-        out.extend(self.marked.iter().map(|w| (w.clone(), w.clone())));
-        for b in &self.read {
-            out.extend(
-                b.words
-                    .iter()
-                    .map(|w| (w.clone(), b.display.get(w).unwrap_or(w).clone())),
-            );
-        }
-        out
-    }
-}
-
-/// [`crate::japanese::keys_each`], remembered: the known words are merged
-/// again whenever any of them change, and analysing every entry of the
-/// imported lists each time would take long. Only entries not seen before
-/// are analysed.
-fn japanese_keys(texts: &[&str]) -> Vec<Vec<String>> {
-    static MEMO: std::sync::Mutex<Option<HashMap<String, Vec<String>>>> =
-        std::sync::Mutex::new(None);
-    let mut memo = MEMO.lock().unwrap_or_else(|e| e.into_inner());
-    let memo = memo.get_or_insert_with(HashMap::new);
-    let mut new: Vec<&str> = texts
-        .iter()
-        .copied()
-        .filter(|t| !memo.contains_key(*t))
-        .collect();
-    new.sort_unstable();
-    new.dedup();
-    // Without Sudachi each entry stands for itself, and isn't remembered so.
-    let Some(keyed) = crate::japanese::analysed_keys_each(&new) else {
-        return texts
-            .iter()
-            .map(|t| memo.get(*t).cloned().unwrap_or_else(|| vec![t.to_string()]))
-            .collect();
-    };
-    for (t, keys) in new.iter().zip(keyed) {
-        memo.insert(t.to_string(), keys);
-    }
-    texts.iter().map(|t| memo[*t].clone()).collect()
-}
-
-/// Read a Chinese word list (see [`read_word_list_in`]).
-pub fn read_word_list(path: &Path) -> Result<WordList, String> {
-    read_word_list_in(path, Language::Chinese)
 }
 
 /// Read a word list: one word per line. On each line the first item (split at
-/// tabs, commas, semicolons and spaces) that contains Chinese (Korean: Hangul;
-/// Japanese: kana or kanji) is taken, so exports with pinyin or definitions
-/// after the word work; HTML and `[readings]` are dropped as in Anki fields.
-/// `#` starts a comment line. Korean words should be dictionary forms (먹다,
-/// 공부하다), as the book's words are; Japanese words may be in any form.
-pub fn read_word_list_in(path: &Path, lang: Language) -> Result<WordList, String> {
+/// tabs, commas, semicolons and spaces) that contains Chinese is taken, so
+/// exports with pinyin or definitions after the word work; HTML and
+/// `[readings]` are dropped as in Anki fields. `#` starts a comment line.
+pub fn read_word_list(path: &Path) -> Result<WordList, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
     let (text, _, _, _) = crate::extract::txt::decode(&bytes, crate::extract::EncodingChoice::Auto);
-    let words = parse_word_list_in(&text, lang);
+    let words = parse_word_list(&text);
     if words.is_empty() {
         return Err(format!(
-            "No {} words found in {}. Expected one word per line.",
-            lang.name(),
+            "No Chinese words found in {}. Expected one word per line.",
             path.display()
         ));
     }
@@ -762,15 +502,9 @@ pub fn read_word_list_in(path: &Path, lang: Language) -> Result<WordList, String
     })
 }
 
-/// Distinct Chinese words, in file order.
+/// Distinct Chinese words (runs of Han characters), in file order.
 pub fn parse_word_list(text: &str) -> Vec<String> {
-    parse_word_list_in(text, Language::Chinese)
-}
-
-/// Distinct words in `lang` (runs of Han characters, of Hangul syllables, or
-/// of kana and kanji), in file order.
-pub fn parse_word_list_in(text: &str, lang: Language) -> Vec<String> {
-    let is_main = |c: char| chars::is_main(c, lang);
+    let is_main = chars::is_han;
     let mut norm = chars::NormStats::default();
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -884,18 +618,12 @@ mod tests {
         let k = s.apply(None, true).unwrap();
         assert_eq!(k.word("賓館"), Status::Listed);
         assert!(!k.word("饭馆").is_known());
-        // Saved only when ticked, and only Chinese uses it.
+        // Saved only when ticked.
         let off = serde_json::to_string(&Settings::default()).unwrap();
         assert!(!off.contains("hsk2"), "{off}");
         let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back.hsk2, [1, 2, 4]);
         assert!(back.levels.is_empty());
-        let ko = Settings {
-            hsk2: vec![1],
-            language: Language::Korean,
-            ..Default::default()
-        };
-        assert!(ko.is_empty() && ko.label().is_empty());
         assert_eq!(hsk2_label(&[1, 2, 3, 4, 5, 6]), "HSK 2.0 1–6");
         assert_eq!(hsk2_label(&[3]), "HSK 2.0 3");
     }
@@ -921,17 +649,11 @@ mod tests {
         let k = s.apply(None, false).unwrap();
         assert_eq!(k.word("臺灣"), Status::Listed);
         assert!(!k.word("台湾").is_known());
-        // Saved only when ticked, and only Chinese uses it.
+        // Saved only when ticked.
         let off = serde_json::to_string(&Settings::default()).unwrap();
         assert!(!off.contains("tocfl"), "{off}");
         let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back.tocfl, [1, 2, 3]);
-        let ko = Settings {
-            tocfl: vec![1],
-            language: Language::Korean,
-            ..Default::default()
-        };
-        assert!(ko.is_empty() && ko.label().is_empty());
         assert_eq!(tocfl_label(&[3, 5, 6, 7]), "TOCFL Level 1, Level 3–5");
         assert_eq!(tocfl_label(&[1, 2]), "TOCFL Novice 1–2");
         assert_eq!(tocfl_band(7), "C");
@@ -981,148 +703,20 @@ mod tests {
     }
 
     #[test]
-    fn korean_data_matches_the_list() {
-        // 10,635 entries (735/1100/1655/2200/2365/2580) → 9,962 distinct words
-        // after splitting variant pairs, merging homographs and dropping
-        // affixes, plus 15 lemmas from the grammar sheet (6 more lowered).
-        let counts: Vec<usize> = KO_LEVELS
-            .iter()
-            .map(|&b| band_count(Language::Korean, b))
-            .collect();
-        assert_eq!(counts, [716, 1068, 1528, 2067, 2130, 2468]);
-        assert_eq!(KO.len(), 9_977);
-        let all: HashSet<&str> = KO.iter().map(|(_, w)| *w).collect();
-        assert_eq!(all.len(), KO.len());
-        assert!(all.iter().all(|w| w.chars().all(chars::is_hangul)));
-        let level = |w: &str| KO.iter().find(|(_, x)| *x == w).map(|(b, _)| *b);
-        assert_eq!(level("가다"), Some(1));
-        assert_eq!(level("싶다"), Some(1)); // -고 싶다
-        assert_eq!(level("않다"), Some(1)); // -지 않다, 3급 as a vocabulary item
-        assert_eq!(level("때문"), Some(2));
-        assert_eq!(level("말하다"), None); // only 말 + -하다
-    }
-
-    #[test]
-    fn korean_hada_verbs_follow_their_noun() {
-        let mut s = Settings {
-            language: Language::Korean,
-            ..Default::default()
-        };
-        s.set_band(1, true);
-        // 말 and 생각 are 1급, but -하다 is taught at 2급.
-        let k = s.apply(None, false).unwrap();
-        assert_eq!(k.word("말"), Status::Listed);
-        assert!(!k.word("말하다").is_known());
-        s.set_band(2, true);
-        let k = s.apply(None, false).unwrap();
-        assert_eq!(k.word("말하다"), Status::Listed);
-        assert_eq!(k.word("생각되다"), Status::Listed);
-        // Not for words outside the ticked levels, nor in Chinese.
-        assert!(!k.word("몽유병하다").is_known());
-        assert!(s.label().starts_with("1–2급"));
-        let mut zh = Settings::default();
-        zh.set_band(1, true);
-        assert!(zh.hada_stems().is_empty());
-        assert_eq!(zh.label(), "HSK 1");
-    }
-
-    #[test]
     fn old_settings_files_load() {
         let s: Settings = serde_json::from_str(r#"{"hsk":[1,2],"lists":[],"marked":[]}"#).unwrap();
         assert_eq!(s.levels, [1, 2]);
     }
 
     #[test]
-    fn jlpt_data() {
-        let ja = Language::Japanese;
-        let counts: Vec<usize> = JLPT_LEVELS.iter().map(|&b| band_count(ja, b)).collect();
-        assert_eq!(counts, [639, 604, 1579, 1679, 2951]);
-        assert_eq!(JLPT.len(), 7_452);
-        let all: HashSet<&str> = JLPT.iter().map(|(_, w)| *w).collect();
-        assert_eq!(all.len(), JLPT.len());
-        let level = |w: &str| JLPT.iter().find(|(_, x)| *x == w).map(|(b, _)| *b);
-        assert_eq!(level("会う"), Some(5));
-        // Keys are Sudachi's normalized forms: する is 為る, すぐ is 直ぐ.
-        assert_eq!(level("為る"), Some(5));
-        assert_eq!(level("直ぐ"), Some(5));
-        assert_eq!(JLPT_HEAD.get("直ぐ"), Some(&"すぐに"));
-        // お菓子 is split by Sudachi into お + 菓子, and keyed by 菓子.
-        assert_eq!(level("菓子"), Some(5));
-    }
-
-    #[test]
-    fn kaishi_deck() {
-        assert_eq!(kaishi_count(), 1_396);
-        let keys: HashSet<&str> = KAISHI.iter().map(|(k, _)| *k).collect();
-        assert_eq!(keys.len(), KAISHI.len());
-        // First cards of the deck; keys are normalized forms, headwords as the deck writes them.
-        assert_eq!(KAISHI[0], ("私", "私"));
-        assert_eq!(KAISHI[1], ("貴方", "あなた"));
-        let mut s = Settings {
-            language: Language::Japanese,
-            ..Default::default()
-        };
-        assert!(s.is_empty());
-        s.kaishi = true;
-        assert!(!s.is_empty());
-        let k = s.apply(None, false).unwrap();
-        assert_eq!(k.word("貴方"), Status::Listed);
-        assert_eq!(k.word("日本語"), Status::Listed);
-        assert_eq!(k.listed.words, 1_396);
-        // Kanji from the deck's spelling: これ is keyed 此れ, but 此 is not taught.
-        assert_eq!(k.char('語'), Status::Listed);
-        assert_eq!(k.word("此れ"), Status::Listed);
-        assert!(!k.char('此').is_known());
-        s.set_band(5, true);
-        assert_eq!(s.label(), "N5 + Kaishi 1.5k");
-        // Only in Japanese, and not written to a file when off.
-        let zh = Settings {
-            kaishi: true,
-            ..Default::default()
-        };
-        assert!(zh.is_empty() && zh.label().is_empty());
-        let off = serde_json::to_string(&Settings::default()).unwrap();
-        assert!(!off.contains("kaishi"), "{off}");
-        let on: Settings = serde_json::from_str(r#"{"kaishi":true}"#).unwrap();
-        assert!(on.kaishi);
-    }
-
-    #[test]
-    fn japanese_levels_mark_keys() {
-        let mut s = Settings {
-            language: Language::Japanese,
-            ..Default::default()
-        };
-        s.set_band(5, true);
-        s.set_marked("冒険者", true);
-        let k = s.apply(None, true).unwrap();
-        assert_eq!(k.word("会う"), Status::Listed);
-        assert_eq!(k.word("冒険者"), Status::Listed);
-        assert!(!k.word("冒険").is_known());
-        // The kanji of the spelling, not of the key 為る.
-        assert_eq!(k.char('会'), Status::Listed);
-        assert!(!k.fold);
-        assert_eq!(s.label(), "N5 + 1 marked");
-    }
-
-    #[test]
     fn band_labels() {
-        let zh = Language::Chinese;
-        assert_eq!(bands_label(zh, &[1, 2, 3]), "HSK 1–3");
-        assert_eq!(bands_label(zh, &[3, 1]), "HSK 1, 3");
-        assert_eq!(bands_label(zh, &[1, 2, 3, 4, 5, 6, 7]), "HSK 1–9");
-        assert_eq!(bands_label(zh, &[7]), "HSK 7–9");
-        assert_eq!(bands_label(zh, &[5, 6, 7]), "HSK 5–9");
-        let ko = Language::Korean;
-        assert_eq!(bands_label(ko, &[1, 2, 3]), "1–3급");
-        assert_eq!(bands_label(ko, &[1, 3, 5, 6]), "1, 3, 5–6급");
-        assert_eq!(band_label(ko, 4), "4급");
-        assert_eq!(band_label(zh, 7), "HSK 7–9");
-        let ja = Language::Japanese;
-        assert_eq!(bands_label(ja, &[5, 4, 3]), "N5–N3");
-        assert_eq!(bands_label(ja, &[3, 5]), "N5, N3");
-        assert_eq!(bands_label(ja, &[1, 2, 3, 4, 5]), "N5–N1");
-        assert_eq!(band_label(ja, 2), "N2");
+        assert_eq!(bands_label(&[1, 2, 3]), "HSK 1–3");
+        assert_eq!(bands_label(&[3, 1]), "HSK 1, 3");
+        assert_eq!(bands_label(&[1, 2, 3, 4, 5, 6, 7]), "HSK 1–9");
+        assert_eq!(bands_label(&[7]), "HSK 7–9");
+        assert_eq!(bands_label(&[5, 6, 7]), "HSK 5–9");
+        assert_eq!(band_label(7), "HSK 7–9");
+        assert_eq!(band_label(3), "HSK 3");
     }
 
     #[test]
@@ -1132,36 +726,6 @@ mod tests {
             parse_word_list(text),
             ["你好", "爱", "學習", "电脑", "一路顺风", "再见"]
         );
-    }
-
-    #[test]
-    fn korean_word_list_lines() {
-        let text =
-            "# 단어장\n먹다\tto eat\n1. 공부하다 [study]\n\"사과\",apple\n漢字\nhello\n먹다\n";
-        assert_eq!(
-            parse_word_list_in(text, Language::Korean),
-            ["먹다", "공부하다", "사과"]
-        );
-        // The Chinese parser ignores Korean, and the other way round.
-        assert_eq!(parse_word_list_in(text, Language::Chinese), ["漢字"]);
-    }
-
-    #[test]
-    fn japanese_word_list_lines() {
-        let text = "# 単語\n会う\tto meet\n分かる・わかる\n食べる[たべる]\n먹다\nhello\n会う\n";
-        assert_eq!(
-            parse_word_list_in(text, Language::Japanese),
-            ["会う", "分かる", "わかる", "食べる"]
-        );
-    }
-
-    #[test]
-    fn settings_files_per_language() {
-        let (zh, _) = Settings::load_for(Language::Chinese);
-        assert_eq!(zh.language, Language::Chinese);
-        assert!(Settings::path_for(Language::Korean).ends_with("known-ko.json"));
-        assert!(anki::Settings::path_for(Language::Korean).ends_with("anki-ko.json"));
-        assert_eq!(Settings::path(), Settings::path_for(Language::Chinese));
     }
 
     #[test]
@@ -1274,28 +838,10 @@ mod tests {
         // Saved and read back.
         s.set_read(ReadBook {
             id: "j".into(),
-            words: vec!["為る".into()],
-            display: HashMap::from([("為る".to_owned(), "する".to_owned())]),
+            words: vec!["学习".into()],
             ..Default::default()
         });
         let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);
-    }
-
-    #[test]
-    fn japanese_read_books_keep_their_spelling() {
-        let mut s = Settings {
-            language: Language::Japanese,
-            ..Default::default()
-        };
-        s.set_read(ReadBook {
-            id: "j".into(),
-            words: vec!["為る".into(), "冒険".into()],
-            display: HashMap::from([("為る".to_owned(), "する".to_owned())]),
-            ..Default::default()
-        });
-        let w = s.japanese_words();
-        assert!(w.contains(&("為る".to_owned(), "する".to_owned())));
-        assert!(w.contains(&("冒険".to_owned(), "冒険".to_owned())));
     }
 }

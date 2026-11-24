@@ -25,7 +25,7 @@ mod coverage;
 mod row;
 
 pub use coverage::Known;
-pub use row::{Entry, Stats};
+pub use row::{Entry, RowLanguage, Stats};
 
 #[derive(Serialize, Deserialize)]
 struct File {
@@ -62,7 +62,9 @@ impl History {
             Err(_) => None,
             Ok(b) => match serde_json::from_slice::<File>(&b) {
                 Ok(f) if f.format <= FORMAT => {
+                    // Korean and Japanese books are no longer analysed.
                     h.entries = f.books;
+                    h.entries.retain(|e| e.stats.language.is_chinese());
                     h.entries.sort_by_key(|e| std::cmp::Reverse(e.analysed));
                     None
                 }
@@ -388,7 +390,6 @@ pub fn date(t: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lang::Language;
 
     fn entry(id: &str, path: &str, words: u64, at: u64) -> Entry {
         Entry {
@@ -398,14 +399,13 @@ mod tests {
             analysed: at,
             stats: Stats {
                 format: "EPUB".into(),
-                language: Language::Chinese,
+                language: Default::default(),
                 variant: "Simplified".into(),
                 segmenter: "LTP perceptron".into(),
                 sections_included: 1,
                 sections_total: 1,
                 han_total: 1,
                 han_unique: 1,
-                kana_total: 0,
                 words_total: words,
                 words_unique: 1,
                 words_for_98: 1,
@@ -534,6 +534,32 @@ mod tests {
         h.record(entry("a", "a", 1, 1), true).unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "not json");
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn korean_and_japanese_rows_are_dropped() {
+        let p = temp().with_file_name("languages.json");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let (mut h, _) = History::load_from(p.clone());
+        h.record(entry("zh", "zh.epub", 1, 3), true).unwrap();
+        h.record(entry("ko", "ko.epub", 1, 2), true).unwrap();
+        h.record(entry("ja", "ja.epub", 1, 1), true).unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        for b in json["books"].as_array_mut().unwrap() {
+            let lang = match b["id"].as_str().unwrap() {
+                "ko" => "Korean",
+                "ja" => "Japanese",
+                _ => continue,
+            };
+            b["stats"]["language"] = lang.into();
+        }
+        std::fs::write(&p, serde_json::to_vec(&json).unwrap()).unwrap();
+        let (h, w) = History::load_from(p.clone());
+        assert!(w.is_none());
+        let ids: Vec<&str> = h.entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["zh"]);
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]

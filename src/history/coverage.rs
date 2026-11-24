@@ -13,7 +13,6 @@ pub struct Known {
     /// Percent of running words (names left out) that are known.
     pub running_words: f64,
     pub unique_words: f64,
-    /// Zero for Korean.
     pub unique_chars: f64,
     pub unknown_words: u64,
 }

@@ -10,7 +10,6 @@ use hanstat::discover::{self, Candidate};
 use hanstat::extract::{self, Book, EncodingChoice, SectionKind};
 use hanstat::history::{self, History};
 use hanstat::known;
-use hanstat::lang::Language;
 use hanstat::plan;
 use hanstat::profile::{self, Profile};
 use hanstat::script::Variant;
@@ -554,27 +553,12 @@ struct Job {
     cancel: Arc<AtomicBool>,
 }
 
-/// What is kept separately for each language: the user dictionary, the Anki
-/// selection and the word lists / marked words. The current language's data
-/// lives in `App`'s own fields; the other one waits here.
-#[derive(Default)]
-struct LangData {
-    user_words: Vec<String>,
-    anki: AnkiState,
-    known: KnownState,
-}
-
 struct App {
     path: Option<PathBuf>,
-    /// The language of the open book (detected), or chosen with the badge
-    /// while no book is open. Picks which `LangData` is in use.
-    language: Language,
-    /// Data of the languages not in use.
-    stash: HashMap<Language, LangData>,
-    /// The Chinese segmenter choice (a Korean book always uses Kiwi, a Japanese one Sudachi).
+    /// The segmenter choice.
     segmenter: SegmenterKind,
     encoding: EncodingChoice,
-    /// Forced words of the current language, saved in `dictionary.txt`
+    /// Forced words, saved in `dictionary.txt`
     /// (see [`hanstat::user_dict_path`]).
     user_words: Vec<String>,
     /// The "Force a word" text box, the Forced words window, and a load/save error.
@@ -606,12 +590,8 @@ struct App {
     word_sel_refill: bool,
     /// The open book's reading speed, where it was changed from the default
     /// in the Settings window (`Settings::cpm` and so on) to try another; reset when
-    /// another book is opened. Chinese: characters per minute.
+    /// another book is opened. Characters per minute.
     cpm: Option<f32>,
-    /// Korean: words per minute (as counted: content words).
-    wpm: Option<f32>,
-    /// Japanese: kanji and kana per minute.
-    ja_cpm: Option<f32>,
     /// `settings` changed by a drag still in progress: saved when it ends.
     settings_unsaved: bool,
     toast: Option<(String, f64)>,
@@ -675,10 +655,6 @@ struct App {
     read_dialog: Option<read_books::ReadDialog>,
     /// Library Stats › Reading.
     reading_view: library_reading::ReadingView,
-    /// Known words of the Library's languages that are neither in use nor
-    /// set aside, read from their files for their books' read marks
-    /// ([`App::load_read_marks`]).
-    known_disk: HashMap<Language, known::Settings>,
     /// The Library's Books tab leaves out the books marked read.
     library_hide_read: bool,
     /// Which Library files and word data exist, checked in the background.
@@ -706,9 +682,9 @@ struct App {
     window_settle_until: f64,
     /// The window's inner size last frame, to notice a resize by hand.
     last_inner: Option<egui::Vec2>,
-    /// [`App::lang_inputs`] by language, with a quick hash of what they were
-    /// made from and the known words they were made with.
-    inputs_memo: HashMap<Language, (u64, Option<Arc<anki::Knowledge>>, Inputs)>,
+    /// [`App::lang_inputs`], with a quick hash of what they were made from
+    /// and the known words they were made with.
+    inputs_memo: Option<(u64, Option<Arc<anki::Knowledge>>, Inputs)>,
     /// Keyboard shortcuts ([`shortcuts`]), from `settings.shortcuts`.
     shortcuts: Shortcuts,
     /// The action whose new keys are being chosen in the Settings window,
@@ -969,11 +945,11 @@ impl Exists {
 struct AutoRefresh {
     /// Next time to look (seconds of `egui` time).
     next_scan: f64,
-    /// Each language's inputs ([`App::lang_inputs`]) as last seen, and when they last changed.
-    seen: HashMap<Language, Inputs>,
+    /// The inputs ([`App::lang_inputs`]) as last seen, and when they last changed.
+    seen: Option<Inputs>,
     changed_at: f64,
     /// Stopped by the user with these inputs: not started again until they change.
-    paused: Option<HashMap<Language, Inputs>>,
+    paused: Option<Inputs>,
     /// Books that could not be analysed (or are missing), by path, with the
     /// inputs tried: not tried again until those change.
     failed: HashMap<PathBuf, Inputs>,
@@ -993,13 +969,13 @@ enum HistTab {
     Stats,
 }
 
-/// The reading path ([`plan`]) of the History's books in the current language.
+/// The reading path ([`plan`]) of the History's books.
 #[derive(Default)]
 struct PlanState {
     settings: plan::Settings,
     error: Option<String>,
     /// History ids of the books with a profile, and what they were listed for.
-    have: Option<((Language, u64, usize), Vec<String>)>,
+    have: Option<((u64, usize), Vec<String>)>,
     /// The library last built, and what from.
     lib: Option<(LibKey, Arc<plan::Library>)>,
     /// What `result`, or the running job, was computed from.
@@ -1042,7 +1018,6 @@ impl StyleState {
 
 #[derive(Clone, PartialEq)]
 struct LibKey {
-    lang: Language,
     fold: bool,
     /// [`Settings::skip_hapax`].
     skip_hapax: bool,
@@ -1080,8 +1055,8 @@ struct PlanDone {
 /// Library's books again.
 struct Batch {
     mode: BatchMode,
-    /// Each language's inputs ([`App::lang_inputs`]) the books are analysed with.
-    inputs: HashMap<Language, Inputs>,
+    /// The inputs ([`App::lang_inputs`]) the books are analysed with.
+    inputs: Option<Inputs>,
     rx: Receiver<BatchMsg>,
     done: Arc<AtomicUsize>,
     /// Including `then_open`.
@@ -1254,41 +1229,26 @@ impl AnkiFilter {
     }
 }
 
-/// Text and colour of the mode badge at the right of the toolbar.
-fn mode_badge(lang: Language, variant: Option<Variant>) -> (&'static str, Color32) {
-    match (lang, variant) {
-        (Language::Korean, _) => (
-            "한국어",
-            palette::pick(palette::MOCHA.blue, palette::ink::BLUE),
-        ),
-        (Language::Japanese, _) => (
-            "日本語",
-            palette::pick(palette::MOCHA.mauve, palette::ink::MAUVE),
-        ),
-        (Language::Chinese, Some(Variant::Simplified)) => (
+/// Text and colour of a book's script, as the Library's Language column
+/// and the image exports show it.
+fn script_badge(variant: Option<Variant>) -> (&'static str, Color32) {
+    match variant {
+        Some(Variant::Simplified) => (
             "简体中文",
             palette::pick(palette::MOCHA.red, palette::ink::RED),
         ),
-        (Language::Chinese, Some(Variant::Traditional)) => (
+        Some(Variant::Traditional) => (
             "繁體中文",
             palette::pick(palette::MOCHA.peach, palette::ink::PEACH),
         ),
-        (Language::Chinese, Some(Variant::Mixed)) => (
+        Some(Variant::Mixed) => (
             "简繁混合",
             palette::pick(palette::MOCHA.maroon, palette::ink::MAROON),
         ),
-        (Language::Chinese, _) => (
+        _ => (
             "中文",
             palette::pick(palette::MOCHA.flamingo, palette::ink::FLAMINGO),
         ),
-    }
-}
-
-fn language_label(lang: Language) -> &'static str {
-    match lang {
-        Language::Chinese => "中文 (Chinese)",
-        Language::Korean => "한국어 (Korean)",
-        Language::Japanese => "日本語 (Japanese)",
     }
 }
 
@@ -1317,8 +1277,6 @@ impl Default for App {
     fn default() -> Self {
         Self {
             path: None,
-            language: Language::Chinese,
-            stash: HashMap::new(),
             segmenter: SegmenterKind::Auto,
             encoding: EncodingChoice::Auto,
             user_words: Vec::new(),
@@ -1341,8 +1299,6 @@ impl Default for App {
             word_sel_pos: 0,
             word_sel_refill: false,
             cpm: None,
-            wpm: None,
-            ja_cpm: None,
             settings_unsaved: false,
             toast: None,
             image_job: None,
@@ -1379,7 +1335,6 @@ impl Default for App {
             auto: AutoRefresh::default(),
             read_dialog: None,
             reading_view: Default::default(),
-            known_disk: HashMap::new(),
             library_hide_read: false,
             exists: Exists::default(),
             removed: None,
@@ -1394,7 +1349,7 @@ impl Default for App {
             window_placed: false,
             window_settle_until: 0.0,
             last_inner: None,
-            inputs_memo: HashMap::new(),
+            inputs_memo: None,
             shortcuts: Shortcuts::default(),
             shortcut_capture: None,
             shortcut_note: None,
@@ -1435,21 +1390,9 @@ impl App {
         let (d2, t2, s2, c3) = (done.clone(), total.clone(), stage.clone(), cancel.clone());
         let (kind, enc) = (self.segmenter, self.encoding);
         let cache = self.cache.clone();
-        // The book's language is only known once it is read: take each language's dictionary.
-        let mut words_by_lang: HashMap<Language, Vec<String>> = self
-            .stash
-            .iter()
-            .map(|(l, d)| (*l, d.user_words.clone()))
-            .collect();
-        words_by_lang.insert(self.language, self.user_words.clone());
-        // Imported word lists join words the segmenter split; a language
-        // whose settings aren't loaded yet is read from disk.
-        let mut known_by_lang: HashMap<Language, Vec<String>> = self
-            .stash
-            .iter()
-            .map(|(l, d)| (*l, d.known.settings.segmenter_words()))
-            .collect();
-        known_by_lang.insert(self.language, self.known.settings.segmenter_words());
+        let words = self.user_words.clone();
+        // Imported word lists join words the segmenter split.
+        let known_words = self.known.settings.segmenter_words();
         // Reuse the already-extracted book if only segmentation options changed.
         let cached = self
             .book
@@ -1463,15 +1406,8 @@ impl App {
                     None => Arc::new(extract::load(&path, enc)?),
                 };
                 // First use of a model: download it (pinned + checksummed) with visible progress.
-                let lang = analyze::detect_language(&book);
-                let words = words_by_lang
-                    .remove(&lang)
-                    .unwrap_or_else(|| hanstat::load_user_dict(lang).0);
-                let known_words = known_by_lang
-                    .remove(&lang)
-                    .unwrap_or_else(|| known::Settings::load_for(lang).0.segmenter_words());
                 let (tr, si) = analyze::detect_variant(&book);
-                let resolved = kind.resolve_in(lang, hanstat::script::classify(tr, si));
+                let resolved = kind.resolve(hanstat::script::classify(tr, si));
                 if let Some(m) = hanstat::segment::model_for(resolved)
                     && !m.is_cached()
                 {
@@ -1629,54 +1565,21 @@ impl App {
 
     // ----- Anki -----
 
-    /// Load the current language's saved settings: forced words, Anki, known words.
+    /// Load the saved settings: forced words, Anki, known words.
     fn anki_init(&mut self, ctx: &egui::Context) {
-        let (w, warn) = hanstat::load_user_dict(self.language);
+        let (w, warn) = hanstat::load_user_dict();
         self.user_words = w;
         self.dict_error = warn;
-        let (s, warn) = anki::Settings::load_for(self.language);
+        let (s, warn) = anki::Settings::load();
         self.anki.settings = s;
         self.anki.error = warn;
-        // Read from its file (again): any read marks changed there are in it.
-        self.known_disk.remove(&self.language);
-        let (k, warn) = known::Settings::load_for(self.language);
+        let (k, warn) = known::Settings::load();
         self.known.settings = k;
         self.known.error = warn;
         self.refresh_anki_coverage();
         self.anki.profiles = anki::find_profiles();
         if self.anki.settings.enabled && self.anki.settings.collection.is_some() {
             self.anki_open(ctx);
-        }
-    }
-
-    /// Switch to `lang`'s user dictionary, Anki selection and known words,
-    /// loading them from disk the first time. Open windows stay open and
-    /// show the new language's settings.
-    fn set_language(&mut self, lang: Language, ctx: &egui::Context) {
-        if lang == self.language {
-            return;
-        }
-        let (anki_window, known_window) = (self.anki.window, self.known.window);
-        let current = LangData {
-            user_words: std::mem::take(&mut self.user_words),
-            anki: std::mem::take(&mut self.anki),
-            known: std::mem::take(&mut self.known),
-        };
-        self.stash.insert(self.language, current);
-        self.language = lang;
-        match self.stash.remove(&lang) {
-            Some(d) => {
-                self.user_words = d.user_words;
-                self.anki = d.anki;
-                self.known = d.known;
-                self.refresh_anki_coverage();
-            }
-            None => self.anki_init(ctx),
-        }
-        self.anki.window = anki_window;
-        self.known.window = known_window;
-        if anki_window && self.anki.col.is_none() && self.anki.rx.is_none() {
-            self.anki_open_default(ctx);
         }
     }
 
@@ -1713,13 +1616,9 @@ impl App {
 
     /// Sentence fields are segmented like the current book.
     fn anki_seg_config(&self) -> anki::SegConfig {
-        anki::SegConfig::for_language(
-            self.language,
+        anki::SegConfig::new(
             self.segmenter,
-            self.prep
-                .as_ref()
-                .filter(|p| p.language == self.language)
-                .map(|p| p.segmenter_kind),
+            self.prep.as_ref().map(|p| p.segmenter_kind),
             &self.user_words,
         )
     }
@@ -1737,16 +1636,7 @@ impl App {
             self.refresh_anki_coverage();
             return;
         }
-        self.anki.busy = if self.language == Language::Korean && !hanstat::models::KIWI.is_cached()
-        {
-            "Downloading Kiwi (about 130 MB, first Korean use only), then classifying Anki notes…"
-        } else if self.language == Language::Japanese
-            && !hanstat::models::sudachi_local().is_cached()
-        {
-            "Downloading SudachiDict (137 MB, first Japanese use only), then classifying Anki notes…"
-        } else {
-            "Classifying Anki notes…"
-        };
+        self.anki.busy = "Classifying Anki notes…";
         let s = self.anki.settings.clone();
         let seg = self.anki_seg_config();
         self.anki.built_with = Some(seg.clone());
@@ -1771,7 +1661,7 @@ impl App {
         if self
             .report
             .as_ref()
-            .is_some_and(|r| r.language == Language::Chinese && r.chars_folded != self.fold_chars())
+            .is_some_and(|r| r.chars_folded != self.fold_chars())
         {
             self.rebuild_report();
         } else {
@@ -1780,20 +1670,9 @@ impl App {
     }
 
     /// Count the Traditional and Simplified forms of a Chinese character as
-    /// one: the Chinese "Match Traditional ↔ Simplified" option.
+    /// one: the "Match Traditional ↔ Simplified" option.
     fn fold_chars(&self) -> bool {
-        if self.language == Language::Chinese {
-            self.anki.settings.match_across_scripts
-        } else {
-            self.stash.get(&Language::Chinese).map_or_else(
-                || {
-                    anki::Settings::load_for(Language::Chinese)
-                        .0
-                        .match_across_scripts
-                },
-                |d| d.anki.settings.match_across_scripts,
-            )
-        }
+        self.anki.settings.match_across_scripts
     }
 
     fn poll_anki(&mut self, ctx: &egui::Context) {
@@ -1872,16 +1751,11 @@ impl App {
         let skip_hapax = self.settings.skip_hapax;
         let Some(r) = &mut self.report else { return };
         self.report_gen += 1;
-        r.anki = self.known.merged.as_ref().map(|k| {
-            BookCoverage::compute(
-                k,
-                &r.char_freq,
-                &r.word_freq,
-                &names,
-                &r.word_parts,
-                skip_hapax,
-            )
-        });
+        r.anki = self
+            .known
+            .merged
+            .as_ref()
+            .map(|k| BookCoverage::compute(k, &r.char_freq, &r.word_freq, &names, skip_hapax));
         if r.anki.is_none() {
             self.anki_filter = AnkiFilter::All;
         }
@@ -1925,10 +1799,7 @@ impl App {
             inputs: String::new(),
         };
         let mut entry = entry;
-        entry.inputs = self
-            .lang_inputs(entry.stats.language)
-            .map(|i| i.joined())
-            .unwrap_or_default();
+        entry.inputs = self.lang_inputs().map(|i| i.joined()).unwrap_or_default();
         let touch = std::mem::take(&mut self.history_touch);
         if let Err(e) = self.history.record(entry, touch) {
             self.history_error = Some(e);
@@ -1949,13 +1820,7 @@ impl App {
         let mut open = self.anki.window;
         let mut changed = false;
         let mut reopen = false;
-        let lang = self.language;
-        let title = match lang {
-            Language::Chinese => "Anki (中文)",
-            Language::Korean => "Anki (한국어)",
-            Language::Japanese => "Anki (日本語)",
-        };
-        egui::Window::new(title)
+        egui::Window::new("Anki")
             .id(egui::Id::unique("anki-window"))
             .open(&mut open)
             .default_size([780.0, 680.0])
@@ -2034,12 +1899,10 @@ impl App {
                         .checkbox(&mut a.settings.include_suspended, "Count suspended cards")
                         .on_hover_text("On: a suspended card counts like any other card. Off: suspended cards are ignored.")
                         .changed();
-                    if lang == Language::Chinese {
-                        changed |= ui
-                            .checkbox(&mut a.settings.match_across_scripts, "Match Traditional ↔ Simplified")
-                            .on_hover_text("Fold both your cards and the book to Simplified (character level) before matching.")
-                            .changed();
-                    }
+                    changed |= ui
+                        .checkbox(&mut a.settings.match_across_scripts, "Match Traditional ↔ Simplified")
+                        .on_hover_text("Fold both your cards and the book to Simplified (character level) before matching.")
+                        .changed();
                 });
                 ui.horizontal_wrapped(|ui| {
                     changed |= ui
@@ -2072,9 +1935,8 @@ impl App {
                         fmt_int(s.notes),
                         if s.notes_without_chinese > 0 {
                             format!(
-                                " ({} have no {} in the ticked fields)",
-                                fmt_int(s.notes_without_chinese),
-                                lang.name()
+                                " ({} have no Chinese in the ticked fields)",
+                                fmt_int(s.notes_without_chinese)
                             )
                         } else {
                             String::new()
@@ -2102,18 +1964,14 @@ impl App {
                             _ => String::new(),
                         }
                     ));
-                    match lang {
-                        Language::Chinese => status_grid(ui, "anki-summary", &[("Cards", &s.cards), ("Words", &s.words), ("Characters", &s.chars)]),
-                        Language::Korean => status_grid(ui, "anki-summary", &[("Cards", &s.cards), ("Words", &s.words)]),
-                        Language::Japanese => status_grid(ui, "anki-summary", &[("Cards", &s.cards), ("Words", &s.words), ("Kanji", &s.chars)]),
-                    }
+                    status_grid(ui, "anki-summary", &[("Cards", &s.cards), ("Words", &s.words), ("Characters", &s.chars)]);
                 }
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new(format!(
                         "{0} Learning and relearning cards are not counted as known. \
                          {2} HTML, sound tags and [readings] are ignored. \
-                         The collection is read from a temporary copy and never modified. Choices are saved to {1}, separately for each language.",
+                         The collection is read from a temporary copy and never modified. Choices are saved to {1}.",
                         match a.settings.stability_threshold() {
                             None => format!(
                                 "Young = review interval under {0} days, mature = {0}+ days (Anki's definitions).",
@@ -2124,12 +1982,8 @@ impl App {
                                 anki::MATURE_IVL
                             ),
                         },
-                        anki::Settings::path_for(lang).display(),
-                        match lang {
-                            Language::Chinese => "A ticked field holding a word counts as that word; one holding a sentence is split into words with the book's segmenter.",
-                            Language::Korean => "Every ticked field is analysed with Kiwi and counts as the dictionary forms of its words (먹었어요 → 먹다), like the book.",
-                            Language::Japanese => "Every ticked field is analysed with Sudachi and counts as its words in dictionary form with spellings merged (わかった, 分かる → 分かる), like the book; furigana readings (会[あ]う) are ignored.",
-                        }
+                        anki::Settings::path().display(),
+                        "A ticked field holding a word counts as that word; one holding a sentence is split into words with the book's segmenter.",
                     ))
                     .weak()
                     .small(),
@@ -2258,7 +2112,7 @@ impl App {
             return;
         }
         self.user_words = words;
-        self.dict_error = hanstat::save_user_dict(self.language, &self.user_words).err();
+        self.dict_error = hanstat::save_user_dict(&self.user_words).err();
         self.rerun(ctx, false);
     }
 
@@ -2532,7 +2386,6 @@ impl App {
             st.error = st.store.save().err();
         }
         if let (Some(id), Some(r), Some(path)) = (&self.report_id, &self.report, &self.path)
-            && r.language == Language::Chinese
             && st.store.get(id).is_none()
             && st.asked.insert(id.clone())
         {
@@ -2551,10 +2404,7 @@ impl App {
             );
         }
         for e in &self.history.entries {
-            if e.stats.language != Language::Chinese
-                || st.store.get(&e.id).is_some()
-                || !st.asked.insert(e.id.clone())
-            {
+            if st.store.get(&e.id).is_some() || !st.asked.insert(e.id.clone()) {
                 continue;
             }
             if e.path.is_file() {
@@ -2690,18 +2540,6 @@ impl App {
                 };
                 ui.label(RichText::new(note).weak().small());
                 ui.end_row();
-                ui.label("Japanese");
-                changed |= ui
-                    .add(egui::DragValue::new(&mut s.ja_cpm).range(50.0..=2000.0).speed(5.0).suffix(" chars/min"))
-                    .on_hover_text("Kanji and kana per minute")
-                    .changed();
-                ui.end_row();
-                ui.label("Korean");
-                changed |= ui
-                    .add(egui::DragValue::new(&mut s.wpm).range(20.0..=1000.0).speed(2.0).suffix(" words/min"))
-                    .on_hover_text("Words per minute, as counted here: dictionary forms of content words")
-                    .changed();
-                ui.end_row();
                 if changed {
                     self.settings_unsaved = true;
                 }
@@ -2787,16 +2625,11 @@ impl App {
                 }
             });
             ui.separator();
-            let chinese: Vec<&history::Entry> = self
-                .history
-                .entries
-                .iter()
-                .filter(|e| e.stats.language == Language::Chinese)
-                .collect();
-            let rated = chinese.iter().filter(|e| self.style.store.get(&e.id).is_some()).count();
+            let books = &self.history.entries;
+            let rated = books.iter().filter(|e| self.style.store.get(&e.id).is_some()).count();
             ui.label(format!(
-                "{rated} of the {} Chinese books in the Library are rated.",
-                chinese.len()
+                "{rated} of the {} books in the Library are rated.",
+                books.len()
             ));
             if let Some(mode) = self
                 .style
@@ -2817,7 +2650,7 @@ impl App {
                      Seen with AMD's Vulkan driver on an RX 7600 XT.",
                 );
             }
-            let skipped: Vec<String> = chinese
+            let skipped: Vec<String> = books
                 .iter()
                 .filter_map(|e| self.style.skipped.get(&e.id).map(|w| format!("{}: {w}", e.title)))
                 .collect();
@@ -2830,7 +2663,7 @@ impl App {
             if let Some(style::Phase::Failed(e)) = &phase {
                 ui.colored_label(palette::warn(), e);
             }
-            let unrated = chinese.len() - rated;
+            let unrated = books.len() - rated;
             // Busy: the books without a rating are already waiting their turn.
             // (Downloading or starting counts too: stopping then would wait for it.)
             let busy = !failed
@@ -2933,14 +2766,12 @@ impl App {
                         });
                     }
                     if !same_book {
-                        (self.cpm, self.ja_cpm, self.wpm) = (None, None, None);
+                        self.cpm = None;
                     }
-                    let lang = l.prep.language;
                     self.cache_usage = self.cache.as_ref().map_or((0, 0), Cache::usage);
                     self.book = Some(l.book);
                     self.prep = Some(l.prep);
-                    // The old report is not this book's: drop it before the
-                    // language switch recomputes its coverage (and records it).
+                    // The old report is not this book's.
                     self.report = None;
                     self.report_id = None;
                     self.book_id = l.file_id;
@@ -2950,8 +2781,6 @@ impl App {
                         None => self.clear_error("copy"),
                     }
                     self.history_touch = true;
-                    // The book's language decides which dictionary, Anki selection and word lists apply.
-                    self.set_language(lang, ctx);
                     self.rebuild_report();
                     // Anki sentences must be segmented like this book.
                     if self.anki.col.is_some()
@@ -3114,30 +2943,20 @@ impl eframe::App for App {
                 }
                 ui.separator();
                 ui.label("Segmenter:");
-                if self.language != Language::Chinese {
-                    let k = SegmenterKind::Auto.resolve_in(self.language, hanstat::script::Variant::Unknown);
-                    ui.label(RichText::new(k.label()).strong())
-                        .on_hover_text(k.description());
-                } else {
-                    let before = self.segmenter;
-                    egui::ComboBox::from_id_salt("seg").selected_text(self.segmenter.label()).show_ui(ui, |ui| {
-                        for k in SegmenterKind::ALL {
-                            ui.selectable_value(&mut self.segmenter, k, k.label()).on_hover_text(k.description());
-                        }
-                    });
-                    // While a book is being analysed, that analysis stops
-                    // and the book is analysed again with the new choice.
-                    if before != self.segmenter {
-                        self.rerun(&ctx, false);
+                let before = self.segmenter;
+                egui::ComboBox::from_id_salt("seg").selected_text(self.segmenter.label()).show_ui(ui, |ui| {
+                    for k in SegmenterKind::ALL {
+                        ui.selectable_value(&mut self.segmenter, k, k.label()).on_hover_text(k.description());
                     }
+                });
+                // While a book is being analysed, that analysis stops
+                // and the book is analysed again with the new choice.
+                if before != self.segmenter {
+                    self.rerun(&ctx, false);
                 }
 
                 {
-                    let hover = match self.language {
-                        Language::Chinese => "Words always segmented as single words, saved between runs. Add them here or from the Suggested words tab.",
-                        Language::Korean => "Kiwi keeps these whole, as proper nouns. Saved between runs, separately from the Chinese ones.",
-                        Language::Japanese => "Sudachi keeps these whole, as proper nouns. Saved between runs, separately from the Chinese and Korean ones.",
-                    };
+                    let hover = "Words always segmented as single words, saved between runs. Add them here or from the Suggested words tab.";
                     if ui
                         .selectable_label(self.forced_window, format!("📖 {} forced words", self.user_words.len()))
                         .on_hover_text(self.shortcuts.hint(&ctx, Action::ForcedWords, hover))
@@ -3185,7 +3004,7 @@ impl eframe::App for App {
                         let busy = self.image_busy();
                         let library_button = |ui: &mut egui::Ui| {
                             ui.add_enabled(!busy, egui::Button::new("Library as image (PNG)…"))
-                                .on_hover_text("One long picture of the Library: its totals, each language's vocabulary and every book")
+                                .on_hover_text("One long picture of the Library: its totals, its vocabulary and every book")
                                 .on_disabled_hover_text("An image is being saved")
                                 .clicked()
                         };
@@ -3198,15 +3017,11 @@ impl eframe::App for App {
                         };
                         let stem = self.path.as_deref().map(file_stem).unwrap_or_else(|| "hanstat".into());
                         let mut msg = None;
-                        // A Korean book has no character statistics; a Japanese one counts kanji.
-                        let chinese = r.language != Language::Korean;
-                        // Japanese word keys are shown as the book spells them.
-                        let shown: Vec<(&str, u32)> = r.word_freq.iter().map(|(w, n)| (r.display(w), *n)).collect();
-                        if chinese && ui.button("Character frequency (CSV)…").clicked() {
+                        if ui.button("Character frequency (CSV)…").clicked() {
                             msg = save(&format!("{stem}-characters.csv"), "csv", analyze::freq_csv(&r.char_freq, "character"));
                         }
                         if ui.button("Word frequency (CSV)…").clicked() {
-                            msg = save(&format!("{stem}-words.csv"), "csv", analyze::freq_csv(&shown, "word"));
+                            msg = save(&format!("{stem}-words.csv"), "csv", analyze::freq_csv(&r.word_freq, "word"));
                         }
                         if ui.button("Full report (JSON)…").clicked() {
                             msg = save(&format!("{stem}-report.json"), "json", serde_json::to_string_pretty(r).unwrap());
@@ -3219,7 +3034,7 @@ impl eframe::App for App {
                                 .iter()
                                 .zip(&c.word_status)
                                 .filter(|(_, s)| !s.is_known())
-                                .map(|((w, _), _)| r.display(w))
+                                .map(|((w, _), _)| w.as_str())
                                 .collect();
                             msg = save(&format!("{stem}-unknown-words.txt"), "txt", list.join("\n") + "\n");
                         }
@@ -3241,12 +3056,12 @@ impl eframe::App for App {
                             ui.close();
                         }
                         ui.separator();
-                        if chinese && ui.button("Copy unique characters").clicked() {
+                        if ui.button("Copy unique characters").clicked() {
                             ctx.copy_text(r.char_freq.iter().map(|x| x.0).collect());
                             msg = Some(format!("Copied {} characters", r.char_freq.len()));
                         }
                         if ui.button("Copy unique words (one per line)").clicked() {
-                            ctx.copy_text(shown.iter().map(|x| x.0).collect::<Vec<_>>().join("\n"));
+                            ctx.copy_text(r.word_freq.iter().map(|x| x.0.as_str()).collect::<Vec<_>>().join("\n"));
                             msg = Some(format!("Copied {} words", r.word_freq.len()));
                         }
                         if let Some(m) = msg {
@@ -3260,17 +3075,12 @@ impl eframe::App for App {
                 }
 
                 ui.separator();
-                let label = match (self.known.settings.is_empty(), self.language) {
-                    (true, Language::Chinese) => "📚 HSK, TOCFL & word lists…".to_owned(),
-                    (true, Language::Korean) => "📚 Levels & word lists…".to_owned(),
-                    (true, Language::Japanese) => "📚 JLPT & word lists…".to_owned(),
-                    (false, _) => format!("📚 Known: {}", self.known.settings.label()),
+                let label = if self.known.settings.is_empty() {
+                    "📚 HSK, TOCFL & word lists…".to_owned()
+                } else {
+                    format!("📚 Known: {}", self.known.settings.label())
                 };
-                let hover = match self.language {
-                    Language::Chinese => "Mark HSK 3.0, HSK 2.0 or TOCFL levels and imported word lists as known, in addition to your Anki cards",
-                    Language::Korean => "Mark vocabulary levels 1–6급 and imported Korean word lists as known, in addition to your Anki cards",
-                    Language::Japanese => "Mark JLPT levels N5–N1 and imported Japanese word lists as known, in addition to your Anki cards",
-                };
+                let hover = "Mark HSK 3.0, HSK 2.0 or TOCFL levels and imported word lists as known, in addition to your Anki cards";
                 if ui
                     .selectable_label(self.known.window, label)
                     .on_hover_text(self.shortcuts.hint(&ctx, Action::KnownWords, hover))
@@ -3306,13 +3116,6 @@ impl eframe::App for App {
                     reader_button.on_disabled_hover_text("No Library book read in the reader yet");
                 }
 
-                // The badge on this row when it fits beside the rest, else on the next.
-                if ui.max_rect().right() - ui.cursor().min.x < 90.0 {
-                    ui.end_row();
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    self.mode_badge_ui(ui, &ctx);
-                });
             });
         });
 
@@ -3472,14 +3275,8 @@ impl eframe::App for App {
                     });
                     return;
                 }
-                if self.tab_hidden(self.tab) {
-                    self.tab = Tab::Overview;
-                }
                 let tab_before = self.tab;
-                let shown: Vec<_> = TABS
-                    .into_iter()
-                    .filter(|(t, _)| !self.tab_hidden(*t))
-                    .collect();
+                let shown: Vec<_> = TABS.into_iter().collect();
                 let shortcuts = &self.shortcuts;
                 palette::tabs(ui, &mut self.tab, shown, 15.0, |t, r| {
                     if let Some(k) = shortcuts.text(&ctx, t.action()) {
@@ -3689,15 +3486,8 @@ impl App {
                     self.history_tab = H[(i + if next { 1 } else { H.len() - 1 }) % H.len()];
                 } else if self.report.is_some() {
                     let step = if next { 1 } else { TABS.len() - 1 };
-                    let mut i = TABS.iter().position(|&(t, _)| t == self.tab).unwrap_or(0);
-                    // The Overview is never hidden, so this ends.
-                    loop {
-                        i = (i + step) % TABS.len();
-                        if !self.tab_hidden(TABS[i].0) {
-                            break;
-                        }
-                    }
-                    self.switch_tab(TABS[i].0, ctx);
+                    let i = TABS.iter().position(|&(t, _)| t == self.tab).unwrap_or(0);
+                    self.switch_tab(TABS[(i + step) % TABS.len()].0, ctx);
                 }
             }
             Action::KnownWords => self.known.window = !self.known.window,
@@ -3715,7 +3505,6 @@ impl App {
             | Action::Notes => {
                 if let Some(&(t, _)) = TABS.iter().find(|(t, _)| t.action() == a)
                     && self.report.is_some()
-                    && !self.tab_hidden(t)
                 {
                     self.show_history = false;
                     self.switch_tab(t, ctx);
@@ -3731,14 +3520,6 @@ impl App {
         if t == Tab::Overview && before != Tab::Overview && self.known_resegment_due() {
             self.rerun(ctx, false);
         }
-    }
-
-    /// A Korean book has word statistics only; Korean and Japanese books have
-    /// no suggested words.
-    fn tab_hidden(&self, t: Tab) -> bool {
-        let lang = self.report.as_ref().map(|r| r.language);
-        (lang == Some(Language::Korean) && t == Tab::Characters)
-            || (lang.is_some_and(|l| l != Language::Chinese) && t == Tab::Suggestions)
     }
 
     fn win_open(&self, w: Win) -> bool {
@@ -3925,114 +3706,31 @@ impl App {
 }
 
 impl App {
-    /// The coloured mode badge: the book's language (and script, for Chinese).
-    /// With no book open it chooses whose settings the windows show.
-    fn mode_badge_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let variant = self
-            .report
-            .as_ref()
-            .filter(|r| r.language == Language::Chinese)
-            .map(|r| r.variant);
-        let (text, fill) = mode_badge(self.language, variant);
-        let resp = ui
-            .add(
-                egui::Button::new(RichText::new(text).size(14.0).color(palette::cat().crust))
-                    .fill(fill)
-                    .corner_radius(egui::CornerRadius::same(11)),
-            )
-            .on_hover_text(
-                "Language mode, detected from the book: Korean when Hangul outnumbers Chinese characters, Japanese when kana are at least a tenth as many as kanji. \
-                 Anki decks and fields, word lists, marked words and the user dictionary are kept separately for each language. Click for details.",
-            );
-        let fixed = self.prep.is_some() || self.job.is_some();
-        let mut pick = None;
-        egui::Popup::menu(&resp).show(|ui| {
-            ui.set_min_width(260.0);
-            ui.label(if fixed {
-                "Set by the open book."
-            } else {
-                "No book open: choose which language's settings to show."
-            });
-            for l in Language::ALL {
-                if ui
-                    .add_enabled(
-                        !fixed || l == self.language,
-                        egui::RadioButton::new(self.language == l, language_label(l)),
-                    )
-                    .clicked()
-                {
-                    pick = Some(l);
-                }
-            }
-            ui.separator();
-            ui.label(
-                RichText::new(format!(
-                    "Saved per language: {} and {}.",
-                    anki::Settings::path_for(self.language).display(),
-                    known::Settings::path_for(self.language).display()
-                ))
-                .weak()
-                .small(),
-            );
-        });
-        if let Some(l) = pick {
-            self.set_language(l, ctx);
-        }
-    }
-
     fn known_window(&mut self, ctx: &egui::Context) {
         let mut open = self.known.window;
         let mut changed = false;
-        let lang = self.language;
-        let title = match lang {
-            Language::Chinese => "Known words: HSK, TOCFL & word lists (中文)",
-            Language::Korean => "Known words: levels & word lists (한국어)",
-            Language::Japanese => "Known words: JLPT & word lists (日本語)",
-        };
-        egui::Window::new(title)
+        egui::Window::new("Known words: HSK, TOCFL & word lists")
             .id(egui::Id::unique("known-window"))
             .open(&mut open)
             .default_width(560.0)
             .show(ctx, |ui| {
                 let k = &mut self.known;
-                let bands = known::bands(lang);
-                match lang {
-                    Language::Chinese => {
-                        ui.strong("HSK 3.0 vocabulary");
-                        ui.label(
-                            RichText::new(
-                                "《HSK 考试大纲》, released November 2025 (exams from July 2026). Tick each level whose new words you know; levels 7–9 share one list.",
-                            )
-                            .weak(),
-                        );
-                    }
-                    Language::Korean => {
-                        ui.strong("Vocabulary by level (1–6급, as in TOPIK)");
-                        ui.label(
-                            RichText::new(
-                                "국립국어원's 국제 통용 한국어 표준 교육과정 list (2017, revised 2020). TOPIK publishes no word list; this is the one TOPIK vocabulary lists follow. Tick each level whose new words you know. A 하다/되다 verb counts with its noun once 2급 is ticked.",
-                            )
-                            .weak(),
-                        );
-                    }
-                    Language::Japanese => {
-                        ui.strong("JLPT vocabulary (N5–N1)");
-                        ui.label(
-                            RichText::new(
-                                "Jonathan Waller's lists, as used by jisho.org. The JLPT has published no word list since 2010, so these are an informed estimate. Tick each level whose new words you know. A long word that isn't on the list (冒険者) counts as known when its parts (冒険, 者) are.",
-                            )
-                            .weak(),
-                        );
-                    }
-                }
+                let bands = &known::BANDS;
+                ui.strong("HSK 3.0 vocabulary");
+                ui.label(
+                    RichText::new(
+                        "《HSK 考试大纲》, released November 2025 (exams from July 2026). Tick each level whose new words you know; levels 7–9 share one list.",
+                    )
+                    .weak(),
+                );
                 ui.horizontal_wrapped(|ui| {
                     let mut cum = 0;
                     for &b in bands {
-                        let n = known::band_count(lang, b);
+                        let n = known::hsk_count(b);
                         cum += n;
                         let mut v = k.settings.band_on(b);
                         if ui
-                            .checkbox(&mut v, format!("{} ({})", known::band_label(lang, b), fmt_int(n as u64)))
+                            .checkbox(&mut v, format!("{} ({})", known::band_label(b), fmt_int(n as u64)))
                             .on_hover_text(format!(
                                 "{} words introduced at this level; {} up to and including it",
                                 fmt_int(n as u64),
@@ -4048,11 +3746,10 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("All up to:").weak());
                     for (i, &b) in bands.iter().enumerate() {
-                        let label = known::band_label(lang, b);
+                        let label = known::band_label(b);
                         let short = label.trim_start_matches("HSK ");
-                        let first = known::band_label(lang, bands[0]);
+                        let first = known::band_label(bands[0]);
                         if ui.small_button(short).on_hover_text(format!("Tick {first} to {label} only")).clicked() {
-                            // Bands are listed easiest first (JLPT counts down from N5).
                             k.settings.levels = bands[..=i].to_vec();
                             k.settings.levels.sort_unstable();
                             changed = true;
@@ -4063,122 +3760,100 @@ impl App {
                         changed = true;
                     }
                 });
-                if lang == Language::Chinese {
-                    ui.add_space(6.0);
-                    ui.strong("HSK 2.0 vocabulary");
-                    ui.label(
-                        RichText::new(
-                            "The 2012 word lists (5,000 words): what the HSK tested before the 2025 syllabus, and what the HSK Standard Course textbooks teach. \
-                             Tick each level whose new words you know, alongside or instead of HSK 3.0.",
-                        )
-                        .weak(),
-                    );
-                    ui.horizontal_wrapped(|ui| {
-                        let mut cum = 0;
-                        for &b in &known::HSK2_LEVELS {
-                            let n = known::hsk2_count(b);
-                            cum += n;
-                            let mut v = k.settings.hsk2_on(b);
-                            if ui
-                                .checkbox(&mut v, format!("HSK {b} ({})", fmt_int(n as u64)))
-                                .on_hover_text(format!(
-                                    "HSK 2.0 level {b}: {} words introduced at this level; {} up to and including it",
-                                    fmt_int(n as u64),
-                                    fmt_int(cum as u64)
-                                ))
-                                .changed()
-                            {
-                                k.settings.set_hsk2(b, v);
-                                changed = true;
-                            }
-                        }
-                    });
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new("All up to:").weak());
-                        for (i, &b) in known::HSK2_LEVELS.iter().enumerate() {
-                            if ui
-                                .small_button(b.to_string())
-                                .on_hover_text(format!("Tick HSK 2.0 1 to {b} only"))
-                                .clicked()
-                            {
-                                k.settings.hsk2 = known::HSK2_LEVELS[..=i].to_vec();
-                                changed = true;
-                            }
-                        }
-                        if ui.small_button("None").clicked() && !k.settings.hsk2.is_empty() {
-                            k.settings.hsk2.clear();
+                ui.add_space(6.0);
+                ui.strong("HSK 2.0 vocabulary");
+                ui.label(
+                    RichText::new(
+                        "The 2012 word lists (5,000 words): what the HSK tested before the 2025 syllabus, and what the HSK Standard Course textbooks teach. \
+                         Tick each level whose new words you know, alongside or instead of HSK 3.0.",
+                    )
+                    .weak(),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    let mut cum = 0;
+                    for &b in &known::HSK2_LEVELS {
+                        let n = known::hsk2_count(b);
+                        cum += n;
+                        let mut v = k.settings.hsk2_on(b);
+                        if ui
+                            .checkbox(&mut v, format!("HSK {b} ({})", fmt_int(n as u64)))
+                            .on_hover_text(format!(
+                                "HSK 2.0 level {b}: {} words introduced at this level; {} up to and including it",
+                                fmt_int(n as u64),
+                                fmt_int(cum as u64)
+                            ))
+                            .changed()
+                        {
+                            k.settings.set_hsk2(b, v);
                             changed = true;
                         }
-                    });
-                    ui.add_space(6.0);
-                    ui.strong("TOCFL vocabulary (華語八千詞表)");
-                    ui.label(
-                        RichText::new(
-                            "SC-TOP's official list for the TOCFL (2024 edition, Traditional characters): Novice 1–2, then Level 1–2 (band A), Level 3–4 (band B) and Level 5 (band C). Level 6 has no list of its own; it is tested on Level 5's. \
-                             Tick each level whose new words you know, alongside or instead of HSK. Variants count as listed (你/妳, 台灣/臺灣, 車/車子); with Match Traditional ↔ Simplified on, they match Simplified books too.",
-                        )
-                        .weak(),
-                    );
-                    ui.horizontal_wrapped(|ui| {
-                        let mut cum = 0;
-                        for &b in &known::TOCFL_LEVELS {
-                            let n = known::tocfl_count(b);
-                            cum += n;
-                            let mut v = k.settings.tocfl_on(b);
-                            if ui
-                                .checkbox(&mut v, format!("{} ({})", known::tocfl_level_name(b), fmt_int(n as u64)))
-                                .on_hover_text(format!(
-                                    "Band {}. {} words introduced at this level; {} up to and including it",
-                                    known::tocfl_band(b),
-                                    fmt_int(n as u64),
-                                    fmt_int(cum as u64)
-                                ))
-                                .changed()
-                            {
-                                k.settings.set_tocfl(b, v);
-                                changed = true;
-                            }
-                        }
-                    });
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new("All up to:").weak());
-                        for (i, &b) in known::TOCFL_LEVELS.iter().enumerate() {
-                            let label = known::tocfl_level_name(b);
-                            if ui
-                                .small_button(label)
-                                .on_hover_text(format!("Tick Novice 1 to {label} only"))
-                                .clicked()
-                            {
-                                k.settings.tocfl = known::TOCFL_LEVELS[..=i].to_vec();
-                                changed = true;
-                            }
-                        }
-                        if ui.small_button("None").clicked() && !k.settings.tocfl.is_empty() {
-                            k.settings.tocfl.clear();
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("All up to:").weak());
+                    for (i, &b) in known::HSK2_LEVELS.iter().enumerate() {
+                        if ui
+                            .small_button(b.to_string())
+                            .on_hover_text(format!("Tick HSK 2.0 1 to {b} only"))
+                            .clicked()
+                        {
+                            k.settings.hsk2 = known::HSK2_LEVELS[..=i].to_vec();
                             changed = true;
                         }
-                    });
-                }
-                if lang == Language::Japanese {
-                    ui.add_space(4.0);
-                    if ui
-                        .checkbox(
-                            &mut k.settings.kaishi,
-                            format!(
-                                "{} deck ({} words)",
-                                known::KAISHI_NAME,
-                                fmt_int(known::kaishi_count() as u64)
-                            ),
-                        )
-                        .on_hover_text(
-                            "Every word of the Kaishi 1.5k Anki deck (donkuri/Kaishi v2.4.3, 1,500 cards) counts as known, for when you studied it outside the Anki collection hanstat reads. \
-                             If the deck is in that collection, tick it in the Anki window instead, so that only the cards you have learned count.",
-                        )
-                        .changed()
-                    {
+                    }
+                    if ui.small_button("None").clicked() && !k.settings.hsk2.is_empty() {
+                        k.settings.hsk2.clear();
                         changed = true;
                     }
-                }
+                });
+                ui.add_space(6.0);
+                ui.strong("TOCFL vocabulary (華語八千詞表)");
+                ui.label(
+                    RichText::new(
+                        "SC-TOP's official list for the TOCFL (2024 edition, Traditional characters): Novice 1–2, then Level 1–2 (band A), Level 3–4 (band B) and Level 5 (band C). Level 6 has no list of its own; it is tested on Level 5's. \
+                         Tick each level whose new words you know, alongside or instead of HSK. Variants count as listed (你/妳, 台灣/臺灣, 車/車子); with Match Traditional ↔ Simplified on, they match Simplified books too.",
+                    )
+                    .weak(),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    let mut cum = 0;
+                    for &b in &known::TOCFL_LEVELS {
+                        let n = known::tocfl_count(b);
+                        cum += n;
+                        let mut v = k.settings.tocfl_on(b);
+                        if ui
+                            .checkbox(&mut v, format!("{} ({})", known::tocfl_level_name(b), fmt_int(n as u64)))
+                            .on_hover_text(format!(
+                                "Band {}. {} words introduced at this level; {} up to and including it",
+                                known::tocfl_band(b),
+                                fmt_int(n as u64),
+                                fmt_int(cum as u64)
+                            ))
+                            .changed()
+                        {
+                            k.settings.set_tocfl(b, v);
+                            changed = true;
+                        }
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("All up to:").weak());
+                    for (i, &b) in known::TOCFL_LEVELS.iter().enumerate() {
+                        let label = known::tocfl_level_name(b);
+                        if ui
+                            .small_button(label)
+                            .on_hover_text(format!("Tick Novice 1 to {label} only"))
+                            .clicked()
+                        {
+                            k.settings.tocfl = known::TOCFL_LEVELS[..=i].to_vec();
+                            changed = true;
+                        }
+                    }
+                    if ui.small_button("None").clicked() && !k.settings.tocfl.is_empty() {
+                        k.settings.tocfl.clear();
+                        changed = true;
+                    }
+                });
                 ui.separator();
 
                 ui.horizontal(|ui| {
@@ -4191,7 +3866,7 @@ impl App {
                     {
                         let mut errors = Vec::new();
                         for p in paths {
-                            match known::read_word_list_in(&p, lang) {
+                            match known::read_word_list(&p) {
                                 Ok(l) => {
                                     k.settings.add_list(l);
                                     changed = true;
@@ -4227,14 +3902,10 @@ impl App {
                     changed = true;
                 }
                 ui.label(
-                    RichText::new(match lang {
-                        Language::Chinese => "One word per line. The first item on a line that contains Chinese is used, so exports with pinyin or definitions after a tab, comma or space work; # starts a comment. \
+                    RichText::new(
+                        "One word per line. The first item on a line that contains Chinese is used, so exports with pinyin or definitions after a tab, comma or space work; # starts a comment. \
                          Lists are copied in: import a file again to update it.",
-                        Language::Korean => "One word per line, in dictionary form (먹다, 공부하다, 사과), since the book's words are counted that way. The first item on a line that contains Hangul is used, so exports with definitions after a tab, comma or space work; # starts a comment. \
-                         Lists are copied in: import a file again to update it.",
-                        Language::Japanese => "One word per line, in any spelling or form: entries are read with Sudachi like the book, so 分かる, わかる and わかった all mark 分かる, and each word of an entry such as 勉強する counts. The first item on a line that contains kana or kanji is used, so exports with readings or definitions after a tab, comma or space work; furigana in [brackets] is dropped; # starts a comment. \
-                         Lists are copied in: import a file again to update it.",
-                    })
+                    )
                     .weak()
                     .small(),
                 );
@@ -4320,34 +3991,18 @@ impl App {
                 ui.separator();
                 let anki_on = self.anki.settings.enabled && self.anki.knowledge.is_some();
                 match k.merged.as_ref().filter(|_| !k.settings.is_empty()) {
-                    Some(m) if lang == Language::Korean => {
-                        let l = &m.listed;
-                        ui.label(if anki_on {
-                            format!(
-                                "{} distinct words marked known; {} of them are not young/mature in Anki.",
-                                fmt_int(l.words),
-                                fmt_int(l.new_words)
-                            )
-                        } else {
-                            format!(
-                                "{} distinct words marked known. Anki is off, so only these count.",
-                                fmt_int(l.words)
-                            )
-                        });
-                    }
                     Some(m) => {
                         let l = &m.listed;
-                        let chars = if lang == Language::Japanese { "kanji" } else { "characters" };
                         ui.label(if anki_on {
                             format!(
-                                "{} distinct words marked known; {} of them are not young/mature in Anki, adding {} {chars}.",
+                                "{} distinct words marked known; {} of them are not young/mature in Anki, adding {} characters.",
                                 fmt_int(l.words),
                                 fmt_int(l.new_words),
                                 fmt_int(l.new_chars)
                             )
                         } else {
                             format!(
-                                "{} distinct words marked known ({} {chars}). Anki is off, so only these count.",
+                                "{} distinct words marked known ({} characters). Anki is off, so only these count.",
                                 fmt_int(l.words),
                                 fmt_int(l.new_chars)
                             )
@@ -4358,24 +4013,12 @@ impl App {
                     }
                 }
                 ui.label(
-                    RichText::new(match lang {
-                        Language::Chinese => format!(
-                            "These words count as known (\"Word list\" in the Characters and Words tabs) alongside young and mature Anki cards, and a character is known if it is in a known word. \
-                             Traditional ↔ Simplified matching follows the Anki window's option (now {}). Saved to {}.",
-                            if self.anki.settings.match_across_scripts { "on" } else { "off" },
-                            known::Settings::path_for(lang).display()
-                        ),
-                        Language::Korean => format!(
-                            "These words count as known (\"Word list\" in the Words tab) alongside young and mature Anki cards. \
-                             Korean lists and marked words are kept apart from the Chinese ones. Saved to {}.",
-                            known::Settings::path_for(lang).display()
-                        ),
-                        Language::Japanese => format!(
-                            "These words count as known (\"Word list\" in the Characters and Words tabs) alongside young and mature Anki cards, and a kanji is known if it is in a known word. \
-                             Japanese lists and marked words are kept apart from the Chinese and Korean ones. Saved to {}.",
-                            known::Settings::path_for(lang).display()
-                        ),
-                    })
+                    RichText::new(format!(
+                        "These words count as known (\"Word list\" in the Characters and Words tabs) alongside young and mature Anki cards, and a character is known if it is in a known word. \
+                         Traditional ↔ Simplified matching follows the Anki window's option (now {}). Saved to {}.",
+                        if self.anki.settings.match_across_scripts { "on" } else { "off" },
+                        known::Settings::path().display()
+                    ))
                     .weak()
                     .small(),
                 );
@@ -4394,15 +4037,14 @@ impl App {
         self.refresh_anki_coverage();
     }
 
-    /// True if the open Chinese book was segmented with other imported word
-    /// lists than the current ones.
+    /// True if the open book was segmented with other imported word lists
+    /// than the current ones.
     fn known_resegment_due(&self) -> bool {
         self.job.is_none()
-            && self.prep.as_ref().is_some_and(|p| {
-                p.language == Language::Chinese
-                    && p.language == self.language
-                    && p.known_words != self.known.settings.segmenter_words()
-            })
+            && self
+                .prep
+                .as_ref()
+                .is_some_and(|p| p.known_words != self.known.settings.segmenter_words())
     }
 }
 
@@ -4589,15 +4231,14 @@ fn share_bar(ui: &mut egui::Ui, label: &str, f: f32) {
 const STYLE_HOVER: &str = "How hard the prose is to read when you know its words: sentence structure, written and classical register, rhetoric and description, what you must infer. Rated by a local AI model (Qwen3.5-4B) from four samples of 3,000 characters. The percentage compares it with the rated books in your Library: 50% is their median, and 9 in 10 of them fall between 5% and 95%. The word after it (plain, typical, literary, very literary) is the model's own judgment, the same for everyone. It counts toward the difficulty with the weight set in Settings (⚙), where it can be turned off.";
 
 impl App {
-    /// The writing-style scale fitted to the rated Chinese books of the
-    /// Library ([`style_scale`]).
+    /// The writing-style scale fitted to the rated books of the Library
+    /// ([`style_scale`]).
     fn style_scale(&self) -> StyleScale {
         let rated = self.style.store.current();
         StyleScale::fit(
             self.history
                 .entries
                 .iter()
-                .filter(|e| e.stats.language == Language::Chinese)
                 .filter_map(|e| rated.get(e.id.as_str()).copied()),
         )
     }
@@ -4645,16 +4286,10 @@ impl App {
         }
         let default_cpm = self.cpm();
         let r = self.report.as_ref().unwrap();
-        // A Korean book has word statistics only; a Japanese one has words
-        // laid out like Korean, plus kanji.
-        let chinese = r.language == Language::Chinese;
-        let japanese = r.language == Language::Japanese;
-        let has_chars = chinese || japanese;
-        let lang_name = r.language.name();
         // Writing style, while ratings are on: (rating, hover). Shown in the
         // difficulty tile, which it counts toward; a tile of its own when
         // nothing is marked known.
-        let style_info: Option<(String, String)> = (chinese && self.style_on()).then(|| {
+        let style_info: Option<(String, String)> = self.style_on().then(|| {
             let id = self.report_id.as_deref().unwrap_or("");
             let scale = self.style_scale();
             match self.style.store.get(id) {
@@ -4699,7 +4334,7 @@ impl App {
                         if let Some(t) = &r.title {
                             ui.heading(t);
                         }
-                        if chinese && r.format == "EPUB" && self.path.is_some() {
+                        if r.format == "EPUB" && self.path.is_some() {
                             read_book = ui
                                 .button(RichText::new("📕 Read").size(15.0))
                                 .on_hover_text("Read the book, with its layout and pictures")
@@ -4719,40 +4354,20 @@ impl App {
                 });
             });
             let (included, sections) = (self.included.iter().filter(|x| **x).count(), self.included.len());
-            ui.label(if chinese {
-                format!(
-                    "{} · {:?} Chinese (traditional-only chars: {}, simplified-only: {}) · {} of {} sections included",
-                    r.format,
-                    r.variant,
-                    fmt_int(r.trad_marks),
-                    fmt_int(r.simp_marks),
-                    included,
-                    sections
-                )
-            } else if japanese {
-                format!(
-                    "{} · Japanese · words are counted in dictionary form with spellings merged (わかった, 分かる → 分かる) · {} of {} sections included",
-                    r.format, included, sections
-                )
-            } else {
-                format!(
-                    "{} · Korean · words are counted in dictionary form (먹었어요 → 먹다) · {} of {} sections included",
-                    r.format, included, sections
-                )
-            });
+            ui.label(format!(
+                "{} · {:?} Chinese (traditional-only chars: {}, simplified-only: {}) · {} of {} sections included",
+                r.format,
+                r.variant,
+                fmt_int(r.trad_marks),
+                fmt_int(r.simp_marks),
+                included,
+                sections
+            ));
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
-                if chinese {
-                    big_stat(ui, "Chinese characters (total)", r.han_total, &format!("{} occur only once", fmt_int(r.han_hapax as u64)));
-                    big_stat(ui, "Unique characters", r.han_unique as u64, &format!("{} needed for 99% coverage", r.char_coverage.iter().find(|c| c.percent == 99.0).map(|c| c.items).unwrap_or(0)));
-                    big_stat(ui, "Chinese words (total)", r.words_total, &format!("segmenter: {}", r.segmenter.label()));
-                } else {
-                    if japanese {
-                        big_stat(ui, "Kanji (total)", r.han_total, &format!("{} occur only once", fmt_int(r.han_hapax as u64)));
-                        big_stat(ui, "Unique kanji", r.han_unique as u64, &format!("{} needed for 99% coverage", r.char_coverage.iter().find(|c| c.percent == 99.0).map(|c| c.items).unwrap_or(0)));
-                    }
-                    big_stat(ui, &format!("{lang_name} words (total)"), r.words_total, &format!("analyser: {}", r.segmenter.label()));
-                }
+                big_stat(ui, "Chinese characters (total)", r.han_total, &format!("{} occur only once", fmt_int(r.han_hapax as u64)));
+                big_stat(ui, "Unique characters", r.han_unique as u64, &format!("{} needed for 99% coverage", r.char_coverage.iter().find(|c| c.percent == 99.0).map(|c| c.items).unwrap_or(0)));
+                big_stat(ui, "Chinese words (total)", r.words_total, &format!("segmenter: {}", r.segmenter.label()));
                 big_stat(
                     ui,
                     "Unique words",
@@ -4781,11 +4396,6 @@ impl App {
                         Some(&explain),
                     );
                 }
-                // Korean only: a Japanese book already has four tiles, and the
-                // coverage table below gives the same number.
-                if !has_chars {
-                    big_stat(ui, "Words for 98% coverage", r.word_coverage.iter().find(|c| c.percent == 98.0).map_or(0, |c| c.items as u64), "most frequent words, see Coverage below");
-                }
             });
             ui.add_space(10.0);
 
@@ -4797,19 +4407,10 @@ impl App {
                     (false, _) => format!("Known from {lists}"),
                 });
                 ui.horizontal_wrapped(|ui| {
-                    let tiles: &[(&str, &anki::KnownCount)] = if chinese {
-                        &[
-                            ("Unique characters you know", &c.unique_chars),
-                            ("Unique words you know", &c.unique_words),
-                        ]
-                    } else if japanese {
-                        &[
-                            ("Unique kanji you know", &c.unique_chars),
-                            ("Unique words you know", &c.unique_words),
-                        ]
-                    } else {
-                        &[("Unique words you know", &c.unique_words)]
-                    };
+                    let tiles: &[(&str, &anki::KnownCount)] = &[
+                        ("Unique characters you know", &c.unique_chars),
+                        ("Unique words you know", &c.unique_words),
+                    ];
                     for (title, k) in tiles {
                         big_stat(
                             ui,
@@ -4833,32 +4434,14 @@ impl App {
                     } else {
                         String::new()
                     };
-                    let running_text = hapax_note + &if chinese {
-                        format!(
-                            "Every occurrence counts, so frequent words weigh more. {} of {} word occurrences are known; {} occurrences of names (your user dictionary and the recommended Suggested words) are left out. \
-                             Of the running characters, {:.1}% are known.",
-                            fmt_int(rw.known),
-                            fmt_int(rw.total),
-                            fmt_int(c.name_tokens),
-                            c.running_chars.percent()
-                        )
-                    } else if japanese {
-                        format!(
-                            "Every occurrence counts, so frequent words weigh more. {} of {} word occurrences are known; {} occurrences of names (your user dictionary) are left out. \
-                             Particles and auxiliaries are grammar, not words. Of the running kanji, {:.1}% are known.",
-                            fmt_int(rw.known),
-                            fmt_int(rw.total),
-                            fmt_int(c.name_tokens),
-                            c.running_chars.percent()
-                        )
-                    } else {
-                        format!(
-                            "Every occurrence counts, so frequent words weigh more. {} of {} word occurrences are known; {} occurrences of names (your user dictionary) are left out.",
-                            fmt_int(rw.known),
-                            fmt_int(rw.total),
-                            fmt_int(c.name_tokens)
-                        )
-                    };
+                    let running_text = hapax_note + &format!(
+                        "Every occurrence counts, so frequent words weigh more. {} of {} word occurrences are known; {} occurrences of names (your user dictionary and the recommended Suggested words) are left out. \
+                         Of the running characters, {:.1}% are known.",
+                        fmt_int(rw.known),
+                        fmt_int(rw.total),
+                        fmt_int(c.name_tokens),
+                        c.running_chars.percent()
+                    );
                     let explain_running = |ui: &mut egui::Ui| {
                         ui.label(&running_text);
                     };
@@ -4918,16 +4501,10 @@ impl App {
                             }
                         });
                         ui.label(
-                            RichText::new(if chinese {
+                            RichText::new(
                                 "Thresholds from L2 reading research: 98% coverage for comfortable reading of fiction (Hu & Nation 2000), 95% as the minimum for adequate comprehension (Laufer 1989). \
-                                 Words you know but have no Anki card for (and aren't in a ticked HSK or TOCFL level or word list) count as unknown, so the book may be easier than this."
-                            } else if japanese {
-                                "Thresholds from L2 reading research: 98% coverage for comfortable reading of fiction (Hu & Nation 2000), 95% as the minimum for adequate comprehension (Laufer 1989). \
-                                 Words you know but have no Anki card for (and aren't in a ticked JLPT level or word list) count as unknown, so the book may be easier than this."
-                            } else {
-                                "Thresholds from L2 reading research: 98% coverage for comfortable reading of fiction (Hu & Nation 2000), 95% as the minimum for adequate comprehension (Laufer 1989). \
-                                 Words you know but have no Anki card for (and aren't in a ticked level or word list) count as unknown, so the book may be easier than this."
-                            })
+                                 Words you know but have no Anki card for (and aren't in a ticked HSK or TOCFL level or word list) count as unknown, so the book may be easier than this.",
+                            )
                             .weak()
                             .small(),
                         );
@@ -4940,19 +4517,11 @@ impl App {
                         Some(&explain),
                     );
                 });
-                let anki_part = if has_chars {
-                    format!(
-                        "on a young or mature card in your selected decks ({} words, {} {})",
-                        fmt_int(c.anki.words.known()),
-                        fmt_int(c.anki.chars.known()),
-                        if japanese { "kanji" } else { "characters" },
-                    )
-                } else {
-                    format!(
-                        "on a young or mature card in your selected decks ({} words)",
-                        fmt_int(c.anki.words.known()),
-                    )
-                };
+                let anki_part = format!(
+                    "on a young or mature card in your selected decks ({} words, {} characters)",
+                    fmt_int(c.anki.words.known()),
+                    fmt_int(c.anki.chars.known()),
+                );
                 let list_part = format!(
                     "in {} ({} words{})",
                     lists,
@@ -4969,125 +4538,14 @@ impl App {
                     (false, _) => list_part,
                 };
                 ui.label(
-                    RichText::new(if chinese {
-                        format!(
-                            "Known = {known_def}. A character is known if it appears in a known word. Click ⓘ on the last two tiles for details."
-                        )
-                    } else if japanese {
-                        format!(
-                            "Known = {known_def}. A kanji is known if it appears in a known word, and a long word (冒険者) if all its parts (冒険, 者) are known. Click ⓘ on the last two tiles for details."
-                        )
-                    } else {
-                        format!("Known = {known_def}. Click ⓘ on the last two tiles for details.")
-                    })
+                    RichText::new(format!(
+                        "Known = {known_def}. A character is known if it appears in a known word. Click ⓘ on the last two tiles for details."
+                    ))
                     .weak(),
                 );
                 ui.add_space(10.0);
             }
 
-            if !chinese {
-                // Korean: words only. Japanese: words, plus kanji.
-                ui.columns(2, |cols| {
-                    let ui = &mut cols[0];
-                    section_card(ui, "Composition", |ui| {
-                    egui::Grid::new("comp").striped(true).num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
-                        let mut rows: Vec<(String, u64)> = vec![
-                            (format!("{lang_name} words (total)"), r.words_total),
-                            (format!("Non-{lang_name} words (total)"), r.foreign_words_total),
-                            (format!("Non-{lang_name} words (unique)"), r.foreign_words_unique as u64),
-                            ("Numbers".into(), r.numbers),
-                            ("Private-use characters (unreadable)".into(), r.private_use),
-                            ("Decode errors (U+FFFD)".into(), r.replacement),
-                        ];
-                        if japanese {
-                            rows.insert(1, ("Kanji (total)".into(), r.han_total));
-                            rows.insert(2, ("Kana (total)".into(), r.kana_total));
-                        }
-                        for (k, v) in rows {
-                            ui.label(k);
-                            ui.label(fmt_int(v));
-                            ui.end_row();
-                        }
-                    });
-                    });
-                    section_card(ui, "Structure", |ui| {
-                    egui::Grid::new("struct").striped(true).num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
-                        ui.label("Paragraphs");
-                        ui.label(fmt_int(r.paragraphs));
-                        ui.end_row();
-                        ui.label("Sentences");
-                        ui.label(fmt_int(r.sentences));
-                        ui.end_row();
-                        ui.label("Avg. sentence length");
-                        ui.label(format!("{:.1} words", r.avg_sentence_words.unwrap_or(0.0)));
-                        ui.end_row();
-                        ui.label("Avg. paragraph length");
-                        ui.label(format!("{:.1} words", r.avg_paragraph_words.unwrap_or(0.0)));
-                        ui.end_row();
-                        ui.label("Reading time");
-                        ui.horizontal(|ui| {
-                            // Japanese reading speed is measured in characters (文字/分), Korean in words.
-                            let (speed, default) = if japanese {
-                                (&mut self.ja_cpm, self.settings.ja_cpm)
-                            } else {
-                                (&mut self.wpm, self.settings.wpm)
-                            };
-                            let v = speed.unwrap_or(default) as f64;
-                            let mins = if japanese {
-                                (r.han_total + r.kana_total) as f64 / v
-                            } else {
-                                r.words_total as f64 / v
-                            };
-                            ui.label(format!("{}h {:02}m at", (mins / 60.0) as u64, (mins % 60.0) as u64));
-                            if japanese {
-                                speed_input(ui, speed, default, 50.0..=2000.0, 5.0, " chars/min");
-                            } else {
-                                speed_input(ui, speed, default, 20.0..=1000.0, 2.0, " words/min");
-                            }
-                        })
-                        .response
-                        .on_hover_text(if japanese {
-                            "Characters are kanji and kana. Punctuation, digits and Latin letters are not counted."
-                        } else {
-                            "Words as counted here: dictionary forms of content words, without particles and endings."
-                        });
-                        ui.end_row();
-                    });
-                    });
-
-                    let ui = &mut cols[1];
-                    section_card(ui, "Coverage", |ui| {
-                    if japanese {
-                        ui.label(RichText::new("How many of the most frequent words (kanji) you must know to recognise X% of the running words (kanji).").weak());
-                        egui::Grid::new("cov").striped(true).num_columns(3).spacing([32.0, 4.0]).show(ui, |ui| {
-                            ui.strong("Coverage");
-                            ui.strong("Words");
-                            ui.strong("Kanji");
-                            ui.end_row();
-                            for (i, w) in r.word_coverage.iter().enumerate() {
-                                ui.label(format!("{}%", w.percent));
-                                ui.label(fmt_int(w.items as u64));
-                                ui.label(r.char_coverage.get(i).map_or("–".into(), |c| fmt_int(c.items as u64)));
-                                ui.end_row();
-                            }
-                        });
-                    } else {
-                        ui.label(RichText::new("How many of the most frequent words you must know to recognise X% of the running words.").weak());
-                        egui::Grid::new("cov").striped(true).num_columns(2).spacing([32.0, 4.0]).show(ui, |ui| {
-                            ui.strong("Coverage");
-                            ui.strong("Words");
-                            ui.end_row();
-                            for w in &r.word_coverage {
-                                ui.label(format!("{}%", w.percent));
-                                ui.label(fmt_int(w.items as u64));
-                                ui.end_row();
-                            }
-                        });
-                    }
-                    });
-                });
-                return;
-            }
             ui.columns(2, |cols| {
                 let ui = &mut cols[0];
                 section_card(ui, "Composition", |ui| {
@@ -5365,12 +4823,12 @@ impl App {
         let mut rows: Vec<usize> = (0..r.word_freq.len())
             .filter(|&i| {
                 let w = &r.word_freq[i].0;
-                f.is_empty() || w.contains(f) || r.display(w).contains(f)
+                f.is_empty() || w.contains(f)
             })
             .filter(|&i| status.is_none_or(|s| key.known.matches(s[i])))
             .collect();
         let (col, desc) = key.sort;
-        let word = |i: usize| r.display(&r.word_freq[i].0);
+        let word = |i: usize| r.word_freq[i].0.as_str();
         match col {
             // Each length counted once, not at every comparison.
             WordCol::Length => {
@@ -5435,9 +4893,6 @@ impl App {
         let rows = self.word_rows();
         let r = self.report.as_ref().unwrap();
         let status = r.anki.as_ref().map(|c| &c.word_status);
-        // Word length is counted in Chinese characters; Korean and Japanese
-        // words have no length column.
-        let show_len = r.language == Language::Chinese;
         let total = r.words_total.max(1) as f64;
         let known = &self.known.settings;
         // Looked up for every row drawn: a set, not the list.
@@ -5515,7 +4970,7 @@ impl App {
                     };
                     note = Some(format!(
                         "{} is known from {from}; {} only unmarks words you marked",
-                        r.display(w),
+                        w,
                         self.shortcuts
                             .text(ui.ctx(), Action::MarkKnown)
                             .unwrap_or_default()
@@ -5525,7 +4980,7 @@ impl App {
                 }
             }
             if copy && let Some(p) = pos {
-                let w = r.display(word_of(p));
+                let w = word_of(p);
                 ui.ctx().copy_text(w.to_owned());
                 note = Some(format!("Copied {w}"));
             }
@@ -5578,8 +5033,8 @@ impl App {
                         "Least known first, then by frequency",
                     ),
                     (
-                        if show_len { "Length" } else { "" },
-                        show_len.then_some((WordCol::Length, true)),
+                        "Length",
+                        Some((WordCol::Length, true)),
                         "Longest first, then by frequency",
                     ),
                 ];
@@ -5626,13 +5081,7 @@ impl App {
                         }
                     });
                     row.col(|ui| {
-                        let shown = r.display(w);
-                        let l = ui.label(RichText::new(shown).size(18.0));
-                        if shown != w {
-                            l.on_hover_text(format!(
-                                "Counted as {w}, which merges its spellings and forms"
-                            ));
-                        }
+                        ui.label(RichText::new(w).size(18.0));
                     });
                     row.col(|ui| {
                         ui.label(fmt_int(*n as u64));
@@ -5649,9 +5098,7 @@ impl App {
                         }
                     });
                     row.col(|ui| {
-                        if show_len {
-                            ui.label(w.chars().count().to_string());
-                        }
+                        ui.label(w.chars().count().to_string());
                     });
                     if row.response().clicked() {
                         clicked = Some(row.index());
@@ -5685,10 +5132,7 @@ impl App {
         if !self.known.settings.set_marked(w, on) {
             return;
         }
-        let shown = self
-            .report
-            .as_ref()
-            .map_or(w.to_owned(), |r| r.display(w).to_owned());
+        let shown = w;
         let msg = if on {
             format!("Marked {shown} as known")
         } else {
@@ -5715,9 +5159,6 @@ impl App {
         });
         let r = self.report.as_ref().unwrap();
         let n = r.sections.len();
-        // A Korean book has word columns only (a Japanese one counts kanji).
-        let chinese = r.language != Language::Korean;
-        let skip = if chinese { 0 } else { 3 };
         let mut toggles: Vec<usize> = Vec::new();
         TableBuilder::new(ui)
             // Cells otherwise inherit the top-down layout: text sits at the row top.
@@ -5732,7 +5173,7 @@ impl App {
                     .clip(true),
             )
             .column(Column::exact(80.0))
-            .columns(Column::exact(80.0), 6 - skip)
+            .columns(Column::exact(80.0), 6)
             .header(24.0, |mut h| {
                 let heads = [
                     "",
@@ -5746,10 +5187,7 @@ impl App {
                     "Unique w.",
                     "New w.",
                 ];
-                for (j, t) in heads.into_iter().enumerate() {
-                    if (4..4 + skip).contains(&j) {
-                        continue;
-                    }
+                for t in heads {
                     h.col(|ui| {
                         ui.strong(t);
                     });
@@ -5795,7 +5233,7 @@ impl App {
                         fmt_int(s.unique_words as u64),
                         dash(s.new_words),
                     ];
-                    for v in values.into_iter().skip(skip) {
+                    for v in values {
                         row.col(|ui| {
                             ui.label(v);
                         });
@@ -6030,8 +5468,6 @@ impl App {
                 for m in [
                     &hanstat::models::LTP,
                     &hanstat::models::CKIP,
-                    &hanstat::models::KIWI,
-                    hanstat::models::sudachi_local(),
                 ] {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(format!(
@@ -6090,12 +5526,7 @@ impl App {
                 }
                 ui.add_space(12.0);
                 ui.heading("How things are counted");
-                let method = match r.language {
-                    Language::Chinese => METHOD,
-                    Language::Korean => KOREAN_METHOD,
-                    Language::Japanese => JAPANESE_METHOD,
-                };
-                for line in method {
+                for line in METHOD {
                     ui.label(format!("• {line}"));
                 }
             });
@@ -6128,34 +5559,6 @@ const SUGGEST_COLUMNS: [(&str, &str); 4] = [
     ),
 ];
 
-const KOREAN_METHOD: &[&str] = &[
-    "Language: a book is Korean when it has more Hangul than Chinese characters. The badge at the top right shows the mode; Anki decks and fields, word lists, marked words and the user dictionary are kept separately for Chinese and Korean.",
-    "A Korean book is measured in words only: there are no character or syllable counts, and lengths and reading time are in words.",
-    "Words are dictionary forms from Kiwi, a Korean morphological analyser: irregular stems are restored (걸어 → 걷다, 도와 → 돕다), predicates are counted with 다 (먹었어요 → 먹다), and a noun, root or adverb with the 하/되 suffix is one word (공부했다 → 공부하다, 깨끗해 → 깨끗하다). Particles, endings, the copula 이다 and affixes are grammar, not words. Hanja, Latin words and numbers are not Korean words.",
-    "Kiwi chooses between readings from context (들어요 as 듣다 or 들다, 물었다 as 묻다 or 물다). In a test on two novels it was right in about four of five places where it disagreed with mecab-ko-dic. Compound verbs are sometimes split into their parts (들려오다 → 들리다 + 오다).",
-    "Names: Kiwi keeps most names whole, but may split one that is also made of common words. Words in the user dictionary are added to Kiwi as proper nouns and are always kept whole.",
-    "EPUB: only documents in the spine are read, in reading order, each once. <head>, scripts, styles, ruby annotations (<rt>/<rp>), hidden elements and image alt text are excluded. Block elements and <br> end paragraphs. Line breaks in the HTML source between Hangul become spaces, as browsers render them.",
-    "TXT: encoding from BOM, strict UTF-8 validation, UTF-16 statistics, then chardetng (EUC-KR is read as CP949). Hard-wrapped lines are joined with a space. Chapter headings like 제1장, 12화, 프롤로그 and 외전 start sections.",
-    "Sentences end at . ? ! … (a full stop counts when a space, quote or the paragraph end follows) or the end of a paragraph.",
-    "Coverage = the number of most-frequent distinct words whose occurrences add up to X% of all word occurrences.",
-    "Anki: the collection is copied (with its write-ahead log) to a temporary folder and read from there, so it works while Anki is open and is never modified. A review card is mature at an interval of 21+ days and young below that, or, with \"Mature by FSRS stability\" on, at the chosen stability (cards without FSRS data keep the interval rule). Every ticked field is analysed with Kiwi and the user dictionary, so a card for 먹다 or 먹어요 matches the book's 먹다.",
-];
-
-const JAPANESE_METHOD: &[&str] = &[
-    "Language: a book is Japanese when its kana are at least a tenth as many as its kanji (a Chinese book has at most a few kana). The badge at the top right shows the mode; Anki decks and fields, word lists, marked words and the user dictionary are kept separately for each language.",
-    "Characters are kanji (Script=Han letters), counted exactly as in Chinese books; kana are letters. Sentence and paragraph lengths are in words. Reading time is in characters per minute, where the characters are kanji and kana; punctuation, digits and Latin letters are not counted.",
-    "Words come from Sudachi, a Japanese morphological analyser, with SudachiDict full in its long-unit mode C: compounds a dictionary lists whole stay whole (事務所, 一生懸命, 冒険者). Each word is counted by Sudachi's normalized form, which merges inflections and spellings (わかった, 分かる → 分かる; かわいく → 可愛い; ウソ → うそ), and shown as the book usually spells it. Two different words the book spells alike are told apart by their normalized form: いる (要る).",
-    "Particles, auxiliaries (た, ます, ない…), punctuation, numbers in digits and Latin words are not Japanese words. Numerals in kanji keep their spelling (二十四).",
-    "Before analysis, dialogue noise that Sudachi misreads is removed: an emphatic small っ at the end of a word (ですっ」), stretched vowels and long marks after two or more kana (ますぅ, まーす), and stutters (い、いいんですか; こ、これ). Short interjections such as はぁ, えー and えーと are kept. On five novels this changed Sudachi's reading in a few hundred places, mostly for the better (49 of 81 judged by hand; 6 worse, all stretched interjections like あはー).",
-    "Sudachi was chosen over UniDic analysers (Lindera, Vibrato) after a comparison on five novels: it keeps character names whole (UniDic splits most invented names) and gives learner-sized words; on other words the two were about even. Words in the user dictionary are added to Sudachi as proper nouns and are always kept whole.",
-    "Known words: a long word that is not known itself counts as known when all its short-unit parts are (冒険者 with 冒険 and 者 known), with the weakest of their statuses. The JLPT levels are Jonathan Waller's N5–N1 lists (as used by jisho.org), keyed by Sudachi's normalized form, so they match however the book writes a word.",
-    "EPUB: only documents in the spine are read, in reading order, each once. <head>, scripts, styles, ruby annotations (<rt>/<rp>, so furigana is not counted), hidden elements and image alt text are excluded. Block elements and <br> end paragraphs. Line breaks in the HTML source between Japanese characters are removed, as browsers do.",
-    "TXT: encoding from BOM, strict UTF-8 validation, UTF-16 statistics, then chardetng. Each line is a paragraph unless the file is detected as hard-wrapped.",
-    "Sentences end at 。！？!?… (runs count once) or the end of a paragraph.",
-    "Coverage = the number of most-frequent distinct words (kanji) whose occurrences add up to X% of all word (kanji) occurrences.",
-    "Anki: the collection is copied (with its write-ahead log) to a temporary folder and read from there, so it works while Anki is open and is never modified. A review card is mature at an interval of 21+ days and young below that, or, with \"Mature by FSRS stability\" on, at the chosen stability (cards without FSRS data keep the interval rule). Every ticked field is analysed with Sudachi and the user dictionary, with furigana readings (会[あ]う) removed, so a card for 分かる, わかる or わかった matches the book's 分かる. A kanji is known if it is written in a known word on a card.",
-];
-
 const METHOD: &[&str] = &[
     "Chinese character = a code point with Unicode Script=Han that is a letter (all CJK Unified Ideograph blocks incl. Extensions A–J and supplementary planes, compatibility ideographs, 〇, 々). Punctuation, radicals, Latin, digits, whitespace are never counted as Chinese characters.",
     "Text is NFC-normalised first: compatibility ideographs become their unified form, Kangxi radicals used as characters are folded, variation selectors are dropped (葛󠄀 and 葛 are one character), invisible characters (zero-width space, soft hyphen, BOM) are removed.",
@@ -6179,7 +5582,6 @@ impl App {
     /// Every book analysed before, as recorded when its analysis (or what
     /// counts as known) last changed. A click on a title opens the book.
     fn history_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        self.load_read_marks();
         ui.horizontal_wrapped(|ui| {
             ui.heading("Library");
             ui.add_space(8.0);
@@ -6219,11 +5621,7 @@ impl App {
                 {
                     self.library_filter.clear();
                 }
-                if self.history_tab == HistTab::Books
-                    && Language::ALL
-                        .into_iter()
-                        .any(|l| self.known_of(l).is_some_and(|k| !k.read.is_empty()))
-                {
+                if self.history_tab == HistTab::Books && !self.known.settings.read.is_empty() {
                     ui.checkbox(&mut self.library_hide_read, "Hide read")
                         .on_hover_text("Leave out the books marked read");
                 }
@@ -6289,7 +5687,7 @@ impl App {
         ui.separator();
         match self.history_tab {
             HistTab::Path => return self.plan_view(ui, ctx),
-            HistTab::Stats => return self.stats_view(ui, ctx),
+            HistTab::Stats => return self.stats_view(ui),
             HistTab::Books => {}
         }
         if self.history.entries.is_empty() {
@@ -6308,12 +5706,8 @@ impl App {
         }
 
         // Reading time at the speeds the Overview uses, as there.
-        let (cpm, ja_cpm, wpm) = self.speeds();
-        let minutes = |s: &history::Stats| match s.language {
-            Language::Chinese => s.han_total as f64 / cpm,
-            Language::Japanese => (s.han_total + s.kana_total) as f64 / ja_cpm,
-            Language::Korean => s.words_total as f64 / wpm,
-        };
+        let cpm = self.speeds();
+        let minutes = |s: &history::Stats| s.han_total as f64 / cpm;
         let (col, desc) = self.history_sort;
         let style_on = self.style_on();
         let style_scores: HashMap<&str, f32> = if style_on {
@@ -6375,12 +5769,7 @@ impl App {
                 HistCol::Title | HistCol::Language => 0.0,
             }
         };
-        let lang_key = |i: usize| {
-            (
-                entries[i].stats.language as u8,
-                entries[i].stats.variant.as_str(),
-            )
-        };
+        let lang_key = |i: usize| entries[i].stats.variant.as_str();
         let query = search::Query::new(&self.library_filter);
         let mut rows: Vec<usize> = (0..entries.len())
             .filter(|&i| book_matches(&query, &entries[i].title, &entries[i].path))
@@ -6396,7 +5785,7 @@ impl App {
             }
             _ => rows.sort_by(|&a, &b| {
                 let o = match col {
-                    HistCol::Language => lang_key(a).cmp(&lang_key(b)),
+                    HistCol::Language => lang_key(a).cmp(lang_key(b)),
                     _ => key(a).total_cmp(&key(b)),
                 };
                 if desc { o.reverse() } else { o }
@@ -6452,11 +5841,11 @@ impl App {
                 let mut heads: Vec<(Option<HistCol>, &str, &str)> = vec![
                     (Some(HistCol::Title), "Book", "The book's title, or its file name"),
                     (None, "", ""),
-                    (Some(HistCol::Language), "Language", "Language, and script for Chinese"),
+                    (Some(HistCol::Language), "Language", "Simplified or Traditional Chinese"),
                     (
                         Some(HistCol::Chars),
                         "Characters",
-                        "Chinese characters, or kanji in a Japanese book (Korean books have none)",
+                        "Chinese characters",
                     ),
                     (Some(HistCol::Words), "Words", "Running words, as the segmenter counted them"),
                     (Some(HistCol::Unique), "Unique words", "Distinct words"),
@@ -6550,12 +5939,10 @@ impl App {
                                 k.unique_words,
                                 fmt_int(k.unknown_words)
                             ));
-                            if s.language != Language::Korean {
-                                hover.push_str(&format!(
-                                    ", {:.1}% of unique characters",
-                                    k.unique_chars
-                                ));
-                            }
+                            hover.push_str(&format!(
+                                ", {:.1}% of unique characters",
+                                k.unique_chars
+                            ));
                         }
                         if s.words_for_98 > 0 {
                             hover.push_str(&format!(
@@ -6602,9 +5989,8 @@ impl App {
                         });
                     });
                     row.col(|ui| {
-                        // As on the Overview: the reader takes Chinese EPUBs.
-                        if s.language == Language::Chinese
-                            && s.format == "EPUB"
+                        // As on the Overview: the reader takes EPUBs.
+                        if s.format == "EPUB"
                             && ui
                                 .add_enabled(exists.get(&e.path), egui::Button::new("📕 Read"))
                                 .on_hover_text("Read the book, with its layout and pictures")
@@ -6625,14 +6011,10 @@ impl App {
                             "Mixed" => Some(Variant::Mixed),
                             _ => None,
                         };
-                        ui.label(mode_badge(s.language, variant).0);
+                        ui.label(script_badge(variant).0);
                     });
                     row.col(|ui| {
-                        if s.language == Language::Korean {
-                            ui.label(dash());
-                        } else {
-                            ui.label(fmt_int(s.han_total));
-                        }
+                        ui.label(fmt_int(s.han_total));
                     });
                     row.col(|ui| {
                         ui.label(fmt_int(s.words_total));
@@ -6681,15 +6063,12 @@ impl App {
                                 ui.label(format!("{} · {}", style_scale.pct(x), style::label(x)))
                                     .on_hover_text(style_scale.hover(x));
                             }
-                            None if s.language == Language::Chinese => {
+                            None => {
                                 ui.label(dash()).on_hover_text(
                                     style_skipped
                                         .get(&e.id)
                                         .map_or("Not rated yet", String::as_str),
                                 );
-                            }
-                            None => {
-                                ui.label(dash()).on_hover_text("Chinese books only");
                             }
                         });
                     }
@@ -6968,14 +6347,12 @@ fn info_button(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) -> egui::
 }
 
 impl App {
-    /// The library of the current language's books `have` (with a profile),
-    /// folded as the known words need.
+    /// The library of the books `have` (with a profile), folded as the
+    /// known words need.
     fn lib_key(&self, have: Vec<String>) -> LibKey {
         LibKey {
-            lang: self.language,
             fold: plan::Library::fold_for(
                 self.known.merged.as_deref(),
-                self.language,
                 self.anki.settings.match_across_scripts,
             ),
             skip_hapax: self.settings.skip_hapax,
@@ -6984,13 +6361,9 @@ impl App {
         }
     }
 
-    /// History ids of the current language's books that have a profile.
+    /// History ids of the books that have a profile.
     fn plan_have(&mut self) -> Vec<String> {
-        let key = (
-            self.language,
-            self.profiles_version,
-            self.history.entries.len(),
-        );
+        let key = (self.profiles_version, self.history.entries.len());
         if let Some((k, ids)) = &self.plan.have
             && *k == key
         {
@@ -7000,7 +6373,7 @@ impl App {
             .history
             .entries
             .iter()
-            .filter(|e| e.stats.language == self.language && self.history.profile(&e.id).is_file())
+            .filter(|e| self.history.profile(&e.id).is_file())
             .map(|e| e.id.clone())
             .collect();
         self.plan.have = Some((key, ids.clone()));
@@ -7053,12 +6426,7 @@ impl App {
                     .into_iter()
                     .filter_map(|(t, p)| Profile::load(&p).map(|p| (t, p)))
                     .collect();
-                Arc::new(plan::Library::build(
-                    key.lang,
-                    key.fold,
-                    key.skip_hapax,
-                    books,
-                ))
+                Arc::new(plan::Library::build(key.fold, key.skip_hapax, books))
             });
             // Writing style: a copy only when the offsets changed.
             let mut lib = lib;
@@ -7222,19 +6590,14 @@ impl App {
         self.start_batch(todo, None, BatchMode::Refresh, ctx);
     }
 
-    /// What a Library row in `lang` is computed from besides its book, its
-    /// sections and its segmenter: the build, the user dictionary, the known
-    /// words (for the segmenter and for coverage) and the settings, as a
-    /// digest. `None` while `lang`'s data is not loaded this session or the
-    /// Anki cards are still being read, when a row could not be computed right.
-    fn lang_inputs(&mut self, lang: Language) -> Option<Inputs> {
+    /// What a Library row is computed from besides its book, its sections
+    /// and its segmenter: the build, the user dictionary, the known words
+    /// (for the segmenter and for coverage) and the settings, as a digest.
+    /// `None` while the Anki cards are still being read, when a row could not
+    /// be computed right.
+    fn lang_inputs(&mut self) -> Option<Inputs> {
         use sha2::{Digest, Sha256};
-        let (user_words, anki, known) = if lang == self.language {
-            (&self.user_words, &self.anki, &self.known)
-        } else {
-            let d = self.stash.get(&lang)?;
-            (&d.user_words, &d.anki, &d.known)
-        };
+        let (user_words, anki, known) = (&self.user_words, &self.anki, &self.known);
         let anki_pending = anki.rx.is_some()
             || anki.dirty
             || (anki.settings.enabled
@@ -7243,8 +6606,8 @@ impl App {
         if anki_pending {
             return None;
         }
-        // Character folding changes a Chinese book's character counts.
-        let fold = lang == Language::Chinese && anki.settings.match_across_scripts;
+        // Character folding changes a book's character counts.
+        let fold = anki.settings.match_across_scripts;
         // Asked every second: made again only when what it is made from changed.
         let quick = {
             use std::hash::{Hash, Hasher};
@@ -7256,7 +6619,7 @@ impl App {
             (self.settings.skip_hapax, fold).hash(&mut h);
             h.finish()
         };
-        if let Some((q, m, i)) = self.inputs_memo.get(&lang)
+        if let Some((q, m, i)) = &self.inputs_memo
             && *q == quick
             && match (m, &known.merged) {
                 (Some(a), Some(b)) => Arc::ptr_eq(a, b),
@@ -7293,19 +6656,13 @@ impl App {
         };
         let mut h = Sha256::new();
         text(&mut h, env!("HANSTAT_LIBRARY_FINGERPRINT"));
-        text(&mut h, &format!("{lang:?}"));
         h.update([u8::from(fold)]);
         h.update((user_words.len() as u64).to_le_bytes());
         for w in user_words {
             text(&mut h, w);
         }
-        // Word lists join the segmenter's tokens in Chinese only: Kiwi and
-        // Sudachi return dictionary forms, and the analysis drops them.
-        let seg = if lang == Language::Chinese {
-            known.settings.segmenter_words()
-        } else {
-            Vec::new()
-        };
+        // Word lists join the segmenter's tokens.
+        let seg = known.settings.segmenter_words();
         h.update((seg.len() as u64).to_le_bytes());
         for w in &seg {
             text(&mut h, w);
@@ -7319,8 +6676,7 @@ impl App {
             analysis,
             coverage: hex(h),
         };
-        self.inputs_memo
-            .insert(lang, (quick, known.merged.clone(), inputs.clone()));
+        self.inputs_memo = Some((quick, known.merged.clone(), inputs.clone()));
         Some(inputs)
     }
 
@@ -7336,12 +6692,7 @@ impl App {
         }
         self.auto.next_scan = now + 1.0;
         // As start_batch takes them, so the two compare.
-        let mut inputs = HashMap::new();
-        for l in Language::ALL {
-            if let Some(d) = self.lang_inputs(l) {
-                inputs.insert(l, d);
-            }
-        }
+        let inputs = self.lang_inputs();
         if inputs != self.auto.seen {
             self.auto.seen = inputs.clone();
             self.auto.changed_at = now;
@@ -7356,15 +6707,18 @@ impl App {
             let b = self.batch.take().unwrap();
             b.cancel.store(true, Ordering::Relaxed);
         }
-        if self.batch.is_some() || self.job.is_some() || inputs.is_empty() {
+        if self.batch.is_some() || self.job.is_some() {
             return;
         }
+        let Some(d) = inputs else {
+            return;
+        };
         let wait = self.auto.changed_at + AUTO_REFRESH_DELAY - now;
         if wait > 0.0 {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait.min(1.0)));
             return;
         }
-        if self.auto.paused.as_ref() == Some(&inputs) {
+        if self.auto.paused.as_ref() == Some(&d) {
             return;
         }
         self.auto.paused = None;
@@ -7373,12 +6727,9 @@ impl App {
         // milliseconds each, the others an analysis.
         let (mut todo, mut full) = (Vec::new(), Vec::new());
         for e in &self.history.entries {
-            let Some(d) = inputs.get(&e.stats.language) else {
-                continue;
-            };
             if e.inputs == d.joined()
                 || Some(e.id.as_str()) == open
-                || self.auto.failed.get(&e.path) == Some(d)
+                || self.auto.failed.get(&e.path) == Some(&d)
             {
                 continue;
             }
@@ -7410,34 +6761,12 @@ impl App {
         if let Some(b) = self.batch.take() {
             b.cancel.store(true, Ordering::Relaxed);
         }
-        // Each language's dictionary, known words for the segmenter, and
-        // knowledge for the History's "Known" (languages not used yet: none).
-        let mut words: HashMap<Language, Vec<String>> = self
-            .stash
-            .iter()
-            .map(|(l, d)| (*l, d.user_words.clone()))
-            .collect();
-        words.insert(self.language, self.user_words.clone());
-        let mut known_words: HashMap<Language, Vec<String>> = self
-            .stash
-            .iter()
-            .map(|(l, d)| (*l, d.known.settings.segmenter_words()))
-            .collect();
-        known_words.insert(self.language, self.known.settings.segmenter_words());
-        let mut knowledge: HashMap<Language, Arc<anki::Knowledge>> = self
-            .stash
-            .iter()
-            .filter_map(|(l, d)| d.known.merged.clone().map(|k| (*l, k)))
-            .collect();
-        if let Some(k) = &self.known.merged {
-            knowledge.insert(self.language, k.clone());
-        }
-        let mut inputs = HashMap::new();
-        for l in Language::ALL {
-            if let Some(d) = self.lang_inputs(l) {
-                inputs.insert(l, d);
-            }
-        }
+        // The dictionary, known words for the segmenter, and knowledge for
+        // the History's "Known".
+        let words = self.user_words.clone();
+        let known_words = self.known.settings.segmenter_words();
+        let knowledge = self.known.merged.clone();
+        let inputs = self.lang_inputs();
         let thread_inputs = inputs.clone();
         let cache = self.cache.clone();
         let skip_hapax = self.settings.skip_hapax;
@@ -7484,7 +6813,13 @@ impl App {
                     saved_sections.get(&id).cloned()
                 });
                 if let Some(e) = refresh.and_then(|e| {
-                    coverage_only(&e, &knowledge, skip_hapax, &history_path, &thread_inputs)
+                    coverage_only(
+                        &e,
+                        knowledge.as_deref(),
+                        skip_hapax,
+                        &history_path,
+                        thread_inputs.as_ref(),
+                    )
                 }) {
                     let _ = tx.send(BatchMsg::Book(Box::new(e), false));
                     d2.fetch_add(1, Ordering::Relaxed);
@@ -7494,18 +6829,8 @@ impl App {
                     &path,
                     kind,
                     sections.as_deref(),
-                    &|l| {
-                        words
-                            .get(&l)
-                            .cloned()
-                            .unwrap_or_else(|| hanstat::load_user_dict(l).0)
-                    },
-                    &|l| {
-                        known_words
-                            .get(&l)
-                            .cloned()
-                            .unwrap_or_else(|| known::Settings::load_for(l).0.segmenter_words())
-                    },
+                    &words,
+                    &known_words,
                     cache.as_ref(),
                     fold_chars,
                 )
@@ -7515,13 +6840,12 @@ impl App {
                         .ok_or_else(|| format!("cannot read {}", path.display()))?;
                     let mut r = a.report;
                     let names: HashSet<String> = a.names.into_iter().collect();
-                    if let Some(k) = knowledge.get(&r.language) {
+                    if let Some(k) = &knowledge {
                         r.anki = Some(BookCoverage::compute(
                             k,
                             &r.char_freq,
                             &r.word_freq,
                             &names,
-                            &r.word_parts,
                             skip_hapax,
                         ));
                     }
@@ -7563,7 +6887,7 @@ impl App {
                             analysed: history::now(),
                             sections: Some(r.sections.iter().map(|s| s.included).collect()),
                             inputs: thread_inputs
-                                .get(&r.language)
+                                .as_ref()
                                 .map(Inputs::joined)
                                 .unwrap_or_default(),
                             stats: history::Stats::from_report(&r),
@@ -7621,9 +6945,9 @@ impl App {
                             .history
                             .entries
                             .iter()
-                            .find(|x| x.path == path)
-                            .and_then(|x| b.inputs.get(&x.stats.language))
-                            .cloned()
+                            .any(|x| x.path == path)
+                            .then(|| b.inputs.clone())
+                            .flatten()
                     {
                         self.auto.failed.insert(path, d);
                     }
@@ -7644,7 +6968,7 @@ impl App {
         let stopped = b.cancel.load(Ordering::Relaxed);
         if b.mode == BatchMode::Auto && stopped {
             // Stopped by the user: not again until something changes.
-            self.auto.paused = Some(b.inputs.clone());
+            self.auto.paused = b.inputs.clone();
         }
         if let Some(p) = b.then_open
             && !stopped
@@ -7700,30 +7024,12 @@ impl App {
         }
     }
 
-    /// The reading path of the History's books in the current language.
+    /// The reading path of the History's books.
     fn plan_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let lang = self.language;
-        let fixed_lang = self.prep.is_some() || self.job.is_some();
-        let mut pick_lang = None;
         let mut changed = false;
-        let style_on = self.style_on() && lang == Language::Chinese;
+        let style_on = self.style_on();
         let st = &mut self.plan.settings;
         ui.horizontal_wrapped(|ui| {
-            if fixed_lang {
-                ui.label(RichText::new(format!("{} books", lang.name())).strong())
-                    .on_hover_text("The open book's language. Close it (or open another) to plan another language.");
-            } else {
-                egui::ComboBox::from_id_salt("plan_lang")
-                    .selected_text(format!("{} books", lang.name()))
-                    .show_ui(ui, |ui| {
-                        for l in Language::ALL {
-                            if ui.selectable_label(l == lang, l.name()).clicked() {
-                                pick_lang = Some(l);
-                            }
-                        }
-                    });
-            }
-            ui.separator();
             ui.label("Before each book, study");
             changed |= ui.radio_value(&mut st.fixed, false, "until").changed();
             changed |= ui
@@ -7779,10 +7085,6 @@ impl App {
         if changed && let Err(e) = st.save() {
             self.plan.error = Some(e);
         }
-        if let Some(l) = pick_lang {
-            self.set_language(l, ctx);
-            return;
-        }
         if let Some(e) = &self.plan.error {
             ui.colored_label(palette::warn(), format!("⚠ {e}"));
         }
@@ -7793,7 +7095,7 @@ impl App {
             .history
             .entries
             .iter()
-            .filter(|e| e.stats.language == lang && !have_set.contains(e.id.as_str()))
+            .filter(|e| !have_set.contains(e.id.as_str()))
             .map(|e| (e.title.clone(), e.path.clone()))
             .collect();
         let lib = self.lib_key(have.clone());
@@ -7819,18 +7121,13 @@ impl App {
                 })
                 .cloned()
                 .collect(),
-            manual: st.manual_order(lang).cloned(),
+            manual: st.manual_order().cloned(),
             offsets,
         };
         if self.plan.inputs.as_ref() != Some(&inputs) {
             self.start_plan(inputs, ctx);
         }
-        let entries: Vec<&history::Entry> = self
-            .history
-            .entries
-            .iter()
-            .filter(|e| e.stats.language == lang)
-            .collect();
+        let entries: Vec<&history::Entry> = self.history.entries.iter().collect();
 
         let mut act: Option<PlanAction> = None;
         // Books without word data.
@@ -7840,10 +7137,9 @@ impl App {
             let can = missing.iter().filter(|(_, p)| self.exists.get(p)).count();
             ui.horizontal_wrapped(|ui| {
                 ui.label(format!(
-                    "{} of the {} {} books have no word data yet (analysed by an older version) and are not on the path.",
+                    "{} of the {} books have no word data yet (analysed by an older version) and are not on the path.",
                     missing.len(),
-                    entries.len(),
-                    lang.name()
+                    entries.len()
                 ));
                 if can > 0
                     && ui
@@ -8251,7 +7547,6 @@ impl App {
 
     fn apply_plan_action(&mut self, act: Option<PlanAction>, ui: &egui::Ui, ctx: &egui::Context) {
         let Some(act) = act else { return };
-        let lang = self.language.name().to_owned();
         let st = &mut self.plan.settings;
         let mut save_settings = true;
         match act {
@@ -8269,7 +7564,7 @@ impl App {
                     .collect();
                 let j = (i as isize + d) as usize;
                 ids.swap(i, j);
-                st.manual.insert(lang, ids);
+                st.set_manual_order(ids);
             }
             PlanAction::LeaveOut(id) => {
                 if !st.left_out.contains(&id) {
@@ -8282,7 +7577,7 @@ impl App {
                 self.open_read_dialog(&id);
             }
             PlanAction::Optimise => {
-                st.manual.remove(&lang);
+                st.clear_manual_order();
             }
             PlanAction::SaveList(i) => {
                 save_settings = false;
@@ -8317,7 +7612,7 @@ impl App {
                     .history
                     .entries
                     .iter()
-                    .filter(|e| e.stats.language == self.language && !have.contains(&e.id))
+                    .filter(|e| !have.contains(&e.id))
                     .filter(|e| e.path.is_file())
                     .map(Self::library_item)
                     .collect();
@@ -8333,8 +7628,8 @@ impl App {
 
 /// A book's reading speed: `speed` where changed from `default` (the ⚙
 /// menu's), with a button to go back to it.
-/// The reading speeds estimates use: Chinese measured in the reader unless
-/// set by hand (see [`App::cpm`]), Japanese and Korean as set.
+/// The reading speed estimates use: measured in the reader unless set by
+/// hand (see [`App::cpm`]).
 impl App {
     /// Chinese characters a minute: the speed measured in the reader, or
     /// the one in Settings when it is set by hand or nothing is measured yet.
@@ -8345,13 +7640,9 @@ impl App {
         reading_stats::measured_now().map_or(self.settings.cpm, |v| v as f32)
     }
 
-    /// (Chinese, Japanese, Korean), for [`library_stats::reading_minutes`].
-    pub(crate) fn speeds(&self) -> (f64, f64, f64) {
-        (
-            self.cpm() as f64,
-            self.settings.ja_cpm as f64,
-            self.settings.wpm as f64,
-        )
+    /// Characters a minute, for [`library_stats::reading_minutes`].
+    pub(crate) fn speeds(&self) -> f64 {
+        self.cpm() as f64
     }
 }
 
@@ -8391,22 +7682,23 @@ fn speed_input(
 /// lacks what that needs (written before character counts were kept).
 fn coverage_only(
     e: &history::Entry,
-    knowledge: &HashMap<Language, Arc<anki::Knowledge>>,
+    knowledge: Option<&anki::Knowledge>,
     skip_hapax: bool,
     history_path: &Path,
-    inputs: &HashMap<Language, Inputs>,
+    inputs: Option<&Inputs>,
 ) -> Option<history::Entry> {
+    let inputs = inputs?;
     let p = Profile::load(&profile::path_in(history_path, &e.id))?;
     let chars = p.chars.as_ref()?;
     let names: HashSet<String> = p.names.iter().cloned().collect();
-    let known = knowledge.get(&p.language).map(|k| {
+    let known = knowledge.map(|k| {
         history::Known::from_coverage(&BookCoverage::compute(
-            k, chars, &p.words, &names, &p.parts, skip_hapax,
+            k, chars, &p.words, &names, skip_hapax,
         ))
     });
     let mut e = e.clone();
     e.stats.known = known;
-    e.inputs = inputs.get(&p.language)?.joined();
+    e.inputs = inputs.joined();
     Some(e)
 }
 
@@ -8416,8 +7708,6 @@ fn segmenter_by_label(label: &str) -> SegmenterKind {
         SegmenterKind::Ckip,
         SegmenterKind::Ltp,
         SegmenterKind::Jieba,
-        SegmenterKind::Kiwi,
-        SegmenterKind::Sudachi,
     ]
     .into_iter()
     .find(|k| k.label() == label)
@@ -8445,13 +7735,6 @@ fn knowledge_digest(k: &anki::Knowledge) -> String {
         h.update(u32::from(*c).to_le_bytes());
         h.update(format!("{s:?}").as_bytes());
         h.update([0]);
-    }
-    let mut stems: Vec<&String> = k.hada_stems.iter().collect();
-    stems.sort_unstable();
-    h.update((stems.len() as u64).to_le_bytes());
-    for w in stems {
-        h.update((w.len() as u64).to_le_bytes());
-        h.update(w.as_bytes());
     }
     h.update([u8::from(k.fold), u8::from(k.from_anki)]);
     h.update(k.listed.source.as_bytes());

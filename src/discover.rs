@@ -150,7 +150,6 @@ impl Options {
 
 /// `word_freq`: the segmenter's token counts over the same sections.
 /// `known`: words already forced (user dictionary) — never suggested.
-/// Chinese only: a Korean or Japanese book has no suggestions.
 pub fn discover(
     book: &Book,
     included: &[bool],
@@ -225,9 +224,6 @@ fn discover_impl(
     cancel: &AtomicBool,
 ) -> Option<Vec<Candidate>> {
     let cancelled = || cancel.load(Ordering::Relaxed);
-    if crate::analyze::detect_language(book) != crate::lang::Language::Chinese {
-        return Some(Vec::new());
-    }
     // Han-only runs of the normalised text.
     let runs: Vec<Vec<char>> = book
         .sections

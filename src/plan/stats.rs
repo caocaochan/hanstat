@@ -37,8 +37,7 @@ pub struct LibStats {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WideWord {
     /// The word as the books' word data has it, which is what marking it
-    /// known records, as in the Words tab: Sudachi's normalised form in
-    /// Japanese, and a book's own spelling (not folded) in Chinese.
+    /// known records, as in the Words tab: a book's own spelling (not folded).
     pub word: String,
     /// How a book writes it.
     pub shown: String,
@@ -49,7 +48,7 @@ pub struct WideWord {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CharStats {
-    /// Chinese characters (kanji) in the running text of every book.
+    /// Chinese characters in the running text of every book.
     pub total: u64,
     pub unique: usize,
     pub cover_at: [usize; 4],
@@ -73,7 +72,7 @@ impl Library {
                 freq[w] += c as u64;
                 books_in[w] += 1;
                 name[w] |= nm;
-                unknown[w] |= !nm && !self.is_known(b, w as u32, k);
+                unknown[w] |= !nm && !k.has(w as u32);
             }
             let s = self.scan(i, k);
             known += s.known;
@@ -100,8 +99,7 @@ impl Library {
                 let shown = self.spelled(w as u32).to_owned();
                 WideWord {
                     // Folded keys are kept as a book spells them; otherwise
-                    // the key is the profile's own word (`spell` holds how
-                    // it is written, as for Japanese).
+                    // the key is the profile's own word.
                     word: if self.fold {
                         shown.clone()
                     } else {
@@ -140,15 +138,14 @@ impl Library {
     }
 }
 
-/// Characters of the books' words, each spelled as its book usually spells
-/// it (Japanese keys are normalised forms). With `fold`, Traditional
+/// Characters of the books' words. With `fold`, Traditional
 /// characters count as their Simplified form (說 and 说 are one), as the
 /// library's words do.
 pub fn char_stats(profiles: &[Profile], k: Option<&Knowledge>, fold: bool) -> CharStats {
     let mut counts: FxHashMap<char, u64> = FxHashMap::default();
     for p in profiles {
         for (w, n) in &p.words {
-            for c in p.shown(w).chars().filter(|&c| crate::chars::is_han(c)) {
+            for c in w.chars().filter(|&c| crate::chars::is_han(c)) {
                 *counts.entry(crate::anki::fold_char(c, fold)).or_default() += *n as u64;
             }
         }
@@ -199,8 +196,6 @@ fn coverage_total(c: &[(usize, f64, u64)]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lang::Language;
-    use std::collections::HashMap;
 
     fn profile(id: &str, words: &[(&str, u32)], names: &[&str]) -> (String, Profile) {
         (
@@ -208,13 +203,10 @@ mod tests {
             Profile {
                 format: crate::profile::FORMAT,
                 id: id.into(),
-                language: Language::Chinese,
                 variant: "Simplified".into(),
                 segmenter: "LTP".into(),
                 words: words.iter().map(|(a, b)| (a.to_string(), *b)).collect(),
                 names: names.iter().map(|s| s.to_string()).collect(),
-                parts: HashMap::new(),
-                display: HashMap::new(),
                 chars: None,
             },
         )
@@ -227,7 +219,7 @@ mod tests {
             profile("b", &[("我们", 50), ("明天", 30), ("今天", 20)], &[]),
             profile("c", &[("我们", 40), ("明天", 40), ("苹果", 20)], &[]),
         ];
-        let lib = Library::build(Language::Chinese, false, false, books.clone());
+        let lib = Library::build(false, false, books.clone());
         let s = lib.stats(&lib.known(None), 10);
         assert_eq!(s.vocab, 5);
         assert_eq!(s.running, 300);
@@ -268,7 +260,6 @@ mod tests {
         let both = [simp.clone(), trad];
         let k = crate::known::Settings {
             marked: vec!["说".into()],
-            language: Language::Chinese,
             ..Default::default()
         }
         .apply(None, true)
@@ -285,31 +276,22 @@ mod tests {
     }
 
     /// A listed word, marked known as the Words tab does, is known at the
-    /// next count: Chinese keeps a book's own spelling under folding, and
-    /// Japanese the normalised key, with its spelling shown.
+    /// next count: a book's own spelling is kept under folding.
     #[test]
     fn widespread_words_mark_as_counted() {
         let (t, mut trad) = profile("t", &[("我們", 9), ("今天", 3)], &[]);
         trad.variant = "Traditional".into();
-        let lib = Library::build(Language::Chinese, true, false, vec![(t, trad)]);
+        let lib = Library::build(true, false, vec![(t, trad)]);
         let s = lib.stats(&lib.known(None), 10);
         let w = &s.widespread[0];
         assert_eq!((w.word.as_str(), w.shown.as_str()), ("我們", "我們"));
         let marked = crate::known::Settings {
             marked: vec![w.word.clone()],
-            language: Language::Chinese,
             ..Default::default()
         };
         let k = marked.apply(None, true).unwrap();
         let s = lib.stats(&lib.known(Some(&k)), 10);
         let left: Vec<&str> = s.widespread.iter().map(|w| w.word.as_str()).collect();
         assert_eq!(left, ["今天"]);
-
-        let (j, mut ja) = profile("j", &[("為る", 9)], &[]);
-        ja.language = Language::Japanese;
-        ja.display = HashMap::from([("為る".into(), "する".into())]);
-        let lib = Library::build(Language::Japanese, false, false, vec![(j, ja)]);
-        let w = &lib.stats(&lib.known(None), 10).widespread[0];
-        assert_eq!((w.word.as_str(), w.shown.as_str()), ("為る", "する"));
     }
 }

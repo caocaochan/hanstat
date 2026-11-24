@@ -16,12 +16,10 @@
 //! status of the notes it appears in, and a character the best status of the
 //! words containing it.
 //!
-//! The user's choice of collection, decks, note types and fields is saved per
-//! language: `%LOCALAPPDATA%\hanstat\anki.json` for Chinese, `anki-ko.json`
-//! for Korean and `anki-ja.json` for Japanese, in [`crate::models::app_dir`].
+//! The user's choice of collection, decks, note types and fields is saved in
+//! `%LOCALAPPDATA%\hanstat\anki.json`, in [`crate::models::app_dir`].
 
 use crate::chars;
-use crate::lang::Language;
 use crate::script::{self, Variant};
 use crate::segment::{Segmenter, SegmenterKind};
 use regex::Regex;
@@ -41,7 +39,7 @@ pub enum Status {
     NotInAnki,
     New,
     Learning,
-    /// Not young/mature in Anki, but in a ticked level (HSK, 급) or an imported word
+    /// Not young/mature in Anki, but in a ticked level (HSK, TOCFL) or an imported word
     /// list (see `crate::known`). Counts as known.
     Listed,
     Young,
@@ -221,9 +219,6 @@ pub struct Settings {
     pub mature_by_stability: bool,
     /// The stability, in days, at which a review card is mature.
     pub mature_stability_days: u32,
-    /// Which language's file these settings belong to (not stored in it).
-    #[serde(skip)]
-    pub language: Language,
 }
 
 impl Default for Settings {
@@ -237,41 +232,27 @@ impl Default for Settings {
             match_across_scripts: true,
             mature_by_stability: false,
             mature_stability_days: MATURE_IVL as u32,
-            language: Language::Chinese,
         }
     }
 }
 
 impl Settings {
-    /// The Chinese settings file (`anki.json`).
+    /// The settings file (`anki.json`).
     pub fn path() -> PathBuf {
-        Self::path_for(Language::Chinese)
-    }
-
-    /// `anki.json` (Chinese) or `anki-ko.json` (Korean).
-    pub fn path_for(lang: Language) -> PathBuf {
-        lang.settings_path("anki")
-    }
-
-    /// The Chinese settings.
-    pub fn load() -> (Settings, Option<String>) {
-        Self::load_for(Language::Chinese)
+        crate::models::app_dir().join("anki.json")
     }
 
     /// Missing file → defaults. An unreadable one is kept aside and
     /// reported by the saver ([`crate::saver::load_json`]); defaults are used.
-    pub fn load_for(lang: Language) -> (Settings, Option<String>) {
-        let mut s: Settings = crate::saver::load_json(&Self::path_for(lang)).unwrap_or_default();
-        s.language = lang;
-        (s, None)
+    pub fn load() -> (Settings, Option<String>) {
+        (
+            crate::saver::load_json(&Self::path()).unwrap_or_default(),
+            None,
+        )
     }
 
-    /// Saved to this language's file.
     pub fn save(&self) -> Result<(), String> {
-        crate::saver::write(
-            &Self::path_for(self.language),
-            serde_json::to_vec_pretty(self).unwrap(),
-        )
+        crate::saver::write(&Self::path(), serde_json::to_vec_pretty(self).unwrap())
     }
 
     /// The stability threshold in days, if maturity is judged by stability.
@@ -407,28 +388,6 @@ impl SegConfig {
                 k => k,
             }),
             user_words: user_words.to_vec(),
-        }
-    }
-
-    /// As [`SegConfig::new`] for Chinese; Kiwi for Korean and Sudachi for
-    /// Japanese, where every field value is analysed into dictionary forms
-    /// like the book.
-    pub fn for_language(
-        lang: Language,
-        chosen: SegmenterKind,
-        book: Option<SegmenterKind>,
-        user_words: &[String],
-    ) -> Self {
-        match lang {
-            Language::Chinese => Self::new(chosen, book, user_words),
-            Language::Korean => SegConfig {
-                kind: SegmenterKind::Kiwi,
-                user_words: user_words.to_vec(),
-            },
-            Language::Japanese => SegConfig {
-                kind: SegmenterKind::Sudachi,
-                user_words: user_words.to_vec(),
-            },
         }
     }
 }
@@ -697,22 +656,13 @@ impl Collection {
             }
         }
 
-        // Sentences and long phrases, segmented together afterwards. In Korean
-        // and Japanese, every field value: Kiwi or Sudachi turns it into
-        // dictionary forms like the book.
-        let korean = seg.kind == SegmenterKind::Kiwi;
-        let japanese = seg.kind == SegmenterKind::Sudachi;
-        // Traditional ↔ Simplified folding is for Chinese; it would merge
-        // distinct Japanese kanji.
-        let fold_on = s.match_across_scripts && !japanese;
+        // Sentences and long phrases, segmented together afterwards.
+        let fold_on = s.match_across_scripts;
         let mut words: HashMap<String, Status> = HashMap::new();
         let mut add = |w: &str, st: Status| {
             let e = words.entry(fold(w, fold_on)).or_default();
             *e = (*e).max(st);
         };
-        // Japanese: the spellings the cards use, for the kanji they teach (a
-        // word's key may be a normalized form such as 為る for する).
-        let mut spelled: Vec<(String, Status)> = Vec::new();
         let mut to_segment: Vec<(String, Status)> = Vec::new();
         if !note_status.is_empty() {
             let mids: Vec<String> = ords.keys().map(|m| m.to_string()).collect();
@@ -737,30 +687,7 @@ impl Collection {
                 let mut any = false;
                 for &o in &ords[&mid] {
                     let Some(f) = parts.get(o) else { continue };
-                    if japanese {
-                        let text = clean_field_ja(f, &mut norm);
-                        if !text.chars().any(|c| chars::is_main(c, Language::Japanese)) {
-                            continue;
-                        }
-                        any = true;
-                        if looks_like_sentence(&text) {
-                            summary.sentences += 1;
-                        }
-                        to_segment.push((text, ns));
-                        continue;
-                    }
                     let text = clean_field(f, &mut norm);
-                    if korean {
-                        if !text.chars().any(chars::is_hangul) {
-                            continue;
-                        }
-                        any = true;
-                        if text.split_whitespace().nth(1).is_some() || looks_like_sentence(&text) {
-                            summary.sentences += 1;
-                        }
-                        to_segment.push((text, ns));
-                        continue;
-                    }
                     if han_runs(&text).next().is_none() {
                         continue;
                     }
@@ -785,44 +712,7 @@ impl Collection {
                 }
             }
         }
-        if korean && !to_segment.is_empty() {
-            let mut nd = chars::NormStats::default();
-            let forced: Vec<String> = seg
-                .user_words
-                .iter()
-                .map(|w| chars::normalize(w.trim(), &mut nd))
-                .filter(|w| !w.is_empty())
-                .collect();
-            let segmenter = Segmenter::new(SegmenterKind::Kiwi, &forced, Variant::Unknown)?;
-            let texts: Vec<&str> = to_segment.iter().map(|(t, _)| t.as_str()).collect();
-            for (ls, (_, st)) in segmenter.lemmas_many(&texts)?.into_iter().zip(&to_segment) {
-                for w in ls.iter().filter(|w| w.chars().any(chars::is_hangul)) {
-                    add(w, *st);
-                }
-            }
-            summary.segmenter = Some(SegmenterKind::Kiwi);
-        } else if japanese && !to_segment.is_empty() {
-            let mut nd = chars::NormStats::default();
-            let forced: Vec<String> = seg
-                .user_words
-                .iter()
-                .map(|w| chars::normalize(w.trim(), &mut nd))
-                .filter(|w| !w.is_empty())
-                .collect();
-            let segmenter = Segmenter::new(SegmenterKind::Sudachi, &forced, Variant::Unknown)?;
-            let texts: Vec<&str> = to_segment.iter().map(|(t, _)| t.as_str()).collect();
-            for (ws, (_, st)) in segmenter
-                .japanese_words_many(&texts)?
-                .into_iter()
-                .zip(&to_segment)
-            {
-                for w in ws {
-                    add(&w.key, *st);
-                    spelled.push((w.spelling, *st));
-                }
-            }
-            summary.segmenter = Some(SegmenterKind::Sudachi);
-        } else if !to_segment.is_empty() {
+        if !to_segment.is_empty() {
             let t = &*script::TABLES;
             let (mut tr, mut si) = (0u64, 0u64);
             for c in to_segment.iter().flat_map(|(x, _)| x.chars()) {
@@ -859,24 +749,14 @@ impl Collection {
         }
         let mut char_status: HashMap<char, Status> = HashMap::new();
         let mut add_chars = |w: &str, st: Status| {
-            // Korean has word statistics only: no per-syllable status; Japanese
-            // counts kanji only.
-            for c in w
-                .chars()
-                .filter(|c| !chars::is_hangul(*c) && !(japanese && !chars::is_han(*c)))
-            {
+            for c in w.chars() {
                 let e = char_status.entry(c).or_default();
                 *e = (*e).max(st);
             }
         };
         for (w, &st) in &words {
             summary.words.add(st, 1);
-            if !japanese {
-                add_chars(w, st);
-            }
-        }
-        for (w, st) in &spelled {
-            add_chars(w, *st);
+            add_chars(w, st);
         }
         for &st in char_status.values() {
             summary.chars.add(st, 1);
@@ -888,7 +768,6 @@ impl Collection {
             summary,
             from_anki: true,
             listed: ListedSummary::default(),
-            hada_stems: HashSet::new(),
         })
     }
 }
@@ -959,18 +838,6 @@ static RE_TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<[^>]*>").unw
 static RE_BRACKET: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[[^\]]*\]").unwrap());
 static RE_NUM_ENTITY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"&#(?:[xX]([0-9a-fA-F]+)|([0-9]+));").unwrap());
-
-/// Anki's Japanese furigana, `日本語[にほんご]を 勉強[べんきょう]する`: the
-/// reading and the space that may start the annotated word go, as in Anki's
-/// `kanji:` filter.
-static RE_FURIGANA: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r" ?([^ >\[\]]+?)\[[^\]]*\]").unwrap());
-
-/// [`clean_field`] for Japanese: furigana readings are removed without
-/// splitting the word they annotate (会[あ]う → 会う).
-pub fn clean_field_ja(field: &str, norm: &mut chars::NormStats) -> String {
-    clean_field(&RE_FURIGANA.replace_all(field, "$1"), norm)
-}
 
 /// One field's text with HTML, cloze markup, sound tags and bracketed readings
 /// removed, NFC-normalised as book text is.
@@ -1067,8 +934,7 @@ pub fn fold_char(c: char, on: bool) -> char {
 pub struct KnowledgeSummary {
     /// Selected notes with at least one card in the selected decks.
     pub notes: u64,
-    /// Of those, notes whose selected fields contain no Chinese characters
-    /// (for Korean settings: no Hangul; for Japanese: no kana or kanji).
+    /// Of those, notes whose selected fields contain no Chinese characters.
     pub notes_without_chinese: u64,
     /// Field values that looked like sentences and were split into words.
     pub sentences: u64,
@@ -1111,9 +977,6 @@ pub struct Knowledge {
     /// Built from an Anki collection, not from word lists alone.
     pub from_anki: bool,
     pub listed: ListedSummary,
-    /// Korean: listed words X whose X하다 and X되다 are known too
-    /// ([`Status::Listed`]); see `crate::known::Settings::hada_stems`.
-    pub hada_stems: HashSet<String>,
 }
 
 impl Knowledge {
@@ -1126,46 +989,20 @@ impl Knowledge {
             summary: KnowledgeSummary::default(),
             from_anki: false,
             listed: ListedSummary::default(),
-            hada_stems: HashSet::new(),
         }
     }
 
     /// Mark `words` known as [`Status::Listed`], keeping a better (young or
     /// mature) Anki status. Their characters become known too.
     pub fn add_listed<'a>(&mut self, words: impl IntoIterator<Item = &'a str>, source: String) {
-        self.add_listed_with(words.into_iter().map(|w| (w, w)), source, |c| {
-            // Korean has word statistics only: no per-syllable status.
-            !chars::is_hangul(c)
-        });
-    }
-
-    /// Japanese: mark (key, spelling) pairs known; the kanji of the spelling
-    /// become known (a key such as 為る is not how the word is written).
-    pub fn add_listed_spelled<'a>(
-        &mut self,
-        words: impl IntoIterator<Item = (&'a str, &'a str)>,
-        source: String,
-    ) {
-        self.add_listed_with(words, source, chars::is_han);
-    }
-
-    fn add_listed_with<'a>(
-        &mut self,
-        words: impl IntoIterator<Item = (&'a str, &'a str)>,
-        source: String,
-        counts_as_char: impl Fn(char) -> bool,
-    ) {
         let mut seen: HashSet<String> = HashSet::new();
-        for (w, spelling) in words {
+        for w in words {
             let key = fold(w, self.fold);
             if key.is_empty() {
                 continue;
             }
             let first = seen.insert(key.clone());
-            for c in fold(spelling, self.fold)
-                .chars()
-                .filter(|c| counts_as_char(*c))
-            {
+            for c in key.chars() {
                 let e = self.chars.entry(c).or_default();
                 if !e.is_known() {
                     self.listed.new_chars += 1;
@@ -1186,26 +1023,12 @@ impl Knowledge {
     }
 
     pub fn word(&self, w: &str) -> Status {
-        let s = self
-            .words
+        self.words
             .get(&fold(w, self.fold))
             .copied()
-            .unwrap_or_default();
-        if !s.is_known() && self.hada_stem_known(w) {
-            Status::Listed
-        } else {
-            s
-        }
+            .unwrap_or_default()
     }
 
-    /// `w` is X하다 or X되다 with X in [`Self::hada_stems`].
-    fn hada_stem_known(&self, w: &str) -> bool {
-        !self.hada_stems.is_empty()
-            && ["하다", "되다"].iter().any(|sfx| {
-                w.strip_suffix(sfx)
-                    .is_some_and(|x| !x.is_empty() && self.hada_stems.contains(x))
-            })
-    }
     pub fn char(&self, c: char) -> Status {
         self.chars
             .get(&fold_char(c, self.fold))
@@ -1322,10 +1145,6 @@ impl BookCoverage {
     /// so any word containing one is left out of the running-word coverage
     /// that sets the difficulty (as coverage studies treat proper nouns).
     ///
-    /// `parts` (Japanese, `Report::word_parts`): a long unit that is not known
-    /// itself (冒険者) counts as known when all its short-unit parts (冒険, 者)
-    /// are, with the weakest of their statuses.
-    ///
     /// `skip_hapax`: words that occur only once are left out of the unique
     /// and running words (known or not), and of the top unknown words.
     pub fn compute(
@@ -1333,23 +1152,10 @@ impl BookCoverage {
         char_freq: &[(char, u32)],
         word_freq: &[(String, u32)],
         names: &HashSet<String>,
-        parts: &HashMap<String, Vec<String>>,
         skip_hapax: bool,
     ) -> Self {
         let counted = |n: u32| !skip_hapax || n > 1;
-        let word_status: Vec<Status> = word_freq
-            .iter()
-            .map(|(w, _)| {
-                let s = k.word(w);
-                match parts.get(w) {
-                    Some(p) if !s.is_known() && !p.is_empty() => {
-                        let weakest = p.iter().map(|x| k.word(x)).min().unwrap_or_default();
-                        if weakest.is_known() { weakest } else { s }
-                    }
-                    _ => s,
-                }
-            })
-            .collect();
+        let word_status: Vec<Status> = word_freq.iter().map(|(w, _)| k.word(w)).collect();
         let char_status: Vec<Status> = char_freq.iter().map(|(c, _)| k.char(*c)).collect();
         let count = |v: &[Status]| KnownCount {
             known: v.iter().filter(|s| s.is_known()).count() as u64,
@@ -1447,17 +1253,6 @@ mod tests {
     }
 
     #[test]
-    fn japanese_furigana() {
-        let mut n = chars::NormStats::default();
-        assert_eq!(
-            clean_field_ja("日本語[にほんご]を 勉強[べんきょう]する", &mut n),
-            "日本語を勉強する"
-        );
-        assert_eq!(clean_field_ja(" 会[あ]う[sound:au.mp3]", &mut n), "会う");
-        assert_eq!(clean_field_ja("<b>食[た]べる</b>", &mut n), "食べる");
-    }
-
-    #[test]
     fn sentence_detection() {
         let mut n = chars::NormStats::default();
         let s = |f: &str, n: &mut chars::NormStats| looks_like_sentence(&clean_field(f, n));
@@ -1496,7 +1291,6 @@ mod tests {
             summary: KnowledgeSummary::default(),
             from_anki: true,
             listed: ListedSummary::default(),
-            hada_stems: HashSet::new(),
         };
         let word_freq = vec![
             ("我".to_string(), 50),
@@ -1507,7 +1301,7 @@ mod tests {
         ];
         let char_freq = vec![('我', 50), ('看', 30), ('顾', 15), ('飞', 15)];
         let names: HashSet<String> = ["顾飞".to_string(), "飞".to_string()].into();
-        let c = BookCoverage::compute(&k, &char_freq, &word_freq, &names, &HashMap::new(), false);
+        let c = BookCoverage::compute(&k, &char_freq, &word_freq, &names, false);
         // 顾飞 and 顾飞说 are names; the one-character "name" 飞 is ignored.
         assert_eq!(c.name_tokens, 15);
         assert_eq!((c.running_words.known, c.running_words.total), (80, 85));
@@ -1531,7 +1325,6 @@ mod tests {
             summary: KnowledgeSummary::default(),
             from_anki: true,
             listed: ListedSummary::default(),
-            hada_stems: HashSet::new(),
         };
         let word_freq = vec![
             ("我".to_string(), 90),
@@ -1539,15 +1332,14 @@ mod tests {
             ("一".to_string(), 1),
             ("滑板".to_string(), 1),
         ];
-        let off =
-            BookCoverage::compute(&k, &[], &word_freq, &HashSet::new(), &HashMap::new(), false);
+        let off = BookCoverage::compute(&k, &[], &word_freq, &HashSet::new(), false);
         assert_eq!(
             (off.running_words.known, off.running_words.total),
             (91, 100)
         );
         assert_eq!((off.unique_words.known, off.unique_words.total), (2, 4));
         // Known (一) and unknown (滑板) words that occur once both go.
-        let on = BookCoverage::compute(&k, &[], &word_freq, &HashSet::new(), &HashMap::new(), true);
+        let on = BookCoverage::compute(&k, &[], &word_freq, &HashSet::new(), true);
         assert_eq!((on.running_words.known, on.running_words.total), (90, 98));
         assert_eq!((on.unique_words.known, on.unique_words.total), (1, 2));
         assert_eq!(on.hapax_left_out, 2);
@@ -1624,7 +1416,6 @@ mod tests {
             summary: Default::default(),
             from_anki: true,
             listed: Default::default(),
-            hada_stems: Default::default(),
         };
         assert_eq!(k.word("响彻"), Status::Mature);
         assert_eq!(k.word("響徹"), Status::Mature);

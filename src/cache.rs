@@ -1,5 +1,5 @@
-//! Saved analysis results. Segmenting a book takes seconds (LTP, Kiwi,
-//! Sudachi) to minutes (CKIP); the outcome, the per-section counts of
+//! Saved analysis results. Segmenting a book takes seconds (LTP, jieba) to
+//! minutes (CKIP); the outcome, the per-section counts of
 //! [`crate::analyze::analyze_book`], is kept in `cache` in
 //! [`crate::models::cache_dir`] (`%LOCALAPPDATA%\hanstat\cache`; override: `HANSTAT_CACHE_DIR`; off: `HANSTAT_NO_CACHE`) and read back the
 //! next time nothing it depends on has changed.
@@ -9,7 +9,7 @@
 //! * the extracted text, paragraph by paragraph and section by section (not
 //!   the file: a renamed, moved or re-zipped book is still the same book, and
 //!   a TXT read with another encoding is not);
-//! * the language, the script variant, the concrete segmenter and its model
+//! * the script variant, the concrete segmenter and its model
 //!   (see [`crate::segment::model_identity`]);
 //! * the forced words and the known words given to the segmenter;
 //! * the analysis code and its data, as a fingerprint made by `build.rs` of
@@ -28,7 +28,6 @@
 use crate::analyze::SectionStats;
 use crate::chars::NormStats;
 use crate::extract::Book;
-use crate::lang::Language;
 use crate::script::Variant;
 use crate::segment::SegmenterKind;
 use serde::{Deserialize, Serialize};
@@ -38,7 +37,7 @@ use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 
 /// Layout of an entry; entries of another layout are not found (it is hashed into the key).
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 
 /// The analysis sources, bundled tables and dependency versions (`build.rs`).
 const FINGERPRINT: &str = env!("HANSTAT_ANALYSIS_FINGERPRINT");
@@ -60,7 +59,6 @@ impl Key {
     /// gets them (normalised); `model` is [`crate::segment::model_identity`].
     pub fn new(
         book: &Book,
-        language: Language,
         variant: Variant,
         segmenter: SegmenterKind,
         model: &str,
@@ -77,7 +75,7 @@ impl Key {
         text(&mut h, "hanstat analysis");
         h.update(FORMAT.to_le_bytes());
         text(&mut h, FINGERPRINT);
-        text(&mut h, &format!("{language:?}/{variant:?}/{segmenter:?}"));
+        text(&mut h, &format!("{variant:?}/{segmenter:?}"));
         text(&mut h, model);
         h.update((words.len() as u64).to_le_bytes());
         for w in words {
@@ -118,7 +116,6 @@ struct Entry {
 #[derive(Serialize, Deserialize)]
 struct Section {
     class_counts: [u64; 9],
-    kana: u64,
     numbers: u64,
     paragraphs: u64,
     sentences: u64,
@@ -131,10 +128,6 @@ struct Section {
     /// (string, count) pairs, flattened.
     words: Vec<u32>,
     foreign_words: Vec<u32>,
-    /// For each word key: key, number of spellings, then (spelling, count) pairs.
-    spellings: Vec<u32>,
-    /// For each word key: key, number of parts, then the parts.
-    parts: Vec<u32>,
 }
 
 /// Gives each distinct string a number, in order of first use.
@@ -174,24 +167,9 @@ fn pack(key: &Key, stats: &[SectionStats]) -> Entry {
     let sections = stats
         .iter()
         .map(|s| {
-            let mut spellings = Vec::new();
-            for (k, m) in &s.spellings {
-                spellings.push(it.id(k));
-                spellings.push(m.len() as u32);
-                spellings.extend(it.pairs(m));
-            }
-            let mut parts = Vec::new();
-            for (k, p) in &s.parts {
-                parts.push(it.id(k));
-                parts.push(p.len() as u32);
-                for x in p {
-                    parts.push(it.id(x));
-                }
-            }
             let (han, han_counts) = s.han.iter().map(|(c, n)| (*c, *n)).unzip();
             Section {
                 class_counts: s.class_counts,
-                kana: s.kana,
                 numbers: s.numbers,
                 paragraphs: s.paragraphs,
                 sentences: s.sentences,
@@ -202,8 +180,6 @@ fn pack(key: &Key, stats: &[SectionStats]) -> Entry {
                 han_counts,
                 words: it.pairs(&s.words),
                 foreign_words: it.pairs(&s.foreign_words),
-                spellings,
-                parts,
             }
         })
         .collect();
@@ -233,36 +209,8 @@ fn unpack(e: Entry) -> Option<Vec<SectionStats>> {
             if han.len() != s.han_counts.len() {
                 return None;
             }
-            let mut spellings = HashMap::new();
-            let mut v = s.spellings.as_slice();
-            while let [k, n, rest @ ..] = v {
-                let n = (*n as usize).checked_mul(2)?;
-                if rest.len() < n {
-                    return None;
-                }
-                spellings.insert(get(*k)?, pairs(&rest[..n])?);
-                v = &rest[n..];
-            }
-            if !v.is_empty() {
-                return None;
-            }
-            let mut parts = HashMap::new();
-            let mut v = s.parts.as_slice();
-            while let [k, n, rest @ ..] = v {
-                let n = *n as usize;
-                if rest.len() < n {
-                    return None;
-                }
-                let p: Option<Vec<String>> = rest[..n].iter().map(|i| get(*i)).collect();
-                parts.insert(get(*k)?, p?);
-                v = &rest[n..];
-            }
-            if !v.is_empty() {
-                return None;
-            }
             Some(SectionStats {
                 class_counts: s.class_counts,
-                kana: s.kana,
                 han: han.into_iter().zip(s.han_counts.iter().copied()).collect(),
                 words: pairs(&s.words)?,
                 foreign_words: pairs(&s.foreign_words)?,
@@ -272,8 +220,6 @@ fn unpack(e: Entry) -> Option<Vec<SectionStats>> {
                 sentences: s.sentences,
                 trad_marks: s.trad_marks,
                 simp_marks: s.simp_marks,
-                spellings,
-                parts,
             })
         })
         .collect()
@@ -455,7 +401,6 @@ mod tests {
         let v = |x: &[&str]| x.iter().map(|w| w.to_string()).collect::<Vec<_>>();
         Key::new(
             b,
-            Language::Chinese,
             Variant::Simplified,
             SegmenterKind::Ltp,
             model,
@@ -467,7 +412,6 @@ mod tests {
     fn sample() -> Vec<SectionStats> {
         let mut a = SectionStats {
             class_counts: [5, 4, 3, 2, 1, 0, 9, 8, 7],
-            kana: 11,
             numbers: 2,
             paragraphs: 3,
             sentences: 4,
@@ -480,15 +424,6 @@ mod tests {
         a.words
             .extend([("我们".to_owned(), 2), ("学习".to_owned(), 1)]);
         a.foreign_words.insert("abc".to_owned(), 4);
-        a.spellings.insert(
-            "分かる".to_owned(),
-            [("わかる".to_owned(), 2), ("分かる".to_owned(), 1)].into(),
-        );
-        a.spellings.insert("我们".to_owned(), HashMap::new());
-        a.parts.insert(
-            "冒険者".to_owned(),
-            vec!["冒険".to_owned(), "者".to_owned()],
-        );
         // An empty section, and one sharing strings with the first.
         let mut c = SectionStats::default();
         c.words.insert("我们".to_owned(), 9);
@@ -533,7 +468,6 @@ mod tests {
         }
         let other = Key::new(
             &b,
-            Language::Chinese,
             Variant::Traditional,
             SegmenterKind::Ltp,
             "m",
@@ -578,7 +512,7 @@ mod tests {
 
         // A list that ends in the middle of an item.
         let mut e = pack(&key, &stats);
-        e.sections[0].parts.pop();
+        e.sections[0].words.pop();
         write(&e);
         assert!(cache.get(&key, 3).is_none());
 

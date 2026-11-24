@@ -5,7 +5,6 @@
 use crate::cache::{Cache, Key};
 use crate::chars::{self, Class, NormStats};
 use crate::extract::{Book, SectionKind};
-use crate::lang::{self, Language};
 use crate::lexicon;
 use crate::script::{self, Variant};
 use crate::segment::{self, Segmenter, SegmenterKind};
@@ -20,8 +19,6 @@ pub const COVERAGE_TARGETS: [f64; 8] = [50.0, 80.0, 90.0, 95.0, 98.0, 99.0, 99.5
 pub struct SectionStats {
     /// Indexed by `class_index`.
     pub class_counts: [u64; 9],
-    /// Japanese: kana (see [`chars::is_kana`]), which `class_counts` holds among the letters.
-    pub kana: u64,
     pub han: HashMap<char, u32>,
     pub words: HashMap<String, u32>,
     pub foreign_words: HashMap<String, u32>,
@@ -31,10 +28,6 @@ pub struct SectionStats {
     pub sentences: u64,
     pub trad_marks: u64,
     pub simp_marks: u64,
-    /// Japanese: how the book spells each word key (in dictionary form).
-    pub spellings: HashMap<String, HashMap<String, u32>>,
-    /// Japanese: the short-unit parts of long-unit word keys.
-    pub parts: HashMap<String, Vec<String>>,
 }
 
 pub fn class_index(c: Class) -> usize {
@@ -56,7 +49,6 @@ impl SectionStats {
         for i in 0..9 {
             self.class_counts[i] += o.class_counts[i];
         }
-        self.kana += o.kana;
         for (k, v) in &o.han {
             *self.han.entry(*k).or_default() += v;
         }
@@ -80,22 +72,12 @@ impl SectionStats {
         self.sentences += o.sentences;
         self.trad_marks += o.trad_marks;
         self.simp_marks += o.simp_marks;
-        for (k, m) in &o.spellings {
-            let e = self.spellings.entry(k.clone()).or_default();
-            for (s, n) in m {
-                *e.entry(s.clone()).or_default() += n;
-            }
-        }
-        for (k, p) in &o.parts {
-            self.parts.entry(k.clone()).or_insert_with(|| p.clone());
-        }
     }
 
     fn merge(mut self, o: SectionStats) -> SectionStats {
         for i in 0..9 {
             self.class_counts[i] += o.class_counts[i];
         }
-        self.kana += o.kana;
         for (k, v) in o.han {
             *self.han.entry(k).or_default() += v;
         }
@@ -111,15 +93,6 @@ impl SectionStats {
         self.sentences += o.sentences;
         self.trad_marks += o.trad_marks;
         self.simp_marks += o.simp_marks;
-        for (k, m) in o.spellings {
-            let e = self.spellings.entry(k).or_default();
-            for (s, n) in m {
-                *e.entry(s).or_default() += n;
-            }
-        }
-        for (k, p) in o.parts {
-            self.parts.entry(k).or_insert(p);
-        }
         self
     }
 }
@@ -141,34 +114,14 @@ pub fn detect_variant(book: &Book) -> (u64, u64) {
         .reduce(|| (0, 0), |x, y| (x.0 + y.0, x.1 + y.1))
 }
 
-/// The book's language from its text (see [`lang::classify`]).
-pub fn detect_language(book: &Book) -> Language {
-    let (hangul, han, kana) = book
-        .sections
-        .par_iter()
-        .flat_map_iter(|s| s.paragraphs.iter())
-        .map(|p| {
-            p.chars().fold((0u64, 0u64, 0u64), |(a, b, k), c| {
-                (
-                    a + chars::is_hangul(c) as u64,
-                    b + chars::is_han(c) as u64,
-                    k + chars::is_kana(c) as u64,
-                )
-            })
-        })
-        .reduce(|| (0, 0, 0), |x, y| (x.0 + y.0, x.1 + y.1, x.2 + y.2));
-    lang::classify(hangul, han, kana)
-}
-
 pub struct Prepared {
-    pub language: Language,
     pub segmenter_kind: SegmenterKind,
     pub variant: Variant,
     pub folding_note: Option<&'static str>,
     pub stats: Vec<SectionStats>,
     pub user_words: usize,
-    /// The known words given to the segmenter, as passed in (Chinese only;
-    /// empty for Korean and Japanese). Compared to see if the book needs re-segmenting.
+    /// The known words given to the segmenter, as passed in. Compared to see
+    /// if the book needs re-segmenting.
     pub known_words: Vec<String>,
     /// The counts were read from the analysis cache instead of segmenting the book.
     pub cached: bool,
@@ -177,11 +130,9 @@ pub struct Prepared {
 /// Paragraphs per work unit: CKIP batches the chunks of one group together.
 const GROUP: usize = 128;
 
-/// Full analysis of every section of the book (included or not). The
-/// language is detected from the text; a Korean book always uses Kiwi, a
-/// Japanese one Sudachi, and `kind` is the Chinese segmenter otherwise.
-/// `known_words` (word lists, marked words) join tokens the model split
-/// (see [`Segmenter::with_known`]); Korean and Japanese books ignore them.
+/// Full analysis of every section of the book (included or not) with
+/// segmenter `kind`. `known_words` (word lists, marked words) join tokens
+/// the model split (see [`Segmenter::with_known`]).
 /// `progress(done, total)` is called in paragraphs.
 pub fn analyze_book(
     book: &Book,
@@ -225,46 +176,33 @@ pub fn analyze_book_cancellable(
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<Prepared, String> {
     let cancelled = || cancel.load(std::sync::atomic::Ordering::Relaxed);
-    let language = detect_language(book);
     let (tr, si) = detect_variant(book);
-    let variant = match language {
-        Language::Chinese => script::classify(tr, si),
-        // Hanja in a Korean book or kanji in a Japanese one say nothing
-        // about Chinese script variants.
-        Language::Korean | Language::Japanese => Variant::Unknown,
-    };
+    let variant = script::classify(tr, si);
     let mut norm_dummy = NormStats::default();
     let words: Vec<String> = user_words
         .iter()
         .map(|w| chars::normalize(w.trim(), &mut norm_dummy))
         .filter(|w| !w.is_empty())
         .collect();
-    let known: Vec<String> = match language {
-        Language::Chinese => known_words
-            .iter()
-            .map(|w| chars::normalize(w.trim(), &mut norm_dummy))
-            .filter(|w| !w.is_empty())
-            .collect(),
-        Language::Korean | Language::Japanese => Vec::new(),
-    };
-    let resolved = kind.resolve_in(language, variant);
+    let known: Vec<String> = known_words
+        .iter()
+        .map(|w| chars::normalize(w.trim(), &mut norm_dummy))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let resolved = kind.resolve(variant);
     let total: usize = book.sections.iter().map(|s| s.paragraphs.len()).sum();
     let prepared = |stats: Vec<SectionStats>, cached: bool| Prepared {
-        language,
         segmenter_kind: resolved,
         variant,
         folding_note: segment::folding_note(resolved, variant),
         stats,
         user_words: words.len(),
-        known_words: match language {
-            Language::Chinese => known_words.to_vec(),
-            Language::Korean | Language::Japanese => Vec::new(),
-        },
+        known_words: known_words.to_vec(),
         cached,
     };
     let lookup = |model: &str| {
         let cache = cache?;
-        let key = Key::new(book, language, variant, resolved, model, &words, &known);
+        let key = Key::new(book, variant, resolved, model, &words, &known);
         let stats = cache.get(&key, book.sections.len());
         if stats.is_some() {
             progress(total, total);
@@ -285,18 +223,6 @@ pub fn analyze_book_cancellable(
         return Err(CANCELLED.to_owned());
     }
     let seg = Segmenter::new(resolved, &words, variant)?.with_known(&known)?;
-    // Sudachi falls back to its tested dictionary when the newest can't be loaded.
-    if let Some(e) = &expected {
-        let loaded = seg.model_identity();
-        if *e != loaded
-            && let Some((k, stats)) = lookup(&loaded)
-        {
-            if let Some(stats) = stats {
-                return Ok(prepared(stats, true));
-            }
-            key = Some(k);
-        }
-    }
     let done = std::sync::atomic::AtomicUsize::new(0);
     let stats = book
         .sections
@@ -308,11 +234,7 @@ pub fn analyze_book_cancellable(
                     if cancelled() {
                         return acc;
                     }
-                    match language {
-                        Language::Chinese => analyze_group(&mut acc, group, &seg),
-                        Language::Korean => analyze_group_korean(&mut acc, group, &seg),
-                        Language::Japanese => analyze_group_japanese(&mut acc, group, &seg),
-                    }
+                    analyze_group(&mut acc, group, &seg);
                     let d = done.fetch_add(group.len(), std::sync::atomic::Ordering::Relaxed)
                         + group.len();
                     progress(d, total);
@@ -325,16 +247,14 @@ pub fn analyze_book_cancellable(
         return Err(CANCELLED.to_owned());
     }
     let mut stats = stats;
-    if language == Language::Chinese {
-        let protected: Vec<String> = words.iter().chain(&known).cloned().collect();
-        let text: Vec<String> = book
-            .sections
-            .par_iter()
-            .flat_map_iter(|s| s.paragraphs.iter())
-            .map(|p| chars::normalize(p, &mut NormStats::default()))
-            .collect();
-        resplit_rare(&mut stats, &protected, &text);
-    }
+    let protected: Vec<String> = words.iter().chain(&known).cloned().collect();
+    let text: Vec<String> = book
+        .sections
+        .par_iter()
+        .flat_map_iter(|s| s.paragraphs.iter())
+        .map(|p| chars::normalize(p, &mut NormStats::default()))
+        .collect();
+    resplit_rare(&mut stats, &protected, &text);
     if let (Some(cache), Some(key)) = (cache, &key) {
         // Not being able to save only means analysing again next time.
         let _ = cache.put(key, &stats);
@@ -378,7 +298,7 @@ fn analyze_group(acc: &mut SectionStats, raw: &[String], seg: &Segmenter) {
         .map(|p| chars::normalize(p, &mut acc.norm))
         .collect();
     for p in &paras {
-        count_paragraph(acc, p, Language::Chinese);
+        count_paragraph(acc, p);
     }
     // Chinese words: segment whitespace-free chunks that contain Han, all at once.
     let chunks: Vec<&str> = paras
@@ -416,64 +336,8 @@ fn analyze_group(acc: &mut SectionStats, raw: &[String], seg: &Segmenter) {
     }
 }
 
-/// Korean: words are Kiwi's dictionary forms of whole paragraphs (spacing
-/// matters to the analysis, so paragraphs are not split at spaces).
-fn analyze_group_korean(acc: &mut SectionStats, raw: &[String], seg: &Segmenter) {
-    let paras: Vec<String> = raw
-        .iter()
-        .map(|p| chars::normalize(p, &mut acc.norm))
-        .collect();
-    for p in &paras {
-        count_paragraph(acc, p, Language::Korean);
-    }
-    let texts: Vec<&str> = paras
-        .iter()
-        .map(String::as_str)
-        .filter(|p| p.chars().any(chars::is_hangul))
-        .collect();
-    let lemmas = seg
-        .lemmas_many(&texts)
-        .unwrap_or_else(|_| vec![Vec::new(); texts.len()]);
-    for w in lemmas.into_iter().flatten() {
-        if w.chars().any(chars::is_hangul) {
-            *acc.words.entry(w).or_default() += 1;
-        }
-    }
-}
-
-/// Japanese: words are Sudachi's normalized forms of whole paragraphs, with
-/// the book's spellings and the parts of long units kept alongside.
-fn analyze_group_japanese(acc: &mut SectionStats, raw: &[String], seg: &Segmenter) {
-    let paras: Vec<String> = raw
-        .iter()
-        .map(|p| chars::normalize(p, &mut acc.norm))
-        .collect();
-    for p in &paras {
-        count_paragraph(acc, p, Language::Japanese);
-    }
-    let texts: Vec<&str> = paras
-        .iter()
-        .map(String::as_str)
-        .filter(|p| p.chars().any(|c| chars::is_main(c, Language::Japanese)))
-        .collect();
-    let words = seg
-        .japanese_words_many(&texts)
-        .unwrap_or_else(|_| vec![Vec::new(); texts.len()]);
-    for w in words.into_iter().flatten() {
-        *acc.words.entry(w.key.clone()).or_default() += 1;
-        *acc.spellings
-            .entry(w.key.clone())
-            .or_default()
-            .entry(w.spelling)
-            .or_default() += 1;
-        if !w.parts.is_empty() {
-            acc.parts.entry(w.key).or_insert(w.parts);
-        }
-    }
-}
-
-/// Character classes, sentences and non-Chinese (non-Korean, non-Japanese) words of one normalised paragraph.
-fn count_paragraph(acc: &mut SectionStats, p: &str, lang: Language) {
+/// Character classes, sentences and non-Chinese words of one normalised paragraph.
+fn count_paragraph(acc: &mut SectionStats, p: &str) {
     let tables = &*script::TABLES;
 
     // Characters and sentences.
@@ -481,11 +345,8 @@ fn count_paragraph(acc: &mut SectionStats, p: &str, lang: Language) {
     let mut para_has_content = false;
     let cs: Vec<char> = p.chars().collect();
     for (i, &c) in cs.iter().enumerate() {
-        let cl = chars::classify_in(c, lang);
+        let cl = chars::classify(c);
         acc.class_counts[class_index(cl)] += 1;
-        if lang == Language::Japanese && chars::is_kana(c) {
-            acc.kana += 1;
-        }
         match cl {
             Class::Han => {
                 *acc.han.entry(c).or_default() += 1;
@@ -519,12 +380,9 @@ fn count_paragraph(acc: &mut SectionStats, p: &str, lang: Language) {
         acc.paragraphs += 1;
     }
 
-    // Non-Chinese/non-Korean/non-Japanese words (UAX #29), excluding anything
-    // containing Han (or, in Korean, Hangul; in Japanese, kana).
+    // Non-Chinese words (UAX #29), excluding anything containing Han.
     for w in p.unicode_words() {
-        if w.chars()
-            .any(|c| chars::is_han(c) || chars::is_main(c, lang))
-        {
+        if w.chars().any(chars::is_han) {
             continue;
         }
         if w.chars().any(char::is_alphabetic) {
@@ -560,13 +418,6 @@ pub struct Coverage {
 pub struct Report {
     pub title: Option<String>,
     pub format: &'static str,
-    /// Chinese, Korean or Japanese. A Korean book has word statistics only
-    /// (words are dictionary forms): its `han_*` counts, character coverage,
-    /// word lengths and character averages are zero or empty. A Japanese book
-    /// counts kanji as its characters; its words are Sudachi's normalized
-    /// forms (shown as the book spells them, see [`Report::display`]) and have
-    /// no length statistics.
-    pub language: Language,
     pub segmenter: SegmenterKind,
     pub variant: Variant,
     pub folded_for_segmentation: bool,
@@ -580,9 +431,6 @@ pub struct Report {
     pub han_total: u64,
     pub han_unique: usize,
     pub han_hapax: usize,
-    /// Japanese: kana, which with the kanji of `han_total` are the characters
-    /// reading time is measured in. Zero for Chinese and Korean.
-    pub kana_total: u64,
     pub nonspace_total: u64,
     pub letters: u64,
     pub digits: u64,
@@ -607,11 +455,6 @@ pub struct Report {
     pub sentences: u64,
     pub avg_sentence_han: f64,
     pub avg_paragraph_han: f64,
-    /// Korean and Japanese: words per sentence and per paragraph.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub avg_sentence_words: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub avg_paragraph_words: Option<f64>,
 
     pub trad_marks: u64,
     pub simp_marks: u64,
@@ -633,52 +476,6 @@ pub struct Report {
     pub word_freq: Vec<(String, u32)>,
     #[serde(skip)]
     pub foreign_freq: Vec<(String, u32)>,
-    /// Japanese: how to show a word key whose usual spelling in the book
-    /// differs from it (為る → する, 事 → こと); see [`Report::display`].
-    #[serde(skip)]
-    pub word_display: HashMap<String, String>,
-    /// Japanese: the short-unit parts of long-unit words (冒険者 → 冒険, 者).
-    #[serde(skip)]
-    pub word_parts: HashMap<String, Vec<String>>,
-}
-
-impl Report {
-    /// How to show word `w`: the book's most frequent spelling of it (a
-    /// Japanese word key may be a normalized form the book never writes).
-    pub fn display<'a>(&'a self, w: &'a str) -> &'a str {
-        self.word_display.get(w).map_or(w, String::as_str)
-    }
-}
-
-/// Japanese: the book's usual spelling of each word key, where it differs
-/// from the key. Two keys spelled alike (居る and 要る, both いる) show the
-/// key after the spelling of the less frequent one: いる (要る).
-fn display_forms(
-    word_freq: &[(String, u32)],
-    spellings: &HashMap<String, HashMap<String, u32>>,
-) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    let mut taken: std::collections::HashSet<String> = Default::default();
-    // Most frequent words first, so they keep the plain spelling.
-    for (k, _) in word_freq {
-        let Some(best) = spellings.get(k).and_then(|m| {
-            m.iter()
-                .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
-                .map(|(s, _)| s.as_str())
-        }) else {
-            continue;
-        };
-        let shown = if taken.contains(best) && best != k {
-            format!("{best} ({k})")
-        } else {
-            best.to_owned()
-        };
-        taken.insert(best.to_owned());
-        if shown != *k {
-            out.insert(k.clone(), shown);
-        }
-    }
-    out
 }
 
 fn coverage<T>(sorted: &[(T, u32)], total: u64) -> Vec<Coverage> {
@@ -728,7 +525,6 @@ fn folded_freq(han: &HashMap<char, u32>) -> Vec<(char, u32)> {
 /// (Chinese only; the "Match Traditional ↔ Simplified" option), as known
 /// words and the Library do. Words are counted as written either way.
 pub fn build_report(book: &Book, prep: &Prepared, included: &[bool], fold: bool) -> Report {
-    let fold = fold && prep.language == Language::Chinese;
     let mut total = SectionStats::default();
     let mut seen_c: std::collections::HashSet<char> = Default::default();
     let mut seen_w: std::collections::HashSet<&str> = Default::default();
@@ -776,25 +572,13 @@ pub fn build_report(book: &Book, prep: &Prepared, included: &[bool], fold: bool)
     let c = &total.class_counts;
     let han_total = c[0];
     let words_total: u64 = word_freq.iter().map(|(_, n)| *n as u64).sum();
-    let lang = prep.language;
     let mut wl = [0u64; 5];
     let mut han_in_words = 0u64;
-    // Lengths are in Chinese characters; Korean words have none.
-    if lang == Language::Chinese {
-        for (w, n) in &word_freq {
-            let l = w.chars().count();
-            wl[l.clamp(1, 5) - 1] += *n as u64;
-            han_in_words += (w.chars().filter(|c| chars::is_han(*c)).count() as u64) * *n as u64;
-        }
+    for (w, n) in &word_freq {
+        let l = w.chars().count();
+        wl[l.clamp(1, 5) - 1] += *n as u64;
+        han_in_words += (w.chars().filter(|c| chars::is_han(*c)).count() as u64) * *n as u64;
     }
-    let per = |n: u64, d: u64| (d > 0).then(|| n as f64 / d as f64);
-    let (avg_sentence_words, avg_paragraph_words) = match lang {
-        Language::Chinese => (None, None),
-        Language::Korean | Language::Japanese => (
-            Some(per(words_total, total.sentences).unwrap_or(0.0)),
-            Some(per(words_total, total.paragraphs).unwrap_or(0.0)),
-        ),
-    };
 
     let mut notes = book.notes.clone();
     if total.class_counts[6] > 0 {
@@ -820,26 +604,9 @@ pub fn build_report(book: &Book, prep: &Prepared, included: &[bool], fold: bool)
         ));
     }
 
-    if lang == Language::Korean && c[1] > 0 {
-        let hanja: u64 = book
-            .sections
-            .iter()
-            .zip(included)
-            .filter(|(_, inc)| **inc)
-            .flat_map(|(s, _)| s.paragraphs.iter())
-            .map(|p| p.chars().filter(|c| chars::is_han(*c)).count() as u64)
-            .sum();
-        if hanja > 0 {
-            notes.push(format!(
-                "{hanja} Hanja (Chinese characters) found; in a Korean book they count as other letters, not as syllables or words."
-            ));
-        }
-    }
-
     Report {
         title: book.title.clone(),
         format: book.format,
-        language: lang,
         segmenter: prep.segmenter_kind,
         variant: prep.variant,
         folded_for_segmentation: prep.folding_note.is_some(),
@@ -849,7 +616,6 @@ pub fn build_report(book: &Book, prep: &Prepared, included: &[bool], fold: bool)
         han_total,
         han_unique: char_freq.len(),
         han_hapax: char_freq.iter().filter(|(_, n)| *n == 1).count(),
-        kana_total: total.kana,
         nonspace_total: c.iter().sum::<u64>() - c[5],
         letters: c[1],
         digits: c[2],
@@ -883,8 +649,6 @@ pub fn build_report(book: &Book, prep: &Prepared, included: &[bool], fold: bool)
         } else {
             0.0
         },
-        avg_sentence_words,
-        avg_paragraph_words,
         trad_marks: total.trad_marks,
         simp_marks: total.simp_marks,
         char_coverage: coverage(&char_freq, han_total),
@@ -893,12 +657,6 @@ pub fn build_report(book: &Book, prep: &Prepared, included: &[bool], fold: bool)
         sections: rows,
         notes,
         anki: None,
-        word_display: if lang == Language::Japanese {
-            display_forms(&word_freq, &total.spellings)
-        } else {
-            HashMap::new()
-        },
-        word_parts: total.parts,
         char_freq,
         word_freq,
         foreign_freq,

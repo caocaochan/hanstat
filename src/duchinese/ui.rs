@@ -11,7 +11,6 @@ use super::worker::{Account, EstimateInputs, Event, Make, Task, Worker};
 use crate::reader::Notice;
 use crate::{App, BatchMode, palette};
 use eframe::egui::{self, RichText};
-use hanstat::lang::Language;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -154,27 +153,12 @@ impl DuState {
 }
 
 impl App {
-    /// Chinese known words for the estimates, if they are loaded.
+    /// The known words for the estimates, if they are loaded.
     fn du_estimate_inputs(&mut self) -> Option<EstimateInputs> {
-        let zh = Language::Chinese;
-        let knowledge = if self.language == zh {
-            self.known.merged.clone()
-        } else {
-            self.stash.get(&zh).and_then(|d| d.known.merged.clone())
-        }?;
-        let inputs = self.lang_inputs(zh)?;
-        let user_words = if self.language == zh {
-            self.user_words.clone()
-        } else {
-            self.stash
-                .get(&zh)
-                .map(|d| d.user_words.clone())
-                .unwrap_or_else(|| hanstat::load_user_dict(zh).0)
-        };
-        let known_words = self
-            .known_of(zh)
-            .map(|k| k.segmenter_words())
-            .unwrap_or_default();
+        let knowledge = self.known.merged.clone()?;
+        let inputs = self.lang_inputs()?;
+        let user_words = self.user_words.clone();
+        let known_words = self.known.settings.segmenter_words();
         Some(EstimateInputs {
             key: inputs.joined(),
             knowledge,
@@ -538,12 +522,6 @@ impl App {
     /// place, read mark, reading path entries and writing-style rating
     /// follow it. `spine`: where each old chapter now is.
     fn du_rekey(&mut self, old: &str, new: &str, spine: &[u32]) {
-        let lang = self
-            .history
-            .entries
-            .iter()
-            .find(|e| e.id == old)
-            .map_or(Language::Chinese, |e| e.stats.language);
         if let Err(e) = self.history.rekey(old, new) {
             self.history_error = Some(e);
         }
@@ -553,16 +531,13 @@ impl App {
             self.set_error("reading stats", e);
         }
         // The mark keeps the words it took: new chapters add none.
-        self.load_read_marks();
         let (old_s, new_s) = (old.to_owned(), new.to_owned());
-        self.edit_known(lang, move |k| {
-            match k.read.iter_mut().find(|b| b.id == old_s) {
-                Some(b) => {
-                    b.id = new_s;
-                    true
-                }
-                None => false,
+        self.edit_known(move |k| match k.read.iter_mut().find(|b| b.id == old_s) {
+            Some(b) => {
+                b.id = new_s;
+                true
             }
+            None => false,
         });
         let st = &mut self.plan.settings;
         let mut changed = false;

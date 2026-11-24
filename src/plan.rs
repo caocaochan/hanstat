@@ -47,7 +47,6 @@
 //! [`LibBook::offset`] percentage points.
 
 use crate::anki::Knowledge;
-use crate::lang::Language;
 use crate::profile::Profile;
 use crate::series;
 use rayon::prelude::*;
@@ -127,10 +126,14 @@ pub struct Settings {
     pub read_min_count: u32,
     /// History ids of the books left out of the path.
     pub left_out: Vec<String>,
-    /// Reading orders set by hand (History ids), by language name; a
-    /// language without one is ordered by the planner.
+    /// The reading order set by hand (History ids), under the key
+    /// [`MANUAL_KEY`] (files from builds that also read Korean and Japanese
+    /// books kept one per language); without one the planner orders the books.
     pub manual: HashMap<String, Vec<String>>,
 }
+
+/// The key of the hand-set order in [`Settings::manual`].
+const MANUAL_KEY: &str = "Chinese";
 
 impl Default for Settings {
     fn default() -> Self {
@@ -180,9 +183,17 @@ impl Settings {
         }
     }
 
-    /// The hand-set order for `lang`, if any.
-    pub fn manual_order(&self, lang: Language) -> Option<&Vec<String>> {
-        self.manual.get(lang.name())
+    /// The hand-set order, if any.
+    pub fn manual_order(&self) -> Option<&Vec<String>> {
+        self.manual.get(MANUAL_KEY)
+    }
+
+    pub fn set_manual_order(&mut self, ids: Vec<String>) {
+        self.manual.insert(MANUAL_KEY.to_owned(), ids);
+    }
+
+    pub fn clear_manual_order(&mut self) {
+        self.manual.remove(MANUAL_KEY);
     }
 }
 
@@ -221,8 +232,6 @@ pub struct LibBook {
     words: Vec<(u32, u32)>,
     /// Parallel to `words`: the word contains a name.
     name: Vec<bool>,
-    /// Japanese: a long unit counts as known when all its parts are.
-    parts: FxHashMap<u32, Vec<u32>>,
     /// Running words that are not names: what shares are taken of.
     denom: u64,
     /// The book's own spelling of a word, where it differs from the key.
@@ -246,11 +255,10 @@ impl LibBook {
     }
 }
 
-/// The books of one language, with every word numbered once (after
-/// Traditional → Simplified folding when `fold`).
+/// The books, with every word numbered once (after Traditional →
+/// Simplified folding when `fold`).
 #[derive(Clone, Debug)]
 pub struct Library {
-    pub language: Language,
     pub fold: bool,
     vocab: Vec<String>,
     pub books: Vec<LibBook>,
@@ -375,15 +383,10 @@ struct State {
 }
 
 impl Library {
-    /// `books`: (title, profile) of one language. `fold` must be the
+    /// `books`: (title, profile). `fold` must be the
     /// knowledge's (see [`Library::fold_for`]). `skip_hapax`: leave out a
     /// book's words that occur only once in it, as the Overview does.
-    pub fn build(
-        language: Language,
-        fold: bool,
-        skip_hapax: bool,
-        books: Vec<(String, Profile)>,
-    ) -> Library {
+    pub fn build(fold: bool, skip_hapax: bool, books: Vec<(String, Profile)>) -> Library {
         let mut ids: FxHashMap<String, u32> = FxHashMap::default();
         let mut vocab: Vec<String> = Vec::new();
         let mut intern = |w: &str| -> (u32, bool) {
@@ -398,7 +401,7 @@ impl Library {
             (i, same)
         };
         let mut out = Vec::new();
-        for (title, p) in books.into_iter().filter(|(_, p)| p.language == language) {
+        for (title, p) in books {
             // Single characters would match far too much (as on the Overview).
             let names: Vec<&str> = p
                 .names
@@ -411,7 +414,6 @@ impl Library {
                 .flatten();
             let mut counts: FxHashMap<u32, (u32, bool)> = FxHashMap::default();
             let mut spell: FxHashMap<u32, String> = FxHashMap::default();
-            let mut parts: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
             // Before folding, so the same words go as on the Overview.
             for (w, n) in p.words.iter().filter(|(_, n)| !skip_hapax || *n > 1) {
                 let (id, unfolded) = intern(w);
@@ -419,13 +421,9 @@ impl Library {
                 let e = counts.entry(id).or_insert((0, false));
                 e.0 += n;
                 e.1 |= is_name;
-                // The most frequent spelling of a key in this book is how it is shown.
-                let shown = p.shown(w);
-                if !spell.contains_key(&id) && (!unfolded || shown != w) {
-                    spell.insert(id, shown.to_owned());
-                }
-                if let Some(ps) = p.parts.get(w).filter(|ps| !ps.is_empty()) {
-                    parts.insert(id, ps.iter().map(|x| intern(x).0).collect());
+                // The book's most frequent spelling of a folded word is how it is shown.
+                if !unfolded && !spell.contains_key(&id) {
+                    spell.insert(id, w.clone());
                 }
             }
             let mut words: Vec<(u32, u32, bool)> =
@@ -439,7 +437,6 @@ impl Library {
                 variant: p.variant,
                 name: words.iter().map(|w| w.2).collect(),
                 words: words.iter().map(|w| (w.0, w.1)).collect(),
-                parts,
                 denom,
                 spell,
                 series: None,
@@ -470,7 +467,6 @@ impl Library {
             }
         }
         Library {
-            language,
             fold,
             vocab,
             books: out,
@@ -478,11 +474,8 @@ impl Library {
     }
 
     /// The folding a library must be built with to match `k`.
-    pub fn fold_for(k: Option<&Knowledge>, language: Language, match_across_scripts: bool) -> bool {
-        match k {
-            Some(k) => k.fold,
-            None => match_across_scripts && language == Language::Chinese,
-        }
+    pub fn fold_for(k: Option<&Knowledge>, match_across_scripts: bool) -> bool {
+        k.map_or(match_across_scripts, |k| k.fold)
     }
 
     /// The library's words that `k` knows.
@@ -578,10 +571,6 @@ impl Library {
         v
     }
 
-    fn is_known(&self, b: &LibBook, w: u32, k: &Known) -> bool {
-        k.has(w) || b.parts.get(&w).is_some_and(|p| p.iter().all(|&x| k.has(x)))
-    }
-
     fn scan(&self, book: usize, k: &Known) -> Scan {
         let b = &self.books[book];
         let mut s = Scan {
@@ -590,7 +579,7 @@ impl Library {
             unknown: Vec::new(),
         };
         for (&(w, n), &name) in b.words.iter().zip(&b.name) {
-            if self.is_known(b, w, k) {
+            if k.has(w) {
                 s.known += n as u64;
                 s.total += n as u64;
             } else if !name {
@@ -608,7 +597,7 @@ impl Library {
         let b = &self.books[book];
         let (mut known, mut total) = (0u64, 0u64);
         for (&(w, n), &name) in b.words.iter().zip(&b.name) {
-            if self.is_known(b, w, k) {
+            if k.has(w) {
                 known += n as u64;
                 total += n as u64;
             } else if !name {
@@ -628,7 +617,7 @@ impl Library {
             .words
             .iter()
             .zip(&b.name)
-            .filter(|(w, name)| !**name && !self.is_known(b, w.0, k))
+            .filter(|(w, name)| !**name && !k.has(w.0))
             .map(|(w, _)| w.1 as u64);
         match study {
             Study::Target(t) => {
@@ -946,13 +935,10 @@ mod tests {
             Profile {
                 format: crate::profile::FORMAT,
                 id: id.into(),
-                language: Language::Chinese,
                 variant: "Simplified".into(),
                 segmenter: "LTP".into(),
                 words: w,
                 names: names.iter().map(|s| s.to_string()).collect(),
-                parts: HashMap::new(),
-                display: HashMap::new(),
                 chars: None,
             },
         )
@@ -970,7 +956,6 @@ mod tests {
     #[test]
     fn target_takes_the_fewest_frequent_words() {
         let lib = Library::build(
-            Language::Chinese,
             false,
             false,
             vec![profile("a", &[("甲", 50), ("乙", 30), ("丙", 20)], &[])],
@@ -993,7 +978,6 @@ mod tests {
     fn style_offset_raises_the_target() {
         let words = [("甲", 50), ("乙", 30), ("丙", 20)];
         let mut lib = Library::build(
-            Language::Chinese,
             false,
             false,
             vec![profile("a", &words, &[]), profile("b", &words, &[])],
@@ -1020,7 +1004,6 @@ mod tests {
     #[test]
     fn names_are_never_studied_and_left_out() {
         let lib = Library::build(
-            Language::Chinese,
             false,
             false,
             vec![profile(
@@ -1046,12 +1029,12 @@ mod tests {
     #[test]
     fn hapax_left_out_when_asked() {
         let books = || vec![profile("a", &[("说", 8), ("走", 1), ("跑", 1)], &[])];
-        let all = Library::build(Language::Chinese, false, false, books());
+        let all = Library::build(false, false, books());
         assert_eq!(
             (all.books[0].unique_words(), all.books[0].running_words()),
             (3, 10)
         );
-        let lib = Library::build(Language::Chinese, false, true, books());
+        let lib = Library::build(false, true, books());
         assert_eq!(
             (lib.books[0].unique_words(), lib.books[0].running_words()),
             (1, 8)
@@ -1064,7 +1047,6 @@ mod tests {
     #[test]
     fn folding_merges_traditional_and_simplified() {
         let lib = Library::build(
-            Language::Chinese,
             true,
             false,
             vec![
@@ -1087,7 +1069,7 @@ mod tests {
         let a = profile("a", &[("一", 40), ("二", 30), ("三", 30)], &[]);
         let b = profile("b", &[("一", 25), ("二", 25), ("四", 25), ("五", 25)], &[]);
         let c = profile("c", &[("四", 40), ("五", 30), ("六", 30)], &[]);
-        let lib = Library::build(Language::Chinese, false, false, vec![a, b, c]);
+        let lib = Library::build(false, false, vec![a, b, c]);
         let k0 = lib.known(None);
         let pr = params(Study::Target(70.0), 0.0);
         let best = lib
@@ -1104,7 +1086,7 @@ mod tests {
     fn lookahead_prefers_words_needed_later() {
         let a = profile("a", &[("甲", 11), ("乙", 10), ("丙", 1)], &[]);
         let b = profile("b", &[("乙", 50), ("丁", 50)], &[]);
-        let lib = Library::build(Language::Chinese, false, false, vec![a, b]);
+        let lib = Library::build(false, false, vec![a, b]);
         let k0 = lib.known(None);
         let p = lib.evaluate(&k0, &params(Study::Fixed(1), 0.0), &[0, 1]);
         assert_eq!(lib.word(p.steps[0].study[0]), "甲");
@@ -1117,7 +1099,7 @@ mod tests {
     fn incidental_learning() {
         let a = profile("a", &[("甲", 20), ("乙", 3)], &[]);
         let b = profile("b", &[("甲", 1), ("乙", 1)], &[]);
-        let lib = Library::build(Language::Chinese, false, false, vec![a, b]);
+        let lib = Library::build(false, false, vec![a, b]);
         let k0 = lib.known(None);
         let mut pr = params(Study::Fixed(0), 0.0);
         pr.incidental = Some(10);
@@ -1162,7 +1144,7 @@ mod tests {
             titled("SCI谜案集 （第四部）", &[("一", 60), ("八", 40)]),
             titled("SCI謎案集(第3部)", &[("一", 40), ("九", 30), ("十", 30)]),
         ];
-        let lib = Library::build(Language::Chinese, false, false, books);
+        let lib = Library::build(false, false, books);
         let series: Vec<Option<Vec<u32>>> = lib
             .books
             .iter()
@@ -1244,7 +1226,7 @@ mod tests {
                     titled(t, &v)
                 })
                 .collect();
-            let lib = Library::build(Language::Chinese, false, false, books);
+            let lib = Library::build(false, false, books);
             assert!(lib.precedes(0, 5) && lib.precedes(5, 2) && lib.precedes(1, 4));
             assert!(lib.books[3].series.is_none());
             let k0 = lib.known(None);
@@ -1352,7 +1334,7 @@ mod tests {
                     profile(["p", "q", "r", "s", "t", "u"][b as usize], &v, &[])
                 })
                 .collect();
-            let lib = Library::build(Language::Chinese, false, false, books);
+            let lib = Library::build(false, false, books);
             let k0 = lib.known(None);
             let idx: Vec<usize> = (0..6).collect();
             for (study, objective) in [

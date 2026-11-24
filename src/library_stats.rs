@@ -1,13 +1,11 @@
 //! The Library's Stats tab: totals of every book's last analysis, then the
-//! vocabulary of the current language's books measured against what is
-//! known now, with charts.
+//! vocabulary of the books measured against what is known now, with charts.
 
 use crate::charts::{self, Band, Bar, Point};
-use crate::{App, LibKey, difficulty_color, difficulty_fill, fmt_int, mode_badge};
+use crate::{App, LibKey, difficulty_color, difficulty_fill, fmt_int};
 use eframe::egui::{self, Color32, RichText};
 use hanstat::anki::{Difficulty, Knowledge};
 use hanstat::history;
-use hanstat::lang::Language;
 use hanstat::plan;
 use hanstat::profile::Profile;
 use serde::{Deserialize, Serialize};
@@ -18,27 +16,8 @@ use std::sync::mpsc::{Receiver, channel};
 
 const CHART_HEIGHT: f32 = 230.0;
 
-/// Totals of one language's books, from their History entries.
-#[derive(Default)]
-struct LangTotals {
-    books: usize,
-    han: u64,
-    kana: u64,
-    words: u64,
-    minutes: f64,
-    /// Running words of the books with a known share, and the known ones among them.
-    known_of: f64,
-    known: f64,
-    /// Books marked read.
-    read: usize,
-}
-
-pub(crate) fn reading_minutes(s: &history::Stats, (cpm, ja_cpm, wpm): (f64, f64, f64)) -> f64 {
-    match s.language {
-        Language::Chinese => s.han_total as f64 / cpm,
-        Language::Japanese => (s.han_total + s.kana_total) as f64 / ja_cpm,
-        Language::Korean => s.words_total as f64 / wpm,
-    }
+pub(crate) fn reading_minutes(s: &history::Stats, cpm: f64) -> f64 {
+    s.han_total as f64 / cpm
 }
 
 pub(crate) fn fmt_time(mins: f64) -> String {
@@ -50,19 +29,9 @@ pub(crate) fn fmt_time(mins: f64) -> String {
     }
 }
 
-/// A book's length in the unit its language is measured in.
+/// A book's length, in Chinese characters.
 pub(crate) fn length(s: &history::Stats) -> u64 {
-    match s.language {
-        Language::Korean => s.words_total,
-        _ => s.han_total,
-    }
-}
-
-pub(crate) fn unit(lang: Language) -> &'static str {
-    match lang {
-        Language::Korean => "words",
-        _ => "characters",
-    }
+    s.han_total
 }
 
 pub(crate) fn pct(a: usize, b: usize) -> f64 {
@@ -193,13 +162,12 @@ type Toggle = (String, String, bool);
 /// Layout of the saved stats; others are ignored and counted again.
 const FORMAT: u32 = 3;
 
-/// One language's vocabulary stats as last counted. Saved in
-/// `library-stats.json` (`-ko`, `-ja`) so the tab is filled at start,
-/// before they are counted again.
+/// The Library's vocabulary stats as last counted. Saved in
+/// `library-stats.json` so the tab is filled at start, before they are
+/// counted again.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Counted {
     format: u32,
-    language: Language,
     /// Traditional and Simplified spellings were one word.
     pub(crate) fold: bool,
     /// History ids of the books counted, in the order of `words.book_known`.
@@ -211,18 +179,18 @@ pub(crate) struct Counted {
 }
 
 impl Counted {
-    fn path(lang: Language) -> PathBuf {
-        lang.settings_path("library-stats")
+    fn path() -> PathBuf {
+        hanstat::models::app_dir().join("library-stats.json")
     }
 
-    fn load(lang: Language) -> Option<Counted> {
-        let c: Counted = serde_json::from_slice(&std::fs::read(Self::path(lang)).ok()?).ok()?;
-        (c.format == FORMAT && c.language == lang).then_some(c)
+    fn load() -> Option<Counted> {
+        let c: Counted = serde_json::from_slice(&std::fs::read(Self::path()).ok()?).ok()?;
+        (c.format == FORMAT).then_some(c)
     }
 
     /// Write under a temporary name, then rename.
     fn save(&self) -> Result<(), String> {
-        let path = Self::path(self.language);
+        let path = Self::path();
         let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
         serde_json::to_vec(self)
             .map_err(|e| e.to_string())
@@ -242,11 +210,11 @@ pub(crate) struct Done {
 }
 
 /// The Library's vocabulary stats, kept up to date in the background
-/// whatever the window shows. The last count of each language is shown
-/// until a newer one is ready.
+/// whatever the window shows. The last count is shown until a newer one is
+/// ready.
 #[derive(Default)]
 pub(crate) struct StatsState {
-    pub(crate) shown: HashMap<Language, Counted>,
+    pub(crate) shown: Option<Counted>,
     /// The library and the known words (`Arc` address; 0: none) of the
     /// running job, or of the last count.
     inputs: Option<(LibKey, usize)>,
@@ -260,10 +228,7 @@ impl StatsState {
     /// The counts saved by the last run.
     pub(crate) fn load() -> StatsState {
         StatsState {
-            shown: Language::ALL
-                .into_iter()
-                .filter_map(|l| Counted::load(l).map(|c| (l, c)))
-                .collect(),
+            shown: Counted::load(),
             ..Default::default()
         }
     }
@@ -278,7 +243,7 @@ fn known_source(k: &Knowledge) -> String {
 }
 
 impl App {
-    /// Count the current language's vocabulary again when its books, their
+    /// Count the Library's vocabulary again when its books, their
     /// word data or the known words have changed: one count at a time, and
     /// not while the known words are still loading (that would replace the
     /// saved count with one against nothing known) or books are being
@@ -305,8 +270,8 @@ impl App {
         }
         self.stats.inputs = Some((key.clone(), knowledge));
         if key.ids.is_empty() {
-            self.stats.shown.remove(&key.lang);
-            let _ = std::fs::remove_file(Counted::path(key.lang));
+            self.stats.shown = None;
+            let _ = std::fs::remove_file(Counted::path());
             return;
         }
         let cached = [self.stats.lib.as_ref(), self.plan.lib.as_ref()]
@@ -337,23 +302,15 @@ impl App {
             let books: Vec<(String, Profile)> = files
                 .into_iter()
                 .filter_map(|(t, p)| Profile::load(&p).map(|p| (t, p)))
-                .filter(|(_, p)| p.language == key.lang)
                 .collect();
             let profiles: Vec<Profile> = books.iter().map(|(_, p)| p.clone()).collect();
             let chars = plan::stats::char_stats(&profiles, k.as_deref(), key.fold);
             drop(profiles);
-            let lib = cached.unwrap_or_else(|| {
-                Arc::new(plan::Library::build(
-                    key.lang,
-                    key.fold,
-                    key.skip_hapax,
-                    books,
-                ))
-            });
+            let lib = cached
+                .unwrap_or_else(|| Arc::new(plan::Library::build(key.fold, key.skip_hapax, books)));
             let words = lib.stats(&lib.known(k.as_deref()), WIDESPREAD);
             let counted = Counted {
                 format: FORMAT,
-                language: key.lang,
                 fold: lib.fold,
                 ids: lib.books.iter().map(|b| b.id.clone()).collect(),
                 source,
@@ -383,7 +340,7 @@ impl App {
                 }
                 self.stats.lib = Some(d.lib);
                 self.stats.error = d.saved.err();
-                self.stats.shown.insert(d.counted.language, d.counted);
+                self.stats.shown = Some(d.counted);
                 self.stats.job = None;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -393,7 +350,7 @@ impl App {
         }
     }
 
-    pub(crate) fn stats_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    pub(crate) fn stats_view(&mut self, ui: &mut egui::Ui) {
         if self.history.entries.is_empty() {
             ui.centered_and_justified(|ui| {
                 ui.label(
@@ -404,7 +361,7 @@ impl App {
             });
             return;
         }
-        let (mut pick_lang, mut toggle) = (None, None);
+        let mut toggle = None;
         egui::ScrollArea::vertical()
             .auto_shrink(false)
             .show(ui, |ui| {
@@ -414,7 +371,7 @@ impl App {
                 ui.add_space(14.0);
                 self.reading_section(ui);
                 ui.add_space(14.0);
-                (pick_lang, toggle) = self.language_stats(ui);
+                toggle = self.vocabulary_stats(ui);
             });
         // As + and − in the Words tab: the word joins the marked words, and
         // leaves the list when the stats are next counted, a moment later.
@@ -429,76 +386,60 @@ impl App {
             self.toast = Some((msg, ui.input(|i| i.time) + 3.0));
             self.known_changed();
         }
-        if let Some(l) = pick_lang {
-            self.set_language(l, ctx);
-        }
     }
 
-    /// Every book of every language, from the History.
+    /// Every book, from the History.
     fn library_totals(&self, ui: &mut egui::Ui) {
         let speeds = self.speeds();
-        let mut by_lang: Vec<(Language, LangTotals)> = Language::ALL
-            .iter()
-            .map(|&l| (l, LangTotals::default()))
-            .collect();
+        let (mut han, mut words, mut minutes) = (0u64, 0u64, 0.0f64);
+        // Running words of the books with a known share, and the known ones among them.
+        let (mut known_of, mut known) = (0.0f64, 0.0f64);
         for e in &self.history.entries {
             let s = &e.stats;
-            let t = &mut by_lang
-                .iter_mut()
-                .find(|(l, _)| *l == s.language)
-                .unwrap()
-                .1;
-            t.books += 1;
-            t.han += s.han_total;
-            t.kana += s.kana_total;
-            t.words += s.words_total;
-            t.minutes += reading_minutes(s, speeds);
+            han += s.han_total;
+            words += s.words_total;
+            minutes += reading_minutes(s, speeds);
             if let Some(k) = &s.known {
-                t.known_of += s.words_total as f64;
-                t.known += s.words_total as f64 * k.running_words / 100.0;
+                known_of += s.words_total as f64;
+                known += s.words_total as f64 * k.running_words / 100.0;
             }
         }
-        by_lang.retain(|(_, t)| t.books > 0);
-        for (l, t) in &mut by_lang {
-            let ids: std::collections::HashSet<&str> = self
-                .known_of(*l)
-                .map(|k| k.read.iter().map(|b| b.id.as_str()).collect())
-                .unwrap_or_default();
-            t.read = self
-                .history
-                .entries
-                .iter()
-                .filter(|e| e.stats.language == *l && ids.contains(e.id.as_str()))
-                .count();
-        }
-        let sum = |f: &dyn Fn(&LangTotals) -> u64| by_lang.iter().map(|(_, t)| f(t)).sum::<u64>();
         let books = self.history.entries.len();
-        let minutes: f64 = by_lang.iter().map(|(_, t)| t.minutes).sum();
+        let read_ids: std::collections::HashSet<&str> = self
+            .known
+            .settings
+            .read
+            .iter()
+            .map(|b| b.id.as_str())
+            .collect();
+        let read = self
+            .history
+            .entries
+            .iter()
+            .filter(|e| read_ids.contains(e.id.as_str()))
+            .count();
 
         ui.label(RichText::new("Whole library").size(18.0).strong());
         ui.add_space(4.0);
-        let langs = by_lang
-            .iter()
-            .map(|(l, t)| format!("{} {}", t.books, l.name()))
-            .collect::<Vec<_>>()
-            .join(" · ");
-        let han = sum(&|t| t.han);
-        let kana = sum(&|t| t.kana);
         let mut tiles = vec![
-            Tile::new("Books", RichText::new(fmt_int(books as u64)), langs),
+            Tile::new(
+                "Books",
+                RichText::new(fmt_int(books as u64)),
+                if read > 0 {
+                    format!("{} marked read", fmt_int(read as u64))
+                } else {
+                    "none marked read".to_owned()
+                },
+            ),
             Tile::new(
                 "Characters",
                 RichText::new(fmt_int(han)),
-                if kana > 0 {
-                    format!("Chinese characters and kanji, + {} kana", fmt_int(kana))
-                } else {
-                    "Chinese characters".to_owned()
-                },
+                format!("{} per book", fmt_int(han / books.max(1) as u64)),
             )
-            .hover("Every Script=Han character of every book's included sections, counted as on the Overview. Korean books have none."),
+            .hover("Every Script=Han character of every book's included sections, counted as on the Overview."),
             Tile::new(
                 "Words",
-                RichText::new(fmt_int(sum(&|t| t.words))),
+                RichText::new(fmt_int(words)),
                 "running words, as segmented".to_owned(),
             ),
             Tile::new(
@@ -506,118 +447,39 @@ impl App {
                 RichText::new(fmt_time(minutes)),
                 format!("{:.0} days of reading 1 h a day", minutes / 60.0),
             )
-            .hover("Chinese at your speed measured in the reader (unless set by hand in Settings, ⚙); Japanese and Korean at the speeds in Settings"),
+            .hover("At your speed measured in the reader (unless set by hand in Settings, ⚙)"),
         ];
+        if known_of > 0.0 {
+            let p = known * 100.0 / known_of;
+            let d = Difficulty::from_percent(p);
+            tiles.push(
+                Tile::new(
+                    "Known",
+                    RichText::new(format!("{p:.1}%")).color(difficulty_color(d)),
+                    d.label().to_owned(),
+                )
+                .hover("Running words known at each book's last analysis, weighted by length; names left out"),
+            );
+        }
         if let Some(e) = self.history.entries.iter().max_by_key(|e| length(&e.stats)) {
             tiles.push(
                 Tile::new(
                     "Longest book",
                     RichText::new(&e.title),
-                    format!("{} {}", fmt_int(length(&e.stats)), unit(e.stats.language)),
+                    format!("{} characters", fmt_int(length(&e.stats))),
                 )
                 .hover(&e.title),
             );
         }
         tile_grid(ui, tiles);
-        ui.add_space(8.0);
-        egui::ScrollArea::horizontal()
-            .id_salt("stats_langs_scroll")
-            .show(ui, |ui| {
-        egui::Grid::new("stats_langs")
-            .striped(true)
-            .spacing([28.0, 6.0])
-            .show(ui, |ui| {
-                for h in [
-                    ("Language", ""),
-                    ("Books", ""),
-                    ("Read", "Books marked read"),
-                    ("Characters", "Chinese characters, or kanji"),
-                    ("Kana", "Japanese books"),
-                    ("Words", "Running words"),
-                    ("Average book", "Characters per book (words for Korean)"),
-                    ("Reading", "Chinese at your measured speed (unless set by hand in Settings); the others at the speeds in Settings"),
-                    ("Known", "Running words known at each book's last analysis, weighted by length; names left out"),
-                ] {
-                    let r = ui.strong(h.0);
-                    if !h.1.is_empty() {
-                        r.on_hover_text(h.1);
-                    }
-                }
-                ui.end_row();
-                let dash = || RichText::new("–").weak();
-                for (l, t) in &by_lang {
-                    let (badge, color) = mode_badge(*l, None);
-                    ui.label(RichText::new(badge).color(color).strong());
-                    ui.label(fmt_int(t.books as u64));
-                    if t.read > 0 {
-                        ui.label(fmt_int(t.read as u64));
-                    } else {
-                        ui.label(dash());
-                    }
-                    if *l == Language::Korean {
-                        ui.label(dash());
-                    } else {
-                        ui.label(fmt_int(t.han));
-                    }
-                    if *l == Language::Japanese {
-                        ui.label(fmt_int(t.kana));
-                    } else {
-                        ui.label(dash());
-                    }
-                    ui.label(fmt_int(t.words));
-                    let len = if *l == Language::Korean { t.words } else { t.han };
-                    ui.label(fmt_int(len / t.books as u64));
-                    ui.label(fmt_time(t.minutes));
-                    if t.known_of > 0.0 {
-                        let p = t.known * 100.0 / t.known_of;
-                        let d = Difficulty::from_percent(p);
-                        ui.label(RichText::new(format!("{p:.1}%")).color(difficulty_color(d)))
-                            .on_hover_text(d.label());
-                    } else {
-                        ui.label(dash());
-                    }
-                    ui.end_row();
-                }
-            });
-        });
     }
 
-    /// The current language's books against what is known now. Returns a
-    /// language picked to show instead, and a word to mark known or unmark.
-    fn language_stats(&self, ui: &mut egui::Ui) -> (Option<Language>, Option<Toggle>) {
-        let lang = self.language;
-        let mut pick = None;
-        let entries: Vec<&history::Entry> = self
-            .history
-            .entries
-            .iter()
-            .filter(|e| e.stats.language == lang)
-            .collect();
+    /// The books against what is known now. Returns a word to mark known or
+    /// unmark.
+    fn vocabulary_stats(&self, ui: &mut egui::Ui) -> Option<Toggle> {
+        let entries: Vec<&history::Entry> = self.history.entries.iter().collect();
         ui.horizontal(|ui| {
-            if self.prep.is_some() || self.job.is_some() {
-                ui.label(
-                    RichText::new(format!("{} books", lang.name()))
-                        .size(18.0)
-                        .strong(),
-                )
-                .on_hover_text(
-                    "The open book's language. Close it (or open another) to see another language.",
-                );
-            } else {
-                egui::ComboBox::from_id_salt("stats_lang")
-                    .selected_text(
-                        RichText::new(format!("{} books", lang.name()))
-                            .size(16.0)
-                            .strong(),
-                    )
-                    .show_ui(ui, |ui| {
-                        for l in Language::ALL {
-                            if ui.selectable_label(l == lang, l.name()).clicked() && l != lang {
-                                pick = Some(l);
-                            }
-                        }
-                    });
-            }
+            ui.label(RichText::new("Vocabulary").size(18.0).strong());
             if self.stats.job.is_some() {
                 ui.spinner().on_hover_text(
                     "Counting again; the figures shown are from the last count until it is done",
@@ -627,12 +489,8 @@ impl App {
         if let Some(e) = &self.stats.error {
             ui.colored_label(crate::palette::warn(), format!("⚠ {e}"));
         }
-        if entries.is_empty() {
-            ui.label(RichText::new("No books in this language yet.").weak());
-            return (pick, None);
-        }
         // The last count, until a newer one is ready.
-        let res = self.stats.shown.get(&lang);
+        let res = self.stats.shown.as_ref();
         let source = res.and_then(|r| r.source.as_ref());
         let profiled = res.map_or(0, |r| r.ids.len());
         if res.is_some() && profiled < entries.len() {
@@ -681,22 +539,18 @@ impl App {
                     ),
                 ),
             ];
-            if lang != Language::Korean {
-                tiles.push(
-                    Tile::new(
-                        "Distinct characters",
-                        RichText::new(fmt_int(c.unique as u64)),
-                        format!("{} in all", fmt_int(c.total)),
-                    )
-                    .hover(if lang == Language::Japanese {
-                        "Kanji in the books' words, each word as its book usually writes it"
-                    } else if r.fold {
-                        "Characters of the books' words; Traditional and Simplified forms are one character, as for your known words"
-                    } else {
-                        "Characters of the books' words, as written"
-                    }),
-                );
-            }
+            tiles.push(
+                Tile::new(
+                    "Distinct characters",
+                    RichText::new(fmt_int(c.unique as u64)),
+                    format!("{} in all", fmt_int(c.total)),
+                )
+                .hover(if r.fold {
+                    "Characters of the books' words; Traditional and Simplified forms are one character, as for your known words"
+                } else {
+                    "Characters of the books' words, as written"
+                }),
+            );
             tiles.push(
                 Tile::new(
                     "Words for 98%",
@@ -730,20 +584,18 @@ impl App {
                     )
                     .hover(&format!("From {src}, now")),
                 );
-                if lang != Language::Korean {
-                    tiles.push(
-                        Tile::new(
-                            "Characters known",
-                            RichText::new(format!("{:.1}%", pct(c.known, c.unique))),
-                            format!(
-                                "{} of {}",
-                                fmt_int(c.known as u64),
-                                fmt_int(c.unique as u64)
-                            ),
-                        )
-                        .hover("A character is known when a known word contains it"),
-                    );
-                }
+                tiles.push(
+                    Tile::new(
+                        "Characters known",
+                        RichText::new(format!("{:.1}%", pct(c.known, c.unique))),
+                        format!(
+                            "{} of {}",
+                            fmt_int(c.known as u64),
+                            fmt_int(c.unique as u64)
+                        ),
+                    )
+                    .hover("A character is known when a known word contains it"),
+                );
             }
             tile_grid(ui, tiles);
             ui.add_space(6.0);
@@ -802,7 +654,7 @@ impl App {
             let marked = |w: &str| self.known.settings.is_marked(w);
             toggle = widespread_table(ui, r, &marked);
         }
-        (pick, toggle)
+        toggle
     }
 
     fn length_chart(
@@ -811,7 +663,6 @@ impl App {
         entries: &[&history::Entry],
         known_now: &std::collections::HashMap<&str, f64>,
     ) {
-        let lang = self.language;
         let mut rows: Vec<&&history::Entry> = entries.iter().collect();
         rows.sort_by_key(|e| std::cmp::Reverse(length(&e.stats)));
         let bars: Vec<Bar> = rows
@@ -819,7 +670,7 @@ impl App {
             .map(|e| {
                 let len = length(&e.stats);
                 let now = known_now.get(e.id.as_str()).copied();
-                let mut hover = format!("{}\n{} {}", e.title, fmt_int(len), unit(lang));
+                let mut hover = format!("{}\n{} characters", e.title, fmt_int(len));
                 let color = match now {
                     Some(p) => {
                         let d = Difficulty::from_percent(p - self.style_offset(&e.id));
@@ -843,7 +694,7 @@ impl App {
         } else {
             "Longest first, coloured by how hard each is now".to_owned()
         };
-        card(ui, &format!("Book lengths ({})", unit(lang)), &sub, |ui| {
+        card(ui, "Book lengths (characters)", &sub, |ui| {
             charts::columns(ui, &bars, None, CHART_HEIGHT, &charts::compact);
         });
     }
@@ -854,7 +705,6 @@ impl App {
         entries: &[&history::Entry],
         known_now: &std::collections::HashMap<&str, f64>,
     ) {
-        let lang = self.language;
         let points: Vec<Point> = entries
             .iter()
             .filter_map(|e| {
@@ -866,10 +716,9 @@ impl App {
                     y: p,
                     color: difficulty_fill(d),
                     hover: format!(
-                        "{}\n{} {} · {p:.1}% known · {}",
+                        "{}\n{} characters · {p:.1}% known · {}",
                         e.title,
                         fmt_int(len),
-                        unit(lang),
                         d.label()
                     ),
                 })
@@ -897,10 +746,7 @@ impl App {
         card(
             ui,
             "Length and difficulty",
-            &format!(
-                "Running words known now against length in {} (log scale)",
-                unit(lang)
-            ),
+            "Running words known now against length in characters (log scale)",
             |ui| charts::scatter(ui, &points, &bands, (y_lo, 100.0), CHART_HEIGHT),
         );
     }
@@ -1078,10 +924,9 @@ mod tests {
     /// A saved count reads back, including an empty library's (no NaN).
     #[test]
     fn counted_round_trips() {
-        let lib = plan::Library::build(Language::Japanese, false, false, Vec::new());
+        let lib = plan::Library::build(false, false, Vec::new());
         let c = Counted {
             format: FORMAT,
-            language: Language::Japanese,
             fold: false,
             ids: Vec::new(),
             source: Some("Anki".into()),
@@ -1089,7 +934,6 @@ mod tests {
             chars: plan::stats::char_stats(&[], None, false),
         };
         let back: Counted = serde_json::from_slice(&serde_json::to_vec(&c).unwrap()).unwrap();
-        assert_eq!(back.language, Language::Japanese);
         assert_eq!(back.source.as_deref(), Some("Anki"));
         assert_eq!(back.words.known_running, 100.0);
     }

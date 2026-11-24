@@ -2,11 +2,11 @@
 Type=Application
 Name=hanstat
 GenericName=Book vocabulary statistics
-Comment=Character and word statistics for Chinese, Japanese and Korean books
+Comment=Character and word statistics for Chinese books
 Exec=hanstat %F
 Icon=io.github.caocaochan.hanstat
 Terminal=false
 Categories=Education;Languages;
 MimeType=application/epub+zip;text/plain;
-Keywords=Chinese;Japanese;Korean;EPUB;vocabulary;Anki;HSK;TOCFL;JLPT;TOPIK;
+Keywords=Chinese;EPUB;vocabulary;Anki;HSK;TOCFL;
 StartupWMClass=hanstat

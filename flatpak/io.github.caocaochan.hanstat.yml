@@ -24,7 +24,7 @@ finish-args:
   - --socket=fallback-x11
   - --share=ipc
   - --device=dri
-  # Downloading the segmentation models and SudachiDict on first use, and
+  # Downloading the segmentation models on first use, and
   # the reader's read-aloud (Azure).
   - --share=network
   # Read-aloud: sound (PulseAudio, or PipeWire's PulseAudio server), and the
@@ -85,7 +85,6 @@ modules:
       - install -Dm644 -t /app/share/licenses/io.github.caocaochan.hanstat LICENSE-MIT LICENSE-APACHE
       - install -Dm644 data/OpenCC-LICENSE.txt /app/share/licenses/io.github.caocaochan.hanstat/LICENSE-OpenCC-data.txt
       - install -Dm644 data/HSK-LICENSE.txt /app/share/licenses/io.github.caocaochan.hanstat/LICENSE-HSK-data.txt
-      - install -Dm644 data/JLPT-LICENSE.txt /app/share/licenses/io.github.caocaochan.hanstat/LICENSE-JLPT-data.txt
       - install -Dm644 data/CEDICT-LICENSE.txt /app/share/licenses/io.github.caocaochan.hanstat/LICENSE-CEDICT-data.txt
       - install -Dm644 assets/fonts/LXGWWenKai-LICENSE.txt /app/share/licenses/io.github.caocaochan.hanstat/LICENSE-LXGWWenKai-font.txt
       - install -Dm644 assets/fonts/Inter-LICENSE.txt /app/share/licenses/io.github.caocaochan.hanstat/LICENSE-Inter-font.txt

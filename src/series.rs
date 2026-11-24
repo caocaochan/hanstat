@@ -14,12 +14,11 @@
 //! `[Vol. 3]`, `【上】`):
 //!
 //! - numbers: `2`, `2.5`, `II`, `Ⅱ`, `②`, `二`, `十二`, `贰`, `two`, `second`;
-//! - Chinese and Japanese units: `第二部`, `第2卷`, `二册`, `卷三`, `3巻`,
-//!   `第4集`, `第2季`, `上`, `中`, `下`, `上册`, `下巻`, `前篇`, `後編`, `续`;
-//! - Korean: `2권`, `제3부`, `상`, `하`, `상권`;
+//! - Chinese units: `第二部`, `第2卷`, `二册`, `卷三`, `第4集`, `第2季`,
+//!   `上`, `中`, `下`, `上册`, `前篇`, `後編`, `续`;
 //! - English: `Vol. 2`, `Volume II`, `Book 3`, `Part Two`, `No. 4`, `#5`,
 //!   `Season 2`, `Tome 2`;
-//! - extras (`番外`, `外传`, `外伝`, `特别篇`), which come after every volume.
+//! - extras (`番外`, `外传`, `特别篇`), which come after every volume.
 //!
 //! To keep ordinary titles whole, a marker joined to the title without a
 //! space or bracket must be unambiguous: digits after letters of another
@@ -306,7 +305,7 @@ fn leading(t: &str) -> Option<(Vec<u32>, &str)> {
     let end = t.find(|c: char| is_sep(c) || c == ':')?;
     // `01 Title`, `第一卷 Title`, but not `三 Title` or `X Title`.
     let word = &t[..end];
-    if !(word.starts_with(|c: char| c.is_ascii_digit()) || word.starts_with(['第', '제'])) {
+    if !(word.starts_with(|c: char| c.is_ascii_digit()) || word.starts_with('第')) {
         return None;
     }
     let v = marker(word, Ctx::Glued)?;
@@ -314,15 +313,15 @@ fn leading(t: &str) -> Option<(Vec<u32>, &str)> {
     (!key_of(rest).is_empty()).then_some((v, rest))
 }
 
-/// Units after a number (`二部`, `3巻`, `2권`) or after 第/제.
+/// Units after a number (`二部`, `3卷`) or after 第.
 const UNITS: &[&str] = &[
-    "部", "卷", "巻", "册", "冊", "集", "季", "篇", "编", "編", "章", "辑", "本", "回", "弹", "弾",
-    "话", "期", "幕", "권", "부", "편", "화", "장", "기", "시즌",
+    "部", "卷", "册", "冊", "集", "季", "篇", "编", "編", "章", "辑", "本", "回", "弹", "话", "期",
+    "幕",
 ];
 /// Units before a number: `卷二`, `vol. 2`.
 const PREFIXES: &[&str] = &[
-    "卷", "巻", "册", "volume", "vol", "v", "book", "bk", "part", "pt", "no", "number", "#",
-    "tome", "band", "season", "episode", "ep", "chapter", "issue", "série", "serie", "libro",
+    "卷", "册", "volume", "vol", "v", "book", "bk", "part", "pt", "no", "number", "#", "tome",
+    "band", "season", "episode", "ep", "chapter", "issue", "série", "serie", "libro",
 ];
 
 /// The volume a whole marker names.
@@ -335,21 +334,19 @@ fn marker(s: &str, ctx: Ctx) -> Option<Vec<u32>> {
     if let Some(n) = number(s, ctx) {
         return Some(vec![n]);
     }
-    // 第N, 第N部, 제N권.
-    for lead in ["第", "제"] {
-        if let Some(rest) = s.strip_prefix(lead) {
-            let rest = rest.trim();
-            let rest = UNITS
-                .iter()
-                .find_map(|u| rest.strip_suffix(u))
-                .unwrap_or(rest)
-                .trim();
-            if let Some(n) = number(rest, Ctx::Apart) {
-                return Some(vec![n]);
-            }
+    // 第N, 第N部.
+    if let Some(rest) = s.strip_prefix('第') {
+        let rest = rest.trim();
+        let rest = UNITS
+            .iter()
+            .find_map(|u| rest.strip_suffix(u))
+            .unwrap_or(rest)
+            .trim();
+        if let Some(n) = number(rest, Ctx::Apart) {
+            return Some(vec![n]);
         }
     }
-    // N部, 3巻, 2권.
+    // N部, 3卷.
     for u in UNITS {
         if let Some(rest) = s.strip_suffix(u)
             && let Some(n) = number(rest.trim(), Ctx::Apart)
@@ -371,7 +368,7 @@ fn marker(s: &str, ctx: Ctx) -> Option<Vec<u32>> {
             }
         }
     }
-    // 上, 下册, 上巻, 상권, 前篇.
+    // 上, 下册, 前篇.
     let (head, unit) = match UNITS
         .iter()
         .find_map(|u| s.strip_suffix(u).map(|h| (h, true)))
@@ -381,9 +378,9 @@ fn marker(s: &str, ctx: Ctx) -> Option<Vec<u32>> {
     };
     if unit || ctx == Ctx::Apart {
         let n = match head {
-            "上" | "상" | "前" | "前半" => Some(10),
-            "中" | "중" => Some(20),
-            "下" | "하" | "后" | "後" | "后半" | "後半" => Some(30),
+            "上" | "前" | "前半" => Some(10),
+            "中" => Some(20),
+            "下" | "后" | "後" | "后半" | "後半" => Some(30),
             _ => None,
         };
         if let Some(n) = n {
@@ -392,15 +389,15 @@ fn marker(s: &str, ctx: Ctx) -> Option<Vec<u32>> {
     }
     if ctx == Ctx::Apart {
         match s {
-            "续" | "続" | "续集" | "続編" | "续篇" | "후속" | "sequel" => {
+            "续" | "续集" | "续篇" | "sequel" => {
                 return Some(vec![20]);
             }
-            "完结篇" | "终章" | "最终章" | "最终卷" | "最终巻" | "最终回" | "finale" | "final" =>
+            "完结篇" | "终章" | "最终章" | "最终卷" | "最终回" | "finale" | "final" =>
             {
                 return Some(vec![FINAL]);
             }
-            "番外" | "番外篇" | "番外集" | "外传" | "外伝" | "特别篇" | "특별편" | "외전"
-            | "extra" | "extras" | "side story" | "side stories" => return Some(vec![EXTRA]),
+            "番外" | "番外篇" | "番外集" | "外传" | "特别篇" | "extra" | "extras"
+            | "side story" | "side stories" => return Some(vec![EXTRA]),
             _ => {}
         }
     }
@@ -640,29 +637,6 @@ mod tests {
     fn nested_volumes() {
         assert_eq!(vol("X 第一部（下）").1, Some(vec![1, 3]));
         assert_eq!(vol("X 第二部 上").1, Some(vec![2, 1]));
-    }
-
-    #[test]
-    fn japanese_and_korean() {
-        same_series(
-            &[
-                "とある魔術の禁書目録 22",
-                "とある魔術の禁書目録(3)",
-                "とある魔術の禁書目録 第4巻",
-            ],
-            &[22, 3, 4],
-        );
-        same_series(&["本好きの下剋上 第二部「神殿の巫女見習いI」"], &[2]);
-        same_series(&["X 上巻", "X 下巻", "X ②"], &[1, 3, 2]);
-        same_series(
-            &[
-                "전지적 독자 시점 1권",
-                "전지적 독자 시점 제2권",
-                "전지적 독자 시점 3",
-            ],
-            &[1, 2, 3],
-        );
-        same_series(&["X 상", "X 하권"], &[1, 3]);
     }
 
     #[test]

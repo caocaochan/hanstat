@@ -1,5 +1,13 @@
 # Changelog
 
+## [2026.11.24.01] - 2026-11-24
+
+### Removed
+- **Japanese and Korean books are no longer supported.** hanstat is for Chinese books only: the Kiwi and Sudachi analysers, the JLPT, Kaishi 1.5k and Korean 1–6급 word lists, and the Japanese and Korean reading speeds are gone. Every book is analysed as Chinese.
+- **The language badge** at the top right of the toolbar is gone, and with it the language choice in the Reading path and Library Stats. The Overview still names the book's script, and the Library's Language column still shows 简体中文 or 繁體中文.
+- **Korean and Japanese books leave the Library** the first time this version starts. Their settings files (`anki-ko.json`, `known-ja.json` and so on) and downloaded analysers are left on disk, unused; delete them by hand if you like.
+- **hanstat-cli** no longer takes `--lang` or `--kaishi`; `--level N` and `--hsk N` are the same option. TXT files can no longer be read as EUC-KR.
+
 ## [2026.11.24.00] - 2026-11-24
 
 ### Added

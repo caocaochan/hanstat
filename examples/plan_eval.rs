@@ -3,31 +3,22 @@
 //! greedy against beam search, the lookahead weight, and the beam against
 //! every order of small random subsets.
 //!
-//!     cargo run --release --example plan_eval [-- --lang zh] [--subsets N]
+//!     cargo run --release --example plan_eval [-- --subsets N]
 
 use hanstat::history::History;
 use hanstat::known;
-use hanstat::lang::Language;
 use hanstat::plan::{self, Library, Objective, Params, Study};
 use hanstat::profile::Profile;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 fn main() {
-    let mut lang = Language::Chinese;
     let mut subsets = 6usize;
     let mut lambdas: Vec<f32> = vec![0.0, 0.1, 0.25, 0.5, 1.0];
     let mut objectives = vec![Objective::Total, Objective::Peak];
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--lang" => {
-                lang = match args.next().as_deref() {
-                    Some("ko") => Language::Korean,
-                    Some("ja") => Language::Japanese,
-                    _ => Language::Chinese,
-                }
-            }
             "--subsets" => subsets = args.next().and_then(|s| s.parse().ok()).unwrap_or(6),
             "--lambdas" => {
                 lambdas = args
@@ -45,10 +36,9 @@ fn main() {
     let books: Vec<(String, Profile)> = hist
         .entries
         .iter()
-        .filter(|e| e.stats.language == lang)
         .filter_map(|e| Profile::load(&hist.profile(&e.id)).map(|p| (e.title.clone(), p)))
         .collect();
-    println!("{} {} books with word data", books.len(), lang.name());
+    println!("{} books with word data", books.len());
     let no = AtomicBool::new(false);
 
     // Learners at three levels.
@@ -58,16 +48,13 @@ fn main() {
         ("HSK 1-6 + 7-9", &[1, 2, 3, 4, 5, 6, 7]),
     ];
     for (label, bands) in levels {
-        let mut s = known::Settings {
-            language: lang,
-            ..Default::default()
-        };
+        let mut s = known::Settings::default();
         for &b in *bands {
             s.set_band(b, true);
         }
         let k = s.apply(None, true);
-        let fold = Library::fold_for(k.as_ref(), lang, true);
-        let lib = Library::build(lang, fold, false, books.clone());
+        let fold = Library::fold_for(k.as_ref(), true);
+        let lib = Library::build(fold, false, books.clone());
         let k0 = lib.known(k.as_ref());
         let all: Vec<usize> = (0..lib.books.len()).collect();
         let width = plan::width_for(&lib, &all, plan::SEARCH_BUDGET);
