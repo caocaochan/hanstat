@@ -1,5 +1,19 @@
 # Changelog
 
+## [2026.11.24.02] - 2026-11-24
+
+### Added
+- **Learn while reading: a second Reading path.** **Library → Reading path** now starts in **Learn while reading**: nothing is studied before a book. Each book teaches the words it uses often (90% of those it uses 10+ times, the rule ✔ Mark read uses), and the books are ordered so that each starts as easy as it can. A book's **Beginning** is how much of its first few chapters (20,000 running words) you'd know, counting the words it teaches as you meet them; **Over the book** is the same for the whole book, so a long book that repeats its words is easier than its word count suggests. **Teaches** says how many words it teaches, and its hover how many unknown words you'd meet (per 1,000 running words). **💾** saves the words it teaches.
+- **Words met across books count.** A word no single book teaches is learned once it occurs in two or more books, 10+ times in all (the same 10 as above). The reading path counts it, and so does ✔ Mark read: the Mark read window says how many more words a mark adds this way, Library Stats › Books read shows them as **Across books**, and they count as known everywhere. A book marked read keeps its word counts from then on (in `read` in the app folder), so analysing it again or removing it from the Library doesn't change them. Books marked read before this version count once their word data is copied, the first time it starts; a book already gone from the Library still counts its own words, but not towards words across books.
+- **The book you're reading comes first.** With Learn while reading, a book you have read past its first 1% of in the reader (📖 37%) is first on the path, most recently read first, and its figures are for the rest of it. An order you set by hand is kept.
+- **Best order** chooses what the path makes best. In Learn while reading: **Easiest beginning** (every book as easy to get into as it can be) or **Fewest unknown words** (over all the books, which can put a long book early when the words it teaches make the books after it easier). In Study before each book: **Fewest before any book** (as before) or **Fewest in all**, and with a fixed number of words, **Easiest hardest book** (as before) or **Easiest on average**.
+- **hanstat-cli --plan --read** plans learning while reading (`--read-percent`, `--min-count`; defaults from the window); `--objective` is listed in the help. With `--json` each step has `known_at_start`, `known_over_book`, `unknown_met` and `teaches`.
+
+### Changed
+- **The Reading path starts in Learn while reading**, including for paths planned before. **Study before each book** is one click away, with your target, number of words and other settings as you left them.
+- **Every Library book is analysed once more** in the background the first time this version starts, to keep where its words occur (by chapter) for **Beginning**. Saved analyses make this quick for most books; until a book is done, its figures use an even spread of its words ("an estimate" in the hover).
+- **The ✔ Mark read rule and the Reading path's are one setting.** Changing the share or the number of times in either changes both.
+
 ## [2026.11.24.01] - 2026-11-24
 
 ### Removed

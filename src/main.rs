@@ -653,6 +653,8 @@ struct App {
     auto: AutoRefresh,
     /// The Mark read window, while open.
     read_dialog: Option<read_books::ReadDialog>,
+    /// The words the books read teach together.
+    across: read_books::Across,
     /// Library Stats › Reading.
     reading_view: library_reading::ReadingView,
     /// The Library's Books tab leaves out the books marked read.
@@ -976,6 +978,9 @@ struct PlanState {
     error: Option<String>,
     /// History ids of the books with a profile, and what they were listed for.
     have: Option<((u64, usize), Vec<String>)>,
+    /// History ids of the books with a profile but no word positions beside
+    /// it, and what they were listed for.
+    no_positions: Option<((u64, usize), HashSet<String>)>,
     /// The library last built, and what from.
     lib: Option<(LibKey, Arc<plan::Library>)>,
     /// What `result`, or the running job, was computed from.
@@ -1036,6 +1041,12 @@ struct PlanInputs {
     manual: Option<Vec<String>>,
     /// Target offsets from writing style, by History id (none: 0).
     offsets: Vec<(String, f64)>,
+    /// Learning while reading, the books the reader has a place in:
+    /// (History id, file, spine index, offset, when).
+    reading: Vec<(String, PathBuf, u32, u64, u64)>,
+    /// Learning while reading, the word counts of the books read
+    /// ([`read_books::Across::counts`], by `Arc` address; 0: none).
+    read_counts: usize,
 }
 
 struct PlanDone {
@@ -1334,6 +1345,7 @@ impl Default for App {
             style: StyleState::load(),
             auto: AutoRefresh::default(),
             read_dialog: None,
+            across: Default::default(),
             reading_view: Default::default(),
             library_hide_read: false,
             exists: Exists::default(),
@@ -1785,6 +1797,18 @@ impl App {
         let profile = (self.profile_written.as_ref() != Some(&(id.clone(), digest))
             || !profile_path.is_file())
         .then(|| Profile::from_report(id, r, names));
+        // Where its words occur, with the profile they were made with.
+        let pos_path = self.history.positions(id);
+        let positions = match (&self.book, &self.prep) {
+            (Some(b), Some(prep)) if profile.is_some() || !pos_path.is_file() => Some((
+                profile::Positions::from_analysis(b, prep, &self.included, &r.word_freq),
+                profile.as_ref().map_or_else(
+                    || Profile::from_report(id, r, names).digest(),
+                    |p| p.digest(),
+                ),
+            )),
+            _ => None,
+        };
         let entry = history::Entry {
             id: id.clone(),
             path: std::path::absolute(path).unwrap_or_else(|_| path.clone()),
@@ -1811,6 +1835,13 @@ impl App {
                     self.profile_written = Some((p.id, digest));
                     self.profiles_version += 1;
                 }
+                Err(e) => self.history_error = Some(e),
+            }
+        }
+        if let Some((pos, digest)) = positions {
+            match pos.save(&pos_path, digest) {
+                // The reading path reads them.
+                Ok(()) => self.profiles_version += 1,
                 Err(e) => self.history_error = Some(e),
             }
         }
@@ -2834,6 +2865,7 @@ impl eframe::App for App {
         self.start_discovery(&ctx);
         self.poll_anki(&ctx);
         self.poll_plan(&ctx);
+        self.poll_across(&ctx);
         self.poll_stats(&ctx);
         self.poll_image(&ctx);
         // Counted only while shown: it reads every book's word data.
@@ -6380,6 +6412,24 @@ impl App {
         ids
     }
 
+    /// History ids of the books with a profile but no [`profile::Positions`]
+    /// file beside it (analysed before they were kept).
+    fn plan_no_positions(&mut self) -> HashSet<String> {
+        let key = (self.profiles_version, self.history.entries.len());
+        if let Some((k, ids)) = &self.plan.no_positions
+            && *k == key
+        {
+            return ids.clone();
+        }
+        let ids: HashSet<String> = self
+            .plan_have()
+            .into_iter()
+            .filter(|id| !self.history.positions(id).is_file())
+            .collect();
+        self.plan.no_positions = Some((key, ids.clone()));
+        ids
+    }
+
     /// Plan in the background; a running plan is cancelled.
     fn start_plan(&mut self, inputs: PlanInputs, ctx: &egui::Context) {
         if let Some((_, c)) = self.plan.job.take() {
@@ -6414,6 +6464,8 @@ impl App {
             })
             .collect();
         let k = self.known.merged.clone();
+        let read_counts = self.across.counts.clone();
+        let history_path = History::path();
         let cancel = Arc::new(AtomicBool::new(false));
         let c2 = cancel.clone();
         let (tx, rx) = channel();
@@ -6422,11 +6474,20 @@ impl App {
             let t = std::time::Instant::now();
             let key = inputs.lib.clone();
             let lib = cached.unwrap_or_else(|| {
-                let books: Vec<(String, Profile)> = files
+                // With where their words occur, when that was saved with them.
+                let books: Vec<(String, Profile, Option<profile::Positions>)> = files
                     .into_iter()
                     .filter_map(|(t, p)| Profile::load(&p).map(|p| (t, p)))
+                    .map(|(t, p)| {
+                        let pos = profile::Positions::load(
+                            &profile::positions_path_in(&history_path, &p.id),
+                            p.digest(),
+                            p.words.len(),
+                        );
+                        (t, p, pos)
+                    })
                     .collect();
-                Arc::new(plan::Library::build(key.fold, key.skip_hapax, books))
+                Arc::new(plan::Library::build_with(key.fold, key.skip_hapax, books))
             });
             // Writing style: a copy only when the offsets changed.
             let mut lib = lib;
@@ -6439,6 +6500,28 @@ impl App {
             if lib.books.iter().any(|b| b.offset != want(&b.id)) {
                 Arc::make_mut(&mut lib).set_offsets(want);
             }
+            // Where the reader is in each book started (learning while
+            // reading): its EPUB file, the share of that file's text before
+            // the place (as the reader counts it), then a running word.
+            let at: HashMap<&str, (u64, u64)> = inputs
+                .reading
+                .iter()
+                .filter_map(|(id, path, spine, offset, saved)| {
+                    let b = lib.books.iter().find(|b| b.id == *id)?;
+                    if !b.has_positions() {
+                        return None;
+                    }
+                    let epub = reader::epub::Epub::open(path).ok()?;
+                    let href = epub.spine.get(*spine as usize)?;
+                    let len = reader::chapter_text_len(&epub, href).max(1);
+                    let f = *offset as f64 / len as f64;
+                    Some((id.as_str(), (b.running_word_at(href, f)?, *saved)))
+                })
+                .collect();
+            let at = |b: &plan::LibBook| at.get(b.id.as_str()).copied();
+            if lib.reading_differs(at) {
+                Arc::make_mut(&mut lib).set_reading(at);
+            }
             let index: HashMap<&str, usize> = lib
                 .books
                 .iter()
@@ -6450,13 +6533,21 @@ impl App {
                 .iter()
                 .filter_map(|id| index.get(id.as_str()).copied())
                 .collect();
-            let k0 = lib.known(k.as_deref());
+            let mut k0 = lib.known(k.as_deref());
             let params = inputs.params;
+            // Learning while reading, a word's meetings in the books read count.
+            if matches!(params.study, plan::Study::Read { .. }) {
+                lib.add_read_meetings(&mut k0, read_counts.values().map(|c| &c[..]));
+            }
             let width = plan::width_for(&lib, &books, plan::SEARCH_BUDGET);
             let Some(best) = lib.optimise(&k0, &params, &books, width, &c2) else {
                 return;
             };
-            let naive = lib.evaluate(&k0, &params, &lib.easiest_now(&k0, &books));
+            let naive = lib.evaluate(
+                &k0,
+                &params,
+                &lib.started_first(&params, &lib.easiest_now(&k0, &books)),
+            );
             let (path, optimised) = match &inputs.manual {
                 Some(order) => {
                     // The hand-set order, then books added since, as the planner placed them.
@@ -6722,15 +6813,21 @@ impl App {
             return;
         }
         self.auto.paused = None;
+        let no_positions = self.plan_no_positions();
         let open = self.book_id.as_deref();
         // Rows of which only the known words changed first: they take
         // milliseconds each, the others an analysis.
         let (mut todo, mut full) = (Vec::new(), Vec::new());
         for e in &self.history.entries {
-            if e.inputs == d.joined()
-                || Some(e.id.as_str()) == open
-                || self.auto.failed.get(&e.path) == Some(&d)
-            {
+            if Some(e.id.as_str()) == open || self.auto.failed.get(&e.path) == Some(&d) {
+                continue;
+            }
+            if e.inputs == d.joined() {
+                // Analysed before word positions were kept: again, which
+                // mostly reads the analysis cache.
+                if no_positions.contains(&e.id) && e.path.is_file() {
+                    full.push(Self::library_item(e));
+                }
                 continue;
             }
             if Inputs::analysis_of(&e.inputs) == Some(d.analysis.as_str()) {
@@ -6859,9 +6956,20 @@ impl App {
                     // not rebuilt for nothing.
                     let p = Profile::from_report(&id, &r, &names);
                     let p_path = profile::path_in(&history_path, &id);
-                    let changed = Profile::load(&p_path).map(|o| o.digest()) != Some(p.digest());
+                    let mut changed =
+                        Profile::load(&p_path).map(|o| o.digest()) != Some(p.digest());
                     if changed {
                         p.save(&p_path)?;
+                    }
+                    // Where its words occur, for the reading path; read only
+                    // with the profile they were made with.
+                    let pos_path = profile::positions_path_in(&history_path, &id);
+                    if changed
+                        || profile::Positions::load(&pos_path, p.digest(), p.words.len()).is_none()
+                    {
+                        a.positions.save(&pos_path, p.digest())?;
+                        // The reading path reads them.
+                        changed = true;
                     }
                     // A book opened is copied into the Library's folder; the
                     // Library's own books are copied there at start
@@ -7029,7 +7137,78 @@ impl App {
         let mut changed = false;
         let style_on = self.style_on();
         let st = &mut self.plan.settings;
+        let read_mode = st.mode == plan::Mode::Read;
         ui.horizontal_wrapped(|ui| {
+            changed |= ui
+                .radio_value(&mut st.mode, plan::Mode::Read, "Learn while reading")
+                .on_hover_text(
+                    "Study nothing before a book: each book teaches the words it uses often, \
+                     and the books are ordered so that each starts as easy as it can",
+                )
+                .changed();
+            changed |= ui
+                .radio_value(&mut st.mode, plan::Mode::Study, "Study before each book")
+                .on_hover_text("Before each book, study its unknown words until enough of it is known")
+                .changed();
+            ui.separator();
+            ui.label("Best order:");
+            let (peak, total, peak_hover, total_hover) = match (st.mode, st.fixed) {
+                (plan::Mode::Read, _) => (
+                    "Easiest beginning",
+                    "Fewest unknown words",
+                    "Every book as easy to get into as it can be: the order in which even the book with the hardest \
+                     beginning (its first few chapters) has as many of its words known as possible",
+                    "The order in which you meet the fewest unknown words over all the books. \
+                     It can put a long book early, even if it is harder to get into, \
+                     because the words it teaches make the books after it easier",
+                ),
+                (plan::Mode::Study, false) => (
+                    "Fewest before any book",
+                    "Fewest in all",
+                    "The order in which the book that needs the most study before it needs as few words as possible",
+                    "The order in which you study the fewest words over all the books. \
+                     It can put a long book early, because what you study for it also helps with the books after it",
+                ),
+                (plan::Mode::Study, true) => (
+                    "Easiest hardest book",
+                    "Easiest on average",
+                    "The order in which the book you know least of while reading it is as easy as possible",
+                    "The order in which you know the most of each book while reading it, on average",
+                ),
+            };
+            changed |= ui
+                .radio_value(&mut st.objective, plan::Objective::Peak, peak)
+                .on_hover_text(peak_hover)
+                .changed();
+            changed |= ui
+                .radio_value(&mut st.objective, plan::Objective::Total, total)
+                .on_hover_text(total_hover)
+                .changed();
+        });
+        if read_mode {
+            ui.horizontal_wrapped(|ui| {
+                let hover = "The rule ✔ Mark read uses (one setting: changing it here changes the Mark read default too). \
+                             A word none of the books teaches on its own is learned once met this many times in two or more books.";
+                ui.label("A book teaches the").on_hover_text(hover);
+                changed |= ui
+                    .add(egui::DragValue::new(&mut st.read_percent).range(1..=100).suffix("%"))
+                    .on_hover_text(hover)
+                    .changed();
+                ui.label("most frequent of the words it uses at least").on_hover_text(hover);
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut st.read_min_count)
+                            .range(1..=10_000)
+                            .speed(0.2),
+                    )
+                    .on_hover_text(hover)
+                    .changed();
+                ui.label("times; words met that often across books are learned too (as ✔ Mark read).")
+                    .on_hover_text(hover);
+            });
+        }
+        if !read_mode {
+            ui.horizontal_wrapped(|ui| {
             ui.label("Before each book, study");
             changed |= ui.radio_value(&mut st.fixed, false, "until").changed();
             changed |= ui
@@ -7082,6 +7261,7 @@ impl App {
                 )
                 .changed();
         });
+        }
         if changed && let Err(e) = st.save() {
             self.plan.error = Some(e);
         }
@@ -7123,6 +7303,25 @@ impl App {
                 .collect(),
             manual: st.manual_order().cloned(),
             offsets,
+            // Not in the other mode, where places don't count: no replanning
+            // after each page read.
+            reading: if read_mode {
+                have.iter()
+                    .filter(|id| self.known.settings.read_book(id).is_none())
+                    .filter_map(|id| {
+                        let at = reading_stats::left_at(id)?;
+                        let e = self.history.entries.iter().find(|e| e.id == *id)?;
+                        Some((id.clone(), e.path.clone(), at.spine, at.offset, at.saved))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            read_counts: if read_mode {
+                Arc::as_ptr(&self.across.counts) as *const () as usize
+            } else {
+                0
+            },
         };
         if self.plan.inputs.as_ref() != Some(&inputs) {
             self.start_plan(inputs, ctx);
@@ -7179,6 +7378,8 @@ impl App {
         let lib = &res.lib;
         let path = &res.path;
         let fixed = matches!(path.params.study, plan::Study::Fixed(_));
+        let reading_mode = matches!(path.params.study, plan::Study::Read { .. });
+        let total_first = path.params.objective == plan::Objective::Total;
         let source = k
             .as_ref()
             .map(|k| match (k.from_anki, k.listed.source.is_empty()) {
@@ -7199,19 +7400,36 @@ impl App {
             ));
             ui.label(RichText::new(format!("· planned in {:.1} s", res.secs)).weak());
         });
+        // The two figures in the order the objective compares them.
         let summary = |p: &plan::Path| {
-            if fixed {
-                format!(
-                    "lowest coverage while reading {:.1}%, average {:.1}%",
-                    p.lowest_reading(),
-                    p.steps.iter().map(|s| s.reading).sum::<f64>() / p.steps.len().max(1) as f64
+            let (peak, total) = if reading_mode {
+                (
+                    format!("hardest beginning {:.1}% known", p.lowest_start()),
+                    format!(
+                        "{} unknown words met in all, {} learned",
+                        fmt_int(p.total_lookups()),
+                        fmt_int(p.total_learned() as u64)
+                    ),
+                )
+            } else if fixed {
+                (
+                    format!("lowest coverage while reading {:.1}%", p.lowest_reading()),
+                    format!(
+                        "average {:.1}%",
+                        p.steps.iter().map(|s| s.reading).sum::<f64>()
+                            / p.steps.len().max(1) as f64
+                    ),
                 )
             } else {
-                format!(
-                    "{} words to study in all, at most {} before one book",
-                    fmt_int(p.total_study() as u64),
-                    fmt_int(p.peak() as u64)
+                (
+                    format!("at most {} words before one book", fmt_int(p.peak() as u64)),
+                    format!("{} words to study in all", fmt_int(p.total_study() as u64)),
                 )
+            };
+            if total_first {
+                format!("{total}, {peak}")
+            } else {
+                format!("{peak}, {total}")
             }
         };
         ui.horizontal_wrapped(|ui| {
@@ -7245,6 +7463,36 @@ impl App {
                 ))
                 .weak(),
             );
+        }
+        // Learning while reading, books analysed before word positions were kept.
+        let estimated = if reading_mode {
+            books
+                .iter()
+                .filter(|&&b| !lib.books[b].has_positions())
+                .count()
+        } else {
+            0
+        };
+        if estimated > 0 {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "{} {} an estimate of where {} words occur until analysed again (the Library does this in the background).",
+                        fmt_int(estimated as u64),
+                        if estimated == 1 { "book uses" } else { "books use" },
+                        if estimated == 1 { "its" } else { "their" },
+                    ))
+                    .weak(),
+                );
+                if self.batch.is_none()
+                    && ui
+                        .small_button("Analyse now")
+                        .on_hover_text("Analyse them again in the background; saved analyses make this quick")
+                        .clicked()
+                {
+                    act = Some(PlanAction::Backfill);
+                }
+            });
         }
         ui.add_space(4.0);
 
@@ -7322,7 +7570,17 @@ impl App {
             .columns(Column::exact(96.0), 6)
             .column(Column::remainder())
             .header(24.0, |mut h| {
-                let mut heads: Vec<(&str, &str)> = vec![
+                let mut heads: Vec<(&str, &str)> = if reading_mode { vec![
+                    ("#", "Reading order. ⏶⏷ set your own order; the planner's is shown alongside. A book you have started comes first (📖)"),
+                    ("Book", "Click a title to open the book"),
+                    ("Known now", "Running words you know now (names left out)"),
+                    ("When reached", "Running words known when the path reaches the book, before reading it"),
+                    ("Beginning", "How much of its first few chapters you'd know (the next few, in a book you have started), counting the words it teaches as you meet them"),
+                    ("Over the book", "Running words known over the whole book (the rest of it, in a book started), as its frequent words are learned"),
+                    ("Teaches", "Words reading it teaches: the ones it uses often enough, and those met often enough across books"),
+                    ("From earlier", "Words of this book you don't know now that the path teaches before it"),
+                    ("", ""),
+                ] } else { vec![
                     ("#", "Reading order. ⏶⏷ set your own order; the planner's is shown alongside"),
                     ("Book", "Click a title to open the book"),
                     ("Known now", "Running words you know now (names left out)"),
@@ -7338,7 +7596,7 @@ impl App {
                     ("From earlier", "Words of this book you don't know now that the path teaches before it"),
                     ("While reading", "Running words known while reading it, after studying"),
                     ("", ""),
-                ];
+                ] };
                 if style_on {
                     heads.insert(
                         2,
@@ -7413,6 +7671,11 @@ impl App {
                             fmt_int(b.unique_words() as u64),
                             fmt_int(b.running_words()),
                         );
+                        // A book started: where the reader is.
+                        if let Some(f) = s.from {
+                            ui.label(RichText::new(format!("📖 {:.0}%", f * 100.0)).strong())
+                                .on_hover_text("You are reading it: it comes first, and its figures are for the rest of it");
+                        }
                         match e.filter(|e| exists.get(&e.path)) {
                             Some(e) => {
                                 if ui.link(&b.title).on_hover_text(hover).clicked() {
@@ -7442,6 +7705,11 @@ impl App {
                                             s.reading - s.offset,
                                             -s.offset
                                         ),
+                                        plan::Study::Read { .. } => format!(
+                                            "Counts as starting at {:.1}% ({:+.1} points for its writing style)",
+                                            s.start - s.offset,
+                                            -s.offset
+                                        ),
                                     });
                                 }
                                 t.on_hover_text(hover);
@@ -7461,6 +7729,43 @@ impl App {
                             t.on_hover_text(format!("+{up:.1} points from the books before it"));
                         }
                     });
+                    if reading_mode {
+                        let estimate = if b.has_positions() {
+                            ""
+                        } else {
+                            "\n\nAn estimate: where its words occur isn't known until it is analysed again."
+                        };
+                        row.col(|ui| {
+                            // Coloured by the difficulty, writing style included.
+                            let d = Difficulty::from_percent(s.start - s.offset);
+                            ui.label(RichText::new(format!("{:.1}%", s.start)).color(difficulty_color(d)))
+                                .on_hover_text(format!("{}: {}{estimate}", d.label(), d.description()));
+                        });
+                        row.col(|ui| {
+                            ui.label(format!("{:.1}%", s.reading));
+                        });
+                        row.col(|ui| {
+                            let t = ui.label(RichText::new(fmt_int(s.learned.len() as u64)).strong());
+                            let left = (100.0 - s.reading) / 100.0;
+                            let per1k = if left > 0.0 { left * 1000.0 } else { 0.0 };
+                            let mut hover = format!(
+                                "{} unknown words met reading it{}: {:.0} per 1,000 running words",
+                                fmt_int(s.lookups),
+                                if s.from.is_some() { " (the rest of it)" } else { "" },
+                                per1k,
+                            );
+                            if s.from.is_some() {
+                                hover.push_str(&format!(
+                                    "\n{} of the words it teaches met often enough already, where you are",
+                                    fmt_int(s.learned_so_far as u64)
+                                ));
+                            }
+                            t.on_hover_text(hover);
+                        });
+                        row.col(|ui| {
+                            ui.label(fmt_int(s.gained as u64));
+                        });
+                    } else {
                     row.col(|ui| {
                         ui.label(RichText::new(fmt_int(s.study.len() as u64)).strong());
                     });
@@ -7488,10 +7793,22 @@ impl App {
                         ui.label(RichText::new(format!("{:.1}%", s.reading)).color(difficulty_color(d)))
                             .on_hover_text(format!("{}: {}", d.label(), d.description()));
                     });
+                    }
                     row.col(|ui| {
+                        let (any, hover) = if reading_mode {
+                            (
+                                !s.learned.is_empty(),
+                                "Save the words it teaches (word, tab, count in the book): study them first, or make Anki cards from them while reading",
+                            )
+                        } else {
+                            (
+                                !s.study.is_empty(),
+                                "Save the words to study before it (word, tab, count in the book): import it as a word list once learned, or make Anki cards from it",
+                            )
+                        };
                         if ui
-                            .add_enabled(!s.study.is_empty(), egui::Button::new("💾").small())
-                            .on_hover_text("Save the words to study before it (word, tab, count in the book): import it as a word list once learned, or make Anki cards from it")
+                            .add_enabled(any, egui::Button::new("💾").small())
+                            .on_hover_text(hover)
                             .clicked()
                         {
                             act = Some(PlanAction::SaveList(i));
@@ -7584,11 +7901,20 @@ impl App {
                 let Some(res) = &self.plan.result else { return };
                 let s = &res.path.steps[i];
                 let title = &res.lib.books[s.book].title;
-                let mut text = format!(
-                    "# Words to study before {title} (step {} of the reading path), with their counts in the book\n",
-                    i + 1
-                );
-                for (w, n) in res.lib.study_list(s.book, &s.study) {
+                let teaches = matches!(res.path.params.study, plan::Study::Read { .. });
+                let mut text = if teaches {
+                    format!(
+                        "# Words {title} teaches (step {} of the reading path), with their counts in the book\n",
+                        i + 1
+                    )
+                } else {
+                    format!(
+                        "# Words to study before {title} (step {} of the reading path), with their counts in the book\n",
+                        i + 1
+                    )
+                };
+                let words = if teaches { &s.learned } else { &s.study };
+                for (w, n) in res.lib.study_list(s.book, words) {
                     text.push_str(&format!("{w}\t{n}\n"));
                 }
                 let name: String = title
@@ -7601,18 +7927,24 @@ impl App {
                         }
                     })
                     .collect();
-                if let Some(m) = save(&format!("{} - study list.txt", name.trim()), "txt", text) {
+                let file = if teaches {
+                    "words it teaches"
+                } else {
+                    "study list"
+                };
+                if let Some(m) = save(&format!("{} - {file}.txt", name.trim()), "txt", text) {
                     self.toast = Some((m, ui.input(|i| i.time) + 3.0));
                 }
             }
             PlanAction::Backfill => {
                 save_settings = false;
                 let have = self.plan_have();
+                let no_positions = self.plan_no_positions();
                 let todo: Vec<BatchItem> = self
                     .history
                     .entries
                     .iter()
-                    .filter(|e| !have.contains(&e.id))
+                    .filter(|e| !have.contains(&e.id) || no_positions.contains(&e.id))
                     .filter(|e| e.path.is_file())
                     .map(Self::library_item)
                     .collect();

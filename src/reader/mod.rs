@@ -40,6 +40,13 @@ use tree::Chapter;
 
 use theme::Theme;
 
+/// Characters of text in the EPUB file `path` as the reader counts them:
+/// what its places' offsets are counted in (the reading path turns a place
+/// into a share of the file with it).
+pub(crate) fn chapter_text_len(epub: &Epub, path: &str) -> usize {
+    tree::build(epub, path, &mut tree::SheetCache::default()).text_len
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct Position {
     spine: usize,

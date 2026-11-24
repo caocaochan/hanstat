@@ -64,10 +64,32 @@ pub enum Study {
     Target(f64),
     /// This many of its unknown words.
     Fixed(usize),
+    /// Nothing: learn while reading. A book teaches the `percent`% most
+    /// frequent of the words it uses at least `min_count` times, as ✔ Mark
+    /// read takes them ([`crate::known::read_selection`]), and a word met in
+    /// two or more books, `min_count` times in all
+    /// ([`crate::known::across_books`]).
+    Read { percent: u8, min_count: u32 },
+}
+
+/// Running words at the start of a book that "at the start" is taken over
+/// ([`Step::start`]): roughly its first few chapters.
+pub const OPENING: u64 = 20_000;
+
+/// The Reading path's two ways of reading.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    /// Nothing studied: books teach their frequent words ([`Study::Read`]).
+    #[default]
+    Read,
+    /// Study before each book ([`Study::Target`], [`Study::Fixed`]).
+    Study,
 }
 
 /// What makes one order better than another.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Objective {
     /// The fewest words studied in all (under a fixed number: the highest
     /// average coverage while reading), then the smallest largest step.
@@ -112,6 +134,10 @@ pub const DEFAULT_LOOKAHEAD: f32 = 2.0;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// Learn while reading, or study before each book.
+    pub mode: Mode,
+    /// What makes one order better than another, in either mode.
+    pub objective: Objective,
     /// Study a fixed number of words before each book instead of to a target.
     pub fixed: bool,
     pub target: f64,
@@ -138,6 +164,8 @@ const MANUAL_KEY: &str = "Chinese";
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            mode: Mode::Read,
+            objective: Objective::Peak,
             fixed: false,
             target: 95.0,
             learn: 300,
@@ -171,15 +199,26 @@ impl Settings {
     }
 
     pub fn params(&self) -> Params {
-        Params {
-            study: if self.fixed {
-                Study::Fixed(self.learn)
-            } else {
-                Study::Target(self.target)
+        match self.mode {
+            Mode::Read => Params {
+                study: Study::Read {
+                    percent: self.read_percent,
+                    min_count: self.read_min_count,
+                },
+                objective: self.objective,
+                incidental: None,
+                lookahead: 0.0,
             },
-            objective: Objective::default(),
-            incidental: self.incidental_on.then_some(self.incidental),
-            lookahead: self.lookahead,
+            Mode::Study => Params {
+                study: if self.fixed {
+                    Study::Fixed(self.learn)
+                } else {
+                    Study::Target(self.target)
+                },
+                objective: self.objective,
+                incidental: self.incidental_on.then_some(self.incidental),
+                lookahead: self.lookahead,
+            },
         }
     }
 
@@ -197,27 +236,47 @@ impl Settings {
     }
 }
 
-/// A set of word ids.
+/// A set of word ids, and (learning while reading) how often each was met
+/// in the books read so far.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Known(Vec<u64>);
+pub struct Known {
+    bits: Vec<u64>,
+    /// By word id, saturating; empty until a meeting is added.
+    met: Vec<u16>,
+}
 
 impl Known {
     fn new(n: usize) -> Known {
-        Known(vec![0; n.div_ceil(64)])
+        Known {
+            bits: vec![0; n.div_ceil(64)],
+            met: Vec::new(),
+        }
     }
     #[inline]
     pub fn has(&self, w: u32) -> bool {
-        self.0[(w >> 6) as usize] >> (w & 63) & 1 == 1
+        self.bits[(w >> 6) as usize] >> (w & 63) & 1 == 1
     }
     #[inline]
     fn add(&mut self, w: u32) {
-        self.0[(w >> 6) as usize] |= 1 << (w & 63);
+        self.bits[(w >> 6) as usize] |= 1 << (w & 63);
     }
     pub fn len(&self) -> usize {
-        self.0.iter().map(|x| x.count_ones() as usize).sum()
+        self.bits.iter().map(|x| x.count_ones() as usize).sum()
     }
     pub fn is_empty(&self) -> bool {
-        self.0.iter().all(|x| *x == 0)
+        self.bits.iter().all(|x| *x == 0)
+    }
+    /// Times word `w` was met in the books read.
+    #[inline]
+    pub fn met(&self, w: u32) -> u32 {
+        self.met.get(w as usize).map_or(0, |&m| m as u32)
+    }
+    fn add_met(&mut self, w: u32, n: u32) {
+        if self.met.is_empty() {
+            self.met = vec![0; self.bits.len() * 64];
+        }
+        let m = &mut self.met[w as usize];
+        *m = (*m as u32 + n).min(u16::MAX as u32) as u16;
     }
 }
 
@@ -244,6 +303,24 @@ pub struct LibBook {
     /// reading coverage under a fixed number), from its writing style
     /// ([`crate::style::target_offset`]); 0 by default.
     pub offset: f64,
+    /// Its words as the profile counts them (each spelling apart, hapax
+    /// included unless left out), most frequent first: what ✔ Mark read
+    /// takes from and what meetings across books count.
+    raw: Vec<(u32, u32)>,
+    /// Where its words occur, if its profile has them.
+    pos: Option<BookPos>,
+    /// Where the reader is in it, as a running word, and when it got there
+    /// (Unix time): a book started is read first ([`Library::set_reading`]).
+    pub reading: Option<(u64, u64)>,
+}
+
+/// [`crate::profile::Positions`] of a book, by the library's word numbers.
+#[derive(Clone, Debug)]
+struct BookPos {
+    sections: Vec<crate::profile::PosSection>,
+    total: u64,
+    /// Parallel to [`LibBook::words`]: (section, count), in order.
+    words: Vec<Vec<(u32, u32)>>,
 }
 
 impl LibBook {
@@ -252,6 +329,51 @@ impl LibBook {
     }
     pub fn running_words(&self) -> u64 {
         self.words.iter().map(|w| w.1 as u64).sum()
+    }
+    /// The running word `fraction` of the way through its EPUB file `href`
+    /// (where the reader is), if it knows where its words occur.
+    pub fn running_word_at(&self, href: &str, fraction: f64) -> Option<u64> {
+        crate::profile::running_word_in(&self.pos.as_ref()?.sections, href, fraction)
+    }
+    /// Whether it knows where its words occur.
+    pub fn has_positions(&self) -> bool {
+        self.pos.is_some()
+    }
+    /// Its running words, as positions count them (names included).
+    fn span(&self) -> u64 {
+        self.pos
+            .as_ref()
+            .map_or_else(|| self.running_words(), |p| p.total)
+    }
+    /// Expected occurrences of its `i`-th word in running words `a..b`:
+    /// even within each section, and past the sections kept, even over the
+    /// rest of the book; without positions, even over the whole book.
+    fn occurs(&self, i: usize, a: u64, b: u64) -> f64 {
+        if b <= a {
+            return 0.0;
+        }
+        let n = self.words[i].1 as f64;
+        let overlap =
+            |s: u64, e: u64| (b.min(e) as f64 - a.max(s) as f64).max(0.0) / (e - s).max(1) as f64;
+        let Some(p) = &self.pos else {
+            let span = self.span();
+            return if span == 0 { 0.0 } else { n * overlap(0, span) };
+        };
+        let mut got = 0.0;
+        let mut kept = 0.0;
+        let mut end = 0;
+        for &(si, c) in &p.words[i] {
+            let sec = &p.sections[si as usize];
+            let e = sec.start + sec.words;
+            got += c as f64 * overlap(sec.start, e);
+            kept += c as f64;
+            end = e;
+        }
+        let rest = n - kept;
+        if rest > 0.0 && end < p.total {
+            got += rest * overlap(end, p.total);
+        }
+        got
     }
 }
 
@@ -302,8 +424,22 @@ pub struct Step {
     pub gained: usize,
     /// The book's [`LibBook::offset`].
     pub offset: f64,
-    /// Words learned from reading it ([`Params::incidental`]).
+    /// Words learned from reading it ([`Params::incidental`], or learning
+    /// while reading: `learned.len()`).
     pub by_reading: usize,
+    /// Learning while reading: running words known over its first
+    /// [`OPENING`] running words (from where the reader is, in a book
+    /// started), as its words are learned; `reading` is the same over the
+    /// whole book (the rest of it).
+    pub start: f64,
+    /// Learning while reading: unknown words met reading it (the rest of it).
+    pub lookups: u64,
+    /// Learning while reading: the words it teaches, most frequent first.
+    pub learned: Vec<u32>,
+    /// A book started: how far the reader is, as a share of it.
+    pub from: Option<f64>,
+    /// A book started: of `learned`, those met often enough already.
+    pub learned_so_far: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -320,6 +456,22 @@ impl Path {
     /// The largest number of words studied before one book.
     pub fn peak(&self) -> usize {
         self.steps.iter().map(|s| s.study.len()).max().unwrap_or(0)
+    }
+    /// Learning while reading: the lowest share of running words known at
+    /// the start of a book.
+    pub fn lowest_start(&self) -> f64 {
+        self.steps
+            .iter()
+            .map(|s| s.start)
+            .fold(f64::INFINITY, f64::min)
+    }
+    /// Learning while reading: unknown words met over the whole path.
+    pub fn total_lookups(&self) -> u64 {
+        self.steps.iter().map(|s| s.lookups).sum()
+    }
+    /// Learning while reading: words the path teaches.
+    pub fn total_learned(&self) -> usize {
+        self.steps.iter().map(|s| s.learned.len()).sum()
     }
     /// The lowest share of running words known while reading a book.
     pub fn lowest_reading(&self) -> f64 {
@@ -349,8 +501,11 @@ pub type Key = [i64; 2];
 /// (largest step cost, sum of step costs), as accumulated.
 const EMPTY: Key = [i64::MIN, 0];
 
-fn add_cost(k: Key, c: i64) -> Key {
-    [k[0].max(c), k[1] + c]
+/// A step's part of the largest and of the sum.
+type Cost = (i64, i64);
+
+fn add_cost(k: Key, c: Cost) -> Key {
+    [k[0].max(c.0), k[1] + c.1]
 }
 
 /// The accumulated (largest, sum) in the order `objective` compares them.
@@ -362,12 +517,29 @@ fn order_key(objective: Objective, k: Key) -> Key {
 }
 
 /// Words studied, or under a fixed number, the reading coverage in
-/// hundredths of a percent, negated (so that smaller is better).
-fn step_cost(study: Study, s: &Step) -> i64 {
+/// hundredths of a percent, negated (so that smaller is better); learning
+/// while reading, the coverage at the start so, and the unknown words met.
+fn step_cost(study: Study, s: &Step) -> Cost {
     match study {
-        Study::Target(_) => s.study.len() as i64,
-        Study::Fixed(_) => -((s.reading - s.offset) * 100.0).round() as i64,
+        Study::Target(_) => (s.study.len() as i64, s.study.len() as i64),
+        Study::Fixed(_) => {
+            let c = -((s.reading - s.offset) * 100.0).round() as i64;
+            (c, c)
+        }
+        Study::Read { .. } => (
+            -((s.start - s.offset) * 100.0).round() as i64,
+            s.lookups as i64,
+        ),
     }
+}
+
+/// What reading a book teaches and what it is like, learning while reading.
+struct ReadEval {
+    start: f64,
+    over: f64,
+    lookups: f64,
+    learned: Vec<u32>,
+    so_far: usize,
 }
 
 /// A partial path in the search.
@@ -387,6 +559,20 @@ impl Library {
     /// knowledge's (see [`Library::fold_for`]). `skip_hapax`: leave out a
     /// book's words that occur only once in it, as the Overview does.
     pub fn build(fold: bool, skip_hapax: bool, books: Vec<(String, Profile)>) -> Library {
+        Self::build_with(
+            fold,
+            skip_hapax,
+            books.into_iter().map(|(t, p)| (t, p, None)).collect(),
+        )
+    }
+
+    /// [`Library::build`], with where each book's words occur, where known
+    /// ([`crate::profile::Positions`] made with that profile).
+    pub fn build_with(
+        fold: bool,
+        skip_hapax: bool,
+        books: Vec<(String, Profile, Option<crate::profile::Positions>)>,
+    ) -> Library {
         let mut ids: FxHashMap<String, u32> = FxHashMap::default();
         let mut vocab: Vec<String> = Vec::new();
         let mut intern = |w: &str| -> (u32, bool) {
@@ -401,7 +587,7 @@ impl Library {
             (i, same)
         };
         let mut out = Vec::new();
-        for (title, p) in books {
+        for (title, p, positions) in books {
             // Single characters would match far too much (as on the Overview).
             let names: Vec<&str> = p
                 .names
@@ -414,9 +600,20 @@ impl Library {
                 .flatten();
             let mut counts: FxHashMap<u32, (u32, bool)> = FxHashMap::default();
             let mut spell: FxHashMap<u32, String> = FxHashMap::default();
+            let mut raw: Vec<(u32, u32)> = Vec::new();
+            let mut placed: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
             // Before folding, so the same words go as on the Overview.
-            for (w, n) in p.words.iter().filter(|(_, n)| !skip_hapax || *n > 1) {
+            for (pi, (w, n)) in p
+                .words
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, n))| !skip_hapax || *n > 1)
+            {
                 let (id, unfolded) = intern(w);
+                raw.push((id, *n));
+                if let Some(pos) = &positions {
+                    placed.entry(id).or_default().extend(&pos.words[pi]);
+                }
                 let is_name = ac.as_ref().is_some_and(|a| a.is_match(w.as_str()));
                 let e = counts.entry(id).or_insert((0, false));
                 e.0 += n;
@@ -430,6 +627,28 @@ impl Library {
                 counts.into_iter().map(|(w, (n, nm))| (w, n, nm)).collect();
             words.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
             let denom = words.iter().filter(|w| !w.2).map(|w| w.1 as u64).sum();
+            // Stable: equal counts keep the profile's order, as Mark read.
+            raw.sort_by_key(|x| std::cmp::Reverse(x.1));
+            let pos = positions.map(|ps| BookPos {
+                total: ps.total(),
+                words: words
+                    .iter()
+                    .map(|w| {
+                        // Spellings folded into one word: their sections merged.
+                        let mut v = placed.remove(&w.0).unwrap_or_default();
+                        v.sort_unstable_by_key(|x| x.0);
+                        v.dedup_by(|b, a| {
+                            let same = a.0 == b.0;
+                            if same {
+                                a.1 += b.1;
+                            }
+                            same
+                        });
+                        v
+                    })
+                    .collect(),
+                sections: ps.sections,
+            });
             out.push(LibBook {
                 id: p.id,
                 title,
@@ -441,6 +660,9 @@ impl Library {
                 spell,
                 series: None,
                 offset: 0.0,
+                raw,
+                pos,
+                reading: None,
             });
         }
         // Series: two or more books whose titles name one, at least one with
@@ -489,6 +711,75 @@ impl Library {
             }
         }
         out
+    }
+
+    /// Add to `k` the meetings of the books read (their word counts, as
+    /// [`crate::known::across_books`] takes them): learning while reading
+    /// counts them towards a word's [`Study::Read`] `min_count`.
+    pub fn add_read_meetings<'a>(
+        &self,
+        k: &mut Known,
+        books: impl IntoIterator<Item = &'a [(String, u32)]>,
+    ) {
+        let index: FxHashMap<&str, u32> = self
+            .vocab
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (w.as_str(), i as u32))
+            .collect();
+        for words in books {
+            for (w, n) in words {
+                if let Some(&i) = index.get(crate::anki::fold(w, self.fold).as_str()) {
+                    k.add_met(i, *n);
+                }
+            }
+        }
+    }
+
+    /// Where the reader is in each book: (running word, when); a book is
+    /// started when that is past its first 1%. True if one changed.
+    pub fn set_reading(&mut self, at: impl Fn(&LibBook) -> Option<(u64, u64)>) -> bool {
+        let mut changed = false;
+        for i in 0..self.books.len() {
+            let r = Self::started_at(&self.books[i], &at);
+            changed |= r != self.books[i].reading;
+            self.books[i].reading = r;
+        }
+        changed
+    }
+
+    /// Whether [`Library::set_reading`] with `at` would change anything.
+    pub fn reading_differs(&self, at: impl Fn(&LibBook) -> Option<(u64, u64)>) -> bool {
+        self.books
+            .iter()
+            .any(|b| Self::started_at(b, &at) != b.reading)
+    }
+
+    fn started_at(b: &LibBook, at: &impl Fn(&LibBook) -> Option<(u64, u64)>) -> Option<(u64, u64)> {
+        let span = b.span();
+        at(b).filter(|r| span > 0 && r.0 * 100 >= span)
+    }
+
+    /// Learning while reading, the books of `books` started, most recently
+    /// read first: they come first on every path.
+    pub fn started(&self, params: &Params, books: &[usize]) -> Vec<usize> {
+        if !matches!(params.study, Study::Read { .. }) {
+            return Vec::new();
+        }
+        let mut v: Vec<usize> = books
+            .iter()
+            .copied()
+            .filter(|&b| self.books[b].reading.is_some())
+            .collect();
+        v.sort_by_key(|&b| (std::cmp::Reverse(self.books[b].reading.unwrap().1), b));
+        v
+    }
+
+    /// `order` with the books started ([`Library::started`]) moved to the front.
+    pub fn started_first(&self, params: &Params, order: &[usize]) -> Vec<usize> {
+        let first = self.started(params, order);
+        let rest = order.iter().copied().filter(|b| !first.contains(b));
+        first.iter().copied().chain(rest).collect()
     }
 
     /// Distinct words across the library.
@@ -593,7 +884,7 @@ impl Library {
     /// Share known now, and the cheap cost of studying `book` next: the
     /// fewest words reaching the target, or (fixed) the reading coverage
     /// after its most frequent unknown words, without building the list.
-    fn cheap(&self, book: usize, k: &Known, study: Study) -> (f64, i64) {
+    fn cheap(&self, book: usize, k: &Known, study: Study) -> (f64, Cost) {
         let b = &self.books[book];
         let (mut known, mut total) = (0u64, 0u64);
         for (&(w, n), &name) in b.words.iter().zip(&b.name) {
@@ -631,12 +922,118 @@ impl Library {
                     got += c;
                     n += 1;
                 }
-                (now, n)
+                (now, (n, n))
             }
             Study::Fixed(n) => {
                 let add: u64 = unknown.take(n).sum();
-                (now, -((pct(known + add) - b.offset) * 100.0).round() as i64)
+                let c = -((pct(known + add) - b.offset) * 100.0).round() as i64;
+                (now, (c, c))
             }
+            Study::Read { percent, min_count } => {
+                let e = self.read_eval(book, k, percent, min_count, false);
+                (
+                    now,
+                    (
+                        -((e.start - b.offset) * 100.0).round() as i64,
+                        e.lookups.round() as i64,
+                    ),
+                )
+            }
+        }
+    }
+
+    /// The words of `book` that ✔ Mark read takes ([`crate::known::read_selection`]):
+    /// of those it uses at least `min_count` times, the `percent`% most frequent.
+    fn selection(&self, book: usize, percent: u8, min_count: u32) -> FxHashSet<u32> {
+        let raw = &self.books[book].raw;
+        // Most frequent first, so those used often enough come first.
+        let often = raw.partition_point(|x| x.1 >= min_count);
+        let take = (often * percent.min(100) as usize).div_ceil(100);
+        raw[..take].iter().map(|x| x.0).collect()
+    }
+
+    /// Learning while reading `book` from `k`: what it teaches and what
+    /// reading it is like (see [`Study::Read`]). `list`: build the list of
+    /// words taught, not only their effect.
+    fn read_eval(
+        &self,
+        book: usize,
+        k: &Known,
+        percent: u8,
+        min_count: u32,
+        list: bool,
+    ) -> ReadEval {
+        let b = &self.books[book];
+        let sel = self.selection(book, percent, min_count);
+        let span = b.span();
+        let from = b.reading.map_or(0, |r| r.0.min(span));
+        let win = (from + OPENING).min(span);
+        // Running words, names left out unless known, as the Overview counts them.
+        let mut total = 0u64;
+        let (mut lk_win, mut lk_rest) = (0f64, 0f64);
+        let mut learned = Vec::new();
+        let mut so_far = 0;
+        for (i, (&(w, n), &name)) in b.words.iter().zip(&b.name).enumerate() {
+            if k.has(w) {
+                total += n as u64;
+                continue;
+            }
+            // Met this many times more, it is learned (`None`: not in this book).
+            let e = k.met(w);
+            let after = if sel.contains(&w) || (e > 0 && e + n >= min_count) {
+                Some(min_count.saturating_sub(e) as f64)
+            } else {
+                None
+            };
+            if after.is_some() && (list || from > 0) {
+                learned.push(w);
+            }
+            if name {
+                continue;
+            }
+            total += n as u64;
+            let before = if from > 0 { b.occurs(i, 0, from) } else { 0.0 };
+            let here = b.occurs(i, from, win);
+            let rest = (n as f64 - before).max(0.0);
+            match after {
+                Some(a) => {
+                    let left = (a - before).max(0.0);
+                    lk_win += left.min(here);
+                    lk_rest += left.min(rest);
+                    if from > 0 && before >= a {
+                        so_far += 1;
+                    }
+                }
+                None => {
+                    lk_win += here;
+                    lk_rest += rest;
+                }
+            }
+        }
+        if !list {
+            learned.clear();
+        }
+        // Running words over the stretches, names left out as in `total`.
+        let share = |a: u64, z: u64| {
+            if span == 0 {
+                0.0
+            } else {
+                total as f64 * (z - a) as f64 / span as f64
+            }
+        };
+        let pct = |lk: f64, toks: f64| {
+            if toks <= 0.0 {
+                100.0
+            } else {
+                (100.0 * (1.0 - lk / toks)).clamp(0.0, 100.0)
+            }
+        };
+        ReadEval {
+            start: pct(lk_win, share(from, win)),
+            over: pct(lk_rest, share(from, span)),
+            lookups: lk_rest,
+            learned,
+            so_far,
         }
     }
 
@@ -655,6 +1052,36 @@ impl Library {
         let now_scan = self.scan(book, known0);
         let now = now_scan.percent();
         let gained = now_scan.unknown.iter().filter(|(w, _)| k.has(*w)).count();
+        if let Study::Read { percent, min_count } = params.study {
+            let e = self.read_eval(book, k, percent, min_count, true);
+            for &w in &e.learned {
+                k.add(w);
+            }
+            // Its words were met, for the books after it.
+            for &(w, n) in &b.raw {
+                k.add_met(w, n);
+            }
+            let span = b.span();
+            return Step {
+                book,
+                now,
+                reached,
+                reading: e.over,
+                study: Vec::new(),
+                study_now: None,
+                gained,
+                by_reading: e.learned.len(),
+                offset: b.offset,
+                start: e.start,
+                lookups: e.lookups.round() as u64,
+                from: b
+                    .reading
+                    .filter(|_| span > 0)
+                    .map(|r| r.0.min(span) as f64 / span as f64),
+                learned_so_far: e.so_far,
+                learned: e.learned,
+            };
+        }
         // Value order: this book's share plus the books still to come.
         let mut cand = s.unknown;
         let lam = params.lookahead;
@@ -687,6 +1114,8 @@ impl Library {
                     add += c as u64;
                 }
             }
+            // Returned above.
+            Study::Read { .. } => {}
         }
         for &w in &study {
             k.add(w);
@@ -715,8 +1144,8 @@ impl Library {
             }
         }
         let study_now = match params.study {
-            Study::Target(_) => Some(self.cheap(book, known0, params.study).1 as usize),
-            Study::Fixed(_) => None,
+            Study::Target(_) => Some(self.cheap(book, known0, params.study).1.0 as usize),
+            Study::Fixed(_) | Study::Read { .. } => None,
         };
         Step {
             book,
@@ -728,6 +1157,11 @@ impl Library {
             gained,
             by_reading,
             offset: b.offset,
+            start: reading,
+            lookups: 0,
+            learned: Vec::new(),
+            from: None,
+            learned_so_far: 0,
         }
     }
 
@@ -808,26 +1242,33 @@ impl Library {
         cancel: &AtomicBool,
     ) -> Option<Path> {
         let mut found = Vec::new();
+        let first = self.started(params, books);
         if width > 1 {
-            found.push(self.beam(known0, params, books, width, cancel)?);
+            found.push(self.beam(known0, params, books, &first, width, cancel)?);
         }
-        found.push(self.beam(known0, params, books, 1, cancel)?);
-        found.push(self.evaluate(known0, params, &self.easiest_now(known0, books)));
+        found.push(self.beam(known0, params, books, &first, 1, cancel)?);
+        found.push(self.evaluate(
+            known0,
+            params,
+            &self.started_first(params, &self.easiest_now(known0, books)),
+        ));
         // The first of the best: the beam's when it ties.
         found.into_iter().min_by_key(|p| p.key())
     }
 
+    /// `first`: books read first, in that order, before the search.
     fn beam(
         &self,
         known0: &Known,
         params: &Params,
         books: &[usize],
+        first: &[usize],
         width: usize,
         cancel: &AtomicBool,
     ) -> Option<Path> {
         let width = width.max(1);
         let words = (self.books.len()).div_ceil(64);
-        let mut beam = vec![State {
+        let mut start = State {
             steps: Vec::new(),
             known: known0.clone(),
             future: if params.lookahead > 0.0 {
@@ -837,10 +1278,17 @@ impl Library {
             },
             done: vec![0; words],
             key: EMPTY,
-        }];
+        };
+        for &b in first {
+            let st = self.step(b, &mut start.known, &mut start.future, params, known0);
+            start.key = add_cost(start.key, step_cost(params.study, &st));
+            start.done[b / 64] |= 1 << (b % 64);
+            start.steps.push(st);
+        }
+        let mut beam = vec![start];
         let in_done = |d: &[u64], b: usize| d[b / 64] >> (b % 64) & 1 == 1;
         let earlier = self.earlier_volumes(books);
-        for _ in 0..books.len() {
+        for _ in first.len()..books.len() {
             if cancel.load(Ordering::Relaxed) {
                 return None;
             }
@@ -912,9 +1360,17 @@ pub const SEARCH_BUDGET: f64 = 2e9;
 /// A beam width that keeps a search near `budget` word lookups.
 pub fn width_for(lib: &Library, books: &[usize], budget: f64) -> usize {
     let n = books.len().max(1) as f64;
+    // Learning while reading also goes through where words occur.
     let avg = books
         .iter()
-        .map(|&b| lib.books[b].words.len() as f64)
+        .map(|&b| {
+            let bk = &lib.books[b];
+            bk.words.len() as f64
+                + bk.pos
+                    .as_ref()
+                    .map_or(0, |p| p.words.iter().map(Vec::len).sum::<usize>())
+                    as f64
+        })
         .sum::<f64>()
         / n;
     // A search of width W scans about W * n^2 / 2 books.
@@ -1061,6 +1517,286 @@ mod tests {
         assert_eq!(p.steps[1].reached, 100.0);
         // Shown as the Traditional book spells it.
         assert_eq!(lib.study_list(1, &p.steps[0].study)[0].0, "說話");
+    }
+
+    const READ: Study = Study::Read {
+        percent: 90,
+        min_count: 10,
+    };
+
+    fn read(percent: u8, min_count: u32) -> Params {
+        params(Study::Read { percent, min_count }, 0.0)
+    }
+
+    /// Words `prefix`0, `prefix`1, … each `n` times.
+    fn many(prefix: &str, words: usize, n: u32) -> Vec<(String, u32)> {
+        (0..words).map(|i| (format!("{prefix}{i}"), n)).collect()
+    }
+
+    fn owned(id: &str, words: Vec<(String, u32)>) -> (String, Profile) {
+        let v: Vec<(&str, u32)> = words.iter().map(|(w, n)| (w.as_str(), *n)).collect();
+        profile(id, &v, &[])
+    }
+
+    #[test]
+    fn learning_while_reading_rewards_repetition() {
+        // The same running words and none known: the long-running words of
+        // one are met 20 times each, the other's twice.
+        let lib = Library::build(
+            false,
+            false,
+            vec![
+                owned("rep", many("甲", 10, 20)),
+                owned("var", many("乙", 100, 2)),
+            ],
+        );
+        let k0 = lib.known(None);
+        let p = lib.evaluate(&k0, &read(100, 10), &[0, 1]);
+        let (a, b) = (&p.steps[0], &p.steps[1]);
+        assert_eq!((a.now, b.now), (0.0, 0.0));
+        // Each of the ten met unknown 10 times, then known.
+        assert_eq!((a.learned.len(), a.lookups), (10, 100));
+        assert!((a.reading - 50.0).abs() < 1e-9 && (a.start - 50.0).abs() < 1e-9);
+        assert_eq!((b.learned.len(), b.lookups), (0, 200));
+        assert_eq!(b.reading, 0.0);
+        assert!(b.study.is_empty() && b.study_now.is_none());
+        assert_eq!(p.total_lookups(), 300);
+        assert_eq!(p.lowest_start(), 0.0);
+        assert_eq!(p.key(), [0, 300]);
+    }
+
+    #[test]
+    fn learning_while_reading_carries_over() {
+        let a = profile("a", &[("甲", 20), ("乙", 20), ("丙", 20)], &[]);
+        let b = profile("b", &[("甲", 5), ("乙", 5), ("丁", 5)], &[]);
+        let c = profile("c", &[("戊", 30), ("己", 30)], &[]);
+        let lib = Library::build(false, false, vec![b, a, c]);
+        let k0 = lib.known(None);
+        let pr = read(100, 10);
+        let best = lib
+            .optimise(&k0, &pr, &[0, 1, 2], 8, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(best.key(), brute_force(&lib, &k0, &pr, &[0, 1, 2]).key());
+        let pos = |x: usize| best.order().iter().position(|&b| b == x).unwrap();
+        // A teaches 甲 乙 before B: B starts at two thirds known, not none.
+        assert!(pos(1) < pos(0));
+        let sb = &best.steps[pos(0)];
+        assert!((sb.reached - 200.0 / 3.0).abs() < 1e-9);
+        assert_eq!(sb.gained, 2);
+        // 丁 met 5 times teaches nothing yet; 甲 乙 were taught by A.
+        assert!(sb.learned.is_empty());
+    }
+
+    /// Marking the path's books read one after another, as ✔ Mark read
+    /// does (with words across books), knows what the path said it would.
+    #[test]
+    fn learning_while_reading_matches_mark_read() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        let pool: Vec<String> = (0..50)
+            .map(|i| char::from_u32(0x4e00 + i).unwrap().to_string())
+            .collect();
+        for round in 0..20 {
+            let profiles: Vec<(String, Profile)> = (0..5)
+                .map(|b| {
+                    let mut m: HashMap<&str, u32> = HashMap::new();
+                    for _ in 0..30 {
+                        let w = &pool[(rnd(30) + b * 5) as usize % pool.len()];
+                        *m.entry(w).or_default() += 1 + (20 / (1 + rnd(15))) as u32;
+                    }
+                    let v: Vec<(&str, u32)> = m.into_iter().collect();
+                    // A name in some: taken by Mark read like any word.
+                    let names: &[&str] = if b % 2 == 0 { &["一丁"] } else { &[] };
+                    let mut v = v;
+                    if b % 2 == 0 {
+                        v.push(("一丁", 12));
+                    }
+                    profile(["p", "q", "r", "s", "t"][b as usize], &v, names)
+                })
+                .collect();
+            let lib = Library::build(false, false, profiles.clone());
+            // Some words known at the start.
+            let mut ks = crate::known::Settings::default();
+            for w in pool.iter().step_by(7) {
+                ks.set_marked(w, true);
+            }
+            let k0 = lib.known(ks.apply(None, false).as_ref());
+            let (percent, min_count) = (80 + (round % 3) as u8 * 10, 6 + round % 5);
+            let pr = read(percent, min_count);
+            let order: Vec<usize> = lib
+                .optimise(&k0, &pr, &[0, 1, 2, 3, 4], 4, &AtomicBool::new(false))
+                .unwrap()
+                .order();
+            let path = lib.evaluate(&k0, &pr, &order);
+            let mut predicted: FxHashSet<u32> =
+                (0..lib.vocab_len() as u32).filter(|&w| k0.has(w)).collect();
+            let mut counts: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+            for (i, s) in path.steps.iter().enumerate() {
+                predicted.extend(s.learned.iter().copied());
+                let p = &profiles[s.book].1;
+                let words: Vec<String> = crate::known::read_selection(&p.words, percent, min_count)
+                    .into_iter()
+                    .map(|(w, _)| w.clone())
+                    .collect();
+                ks.set_read(crate::known::ReadBook {
+                    id: p.id.clone(),
+                    words,
+                    percent,
+                    min_count,
+                    ..Default::default()
+                });
+                counts.insert(p.id.clone(), p.words.clone());
+                let input: Vec<crate::known::ReadCounts> = ks
+                    .read
+                    .iter()
+                    .map(|m| (&counts[&m.id][..], &m.words[..]))
+                    .collect();
+                ks.across = crate::known::across_books(&input, min_count, false);
+                let marked = lib.known(ks.apply(None, false).as_ref());
+                let got: FxHashSet<u32> = (0..lib.vocab_len() as u32)
+                    .filter(|&w| marked.has(w))
+                    .collect();
+                assert_eq!(got, predicted, "round {round}, after step {i}");
+            }
+        }
+    }
+
+    /// One book of two sections, 20,000 and 80,000 running words: 的 in both,
+    /// a hundred rare words in the first (`front`) or the second.
+    fn two_part(id: &str, front: bool) -> (String, Profile, Option<crate::profile::Positions>) {
+        use crate::profile::{PosSection, Positions};
+        let mut words = vec![("的".to_owned(), 90_000u32)];
+        words.extend(many("稀", 100, 100));
+        let (_, p) = owned(id, words);
+        let sections = vec![
+            PosSection {
+                href: Some("a.xhtml".into()),
+                start: 0,
+                words: 20_000,
+            },
+            PosSection {
+                href: Some("b.xhtml".into()),
+                start: 20_000,
+                words: 80_000,
+            },
+        ];
+        let pw: Vec<Vec<(u32, u32)>> = p
+            .words
+            .iter()
+            .map(|(w, n)| match (w.as_str(), front) {
+                ("的", true) => vec![(0, 10_000)],
+                ("的", false) => vec![(0, 20_000)],
+                (_, true) => vec![(0, *n)],
+                (_, false) => vec![(1, *n)],
+            })
+            .collect();
+        (
+            id.to_uppercase(),
+            p,
+            Some(Positions {
+                sections,
+                words: pw,
+            }),
+        )
+    }
+
+    #[test]
+    fn start_counts_where_words_occur() {
+        let mut no_pos = two_part("even", true);
+        no_pos.2 = None;
+        let lib = Library::build_with(
+            false,
+            false,
+            vec![two_part("front", true), two_part("back", false), no_pos],
+        );
+        let k0 = lib.known(None);
+        // 的 learned after 1,000 meetings; the rare words never.
+        let pr = read(100, 1_000);
+        let at = |b: usize| lib.evaluate(&k0, &pr, &[b]).steps[0].clone();
+        let (front, back, even) = (at(0), at(1), at(2));
+        // Front: all 10,000 rare and 1,000 的 unknown in the first 20,000.
+        assert!((front.start - 45.0).abs() < 1e-6, "{}", front.start);
+        assert!((back.start - 95.0).abs() < 1e-6, "{}", back.start);
+        // Even spread: a fifth of the rare words.
+        assert!((even.start - 85.0).abs() < 1e-6, "{}", even.start);
+        // Over the whole book the same: 11,000 of 100,000.
+        for s in [&front, &back, &even] {
+            assert!((s.reading - 89.0).abs() < 1e-6);
+            assert_eq!(s.lookups, 11_000);
+        }
+        assert!(lib.books[0].has_positions() && !lib.books[2].has_positions());
+        // The easier start first.
+        let best = lib
+            .optimise(&k0, &pr, &[0, 1], 4, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(best.order(), [1, 0]);
+    }
+
+    #[test]
+    fn a_book_started_comes_first() {
+        let mut lib = Library::build_with(
+            false,
+            false,
+            vec![two_part("front", true), two_part("back", false)],
+        );
+        let pr = read(100, 1_000);
+        let k0 = lib.known(None);
+        // Under 1% in: not started.
+        assert!(!lib.set_reading(|b| (b.id == "front").then_some((999, 5))));
+        assert!(lib.started(&pr, &[0, 1]).is_empty());
+        // Past the first section of the harder book: it comes first, and
+        // what is left of it is easy.
+        assert!(lib.set_reading(|b| (b.id == "front").then_some((20_000, 5))));
+        assert_eq!(lib.started(&pr, &[0, 1]), [0]);
+        assert!(
+            lib.started(&params(Study::Target(90.0), 0.0), &[0, 1])
+                .is_empty()
+        );
+        let best = lib
+            .optimise(&k0, &pr, &[0, 1], 4, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(best.order(), [0, 1]);
+        let s = &best.steps[0];
+        assert_eq!(s.from, Some(0.2));
+        // 的 met 10,000 times already: learned; nothing unknown left to meet.
+        assert_eq!((s.learned_so_far, s.learned.len()), (1, 1));
+        assert_eq!((s.start, s.reading, s.lookups), (100.0, 100.0, 0));
+        // The other book benefits: 的 known.
+        assert!(best.steps[1].start > 99.0);
+        // Two started: the one read last first.
+        lib.set_reading(|b| Some((30_000, if b.id == "back" { 9 } else { 5 })));
+        assert_eq!(lib.started(&pr, &[0, 1]), [1, 0]);
+        assert_eq!(lib.started_first(&pr, &[0, 1]), [1, 0]);
+    }
+
+    #[test]
+    fn settings_default_to_learning_while_reading() {
+        let s: Settings = serde_json::from_str(r#"{"fixed": true, "learn": 50}"#).unwrap();
+        assert_eq!(
+            (s.mode, s.objective, s.fixed, s.learn),
+            (Mode::Read, Objective::Peak, true, 50)
+        );
+        assert_eq!(
+            s.params().study,
+            Study::Read {
+                percent: 90,
+                min_count: 10
+            }
+        );
+        let mut t = s.clone();
+        t.mode = Mode::Study;
+        t.objective = Objective::Total;
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(json.contains(r#""mode":"study""#) && json.contains(r#""objective":"total""#));
+        let u: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(u, t);
+        assert_eq!(u.params().study, Study::Fixed(50));
+        assert_eq!(u.params().objective, Objective::Total);
     }
 
     #[test]
@@ -1342,6 +2078,8 @@ mod tests {
                 (Study::Fixed(3), Objective::Peak),
                 (Study::Target(90.0), Objective::Total),
                 (Study::Fixed(3), Objective::Total),
+                (READ, Objective::Peak),
+                (READ, Objective::Total),
             ] {
                 let mut pr = params(study, if round % 2 == 0 { 0.0 } else { 0.5 });
                 pr.objective = objective;

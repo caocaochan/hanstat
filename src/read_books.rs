@@ -14,9 +14,45 @@ use hanstat::known::{self, ReadBook};
 use hanstat::profile::Profile;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, channel};
 
 /// New words listed in the dialog, most frequent first.
 const SHOW_NEW: usize = 80;
+
+/// Word counts of a book read, as frozen when it was marked.
+type Counts = Arc<Vec<(String, u32)>>;
+
+/// The words the books read teach together ([`known::across_books`]), kept
+/// in `known.json` as [`known::Settings::across`] and worked out again in the
+/// background whenever the marks, the reading rule or the T/S matching change.
+#[derive(Default)]
+pub(crate) struct Across {
+    /// What the last result was worked out from.
+    key: Option<u64>,
+    job: Option<(u64, Receiver<AcrossDone>)>,
+    /// Word counts of the books read, by History id (their frozen copies).
+    pub(crate) counts: Arc<HashMap<String, Counts>>,
+    /// Books marked read with no word counts: marked before copies were
+    /// kept, and no longer in the Library.
+    pub(crate) missing: usize,
+}
+
+struct AcrossDone {
+    counts: HashMap<String, Counts>,
+    missing: usize,
+    words: Vec<String>,
+}
+
+/// Of `marks`, those with word counts, as [`known::across_books`] takes them.
+pub(crate) fn across_input<'a>(
+    marks: &'a [ReadBook],
+    counts: &'a HashMap<String, Counts>,
+) -> Vec<known::ReadCounts<'a>> {
+    marks
+        .iter()
+        .filter_map(|m| counts.get(&m.id).map(|c| (&c[..], &m.words[..])))
+        .collect()
+}
 
 /// The Mark read window, for one book.
 pub(crate) struct ReadDialog {
@@ -33,6 +69,14 @@ pub(crate) struct ReadDialog {
     marked: Option<u64>,
     /// Why "not known yet" may count too many.
     note: Option<String>,
+    /// The other books read, as [`known::across_books`] takes them.
+    others: Vec<(Counts, Vec<String>)>,
+    /// The words they teach together now, and what this mark would add:
+    /// worked out for (percent, min_count).
+    across_now: HashSet<String>,
+    across_new: Option<((u8, u32), usize)>,
+    /// Traditional and Simplified spellings count as one word.
+    fold: bool,
 }
 
 /// Anki (if on) plus the levels, word lists, marked words and books read:
@@ -90,6 +134,17 @@ impl App {
                 .to_owned()
         });
         let running = p.words.iter().map(|(_, n)| *n as u64).sum();
+        let others: Vec<(Counts, Vec<String>)> = k
+            .read
+            .iter()
+            .filter_map(|m| {
+                self.across
+                    .counts
+                    .get(&m.id)
+                    .map(|c| (c.clone(), m.words.clone()))
+            })
+            .collect();
+        let across_now: HashSet<String> = self.known.settings.across.iter().cloned().collect();
         self.read_dialog = Some(ReadDialog {
             id: id.to_owned(),
             title,
@@ -104,6 +159,10 @@ impl App {
             before,
             marked: mark.map(|m| m.read),
             note,
+            others,
+            across_now,
+            across_new: None,
+            fold: self.anki.settings.match_across_scripts,
         });
     }
 
@@ -156,6 +215,37 @@ impl App {
                     d.min_count,
                     fmt_int(new.len() as u64),
                 ));
+                // What marking it adds across the books read (other books
+                // with these words): worked out again when the rule changes.
+                if !d.others.is_empty() {
+                    let rule = (d.percent, d.min_count);
+                    if d.across_new.is_none_or(|(r, _)| r != rule) {
+                        let taken: Vec<String> = sel.iter().map(|(w, _)| w.clone()).collect();
+                        let mut books: Vec<known::ReadCounts> = d
+                            .others
+                            .iter()
+                            .map(|(c, t)| (&c[..], &t[..]))
+                            .collect();
+                        books.push((&d.words[..], &taken[..]));
+                        let n = known::across_books(&books, d.min_count, d.fold)
+                            .into_iter()
+                            .filter(|w| !d.across_now.contains(w) && !known(w))
+                            .count();
+                        d.across_new = Some((rule, n));
+                    }
+                    if let Some((_, n)) = d.across_new {
+                        ui.label(format!(
+                            "With the {} other books read: {} more words met {}+ times across books.",
+                            fmt_int(d.others.len() as u64),
+                            fmt_int(n as u64),
+                            d.min_count,
+                        ))
+                        .on_hover_text(
+                            "A word none of the books took counts as known once it occurs in two or more books read, \
+                             this many times in all. The reading path's Learn while reading mode counts the same way.",
+                        );
+                    }
+                }
                 if let Some(n) = &d.note {
                     ui.colored_label(crate::palette::warn(), format!("⚠ {n}"));
                 }
@@ -259,9 +349,90 @@ impl App {
             Some(ReadAct::Unmark) => {
                 self.read_dialog = None;
                 self.edit_known(|k| k.unset_read(&id));
+                // Marked again, it is copied again as it is then.
+                let _ = std::fs::remove_file(hanstat::profile::read_copy_path_in(
+                    &history::History::path(),
+                    &id,
+                ));
                 self.toast = Some((format!("Unmarked {title}"), time + 3.0));
             }
         }
+    }
+
+    /// Keep [`known::Settings::across`] up to date with the books marked
+    /// read, the reading rule ([`crate::plan::Settings::read_min_count`]) and
+    /// the T/S matching: worked out in the background, then saved.
+    pub(crate) fn poll_across(&mut self, ctx: &egui::Context) {
+        use std::hash::{Hash, Hasher};
+        let fold = self.anki.settings.match_across_scripts;
+        let min_count = self.plan.settings.read_min_count;
+        // Every frame: what tells marks apart, not their words.
+        let key = {
+            let mut h = std::hash::DefaultHasher::new();
+            (fold, min_count).hash(&mut h);
+            for m in &self.known.settings.read {
+                (&m.id, m.read, m.percent, m.min_count, m.words.len()).hash(&mut h);
+            }
+            h.finish()
+        };
+        if self.across.key == Some(key) {
+            return;
+        }
+        if let Some((k, rx)) = &self.across.job
+            && *k == key
+        {
+            let Ok(done) = rx.try_recv() else { return };
+            self.across.job = None;
+            self.across.key = Some(key);
+            self.across.counts = Arc::new(done.counts);
+            self.across.missing = done.missing;
+            let words = done.words;
+            self.edit_known(|k| {
+                let changed = k.across != words;
+                k.across = words;
+                changed
+            });
+            return;
+        }
+        // Start (again, for what changed meanwhile).
+        let marks = self.known.settings.read.clone();
+        let had = self.across.counts.clone();
+        let ctx = ctx.clone();
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let hist = history::History::path();
+            let mut counts: HashMap<String, Counts> = HashMap::new();
+            let mut missing = 0;
+            for m in &marks {
+                if let Some(c) = had.get(&m.id) {
+                    counts.insert(m.id.clone(), c.clone());
+                    continue;
+                }
+                let copy = hanstat::profile::read_copy_path_in(&hist, &m.id);
+                // Marked before copies were kept (or just now): copied from
+                // the Library's word data while it is there.
+                if !copy.is_file()
+                    && let Ok(b) = hanstat::saver::read(&hanstat::profile::path_in(&hist, &m.id))
+                {
+                    let _ = std::fs::create_dir_all(copy.parent().unwrap());
+                    let _ = hanstat::saver::write(&copy, b);
+                }
+                match Profile::load(&copy) {
+                    Some(p) => {
+                        counts.insert(m.id.clone(), Arc::new(p.words));
+                    }
+                    None => missing += 1,
+                }
+            }
+            let words = known::across_books(&across_input(&marks, &counts), min_count, fold);
+            let _ = tx.send(AcrossDone {
+                counts,
+                missing,
+                words,
+            });
+            ctx.request_repaint();
+        });
+        self.across.job = Some((key, rx));
     }
 
     /// Library Stats: the books marked read.
@@ -328,8 +499,25 @@ impl App {
                     format!("{} were new when marked", fmt_int(added as u64)),
                 )
                 .hover("Distinct words the books marked read count as known. A word new for two books is counted for each."),
+                Tile::new(
+                    "Across books",
+                    RichText::new(fmt_int(self.known.settings.across.len() as u64)),
+                    format!("met {}+ times in two or more", self.plan.settings.read_min_count),
+                )
+                .hover("Words none of the books took on its own that count as known because the books read use them, together, often enough"),
             ],
         );
+        if self.across.missing > 0 {
+            ui.label(
+                RichText::new(format!(
+                    "{} {} marked read before word counts were kept with the mark and no longer in the Library: {} words count, but not towards words across books.",
+                    fmt_int(self.across.missing as u64),
+                    if self.across.missing == 1 { "book was" } else { "books were" },
+                    if self.across.missing == 1 { "its" } else { "their" },
+                ))
+                .weak(),
+            );
+        }
         ui.add_space(6.0);
         egui::Grid::new("read_books")
             .striped(true)

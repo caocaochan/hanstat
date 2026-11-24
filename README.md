@@ -33,9 +33,9 @@ Open a book or drop it on the window. It is segmented with LTP (Simplified) or C
 
 **Names.** Character names inflate the unknown words. **Suggested words** lists the likely names and terms the segmenter split or glued to other words; apply them, or type one into **Force a word**.
 
-**Library.** Every book you open is added to **📖 Library**, with its length, the share of running words you know, its difficulty and reading time; click a column to sort. Rows update on their own when what you know changes. Click **✔** in the **Read** column once you've read a book: the most frequent of its words (90% of those it uses 10+ times, adjustable) count as known from then on, and it leaves the reading path.
+**Library.** Every book you open is added to **📖 Library**, with its length, the share of running words you know, its difficulty and reading time; click a column to sort. Rows update on their own when what you know changes. Click **✔** in the **Read** column once you've read a book: the most frequent of its words (90% of those it uses 10+ times, adjustable) count as known from then on, and so do words met 10+ times across the books you've read; it leaves the reading path.
 
-**Reading path.** **Library → Reading path** orders the books so that the words you study for one book make the next ones easier: before each, it lists the words to study until you know 95% of its running words (or a fixed number). Series are read in order, and **💾** saves a book's study list for Anki.
+**Reading path.** **Library → Reading path** orders the books from easiest to hardest as you learn. In **Learn while reading** you study nothing beforehand: each book teaches the words it uses often (and words met often across books), and the books are ordered so that each one's first chapters are as easy as they can be; a long book that repeats its words counts as easier than its vocabulary size suggests, and the book you're reading comes first. In **Study before each book** it lists the words to study before each book until you know 95% of its running words (or a fixed number), so that they make the next ones easier. Series are read in order, and **💾** saves a book's word list for Anki.
 
 **Stats.** **Library → Stats** shows the library as a whole: how much of it you know, how hard each book is now, the books you've read, and the unknown words that the most books use.
 

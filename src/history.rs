@@ -192,6 +192,11 @@ impl History {
         crate::profile::path_in(&self.path, id)
     }
 
+    /// Where book `id`'s words occur ([`crate::profile::Positions`]).
+    pub fn positions(&self, id: &str) -> PathBuf {
+        crate::profile::positions_path_in(&self.path, id)
+    }
+
     /// Through [`crate::saver`]: in the window, written in the background.
     fn save(&self) -> Result<(), String> {
         if self.read_only {
@@ -246,6 +251,7 @@ impl History {
     fn delete_files(&self, id: &str) {
         let _ = std::fs::remove_file(self.cover(id));
         let _ = std::fs::remove_file(self.profile(id));
+        let _ = std::fs::remove_file(self.positions(id));
         crate::books::delete(&self.books(), id);
     }
 

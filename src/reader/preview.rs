@@ -2561,6 +2561,106 @@ fn reading_stats_tracker() {
     rs::set_test_clock(None);
 }
 
+/// Reader places against the analysis's sections, which the reading path
+/// maps them onto ([`hanstat::profile::Positions::running_word_at`]): every
+/// spine file with text is a section of the same path, holding the same
+/// Chinese text. (A place is taken as a share of the reader's own chapter
+/// text, which counts whitespace and markup text differently from the
+/// section's paragraphs.) `READER_EPUBS`: books separated by `;`, or a
+/// folder of them.
+#[test]
+#[ignore]
+fn reader_places_map_to_sections() {
+    let spec = env("READER_EPUBS").expect("set READER_EPUBS");
+    let mut books: Vec<std::path::PathBuf> = Vec::new();
+    for p in spec.split(';').map(std::path::PathBuf::from) {
+        if p.is_dir() {
+            let mut v: Vec<_> = std::fs::read_dir(&p)
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("epub"))
+                })
+                .collect();
+            v.sort();
+            books.extend(v);
+        } else {
+            books.push(p);
+        }
+    }
+    let (mut chapters, mut missing, mut off) = (0, 0, 0);
+    let mut worst = 0f64;
+    for path in books {
+        let epub = Arc::new(Epub::open(&path).unwrap());
+        let book = hanstat::extract::load(&path, hanstat::extract::EncodingChoice::Auto).unwrap();
+        let mut sheets = tree::SheetCache::default();
+        let (mut reader_all, mut lib_all) = (0u64, 0u64);
+        for item in epub.spine.iter() {
+            let ch = tree::build(&epub, item, &mut sheets);
+            if ch.han_len == 0 {
+                continue;
+            }
+            chapters += 1;
+            let Some(sec) = book.sections.iter().find(|s| {
+                s.href
+                    .as_deref()
+                    .is_some_and(|h| h.eq_ignore_ascii_case(item))
+            }) else {
+                missing += 1;
+                eprintln!("{}: {item} has no section", path.display());
+                continue;
+            };
+            // The same text: its Chinese characters (whitespace and markup
+            // text are counted differently, so all characters aren't).
+            let han: u64 = sec
+                .paragraphs
+                .iter()
+                .map(|p| p.chars().filter(|&c| hanstat::chars::is_han(c)).count() as u64)
+                .sum();
+            let all: u64 = sec
+                .paragraphs
+                .iter()
+                .map(|p| p.chars().count() as u64)
+                .sum();
+            reader_all += ch.text_len as u64;
+            lib_all += all;
+            let r = ch.han_len as f64 / han.max(1) as f64;
+            // Short chapters (a title page) can differ a lot in relative terms.
+            if han >= 1_000 {
+                worst = worst.max((r - 1.0).abs());
+                if (r - 1.0).abs() > 0.02 {
+                    off += 1;
+                    eprintln!(
+                        "{}: {item}: reader {} Chinese characters, section {han} ({:+.1}%)",
+                        path.display(),
+                        ch.han_len,
+                        (r - 1.0) * 100.0
+                    );
+                }
+            }
+        }
+        // Why a place is a share of the reader's own text, not of the section's.
+        eprintln!(
+            "{}: reader text {reader_all} characters, sections {lib_all} ({:+.2}%)",
+            path.file_name().unwrap().to_string_lossy(),
+            (reader_all as f64 - lib_all as f64) * 100.0 / lib_all.max(1) as f64
+        );
+    }
+    eprintln!(
+        "{chapters} chapters; {missing} without a section; {off} with other Chinese text (worst {:.1}%)",
+        worst * 100.0
+    );
+    assert_eq!(
+        missing, 0,
+        "spine files with text that the analysis has no section for"
+    );
+    assert_eq!(
+        off, 0,
+        "chapters whose Chinese characters differ from the section's by over 2%"
+    );
+}
+
 /// The reader's count of Chinese characters, chapter by chapter, against
 /// its layout's and against the Library's analysis. `READER_EPUBS`: books
 /// separated by `;`, or a folder of them.

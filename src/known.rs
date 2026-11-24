@@ -255,6 +255,49 @@ pub fn read_selection(words: &[(String, u32)], percent: u8, min_count: u32) -> V
     often
 }
 
+/// A book read as [`across_books`] takes it: its word counts and the words
+/// it took ([`ReadBook::words`]).
+pub type ReadCounts<'a> = (&'a [(String, u32)], &'a [String]);
+
+/// The words books read teach together, beyond what each teaches alone
+/// ([`ReadBook::words`]): a word none of them took counts as known once it
+/// occurs in two or more of them, `min_count` or more times in all. (Two
+/// books, so that the share a book leaves out of its own frequent words,
+/// [`read_selection`], stays left out until the word is met elsewhere too.)
+/// `books`: each book read, its word counts and the words it took. `fold`:
+/// Traditional and Simplified spellings count as one word, given in its
+/// Simplified form. Most met first.
+pub fn across_books(books: &[ReadCounts<'_>], min_count: u32, fold: bool) -> Vec<String> {
+    let taken: HashSet<String> = books
+        .iter()
+        .flat_map(|(_, t)| t.iter())
+        .map(|w| anki::fold(w, fold))
+        .collect();
+    // Folded word → (meetings, books, spelling).
+    let mut met: std::collections::HashMap<String, (u64, u32, String)> = Default::default();
+    for (words, _) in books {
+        let mut here: HashSet<String> = HashSet::new();
+        for (w, n) in words.iter() {
+            let k = anki::fold(w, fold);
+            if taken.contains(&k) {
+                continue;
+            }
+            let e = met.entry(k.clone()).or_insert((0, 0, k.clone()));
+            e.0 += *n as u64;
+            if here.insert(k) {
+                e.1 += 1;
+            }
+        }
+    }
+    let mut out: Vec<(u64, String)> = met
+        .into_values()
+        .filter(|(n, b, _)| *b >= 2 && *n >= min_count as u64)
+        .map(|(n, _, w)| (n, w))
+        .collect();
+    out.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    out.into_iter().map(|x| x.1).collect()
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -273,6 +316,10 @@ pub struct Settings {
     /// Books marked read in the Library, in the order they were marked.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub read: Vec<ReadBook>,
+    /// Words the books read teach together ([`across_books`]): kept up to
+    /// date by the window as books are marked and unmarked.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub across: Vec<String>,
 }
 
 impl Settings {
@@ -308,6 +355,7 @@ impl Settings {
             && self.hsk2.is_empty()
             && self.tocfl.is_empty()
             && self.read.iter().all(|b| b.words.is_empty())
+            && self.across.is_empty()
     }
 
     /// The book with History id `id`, if it is marked read.
@@ -417,6 +465,7 @@ impl Settings {
                     .iter()
                     .flat_map(|b| b.words.iter().map(String::as_str)),
             )
+            .chain(self.across.iter().map(String::as_str))
     }
 
     /// The words given to the segmenter: the imported lists' (not the levels,
@@ -459,6 +508,9 @@ impl Settings {
             0 => {}
             1 => parts.push("1 book read".to_owned()),
             n => parts.push(format!("{n} books read")),
+        }
+        if !self.across.is_empty() {
+            parts.push(format!("{} across books", self.across.len()));
         }
         parts.join(" + ")
     }
@@ -768,6 +820,43 @@ mod tests {
 
     fn counts(w: &[(&str, u32)]) -> Vec<(String, u32)> {
         w.iter().map(|(w, n)| (w.to_string(), *n)).collect()
+    }
+
+    #[test]
+    fn words_across_books() {
+        let a = counts(&[
+            ("的", 50),
+            ("宝剑", 6),
+            ("魔法", 12),
+            ("灵石", 9),
+            ("學習", 4),
+        ]);
+        let b = counts(&[("的", 40), ("宝剑", 5), ("灵石", 1), ("学习", 7)]);
+        let c = counts(&[("魔法", 3)]);
+        let ta: Vec<String> = vec!["的".into()];
+        let tb: Vec<String> = vec!["的".into()];
+        let tc: Vec<String> = Vec::new();
+        let books = [(&a[..], &ta[..]), (&b[..], &tb[..])];
+        // 宝剑 6 + 5 in two books; 灵石 9 + 1; 魔法 12 in one book only (its
+        // own book left it out); 学习 4 + 7 once Traditional and Simplified
+        // are one word; 的 was taken.
+        assert_eq!(across_books(&books, 10, true), ["学习", "宝剑", "灵石"]);
+        assert_eq!(across_books(&books, 10, false), ["宝剑", "灵石"]);
+        assert_eq!(across_books(&books, 11, true), ["学习", "宝剑"]);
+        assert!(across_books(&books, 12, true).is_empty());
+        // Met elsewhere too, 魔法 counts.
+        let books3 = [(&a[..], &ta[..]), (&b[..], &tb[..]), (&c[..], &tc[..])];
+        assert!(across_books(&books3, 10, true).contains(&"魔法".to_owned()));
+        // Unmarking one of the two takes 宝剑 back.
+        assert!(across_books(&books[..1], 10, true).is_empty());
+        // Words across books count as known.
+        let s = Settings {
+            across: vec!["宝剑".into()],
+            ..Default::default()
+        };
+        assert!(!s.is_empty());
+        assert_eq!(s.apply(None, true).unwrap().word("宝剑"), Status::Listed);
+        assert_eq!(s.label(), "1 across books");
     }
 
     #[test]

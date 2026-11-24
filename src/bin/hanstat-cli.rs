@@ -2,7 +2,7 @@
 //!
 //! hanstat-cli <file> [--ckip|--ltp|--jieba] [--dict words.txt] [--json] [--top N]
 //!             [--include-all] [--exclude N,M,..] [--chars-csv out.csv] [--words-csv out.csv] [--suggest N] [--auto-dict] [--library]
-//! hanstat-cli --plan [--target P | --learn N] [--incidental M] [--lookahead X] [--width W] [--study-lists DIR] [--json]
+//! hanstat-cli --plan [--read [--read-percent P] [--min-count M] | --target P | --learn N] [--incidental M] [--lookahead X] [--objective peak|total] [--width W] [--study-lists DIR] [--json]
 
 use hanstat::analyze::{self, Report};
 use hanstat::anki::{self, BookCoverage, ByStatus, Knowledge, KnowledgeSummary};
@@ -326,6 +326,11 @@ struct PlanArgs {
     objective: plan::Objective,
     width: Option<usize>,
     study_lists: Option<PathBuf>,
+    /// Learn while reading ([`plan::Study::Read`]), with this rule (default:
+    /// the window's, in `plan.json`).
+    read: bool,
+    read_percent: Option<u8>,
+    min_count: Option<u32>,
 }
 
 impl Default for PlanArgs {
@@ -339,6 +344,9 @@ impl Default for PlanArgs {
             objective: plan::Objective::default(),
             width: None,
             study_lists: None,
+            read: false,
+            read_percent: None,
+            min_count: None,
         }
     }
 }
@@ -371,19 +379,66 @@ fn run_plan(a: &PlanArgs, k: Option<&Knowledge>, fold: bool, json: bool) {
         );
         std::process::exit(1);
     }
-    let params = plan::Params {
-        study: match (a.target, a.learn) {
-            (_, Some(n)) => plan::Study::Fixed(n),
-            (Some(t), None) => plan::Study::Target(t),
-            (None, None) => plan::Study::Target(95.0),
-        },
-        objective: a.objective,
-        incidental: a.incidental,
-        lookahead: a.lookahead,
+    let window = plan::Settings::load().0;
+    let params = if a.read {
+        plan::Params {
+            study: plan::Study::Read {
+                percent: a.read_percent.unwrap_or(window.read_percent),
+                min_count: a.min_count.unwrap_or(window.read_min_count),
+            },
+            objective: a.objective,
+            incidental: None,
+            lookahead: 0.0,
+        }
+    } else {
+        plan::Params {
+            study: match (a.target, a.learn) {
+                (_, Some(n)) => plan::Study::Fixed(n),
+                (Some(t), None) => plan::Study::Target(t),
+                (None, None) => plan::Study::Target(95.0),
+            },
+            objective: a.objective,
+            incidental: a.incidental,
+            lookahead: a.lookahead,
+        }
     };
     let t = std::time::Instant::now();
-    let lib = plan::Library::build(fold, hanstat::settings::Settings::load().skip_hapax, books);
-    let k0 = lib.known(k);
+    // With where their words occur, when that was saved with them.
+    let hist_path = History::path();
+    let books: Vec<(
+        String,
+        hanstat::profile::Profile,
+        Option<hanstat::profile::Positions>,
+    )> = books
+        .into_iter()
+        .map(|(t, p)| {
+            let pos = hanstat::profile::Positions::load(
+                &hanstat::profile::positions_path_in(&hist_path, &p.id),
+                p.digest(),
+                p.words.len(),
+            );
+            (t, p, pos)
+        })
+        .collect();
+    let lib =
+        plan::Library::build_with(fold, hanstat::settings::Settings::load().skip_hapax, books);
+    let mut k0 = lib.known(k);
+    // Learning while reading, a word's meetings in the books marked read
+    // count (their word counts as kept when marked, else the Library's).
+    if a.read {
+        let marks = hanstat::known::Settings::load().0.read;
+        let counts: Vec<Vec<(String, u32)>> = marks
+            .iter()
+            .filter_map(|m| {
+                hanstat::profile::Profile::load(&hanstat::profile::read_copy_path_in(
+                    &hist_path, &m.id,
+                ))
+                .or_else(|| hanstat::profile::Profile::load(&hist.profile(&m.id)))
+                .map(|p| p.words)
+            })
+            .collect();
+        lib.add_read_meetings(&mut k0, counts.iter().map(|c| &c[..]));
+    }
     let all: Vec<usize> = (0..lib.books.len()).collect();
     let width = a
         .width
@@ -444,6 +499,22 @@ fn run_plan(a: &PlanArgs, k: Option<&Knowledge>, fold: bool, json: bool) {
             .iter()
             .map(|s| {
                 let b = &lib.books[s.book];
+                if a.read {
+                    return serde_json::json!({
+                        "id": b.id,
+                        "title": b.title,
+                        "segmenter": b.segmenter,
+                        "positions": b.has_positions(),
+                        "from": s.from,
+                        "known_now": s.now,
+                        "known_when_reached": s.reached,
+                        "known_at_start": s.start,
+                        "known_over_book": s.reading,
+                        "unknown_met": s.lookups,
+                        "teaches": lib.study_list(s.book, &s.learned),
+                        "words_from_earlier_books": s.gained,
+                    });
+                }
                 serde_json::json!({
                     "id": b.id,
                     "title": b.title,
@@ -459,9 +530,19 @@ fn run_plan(a: &PlanArgs, k: Option<&Knowledge>, fold: bool, json: bool) {
             })
             .collect();
         let out = serde_json::json!({
+            "mode": if a.read { "read" } else { "study" },
+            "lowest_start": a.read.then(|| path.lowest_start()),
+            "total_unknown_met": a.read.then(|| path.total_lookups()),
+            "objective": match params.objective {
+                plan::Objective::Peak => "peak",
+                plan::Objective::Total => "total",
+            },
             "study": match params.study {
                 plan::Study::Target(t) => serde_json::json!({"target": t}),
                 plan::Study::Fixed(n) => serde_json::json!({"learn": n}),
+                plan::Study::Read { percent, min_count } => {
+                    serde_json::json!({"read_percent": percent, "min_count": min_count})
+                }
             },
             "lookahead": params.lookahead,
             "incidental": params.incidental,
@@ -486,6 +567,9 @@ fn run_plan(a: &PlanArgs, k: Option<&Knowledge>, fold: bool, json: bool) {
         match params.study {
             plan::Study::Target(t) => format!("studying until {t}% of running words are known"),
             plan::Study::Fixed(n) => format!("studying {n} words before each"),
+            plan::Study::Read { percent, min_count } => format!(
+                "learning while reading ({percent}% of the words a book uses {min_count}+ times, and words met {min_count}+ times across books)"
+            ),
         },
         match params.incidental {
             Some(m) => format!(", words read {m}+ times learned"),
@@ -517,6 +601,47 @@ fn run_plan(a: &PlanArgs, k: Option<&Knowledge>, fold: bool, json: bool) {
     }
     println!();
     let fixed = matches!(params.study, plan::Study::Fixed(_));
+    if a.read {
+        println!(
+            "{:>3}  {:>6}  {:>7}  {:>6}  {:>6}  {:>7}  {:>8}  {:>6}  title",
+            "#", "now", "reached", "start", "book", "teaches", "unknown", "gained"
+        );
+        for (i, s) in path.steps.iter().enumerate() {
+            let b = &lib.books[s.book];
+            println!(
+                "{:>3}  {:>5.1}%  {:>6.1}%  {:>5.1}%  {:>5.1}%  {:>7}  {:>8}  {:>6}  {}{}{}",
+                i + 1,
+                s.now,
+                s.reached,
+                s.start,
+                s.reading,
+                s.learned.len(),
+                s.lookups,
+                s.gained,
+                s.from
+                    .map(|f| format!("[reading, {:.0}%] ", f * 100.0))
+                    .unwrap_or_default(),
+                b.title,
+                if b.has_positions() {
+                    ""
+                } else {
+                    " (positions estimated)"
+                },
+            );
+        }
+        println!();
+        let summary = |p: &plan::Path| {
+            format!(
+                "hardest beginning {:.1}% known, {} unknown words met, {} learned",
+                p.lowest_start(),
+                p.total_lookups(),
+                p.total_learned()
+            )
+        };
+        println!("This order:           {}", summary(&path));
+        println!("Easiest-now order:    {}", summary(&naive));
+        return;
+    }
     println!(
         "{:>3}  {:>6}  {:>7}  {:>6}  {:>8}  {:>6}  {:>7}  title",
         "#",
@@ -870,6 +995,26 @@ fn main() {
                     std::process::exit(2)
                 }
             }
+            "--read" => {
+                pa.on = true;
+                pa.read = true;
+            }
+            "--read-percent" => {
+                pa.on = true;
+                pa.read = true;
+                pa.read_percent = Some(num(
+                    args.next(),
+                    "--read-percent expects a percentage, e.g. 90",
+                ));
+            }
+            "--min-count" => {
+                pa.on = true;
+                pa.read = true;
+                pa.min_count = Some(num(
+                    args.next(),
+                    "--min-count expects a number of times, e.g. 10",
+                ));
+            }
             "--learn" => {
                 pa.on = true;
                 pa.learn = Some(num(args.next(), "--learn expects a number of words"));
@@ -904,7 +1049,7 @@ fn main() {
             "-h" | "--help" => {
                 eprintln!(
                     "usage: hanstat-cli <file.epub|file.txt> [--ckip|--ltp|--jieba] [--dict words.txt] [--json] [--top N] [--include-all] [--exclude i,j] [--chars-csv f] [--words-csv f] [--suggest N] [--auto-dict] [--no-cache] [--library]\n\
-                     \x20      hanstat-cli --plan [--target P | --learn N] [--incidental M] [--lookahead X] [--width W] [--study-lists DIR] [--json]\n\
+                     \x20      hanstat-cli --plan [--read [--read-percent P] [--min-count M] | --target P | --learn N] [--incidental M] [--lookahead X] [--objective peak|total] [--width W] [--study-lists DIR] [--json]\n\
                      \x20      [--anki] [--anki-list] [--anki-collection collection.anki2] [--anki-deck NAME]... [--anki-field \"NOTE TYPE:FIELD\"]... [--anki-mature-stability DAYS] [--anki-save]\n\
                      \x20      [--known] [--level N] [--hsk2 N] [--tocfl N] [--known-list words.txt]...\n\
                      \n\
@@ -926,6 +1071,9 @@ fn main() {
                      \x20 before each book you study its unknown words until --target P% of its running words are known (default 95), or --learn N of them;\n\
                      \x20 they stay known for the books after it. --incidental M also counts words read M+ times in a book as learned.\n\
                      \x20 --lookahead X weighs the books still to come when choosing study words (0: the book's most frequent; default {}).\n\
+                     \x20 --read instead studies nothing: a book teaches the --read-percent P% most frequent of the words it uses --min-count M+ times,\n\
+                     \x20 and words met M+ times across books (as ✔ Mark read; defaults from the window), and books are ordered by how easy they start\n\
+                     \x20 (their first 20,000 running words). --objective peak (default) or total (fewest words studied / unknown words met in all).\n\
                      \x20 --width W sets the search's beam width (1: greedy). --study-lists DIR writes each book's study list (word<TAB>count).",
                     hanstat::cache::Cache::default_dir().display(),
                     hanstat::known::Settings::path().display(),
@@ -1040,6 +1188,9 @@ fn main() {
         None => anki::Settings::load().0.match_across_scripts,
     };
     let mut r = analyze::build_report(&book, &prep, &included, fold);
+    // Where its words occur, saved with them by --library.
+    let mut positions =
+        hanstat::profile::Positions::from_analysis(&book, &prep, &included, &r.word_freq);
     if auto_dict {
         let known: std::collections::HashSet<String> = words.iter().cloned().collect();
         let found = hanstat::discover::discover(
@@ -1064,6 +1215,8 @@ fn main() {
         let prep = analyse(&words);
         analysis = (analysis.0 + t_analysis.elapsed(), analysis.1 && prep.cached);
         r = analyze::build_report(&book, &prep, &included, fold);
+        positions =
+            hanstat::profile::Positions::from_analysis(&book, &prep, &included, &r.word_freq);
     }
     let anki_k = anki_col.as_ref().map(|loaded| {
         anki_knowledge(
@@ -1105,7 +1258,7 @@ fn main() {
         ));
     }
     if add_history {
-        record_history(&file, &book, &r, names.as_ref().unwrap());
+        record_history(&file, &book, &r, names.as_ref().unwrap(), &positions);
     }
     eprintln!(
         "load {:?}, analysis {:?}{}, total {:?}",
@@ -1165,6 +1318,7 @@ fn record_history(
     book: &extract::Book,
     r: &Report,
     names: &std::collections::HashSet<String>,
+    positions: &hanstat::profile::Positions,
 ) {
     fn fail(e: String) -> ! {
         eprintln!("{e}");
@@ -1203,8 +1357,10 @@ fn record_history(
     if let Err(e) = hist.record(entry, true) {
         fail(e);
     }
-    hanstat::profile::Profile::from_report(&id, r, names)
-        .save(&hist.profile(&id))
+    let p = hanstat::profile::Profile::from_report(&id, r, names);
+    p.save(&hist.profile(&id)).unwrap_or_else(|e| fail(e));
+    positions
+        .save(&hist.positions(&id), p.digest())
         .unwrap_or_else(|e| fail(e));
     eprintln!("recorded in {}", History::path().display());
 }

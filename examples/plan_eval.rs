@@ -1,7 +1,8 @@
 //! Measure the reading path on the books in a History (`LOCALAPPDATA` picks
 //! which): the optimised order against reading the easiest-now book first,
 //! greedy against beam search, the lookahead weight, and the beam against
-//! every order of small random subsets.
+//! every order of small random subsets; and learning while reading, with
+//! where words occur against an even spread.
 //!
 //!     cargo run --release --example plan_eval [-- --subsets N]
 
@@ -38,7 +39,17 @@ fn main() {
         .iter()
         .filter_map(|e| Profile::load(&hist.profile(&e.id)).map(|p| (e.title.clone(), p)))
         .collect();
-    println!("{} books with word data", books.len());
+    let positions: Vec<Option<hanstat::profile::Positions>> = books
+        .iter()
+        .map(|(_, p)| {
+            hanstat::profile::Positions::load(&hist.positions(&p.id), p.digest(), p.words.len())
+        })
+        .collect();
+    println!(
+        "{} books with word data, {} with word positions",
+        books.len(),
+        positions.iter().filter(|p| p.is_some()).count()
+    );
     let no = AtomicBool::new(false);
 
     // Learners at three levels.
@@ -85,9 +96,22 @@ fn main() {
             "{:<12} {:<6} {:>5} | {:>18} | {:>18} | {:>18} | {:>8} | {:>9}",
             "study", "obj", "λ", "easiest-now", "greedy", "beam", "beam s", "mean gain"
         );
-        for study in [Study::Target(95.0), Study::Target(98.0), Study::Fixed(300)] {
+        const READ: Study = Study::Read {
+            percent: 90,
+            min_count: 10,
+        };
+        for study in [
+            Study::Target(95.0),
+            Study::Target(98.0),
+            Study::Fixed(300),
+            READ,
+        ] {
             for &objective in &objectives {
                 for &lam in &lambdas {
+                    // Nothing is studied: the weight changes nothing.
+                    if matches!(study, Study::Read { .. }) && lam != lambdas[0] {
+                        continue;
+                    }
                     let p = Params {
                         study,
                         objective,
@@ -106,6 +130,11 @@ fn main() {
                             x.lowest_reading(),
                             mean_reading(x)
                         ),
+                        Study::Read { .. } => format!(
+                            "{:>5.1}% / {:>6}k",
+                            x.lowest_start(),
+                            x.total_lookups() / 1000
+                        ),
                     };
                     // How much of each book's first-read cost the path saved.
                     let gain = match study {
@@ -115,13 +144,14 @@ fn main() {
                             });
                             format!("{:>8.0}%", 100.0 * (1.0 - b as f64 / a.max(1) as f64))
                         }
-                        Study::Fixed(_) => String::new(),
+                        Study::Fixed(_) | Study::Read { .. } => String::new(),
                     };
                     println!(
                         "{:<12} {:<6} {:>5} | {} | {} | {} | {:>8.2} | {}",
                         match study {
                             Study::Target(t) => format!("target {t}%"),
                             Study::Fixed(n) => format!("learn {n}"),
+                            Study::Read { .. } => "read".to_owned(),
                         },
                         format!("{objective:?}"),
                         lam,
@@ -133,6 +163,77 @@ fn main() {
                     );
                 }
             }
+        }
+
+        // Learning while reading: where words occur against an even spread,
+        // and how much of what the path teaches comes from meetings across
+        // books (words no single book teaches).
+        {
+            let lib_pos = Library::build_with(
+                fold,
+                false,
+                books
+                    .iter()
+                    .cloned()
+                    .zip(positions.iter().cloned())
+                    .map(|((t, p), pos)| (t, p, pos))
+                    .collect(),
+            );
+            let k0p = lib_pos.known(k.as_ref());
+            let p = Params {
+                study: READ,
+                objective: Objective::Peak,
+                incidental: None,
+                lookahead: 0.0,
+            };
+            let even = lib.optimise(&k0, &p, &all, width, &no).unwrap();
+            let placed = lib_pos.optimise(&k0p, &p, &all, width, &no).unwrap();
+            // The positioned order, figured without positions: how much the
+            // order changed for the even-spread model's own measure.
+            let placed_even = lib.evaluate(&k0, &p, &placed.order());
+            let rho = spearman_orders(&even.order(), &placed.order());
+            println!(
+                "read, even spread: {} | with positions: {} (that order with an even spread: {}) | order agreement rho {:.2}",
+                fmt_key(&even, READ),
+                fmt_key(&placed, READ),
+                fmt_key(&placed_even, READ),
+                rho
+            );
+            let starts: Vec<(f64, f64)> = all
+                .iter()
+                .map(|&b| {
+                    let a = lib.evaluate(&k0, &p, &[b]).steps[0].start;
+                    let c = lib_pos.evaluate(&k0p, &p, &[b]).steps[0].start;
+                    (a, c)
+                })
+                .collect();
+            let diff: Vec<f64> = starts.iter().map(|(a, c)| c - a).collect();
+            let mean = diff.iter().sum::<f64>() / diff.len().max(1) as f64;
+            let (lo, hi) = diff
+                .iter()
+                .fold((f64::MAX, f64::MIN), |a, &x| (a.0.min(x), a.1.max(x)));
+            println!(
+                "start read first, positions minus even spread: mean {mean:+.2} points, from {lo:+.2} to {hi:+.2}"
+            );
+            let (mut taught, mut across) = (0usize, 0usize);
+            for s in &placed.steps {
+                let (_, prof) = &books[s.book];
+                let sel: std::collections::HashSet<String> =
+                    known::read_selection(&prof.words, 90, 10)
+                        .into_iter()
+                        .map(|(w, _)| hanstat::anki::fold(w, fold))
+                        .collect();
+                taught += s.learned.len();
+                across += s
+                    .learned
+                    .iter()
+                    .filter(|&&w| !sel.contains(lib_pos.word(w)))
+                    .count();
+            }
+            println!(
+                "read: the path teaches {taught} words, {across} of them ({:.1}%) from meetings across books",
+                100.0 * across as f64 / taught.max(1) as f64
+            );
         }
 
         // Beam against every order of random 7-book subsets.
@@ -198,6 +299,17 @@ fn main() {
     }
 }
 
+/// Spearman's rho between two orders of the same books.
+fn spearman_orders(a: &[usize], b: &[usize]) -> f64 {
+    let n = a.len() as f64;
+    if n < 2.0 {
+        return 1.0;
+    }
+    let pos = |o: &[usize], x: usize| o.iter().position(|&y| y == x).unwrap() as f64;
+    let d2: f64 = a.iter().map(|&x| (pos(a, x) - pos(b, x)).powi(2)).sum();
+    1.0 - 6.0 * d2 / (n * (n * n - 1.0))
+}
+
 fn mean_reading(p: &plan::Path) -> f64 {
     p.steps.iter().map(|s| s.reading).sum::<f64>() / p.steps.len().max(1) as f64
 }
@@ -206,6 +318,7 @@ fn fmt_key(p: &plan::Path, study: Study) -> String {
     match study {
         Study::Target(_) => format!("{}/{}", p.peak(), p.total_study()),
         Study::Fixed(_) => format!("{:.2}%", p.lowest_reading()),
+        Study::Read { .. } => format!("{:.2}%/{}", p.lowest_start(), p.total_lookups()),
     }
 }
 

@@ -100,6 +100,275 @@ pub fn path_in(history: &Path, id: &str) -> PathBuf {
         .join(format!("{id}.json.gz"))
 }
 
+/// `profiles/<id>.pos.gz` next to the history file `history`: the book's
+/// [`Positions`].
+pub fn positions_path_in(history: &Path, id: &str) -> PathBuf {
+    history
+        .with_file_name("profiles")
+        .join(format!("{id}.pos.gz"))
+}
+
+/// `read/<id>.json.gz` next to the history file `history`: the profile of a
+/// book marked read, as it was then ([`crate::known::across_books`] counts
+/// its words), so analysing it again or removing it from the Library
+/// doesn't change what it taught.
+pub fn read_copy_path_in(history: &Path, id: &str) -> PathBuf {
+    history.with_file_name("read").join(format!("{id}.json.gz"))
+}
+
+/// Occurrences of a word whose place is kept; the rest are taken as spread
+/// evenly over the book after them. Covers learning after up to this many
+/// meetings exactly.
+pub const POSITION_CAP: u32 = 32;
+
+/// One included section of a book, in reading order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PosSection {
+    /// Path inside the EPUB, if any: how the reader's places find it.
+    pub href: Option<String>,
+    /// Running words before it, over the included sections.
+    pub start: u64,
+    /// Its running words.
+    pub words: u64,
+}
+
+/// Where a book's words occur, section by section: the reading path's
+/// "at the start" and the book being read are computed from it. Kept beside
+/// the profile (`profiles/<id>.pos.gz`, binary: the Library loads profiles
+/// all the time and has no use for these), and read only with the profile
+/// it was made with ([`Profile::digest`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Positions {
+    pub sections: Vec<PosSection>,
+    /// Parallel to [`Profile::words`]: (index into `sections`, count there)
+    /// for the sections the word occurs in, in order, until
+    /// [`POSITION_CAP`] occurrences are covered.
+    pub words: Vec<Vec<(u32, u32)>>,
+}
+
+const POS_MAGIC: &[u8; 6] = b"HSPOS\x01";
+
+impl Positions {
+    /// From the analysis the report was built from: `words` is the report's
+    /// `word_freq` (the profile's words), `included` its sections.
+    pub fn from_analysis(
+        book: &crate::extract::Book,
+        prep: &crate::analyze::Prepared,
+        included: &[bool],
+        words: &[(String, u32)],
+    ) -> Positions {
+        let index: std::collections::HashMap<&str, usize> = words
+            .iter()
+            .enumerate()
+            .map(|(i, (w, _))| (w.as_str(), i))
+            .collect();
+        let mut out = Positions {
+            sections: Vec::new(),
+            words: vec![Vec::new(); words.len()],
+        };
+        let mut covered = vec![0u32; words.len()];
+        let mut start = 0u64;
+        for ((sec, st), _) in book
+            .sections
+            .iter()
+            .zip(&prep.stats)
+            .zip(included)
+            .filter(|(_, inc)| **inc)
+        {
+            let si = out.sections.len() as u32;
+            let n: u64 = st.words.values().map(|&v| v as u64).sum();
+            out.sections.push(PosSection {
+                href: sec.href.clone(),
+                start,
+                words: n,
+            });
+            start += n;
+            // In the profile's order, so the file is the same each time.
+            let mut here: Vec<(usize, u32)> = st
+                .words
+                .iter()
+                .filter_map(|(w, &c)| index.get(w.as_str()).map(|&i| (i, c)))
+                .collect();
+            here.sort_unstable();
+            for (i, c) in here {
+                if covered[i] < POSITION_CAP {
+                    out.words[i].push((si, c));
+                    covered[i] = covered[i].saturating_add(c);
+                }
+            }
+        }
+        out
+    }
+
+    /// Running words in all.
+    pub fn total(&self) -> u64 {
+        self.sections.last().map_or(0, |s| s.start + s.words)
+    }
+
+    /// The running word `fraction` of the way through the section with
+    /// `href` (compared without case), if the book has it. The reader gives
+    /// the fraction: its offset over its own chapter text's length, which
+    /// counts the text differently from the analysis (about 13% shorter on
+    /// JJWXC books), so the analysis's characters can't be used.
+    pub fn running_word_at(&self, href: &str, fraction: f64) -> Option<u64> {
+        running_word_in(&self.sections, href, fraction)
+    }
+
+    /// Gzip-compressed, through [`crate::saver`]. `digest`: the profile's
+    /// ([`Profile::digest`]), checked on loading.
+    pub fn save(&self, path: &Path, digest: u64) -> Result<(), String> {
+        use std::io::Write;
+        let mut b = Vec::new();
+        b.extend_from_slice(POS_MAGIC);
+        b.extend_from_slice(&digest.to_le_bytes());
+        put(&mut b, self.sections.len() as u64);
+        for s in &self.sections {
+            match &s.href {
+                Some(h) => {
+                    put(&mut b, h.len() as u64 + 1);
+                    b.extend_from_slice(h.as_bytes());
+                }
+                None => put(&mut b, 0),
+            }
+            put(&mut b, s.start);
+            put(&mut b, s.words);
+        }
+        put(&mut b, self.words.len() as u64);
+        for w in &self.words {
+            put(&mut b, w.len() as u64);
+            let mut prev = 0u32;
+            for &(s, c) in w {
+                put(&mut b, (s - prev) as u64);
+                put(&mut b, c as u64);
+                prev = s;
+            }
+        }
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
+        gz.write_all(&b)
+            .and_then(|_| gz.finish())
+            .map_err(|e| format!("Cannot write {}: {e}", path.display()))
+            .and_then(|bytes| crate::saver::write(path, bytes))
+    }
+
+    /// `None` if missing, unreadable, of another layout, or made with
+    /// another profile than the one of `digest` with `words` words.
+    pub fn load(path: &Path, digest: u64, words: usize) -> Option<Positions> {
+        use std::io::Read;
+        let gz = crate::saver::read(path).ok()?;
+        let mut b = Vec::new();
+        flate2::read::GzDecoder::new(&gz[..])
+            .read_to_end(&mut b)
+            .ok()?;
+        let mut r = Cursor { b: &b, i: 0 };
+        if r.take(POS_MAGIC.len())? != POS_MAGIC
+            || u64::from_le_bytes(r.take(8)?.try_into().ok()?) != digest
+        {
+            return None;
+        }
+        let ns = r.get()? as usize;
+        let mut sections = Vec::with_capacity(ns.min(1 << 16));
+        for _ in 0..ns {
+            let h = r.get()? as usize;
+            let href = if h == 0 {
+                None
+            } else {
+                Some(String::from_utf8(r.take(h - 1)?.to_vec()).ok()?)
+            };
+            sections.push(PosSection {
+                href,
+                start: r.get()?,
+                words: r.get()?,
+            });
+        }
+        if r.get()? as usize != words {
+            return None;
+        }
+        let mut out = Vec::with_capacity(words);
+        for _ in 0..words {
+            let k = r.get()? as usize;
+            let mut v = Vec::with_capacity(k.min(POSITION_CAP as usize));
+            let mut s = 0u32;
+            for _ in 0..k {
+                s = s.checked_add(u32::try_from(r.get()?).ok()?)?;
+                if s as usize >= ns {
+                    return None;
+                }
+                v.push((s, u32::try_from(r.get()?).ok()?));
+            }
+            out.push(v);
+        }
+        (r.i == b.len()).then_some(Positions {
+            sections,
+            words: out,
+        })
+    }
+}
+
+/// [`Positions::running_word_at`] over `sections`.
+pub fn running_word_in(sections: &[PosSection], href: &str, fraction: f64) -> Option<u64> {
+    let s = sections.iter().find(|s| {
+        s.href
+            .as_deref()
+            .is_some_and(|h| h.eq_ignore_ascii_case(href))
+    })?;
+    Some(s.start + (fraction.clamp(0.0, 1.0) * s.words as f64).round() as u64)
+}
+
+/// LEB128.
+fn put(b: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            b.push(byte);
+            return;
+        }
+        b.push(byte | 0x80);
+    }
+}
+
+struct Cursor<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl Cursor<'_> {
+    fn take(&mut self, n: usize) -> Option<&[u8]> {
+        let s = self.b.get(self.i..self.i.checked_add(n)?)?;
+        self.i += n;
+        Some(s)
+    }
+    fn get(&mut self) -> Option<u64> {
+        let mut v = 0u64;
+        for shift in (0..64).step_by(7) {
+            let byte = *self.b.get(self.i)?;
+            self.i += 1;
+            v |= ((byte & 0x7f) as u64) << shift;
+            if byte & 0x80 == 0 {
+                return Some(v);
+            }
+        }
+        None
+    }
+}
+
+/// Write `p`'s [`Positions`] beside it, made from the analysis.
+pub fn save_positions(
+    history: &Path,
+    p: &Profile,
+    book: &crate::extract::Book,
+    prep: &crate::analyze::Prepared,
+    included: &[bool],
+) -> Result<(), String> {
+    Positions::from_analysis(book, prep, included, &p.words)
+        .save(&positions_path_in(history, &p.id), p.digest())
+}
+
+/// Whether profile `id` has positions beside it (not checked against it).
+pub fn has_positions(history: &Path, id: &str) -> bool {
+    positions_path_in(history, id).is_file()
+}
+
 /// Analyse a book file the way the window does, for a Library book analysed
 /// in the background. `included`: the sections to include (the book's
 /// defaults if `None` or not of its length). `words` and
@@ -112,6 +381,8 @@ pub struct Analysed {
     /// The user dictionary plus the recommended discovered words.
     pub names: Vec<String>,
     pub file_id: Option<String>,
+    /// Where the report's words occur.
+    pub positions: Positions,
 }
 
 pub fn analyse_file(
@@ -138,6 +409,7 @@ pub fn analyse_file(
         _ => book.sections.iter().map(|s| s.default_included()).collect(),
     };
     let report = analyze::build_report(&book, &prep, &included, fold_chars);
+    let positions = Positions::from_analysis(&book, &prep, &included, &report.word_freq);
     let have: std::collections::HashSet<String> = user.iter().cloned().collect();
     let mut names = user;
     names.extend(
@@ -157,6 +429,7 @@ pub fn analyse_file(
         book,
         report,
         names,
+        positions,
     })
 }
 
@@ -187,6 +460,105 @@ mod tests {
         assert_ne!(r.digest(), p.digest());
         std::fs::write(&path, b"junk").unwrap();
         assert!(Profile::load(&path).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn section(
+        href: &str,
+        text: &str,
+        words: &[(&str, u32)],
+    ) -> (crate::extract::Section, crate::analyze::SectionStats) {
+        let sec = crate::extract::Section {
+            label: href.into(),
+            href: Some(href.into()),
+            kind: crate::extract::SectionKind::Body,
+            paragraphs: vec![text.into()],
+        };
+        let mut st = crate::analyze::SectionStats::default();
+        for (w, n) in words {
+            st.words.insert((*w).into(), *n);
+        }
+        (sec, st)
+    }
+
+    fn analysed(
+        secs: Vec<(crate::extract::Section, crate::analyze::SectionStats)>,
+    ) -> (crate::extract::Book, crate::analyze::Prepared) {
+        let (sections, stats): (Vec<_>, Vec<_>) = secs.into_iter().unzip();
+        (
+            crate::extract::Book {
+                title: None,
+                format: "epub",
+                sections,
+                notes: Vec::new(),
+                decode_errors: 0,
+                cover: None,
+            },
+            crate::analyze::Prepared {
+                segmenter_kind: crate::segment::SegmenterKind::Ltp,
+                variant: crate::script::Variant::Simplified,
+                folding_note: None,
+                stats,
+                user_words: 0,
+                known_words: Vec::new(),
+                cached: false,
+            },
+        )
+    }
+
+    #[test]
+    fn positions_by_section() {
+        let (book, prep) = analysed(vec![
+            section("toc.xhtml", "目录", &[("目录", 1)]),
+            section(
+                "c1.xhtml",
+                "一二三四五六七八九十",
+                &[("我们", 30), ("冒险", 2)],
+            ),
+            section(
+                "c2.xhtml",
+                "一二三四五",
+                &[("我们", 10), ("冒险", 8), ("龙", 4)],
+            ),
+        ]);
+        // The table of contents left out.
+        let included = [false, true, true];
+        let words: Vec<(String, u32)> =
+            vec![("我们".into(), 40), ("冒险".into(), 10), ("龙".into(), 4)];
+        let p = Positions::from_analysis(&book, &prep, &included, &words);
+        assert_eq!(p.sections.len(), 2);
+        assert_eq!((p.sections[0].start, p.sections[0].words), (0, 32));
+        assert_eq!((p.sections[1].start, p.sections[1].words), (32, 22));
+        assert_eq!(p.total(), 54);
+        // 我们: 30 in c1, then 10 in c2 (30 < 32); 冒险: both; 龙: c2 only.
+        assert_eq!(
+            p.words,
+            vec![vec![(0, 30), (1, 10)], vec![(0, 2), (1, 8)], vec![(1, 4)]]
+        );
+        // Past the cap, no more sections are kept.
+        let words2: Vec<(String, u32)> = vec![("我们".into(), 40)];
+        let (book2, prep2) = analysed(vec![
+            section("a", "x", &[("我们", 33)]),
+            section("b", "x", &[("我们", 7)]),
+        ]);
+        let q = Positions::from_analysis(&book2, &prep2, &[true, true], &words2);
+        assert_eq!(q.words, vec![vec![(0, 33)]]);
+        // Reader places: a share of c2 is that share of its words.
+        assert_eq!(p.running_word_at("C2.xhtml", 0.0), Some(32));
+        assert_eq!(p.running_word_at("c2.xhtml", 0.4), Some(32 + 9));
+        assert_eq!(p.running_word_at("c2.xhtml", 1.5), Some(54));
+        assert_eq!(p.running_word_at("toc.xhtml", 0.0), None);
+
+        let dir = std::env::temp_dir().join(format!("hanstat-pos-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = positions_path_in(&dir.join("history.json"), "abc");
+        p.save(&path, 42).unwrap();
+        assert_eq!(Positions::load(&path, 42, 3).as_ref(), Some(&p));
+        // Made with another profile, or another number of words: not read.
+        assert!(Positions::load(&path, 43, 3).is_none());
+        assert!(Positions::load(&path, 42, 4).is_none());
+        std::fs::write(&path, b"junk").unwrap();
+        assert!(Positions::load(&path, 42, 3).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
