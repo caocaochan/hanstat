@@ -2,7 +2,7 @@
 //!
 //! hanstat-cli <file> [--ckip|--ltp|--jieba] [--dict words.txt] [--json] [--top N]
 //!             [--include-all] [--exclude N,M,..] [--chars-csv out.csv] [--words-csv out.csv] [--suggest N] [--auto-dict] [--library]
-//! hanstat-cli --plan [--read [--read-percent P] [--min-count M] | --target P | --learn N] [--incidental M] [--lookahead X] [--objective peak|total] [--width W] [--study-lists DIR] [--json]
+//! hanstat-cli --plan [--read [--read-percent P] [--min-count M] | --target P | --learn N] [--incidental M] [--lookahead X] [--objective peak|total] [--keep-series] [--width W] [--study-lists DIR] [--json]
 
 use hanstat::analyze::{self, Report};
 use hanstat::anki::{self, BookCoverage, ByStatus, Knowledge, KnowledgeSummary};
@@ -331,6 +331,8 @@ struct PlanArgs {
     read: bool,
     read_percent: Option<u8>,
     min_count: Option<u32>,
+    /// Read each series' books one after another ([`plan::Params::keep_series`]).
+    keep_series: bool,
 }
 
 impl Default for PlanArgs {
@@ -347,6 +349,7 @@ impl Default for PlanArgs {
             read: false,
             read_percent: None,
             min_count: None,
+            keep_series: false,
         }
     }
 }
@@ -389,6 +392,7 @@ fn run_plan(a: &PlanArgs, k: Option<&Knowledge>, fold: bool, json: bool) {
             objective: a.objective,
             incidental: None,
             lookahead: 0.0,
+            keep_series: a.keep_series,
         }
     } else {
         plan::Params {
@@ -400,6 +404,7 @@ fn run_plan(a: &PlanArgs, k: Option<&Knowledge>, fold: bool, json: bool) {
             objective: a.objective,
             incidental: a.incidental,
             lookahead: a.lookahead,
+            keep_series: a.keep_series,
         }
     };
     let t = std::time::Instant::now();
@@ -452,7 +457,11 @@ fn run_plan(a: &PlanArgs, k: Option<&Knowledge>, fold: bool, json: bool) {
             &std::sync::atomic::AtomicBool::new(false),
         )
         .unwrap();
-    let naive = lib.evaluate(&k0, &params, &lib.easiest_now(&k0, &all));
+    let naive = lib.evaluate(
+        &k0,
+        &params,
+        &lib.started_first(&params, &lib.easiest_now(&k0, &all)),
+    );
     eprintln!(
         "plan of {} books, beam width {width}: {:?}",
         all.len(),
@@ -546,6 +555,7 @@ fn run_plan(a: &PlanArgs, k: Option<&Knowledge>, fold: bool, json: bool) {
             },
             "lookahead": params.lookahead,
             "incidental": params.incidental,
+            "keep_series": params.keep_series,
             "known_words": k0.len(),
             "library_words": lib.vocab_len(),
             "total_study": path.total_study(),
@@ -562,7 +572,7 @@ fn run_plan(a: &PlanArgs, k: Option<&Knowledge>, fold: bool, json: bool) {
         return;
     }
     println!(
-        "Reading path: {} books, {}{}{}",
+        "Reading path: {} books, {}{}{}{}",
         lib.books.len(),
         match params.study {
             plan::Study::Target(t) => format!("studying until {t}% of running words are known"),
@@ -579,6 +589,11 @@ fn run_plan(a: &PlanArgs, k: Option<&Knowledge>, fold: bool, json: bool) {
             format!(", lookahead {}", params.lookahead)
         } else {
             String::new()
+        },
+        if params.keep_series {
+            ", each series' books together"
+        } else {
+            ""
         }
     );
     println!(
@@ -1038,6 +1053,10 @@ fn main() {
                     }
                 };
             }
+            "--keep-series" => {
+                pa.on = true;
+                pa.keep_series = true;
+            }
             "--width" => {
                 pa.on = true;
                 pa.width = Some(num(args.next(), "--width expects a beam width"));
@@ -1049,7 +1068,7 @@ fn main() {
             "-h" | "--help" => {
                 eprintln!(
                     "usage: hanstat-cli <file.epub|file.txt> [--ckip|--ltp|--jieba] [--dict words.txt] [--json] [--top N] [--include-all] [--exclude i,j] [--chars-csv f] [--words-csv f] [--suggest N] [--auto-dict] [--no-cache] [--library]\n\
-                     \x20      hanstat-cli --plan [--read [--read-percent P] [--min-count M] | --target P | --learn N] [--incidental M] [--lookahead X] [--objective peak|total] [--width W] [--study-lists DIR] [--json]\n\
+                     \x20      hanstat-cli --plan [--read [--read-percent P] [--min-count M] | --target P | --learn N] [--incidental M] [--lookahead X] [--objective peak|total] [--keep-series] [--width W] [--study-lists DIR] [--json]\n\
                      \x20      [--anki] [--anki-list] [--anki-collection collection.anki2] [--anki-deck NAME]... [--anki-field \"NOTE TYPE:FIELD\"]... [--anki-mature-stability DAYS] [--anki-save]\n\
                      \x20      [--known] [--level N] [--hsk2 N] [--tocfl N] [--known-list words.txt]...\n\
                      \n\
@@ -1074,6 +1093,7 @@ fn main() {
                      \x20 --read instead studies nothing: a book teaches the --read-percent P% most frequent of the words it uses --min-count M+ times,\n\
                      \x20 and words met M+ times across books (as ✔ Mark read; defaults from the window), and books are ordered by how easy they start\n\
                      \x20 (their first 20,000 running words). --objective peak (default) or total (fewest words studied / unknown words met in all).\n\
+                     \x20 --keep-series reads each series' books one after another, in volume order, with no other book between them.\n\
                      \x20 --width W sets the search's beam width (1: greedy). --study-lists DIR writes each book's study list (word<TAB>count).",
                     hanstat::cache::Cache::default_dir().display(),
                     hanstat::known::Settings::path().display(),

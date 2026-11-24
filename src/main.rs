@@ -6558,7 +6558,15 @@ impl App {
                         .collect();
                     for s in &best.steps {
                         if !o.contains(&s.book) {
-                            o.push(s.book);
+                            // Keeping series together, a volume goes after its series.
+                            match params
+                                .keep_series
+                                .then(|| o.iter().rposition(|&x| lib.same_series(x, s.book)))
+                                .flatten()
+                            {
+                                Some(i) => o.insert(i + 1, s.book),
+                                None => o.push(s.book),
+                            }
                         }
                     }
                     // A volume added since, or an order saved before series
@@ -7183,6 +7191,17 @@ impl App {
             changed |= ui
                 .radio_value(&mut st.objective, plan::Objective::Total, total)
                 .on_hover_text(total_hover)
+                .changed();
+            ui.separator();
+            changed |= ui
+                .checkbox(&mut st.keep_series, "Keep series together")
+                .on_hover_text(
+                    "Read all the books of a series one after another, in order (volume 1, 2, 3…), \
+                     with no other book between them. The whole series goes where it is best on the path, \
+                     counting what the earlier volumes teach for the later ones. \
+                     An order you set by hand is kept until you click Use the planner's order. \
+                     Off: other books can come between volumes, though volumes are still read in order",
+                )
                 .changed();
         });
         if read_mode {

@@ -41,6 +41,12 @@
 //! easiest-first and orders set by hand are put in series order
 //! ([`Library::in_series_order`]).
 //!
+//! **Keeping series together** ([`Params::keep_series`]). Each series is
+//! one block: its volumes are read one after another, in volume order, and
+//! the search places the block where it is best overall, with what earlier
+//! volumes teach counted for the later ones (it compares a path that has
+//! just read the whole block with the other paths of as many books).
+//!
 //! **Writing style.** With ratings on ([`crate::style`]), a book whose prose
 //! is harder than typical gets a higher target (or, under a fixed number,
 //! counts as read at a lower coverage), and an easier one a lower:
@@ -110,6 +116,9 @@ pub struct Params {
     /// Weight of the books still to come when choosing study words (0: this
     /// book's most frequent unknown words).
     pub lookahead: f32,
+    /// Read every series' volumes one after another, with no other book
+    /// between them (the module documentation, **Keeping series together**).
+    pub keep_series: bool,
 }
 
 impl Default for Params {
@@ -119,6 +128,7 @@ impl Default for Params {
             objective: Objective::default(),
             incidental: None,
             lookahead: DEFAULT_LOOKAHEAD,
+            keep_series: false,
         }
     }
 }
@@ -150,6 +160,8 @@ pub struct Settings {
     /// ([`crate::known::read_selection`]), as last chosen.
     pub read_percent: u8,
     pub read_min_count: u32,
+    /// Keep each series' books together, in either mode ([`Params::keep_series`]).
+    pub keep_series: bool,
     /// History ids of the books left out of the path.
     pub left_out: Vec<String>,
     /// The reading order set by hand (History ids), under the key
@@ -174,6 +186,7 @@ impl Default for Settings {
             lookahead: DEFAULT_LOOKAHEAD,
             read_percent: 90,
             read_min_count: 10,
+            keep_series: false,
             left_out: Vec::new(),
             manual: HashMap::new(),
         }
@@ -208,6 +221,7 @@ impl Settings {
                 objective: self.objective,
                 incidental: None,
                 lookahead: 0.0,
+                keep_series: self.keep_series,
             },
             Mode::Study => Params {
                 study: if self.fixed {
@@ -218,6 +232,7 @@ impl Settings {
                 objective: self.objective,
                 incidental: self.incidental_on.then_some(self.incidental),
                 lookahead: self.lookahead,
+                keep_series: self.keep_series,
             },
         }
     }
@@ -775,9 +790,47 @@ impl Library {
         v
     }
 
-    /// `order` with the books started ([`Library::started`]) moved to the front.
+    /// The books every path of `books` starts with: those started
+    /// ([`Library::started`]), and keeping series together, each followed
+    /// by the rest of its series: its later volumes in order, then any
+    /// earlier ones (not marked read) in order.
+    pub fn first_books(&self, params: &Params, books: &[usize]) -> Vec<usize> {
+        let started = self.started(params, books);
+        if !params.keep_series {
+            return started;
+        }
+        let mut out: Vec<usize> = Vec::new();
+        for b in started {
+            if out.contains(&b) {
+                continue;
+            }
+            out.push(b);
+            if let Some((s, _)) = &self.books[b].series {
+                let (before, after): (Vec<usize>, Vec<usize>) = self
+                    .volumes(*s, books)
+                    .into_iter()
+                    .filter(|&v| v != b)
+                    .partition(|&v| self.precedes(v, b));
+                for v in after.into_iter().chain(before) {
+                    if !out.contains(&v) {
+                        out.push(v);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// `order` with the books every path starts with
+    /// ([`Library::first_books`]) moved to the front, and keeping series
+    /// together, each series where its first book in `order` is.
     pub fn started_first(&self, params: &Params, order: &[usize]) -> Vec<usize> {
-        let first = self.started(params, order);
+        let order = if params.keep_series {
+            self.series_together(order)
+        } else {
+            order.to_vec()
+        };
+        let first = self.first_books(params, &order);
         let rest = order.iter().copied().filter(|b| !first.contains(b));
         first.iter().copied().chain(rest).collect()
     }
@@ -836,6 +889,69 @@ impl Library {
             }
         }
         out
+    }
+
+    /// `a` and `b` are books of one series.
+    pub fn same_series(&self, a: usize, b: usize) -> bool {
+        match (&self.books[a].series, &self.books[b].series) {
+            (Some((sa, _)), Some((sb, _))) => sa == sb,
+            _ => false,
+        }
+    }
+
+    /// The books of `books` in series `s`, in volume order (volumes that
+    /// compare equal in their order in `books`).
+    fn volumes(&self, s: u32, books: &[usize]) -> Vec<usize> {
+        let vol = |b: usize| {
+            self.books[b]
+                .series
+                .as_ref()
+                .filter(|x| x.0 == s)
+                .map(|x| &x.1)
+        };
+        let mut v: Vec<usize> = books
+            .iter()
+            .copied()
+            .filter(|&b| vol(b).is_some())
+            .collect();
+        v.sort_by(|&x, &y| vol(x).cmp(&vol(y)));
+        v
+    }
+
+    /// `order` with each series' books moved together, in volume order, to
+    /// where the first of them is; other books keep their order.
+    pub fn series_together(&self, order: &[usize]) -> Vec<usize> {
+        let mut out = Vec::with_capacity(order.len());
+        let mut placed: FxHashSet<u32> = FxHashSet::default();
+        for &b in order {
+            match &self.books[b].series {
+                None => out.push(b),
+                Some((s, _)) => {
+                    if placed.insert(*s) {
+                        out.extend(self.volumes(*s, order));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Keeping series together, the series of `books` with two or more
+    /// books there, each in volume order.
+    fn blocks(&self, params: &Params, books: &[usize]) -> Vec<Vec<usize>> {
+        if !params.keep_series {
+            return Vec::new();
+        }
+        let mut ids: Vec<u32> = books
+            .iter()
+            .filter_map(|&b| self.books[b].series.as_ref().map(|s| s.0))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_iter()
+            .map(|s| self.volumes(s, books))
+            .filter(|v| v.len() > 1)
+            .collect()
     }
 
     /// For each book of the library, the books of `books` that precede it.
@@ -1232,7 +1348,8 @@ impl Library {
     /// The best order of `books` found by a beam search of `width`, by
     /// greedy search, or reading the easiest book now first, whichever is
     /// best (a beam can lose either order). Every one reads a series in
-    /// volume order. `None` if cancelled.
+    /// volume order, and with [`Params::keep_series`], with no other book
+    /// between its volumes. `None` if cancelled.
     pub fn optimise(
         &self,
         known0: &Known,
@@ -1242,7 +1359,7 @@ impl Library {
         cancel: &AtomicBool,
     ) -> Option<Path> {
         let mut found = Vec::new();
-        let first = self.started(params, books);
+        let first = self.first_books(params, books);
         if width > 1 {
             found.push(self.beam(known0, params, books, &first, width, cancel)?);
         }
@@ -1257,6 +1374,11 @@ impl Library {
     }
 
     /// `first`: books read first, in that order, before the search.
+    ///
+    /// The partial paths are kept by how many books they have read
+    /// (`levels`), and only paths of as many books are compared. A book
+    /// leads to the paths one longer; keeping series together, a whole
+    /// series ([`Library::blocks`]) leads to the paths as many books longer.
     fn beam(
         &self,
         known0: &Known,
@@ -1285,25 +1407,53 @@ impl Library {
             start.done[b / 64] |= 1 << (b % 64);
             start.steps.push(st);
         }
-        let mut beam = vec![start];
         let in_done = |d: &[u64], b: usize| d[b / 64] >> (b % 64) & 1 == 1;
+        let with = |d: &[u64], bs: &[usize]| {
+            let mut d = d.to_vec();
+            for &b in bs {
+                d[b / 64] |= 1 << (b % 64);
+            }
+            d
+        };
         let earlier = self.earlier_volumes(books);
-        for _ in first.len()..books.len() {
+        let blocks = self.blocks(params, books);
+        let mut in_block = vec![false; self.books.len()];
+        for &b in blocks.iter().flatten() {
+            in_block[b] = true;
+        }
+        let rank = |v: &mut Vec<State>| {
+            v.sort_by_key(|s| order_key(params.objective, s.key));
+            let mut seen: FxHashSet<Vec<u64>> = FxHashSet::default();
+            v.retain(|s| seen.insert(s.done.clone()));
+            v.truncate(width);
+        };
+        let mut levels: Vec<Vec<State>> = (0..=books.len()).map(|_| Vec::new()).collect();
+        levels[first.len().min(books.len())].push(start);
+        for at in first.len()..books.len() {
             if cancel.load(Ordering::Relaxed) {
                 return None;
             }
+            let mut beam = std::mem::take(&mut levels[at]);
+            rank(&mut beam);
+            if beam.is_empty() {
+                continue;
+            }
             // Every (state, next book), ranked by the cheap cost. A book of a
             // series waits for its earlier volumes; one of them is always
-            // free, since volumes are ordered.
+            // free, since volumes are ordered. Keeping series together, a
+            // series' books come only as the whole series, below.
             let mut cands: Vec<(Key, usize, usize)> = beam
                 .par_iter()
                 .enumerate()
                 .flat_map_iter(|(si, s)| {
                     let earlier = &earlier;
+                    let in_block = &in_block;
                     books
                         .iter()
                         .filter(move |&&b| {
-                            !in_done(&s.done, b) && earlier[b].iter().all(|&a| in_done(&s.done, a))
+                            !in_block[b]
+                                && !in_done(&s.done, b)
+                                && earlier[b].iter().all(|&a| in_done(&s.done, a))
                         })
                         .map(move |&b| (si, b))
                 })
@@ -1318,32 +1468,90 @@ impl Library {
             let mut seen: FxHashSet<Vec<u64>> = FxHashSet::default();
             let picked: Vec<(usize, usize)> = cands
                 .iter()
-                .filter(|(_, si, b)| {
-                    let mut d = beam[*si].done.clone();
-                    d[b / 64] |= 1 << (b % 64);
-                    seen.insert(d)
-                })
+                .filter(|(_, si, b)| seen.insert(with(&beam[*si].done, &[*b])))
                 .take(width * 2)
                 .map(|(_, si, b)| (*si, *b))
                 .collect();
-            let mut next: Vec<State> = picked
+            let next: Vec<State> = picked
                 .par_iter()
-                .map(|&(si, b)| {
-                    let mut s = beam[si].clone();
-                    let st = self.step(b, &mut s.known, &mut s.future, params, known0);
-                    s.key = add_cost(s.key, step_cost(params.study, &st));
-                    s.done[b / 64] |= 1 << (b % 64);
-                    s.steps.push(st);
-                    s
+                .map(|&(si, b)| self.advance(&beam[si], &[b], params, known0))
+                .collect();
+            levels[at + 1].extend(next);
+            if blocks.is_empty() {
+                continue;
+            }
+            // Each series not yet read, read whole from each state: its real
+            // cost, for the paths of as many books more (the states it leads
+            // to are made again, as only the best are kept).
+            let mut whole: Vec<(Key, usize, usize)> = beam
+                .par_iter()
+                .enumerate()
+                .flat_map_iter(|(si, s)| {
+                    let blocks = &blocks;
+                    (0..blocks.len())
+                        .filter(move |&bi| !blocks[bi].iter().any(|&b| in_done(&s.done, b)))
+                        .map(move |bi| (si, bi))
+                })
+                .map(|(si, bi)| {
+                    let k = self.advance_key(&beam[si], &blocks[bi], params, known0);
+                    (order_key(params.objective, k), si, bi)
                 })
                 .collect();
-            next.sort_by_key(|s| order_key(params.objective, s.key));
-            next.truncate(width);
-            beam = next;
+            whole.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+            // At most `width` distinct sets of books for each length.
+            let mut seen: FxHashSet<Vec<u64>> = FxHashSet::default();
+            let mut per_level: FxHashMap<usize, usize> = FxHashMap::default();
+            let picked: Vec<(usize, usize)> = whole
+                .iter()
+                .filter(|(_, si, bi)| {
+                    let n = per_level.entry(blocks[*bi].len()).or_default();
+                    *n < width && seen.insert(with(&beam[*si].done, &blocks[*bi])) && {
+                        *n += 1;
+                        true
+                    }
+                })
+                .map(|(_, si, bi)| (*si, *bi))
+                .collect();
+            let made: Vec<State> = picked
+                .par_iter()
+                .map(|&(si, bi)| self.advance(&beam[si], &blocks[bi], params, known0))
+                .collect();
+            for s in made {
+                let to = s.steps.len();
+                levels[to].push(s);
+                if levels[to].len() > width * 2 {
+                    rank(&mut levels[to]);
+                }
+            }
         }
-        beam.into_iter().next().map(|s| Path {
+        let mut last = std::mem::take(&mut levels[books.len()]);
+        rank(&mut last);
+        last.into_iter().next().map(|s| Path {
             steps: s.steps,
             params: *params,
+        })
+    }
+
+    /// `s` after reading `next`, in that order.
+    fn advance(&self, s: &State, next: &[usize], params: &Params, known0: &Known) -> State {
+        let mut s = s.clone();
+        for &b in next {
+            let st = self.step(b, &mut s.known, &mut s.future, params, known0);
+            s.key = add_cost(s.key, step_cost(params.study, &st));
+            s.done[b / 64] |= 1 << (b % 64);
+            s.steps.push(st);
+        }
+        s
+    }
+
+    /// The key of `s` after reading `next` ([`Library::advance`] without
+    /// keeping the steps).
+    fn advance_key(&self, s: &State, next: &[usize], params: &Params, known0: &Known) -> Key {
+        let mut known = s.known.clone();
+        let mut future = s.future.clone();
+        next.iter().fold(s.key, |k, &b| {
+            let st = self.step(b, &mut known, &mut future, params, known0);
+            add_cost(k, step_cost(params.study, &st))
         })
     }
 }
@@ -1406,6 +1614,7 @@ mod tests {
             objective: Objective::Peak,
             incidental: None,
             lookahead,
+            keep_series: false,
         }
     }
 
@@ -1800,6 +2009,21 @@ mod tests {
     }
 
     #[test]
+    fn keep_series_is_saved_and_off_in_older_files() {
+        let s: Settings = serde_json::from_str(r#"{"mode": "study", "target": 98.0}"#).unwrap();
+        assert!(!s.keep_series && !s.params().keep_series);
+        let mut t = s.clone();
+        t.keep_series = true;
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(json.contains(r#""keep_series":true"#));
+        let u: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(u, t);
+        assert!(u.params().keep_series);
+        t.mode = Mode::Read;
+        assert!(t.params().keep_series);
+    }
+
+    #[test]
     fn small_library_matches_every_order() {
         // B shares its vocabulary with A and C: whichever comes first makes the others easier.
         let a = profile("a", &[("一", 40), ("二", 30), ("三", 30)], &[]);
@@ -1990,6 +2214,199 @@ mod tests {
             optimal * 10 >= runs * 7,
             "beam optimal in only {optimal} of {runs}"
         );
+    }
+
+    /// Each series' books of `order` come one after another, in volume order.
+    fn series_kept_together(lib: &Library, order: &[usize]) -> bool {
+        let mut seen: Vec<u32> = Vec::new();
+        let mut last: Option<u32> = None;
+        for &b in order {
+            let s = lib.books[b].series.as_ref().map(|x| x.0);
+            if let Some(s) = s
+                && s != last.unwrap_or(u32::MAX)
+            {
+                if seen.contains(&s) {
+                    return false;
+                }
+                seen.push(s);
+            }
+            last = s;
+        }
+        in_series_order(lib, order)
+    }
+
+    #[test]
+    fn keep_series_keeps_a_series_together() {
+        // 乙 shares 三 四 with 甲 2: reading it between the volumes makes
+        // the largest step 2 words, keeping 甲 together 3.
+        let books = vec![
+            titled(
+                "甲 2",
+                &[("一", 10), ("二", 10), ("三", 10), ("四", 10), ("五", 10)],
+            ),
+            titled("乙", &[("一", 10), ("二", 10), ("三", 10), ("四", 10)]),
+            titled("甲 1", &[("一", 10), ("二", 10)]),
+        ];
+        let lib = Library::build(false, false, books);
+        assert!(lib.precedes(2, 0) && lib.same_series(0, 2) && !lib.same_series(0, 1));
+        let k0 = lib.known(None);
+        let all = [0, 1, 2];
+        let none = AtomicBool::new(false);
+        let mut pr = params(Study::Target(100.0), 0.0);
+        for width in [1, 8] {
+            let split = lib.optimise(&k0, &pr, &all, width, &none).unwrap();
+            assert_eq!(split.order(), [2, 1, 0], "width {width}");
+            assert_eq!(split.key(), [2, 5]);
+        }
+        pr.keep_series = true;
+        for width in [1, 8] {
+            let kept = lib.optimise(&k0, &pr, &all, width, &none).unwrap();
+            assert_eq!(kept.order(), [2, 0, 1], "width {width}");
+            assert_eq!(kept.key(), [3, 5]);
+            // 甲 1's words are known for 甲 2.
+            assert_eq!(kept.steps[1].gained, 2);
+        }
+        // Every mode and objective keeps it together.
+        for study in [Study::Target(90.0), Study::Fixed(1), READ] {
+            for objective in [Objective::Peak, Objective::Total] {
+                let mut pr = params(study, 0.0);
+                pr.objective = objective;
+                pr.keep_series = true;
+                for width in [1, 8] {
+                    let o = lib.optimise(&k0, &pr, &all, width, &none).unwrap().order();
+                    assert!(
+                        series_kept_together(&lib, &o),
+                        "{study:?} {objective:?} width {width}: {o:?}"
+                    );
+                }
+            }
+        }
+        // Easiest first: the series where its easiest volume is.
+        assert_eq!(lib.series_together(&[1, 0, 2]), [1, 2, 0]);
+        assert_eq!(lib.started_first(&pr, &[0, 1, 2]), [2, 0, 1]);
+    }
+
+    #[test]
+    fn a_started_volume_brings_the_rest_of_its_series() {
+        let books = vec![
+            titled("甲 1", &[("一", 10), ("二", 10)]),
+            titled("乙", &[("一", 10), ("三", 10)]),
+            titled("甲 3", &[("一", 10), ("四", 10)]),
+            titled("甲 2", &[("一", 10), ("五", 10)]),
+        ];
+        let mut lib = Library::build(false, false, books);
+        // Halfway through volume 2.
+        assert!(lib.set_reading(|b| (b.title == "甲 2").then_some((10, 5))));
+        let k0 = lib.known(None);
+        let none = AtomicBool::new(false);
+        let mut pr = read(100, 10);
+        let all = [0, 1, 2, 3];
+        assert_eq!(lib.first_books(&pr, &all), [3]);
+        pr.keep_series = true;
+        // Volume 3 next, then volume 1, which was not marked read.
+        assert_eq!(lib.first_books(&pr, &all), [3, 2, 0]);
+        for width in [1, 8] {
+            let p = lib.optimise(&k0, &pr, &all, width, &none).unwrap();
+            assert_eq!(p.order(), [3, 2, 0, 1]);
+        }
+        assert_eq!(lib.started_first(&pr, &[1, 0, 2, 3]), [3, 2, 0, 1]);
+        // Studying before each book, nothing is started.
+        let mut st = params(Study::Target(90.0), 0.0);
+        st.keep_series = true;
+        assert!(lib.first_books(&st, &all).is_empty());
+    }
+
+    /// Random libraries with series kept together: every path keeps them
+    /// together and in order, and the beam is close to the best such order.
+    #[test]
+    fn keep_series_against_every_kept_order() {
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let mut rnd = |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        let pool: Vec<String> = (0..50)
+            .map(|i| char::from_u32(0x4e00 + i).unwrap().to_string())
+            .collect();
+        let titles = [
+            "甲 1",
+            "乙（上）",
+            "甲 第三部",
+            "丙",
+            "乙（下）",
+            "甲 2",
+            "丁",
+        ];
+        let (mut optimal, mut runs) = (0, 0);
+        for round in 0..12 {
+            let books: Vec<(String, Profile)> = titles
+                .iter()
+                .enumerate()
+                .map(|(b, t)| {
+                    let mut m: HashMap<&str, u32> = HashMap::new();
+                    for _ in 0..20 {
+                        let w = &pool[(rnd(30) + b as u64 * 4) as usize % pool.len()];
+                        *m.entry(w).or_default() += 1 + (50 / (1 + rnd(25))) as u32;
+                    }
+                    let v: Vec<(&str, u32)> = m.into_iter().collect();
+                    titled(t, &v)
+                })
+                .collect();
+            let lib = Library::build(false, false, books);
+            let k0 = lib.known(None);
+            let idx: Vec<usize> = (0..titles.len()).collect();
+            // Units: the two series, whole, and the other books.
+            let units: Vec<Vec<usize>> = vec![vec![0, 5, 2], vec![1, 4], vec![3], vec![6]];
+            let mut kept = Vec::new();
+            let mut perm: Vec<usize> = (0..units.len()).collect();
+            permute(&mut perm, 0, &mut |p| {
+                kept.push(p.iter().flat_map(|&u| units[u].clone()).collect::<Vec<_>>())
+            });
+            for (study, objective) in [
+                (Study::Target(90.0), Objective::Peak),
+                (Study::Fixed(3), Objective::Total),
+                (READ, Objective::Peak),
+                (READ, Objective::Total),
+            ] {
+                let mut pr = params(study, if round % 2 == 0 { 0.0 } else { 0.5 });
+                pr.objective = objective;
+                pr.keep_series = true;
+                let none = AtomicBool::new(false);
+                let greedy = lib.optimise(&k0, &pr, &idx, 1, &none).unwrap();
+                let beam = lib.optimise(&k0, &pr, &idx, 16, &none).unwrap();
+                for p in [&greedy, &beam] {
+                    assert!(series_kept_together(&lib, &p.order()), "{:?}", p.order());
+                    assert_eq!(p.steps.len(), idx.len());
+                }
+                assert!(beam.key() <= greedy.key());
+                let best = kept
+                    .iter()
+                    .map(|o| lib.evaluate(&k0, &pr, o))
+                    .min_by_key(|p| p.key())
+                    .unwrap();
+                assert!(best.key() <= beam.key());
+                runs += 1;
+                optimal += usize::from(best.key() == beam.key());
+            }
+        }
+        assert!(
+            optimal * 10 >= runs * 8,
+            "beam optimal in only {optimal} of {runs}"
+        );
+    }
+
+    fn permute(v: &mut Vec<usize>, k: usize, f: &mut impl FnMut(&[usize])) {
+        if k == v.len() {
+            f(v);
+            return;
+        }
+        for i in k..v.len() {
+            v.swap(k, i);
+            permute(v, k + 1, f);
+            v.swap(k, i);
+        }
     }
 
     fn valid_orders(lib: &Library, books: &[usize]) -> Vec<Vec<usize>> {

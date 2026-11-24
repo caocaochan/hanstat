@@ -2,6 +2,10 @@
 
 ## [2026.11.24.03] - 2026-11-24
 
+### Added
+- **Keep series together** on **Library → Reading path**. Ticked, the books of a series are read one after another, volume 1, 2, 3…, with no other book between them, in both **Learn while reading** and **Study before each book** and whichever **Best order** you choose. The whole series goes where it is best on the path, counting what its earlier volumes teach for the later ones. A book you're reading still comes first, followed by the rest of its series. An order you set by hand is kept until you click **Use the planner's order**; a volume added since goes after the rest of its series. Unticked (the default) works as before: volumes are read in order, but other books can come between them.
+- **hanstat-cli --plan --keep-series** does the same on the command line.
+
 ### Fixed
 - **Frequency ranks no longer squeeze the popup.** With several frequency lists, a rank that didn't fit at the end of the popup's first line was squashed into the space left, one letter per line, and made the header so tall that the definitions were pushed out of sight. A rank that doesn't fit now starts the next line.
 

@@ -2,9 +2,12 @@
 //! which): the optimised order against reading the easiest-now book first,
 //! greedy against beam search, the lookahead weight, and the beam against
 //! every order of small random subsets; and learning while reading, with
-//! where words occur against an even spread.
+//! where words occur against an even spread; and keeping series together
+//! against letting other books come between volumes.
 //!
-//!     cargo run --release --example plan_eval [-- --subsets N]
+//!     cargo run --release --example plan_eval [-- --subsets N] [--keep-series]
+//!
+//! `--keep-series` plans every order above with each series kept together.
 
 use hanstat::history::History;
 use hanstat::known;
@@ -17,6 +20,7 @@ fn main() {
     let mut subsets = 6usize;
     let mut lambdas: Vec<f32> = vec![0.0, 0.1, 0.25, 0.5, 1.0];
     let mut objectives = vec![Objective::Total, Objective::Peak];
+    let mut keep_series = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -30,6 +34,7 @@ fn main() {
                     .collect()
             }
             "--peak-only" => objectives = vec![Objective::Peak],
+            "--keep-series" => keep_series = true,
             _ => {}
         }
     }
@@ -117,8 +122,10 @@ fn main() {
                         objective,
                         incidental: None,
                         lookahead: lam,
+                        keep_series,
                     };
-                    let naive = lib.evaluate(&k0, &p, &lib.easiest_now(&k0, &all));
+                    let naive =
+                        lib.evaluate(&k0, &p, &lib.started_first(&p, &lib.easiest_now(&k0, &all)));
                     let greedy = lib.optimise(&k0, &p, &all, 1, &no).unwrap();
                     let t = Instant::now();
                     let beam = lib.optimise(&k0, &p, &all, width, &no).unwrap();
@@ -185,6 +192,7 @@ fn main() {
                 objective: Objective::Peak,
                 incidental: None,
                 lookahead: 0.0,
+                keep_series,
             };
             let even = lib.optimise(&k0, &p, &all, width, &no).unwrap();
             let placed = lib_pos.optimise(&k0p, &p, &all, width, &no).unwrap();
@@ -236,6 +244,56 @@ fn main() {
             );
         }
 
+        // Keeping series together: what it costs, how many series the
+        // planner splits otherwise, and the search time.
+        {
+            let mut series: Vec<u32> = lib
+                .books
+                .iter()
+                .filter_map(|b| b.series.as_ref().map(|s| s.0))
+                .collect();
+            let in_series = series.len();
+            series.sort_unstable();
+            series.dedup();
+            println!(
+                "series: {in_series} of {} books, in {} series",
+                lib.books.len(),
+                series.len()
+            );
+            for (study, objective) in [
+                (Study::Target(95.0), Objective::Peak),
+                (Study::Target(95.0), Objective::Total),
+                (READ, Objective::Peak),
+                (READ, Objective::Total),
+            ] {
+                let mut p = Params {
+                    study,
+                    objective,
+                    incidental: None,
+                    lookahead: if matches!(study, Study::Read { .. }) {
+                        0.0
+                    } else {
+                        plan::DEFAULT_LOOKAHEAD
+                    },
+                    keep_series: false,
+                };
+                let t = Instant::now();
+                let free = lib.optimise(&k0, &p, &all, width, &no).unwrap();
+                let t_free = t.elapsed().as_secs_f64();
+                p.keep_series = true;
+                let t = Instant::now();
+                let kept = lib.optimise(&k0, &p, &all, width, &no).unwrap();
+                let t_kept = t.elapsed().as_secs_f64();
+                assert!(series_kept_together(&lib, &kept.order()));
+                println!(
+                    "keep series, {study:?} {objective:?}: between volumes {} ({} series split, {t_free:.2}s) | together {} ({t_kept:.2}s)",
+                    fmt_key(&free, study),
+                    split_series(&lib, &free.order()),
+                    fmt_key(&kept, study),
+                );
+            }
+        }
+
         // Beam against every order of random 7-book subsets.
         if *label == "HSK 1-5" && subsets > 0 && lib.books.len() >= 7 {
             let mut seed = 0x2545_f491_4f6c_dd1du64;
@@ -255,6 +313,7 @@ fn main() {
                     objective,
                     incidental: None,
                     lookahead: plan::DEFAULT_LOOKAHEAD,
+                    keep_series,
                 };
                 let (mut same, mut gaps) = (0, Vec::new());
                 for _ in 0..subsets {
@@ -297,6 +356,33 @@ fn main() {
             }
         }
     }
+}
+
+/// Series whose books have another book between two of them.
+fn split_series(lib: &Library, order: &[usize]) -> usize {
+    let mut seen: Vec<u32> = Vec::new();
+    let mut split: Vec<u32> = Vec::new();
+    let mut last = None;
+    for &b in order {
+        let s = lib.books[b].series.as_ref().map(|x| x.0);
+        if let Some(s) = s
+            && last != Some(s)
+        {
+            if seen.contains(&s) {
+                if !split.contains(&s) {
+                    split.push(s);
+                }
+            } else {
+                seen.push(s);
+            }
+        }
+        last = s;
+    }
+    split.len()
+}
+
+fn series_kept_together(lib: &Library, order: &[usize]) -> bool {
+    split_series(lib, order) == 0
 }
 
 /// Spearman's rho between two orders of the same books.
