@@ -42,6 +42,7 @@ const NOT_ANALYSIS: &[&str] = &[
     "src/charts.rs",
     "src/library_stats.rs",
     "src/library_reading.rs",
+    "src/home.rs",
     "src/png_report.rs",
     "src/raster.rs",
     "src/read_books.rs",

@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 
 mod charts;
 mod duchinese;
+mod home;
 mod library_reading;
 mod library_stats;
 mod palette;
@@ -142,6 +143,7 @@ fn main() -> eframe::Result {
                 app.show_history = true;
                 app.history_tab = t;
             }
+            app.home = paths.is_empty();
             match paths.len() {
                 0 => {}
                 // As before: a history view asked for stays up.
@@ -627,6 +629,10 @@ struct App {
     moves: Option<BookMoves>,
     /// The History view replaces the book's tabs.
     show_history: bool,
+    /// Home ([`home`]) is shown in place of the open book's tabs (the
+    /// Library still goes over it). Home is also shown with no book open.
+    home: bool,
+    home_view: home::HomeView,
     history_sort: (HistCol, bool),
     /// The Library's search box (Books and Reading path; [`search`]).
     library_filter: String,
@@ -1332,6 +1338,8 @@ impl Default for App {
             history_error: None,
             moves: None,
             show_history: false,
+            home: true,
+            home_view: Default::default(),
             history_sort: (HistCol::Analysed, true),
             library_filter: String::new(),
             book_id: None,
@@ -1475,6 +1483,11 @@ impl App {
                     if !dest.is_file() {
                         let _ = history::save_cover(cover, &dest);
                     }
+                    // And a large one for Home.
+                    let large = history::large_cover_path(id);
+                    if !large.is_file() {
+                        let _ = history::save_large_cover(cover, &large);
+                    }
                 }
                 Ok(Loaded {
                     book,
@@ -1508,6 +1521,7 @@ impl App {
 
     fn open(&mut self, path: PathBuf, ctx: &egui::Context) {
         self.show_history = false;
+        self.home = false;
         self.book = None;
         self.prep = None;
         self.report = None;
@@ -2966,6 +2980,7 @@ impl eframe::App for App {
             self.handle_shortcuts(&ctx);
         }
 
+        let on_home = self.on_home();
         egui::Panel::top("toolbar").frame(palette::bar(true)).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 palette::compact(ui);
@@ -2976,21 +2991,29 @@ impl eframe::App for App {
                 {
                     self.open_dialog(&ctx);
                 }
-                ui.separator();
-                ui.label("Segmenter:");
-                let before = self.segmenter;
-                egui::ComboBox::from_id_salt("seg").selected_text(self.segmenter.label()).show_ui(ui, |ui| {
-                    for k in SegmenterKind::ALL {
-                        ui.selectable_value(&mut self.segmenter, k, k.label()).on_hover_text(k.description());
-                    }
-                });
-                // While a book is being analysed, that analysis stops
-                // and the book is analysed again with the new choice.
-                if before != self.segmenter {
-                    self.rerun(&ctx, false);
-                }
-
+                if ui
+                    .selectable_label(on_home, "🏠 Home")
+                    .on_hover_text(self.shortcuts.hint(&ctx, Action::Home, "The book you're reading, today's reading and your totals"))
+                    .clicked()
                 {
+                    self.go_home();
+                }
+                // Home has no book: what applies to one isn't offered there.
+                if !on_home {
+                    ui.separator();
+                    ui.label("Segmenter:");
+                    let before = self.segmenter;
+                    egui::ComboBox::from_id_salt("seg").selected_text(self.segmenter.label()).show_ui(ui, |ui| {
+                        for k in SegmenterKind::ALL {
+                            ui.selectable_value(&mut self.segmenter, k, k.label()).on_hover_text(k.description());
+                        }
+                    });
+                    // While a book is being analysed, that analysis stops
+                    // and the book is analysed again with the new choice.
+                    if before != self.segmenter {
+                        self.rerun(&ctx, false);
+                    }
+
                     let hover = "Words always segmented as single words, saved between runs. Add them here or from the Suggested words tab.";
                     if ui
                         .selectable_label(self.forced_window, format!("📖 {} forced words", self.user_words.len()))
@@ -3017,7 +3040,8 @@ impl eframe::App for App {
                     self.toggle_anki(&ctx);
                 }
 
-                let is_txt = self.book.as_ref().is_some_and(|b| b.format == "TXT");
+                let is_txt =
+                    !on_home && self.book.as_ref().is_some_and(|b| b.format == "TXT");
                 if is_txt {
                     ui.separator();
                     ui.label("Encoding:");
@@ -3043,7 +3067,7 @@ impl eframe::App for App {
                                 .on_disabled_hover_text("An image is being saved")
                                 .clicked()
                         };
-                        let Some(r) = self.report.as_ref() else {
+                        let Some(r) = self.report.as_ref().filter(|_| !on_home) else {
                             if library_button(ui) {
                                 image = Some(png_report::ImageExport::Library);
                                 ui.close();
@@ -3294,19 +3318,13 @@ impl eframe::App for App {
                     self.history_view(ui, &ctx);
                     return;
                 }
+                if self.on_home() {
+                    self.home_page(ui, &ctx);
+                    return;
+                }
                 if self.report.is_none() {
                     ui.centered_and_justified(|ui| {
-                        ui.label(
-                            RichText::new(if self.job.is_some() || self.batch.is_some() {
-                                "Analysing…"
-                            } else if drop_works() {
-                                "Drop .epub or .txt files here, or click Open…"
-                            } else {
-                                "Click Open… to choose .epub or .txt files"
-                            })
-                            .size(22.0)
-                            .weak(),
-                        );
+                        ui.label(RichText::new("Analysing…").size(22.0).weak());
                     });
                     return;
                 }
@@ -3373,6 +3391,22 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// Whether Home is in the central panel: chosen, or no book to show
+    /// (none open and none on its way).
+    fn on_home(&self) -> bool {
+        let opening = self.job.is_some()
+            || self
+                .batch
+                .as_ref()
+                .is_some_and(|b| b.mode == BatchMode::Open);
+        !self.show_history && (self.home || self.report.is_none() && !opening)
+    }
+
+    fn go_home(&mut self) {
+        self.home = true;
+        self.show_history = false;
+    }
+
     /// At startup, centre the window on the screen at the size chosen by hand
     /// (or three quarters of the screen), or maximise it as it was; then
     /// remember a size or maximised state the user picks. Its place is not
@@ -3501,6 +3535,7 @@ impl App {
     fn run_action(&mut self, a: Action, ctx: &egui::Context) {
         match a {
             Action::Open => self.open_dialog(ctx),
+            Action::Home => self.go_home(),
             Action::Library => self.show_history = !self.show_history,
             Action::Filter => {
                 if self.show_history || self.report.is_none() {
@@ -3519,7 +3554,7 @@ impl App {
                     const H: [HistTab; 3] = [HistTab::Books, HistTab::Path, HistTab::Stats];
                     let i = H.iter().position(|&t| t == self.history_tab).unwrap_or(0);
                     self.history_tab = H[(i + if next { 1 } else { H.len() - 1 }) % H.len()];
-                } else if self.report.is_some() {
+                } else if self.report.is_some() && !self.on_home() {
                     let step = if next { 1 } else { TABS.len() - 1 };
                     let i = TABS.iter().position(|&(t, _)| t == self.tab).unwrap_or(0);
                     self.switch_tab(TABS[(i + step) % TABS.len()].0, ctx);
@@ -3542,6 +3577,7 @@ impl App {
                     && self.report.is_some()
                 {
                     self.show_history = false;
+                    self.home = false;
                     self.switch_tab(t, ctx);
                 }
             }
@@ -6319,6 +6355,7 @@ impl App {
         self.history.forget(id);
         if !self.history.entries.iter().any(|e| e.id == *id) {
             self.covers.remove(id);
+            self.home_view.forget(id);
             self.exists.set(self.history.profile(id), false);
         }
     }
@@ -6634,6 +6671,7 @@ impl App {
             .into_iter()
             .map(|p| self.batch_item(file_name(&p), p, self.segmenter))
             .collect();
+        self.home = false;
         self.start_batch(todo, Some(last), BatchMode::Open, ctx);
     }
 

@@ -167,6 +167,7 @@ impl History {
         }
         let moves = [
             (self.cover(old), self.cover(new)),
+            (self.large_cover(old), self.large_cover(new)),
             (self.profile(old), self.profile(new)),
         ];
         let Some(e) = self.entries.iter_mut().find(|e| e.id == old) else {
@@ -184,6 +185,11 @@ impl History {
     /// Where the cover thumbnail of book `id` is kept (it may not exist).
     pub fn cover(&self, id: &str) -> PathBuf {
         cover_in(&self.path, id)
+    }
+
+    /// Where the large cover of book `id` is kept, for Home (it may not exist).
+    pub fn large_cover(&self, id: &str) -> PathBuf {
+        large_cover_in(&self.path, id)
     }
 
     /// Where the vocabulary profile of book `id` is kept (it may not exist);
@@ -250,6 +256,7 @@ impl History {
     /// Delete book `id`'s cover, word data and copy.
     fn delete_files(&self, id: &str) {
         let _ = std::fs::remove_file(self.cover(id));
+        let _ = std::fs::remove_file(self.large_cover(id));
         let _ = std::fs::remove_file(self.profile(id));
         let _ = std::fs::remove_file(self.positions(id));
         crate::books::delete(&self.books(), id);
@@ -313,11 +320,45 @@ pub fn cover_path(id: &str) -> PathBuf {
     cover_in(&History::path(), id)
 }
 
+/// Large covers, for Home's books (pixels): sharp at the size Home draws
+/// them on a screen at twice the usual density.
+pub const LARGE_COVER_MAX: (u32, u32) = (480, 720);
+
+/// `covers/large/<id>.png` next to the history file.
+fn large_cover_in(history: &Path, id: &str) -> PathBuf {
+    history
+        .with_file_name("covers")
+        .join("large")
+        .join(format!("{id}.png"))
+}
+
+/// Where the large cover of book `id` is kept, in the default folder.
+pub fn large_cover_path(id: &str) -> PathBuf {
+    large_cover_in(&History::path(), id)
+}
+
 /// Shrink a book's cover (JPEG, PNG, GIF or WebP) to fit [`COVER_MAX`] and
 /// save it as PNG at `dest`, under a temporary name first.
 pub fn save_cover(image: &[u8], dest: &Path) -> Result<(), String> {
     let img = image::load_from_memory(image).map_err(|e| format!("Cannot read the cover: {e}"))?;
-    let thumb = img.thumbnail(COVER_MAX.0, COVER_MAX.1).into_rgba8();
+    write_png(img.thumbnail(COVER_MAX.0, COVER_MAX.1).into_rgba8(), dest)
+}
+
+/// As [`save_cover`], at most [`LARGE_COVER_MAX`]: never larger than the
+/// image itself.
+pub fn save_large_cover(image: &[u8], dest: &Path) -> Result<(), String> {
+    let img = image::load_from_memory(image).map_err(|e| format!("Cannot read the cover: {e}"))?;
+    let (w, h) = LARGE_COVER_MAX;
+    let img = if img.width() > w || img.height() > h {
+        img.resize(w, h, image::imageops::FilterType::Lanczos3)
+    } else {
+        img
+    };
+    write_png(img.into_rgba8(), dest)
+}
+
+/// Save `thumb` as PNG at `dest`, under a temporary name first.
+fn write_png(thumb: image::RgbaImage, dest: &Path) -> Result<(), String> {
     let dir = dest.parent().unwrap();
     std::fs::create_dir_all(dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
     let tmp = dest.with_extension(format!("png.{}.tmp", std::process::id()));

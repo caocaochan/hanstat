@@ -7,7 +7,7 @@ How hard is this book for you? hanstat counts the characters and words of Chines
 
 Runs on Windows, macOS and Linux. The Mac app's font handling and self-updating are by [@linlin56](https://github.com/linlin56), from [#1](https://github.com/caocaochan/hanstat/pull/1).
 
-![hanstat's Overview tab for a Chinese novel: character and word totals, HSK 1–5 coverage, difficulty with writing style, composition, coverage table and word lengths](docs/screenshot.png)
+![hanstat's Home page: the book being read with its cover, chapter, progress and time left, today's reading against the goal with the streak, and the covers of the books read recently](docs/screenshot.png)
 
 ## Install
 

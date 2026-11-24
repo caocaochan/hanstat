@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
     Open,
+    Home,
     Library,
     Filter,
     Overview,
@@ -33,8 +34,9 @@ pub enum Action {
 const N: usize = Action::ALL.len();
 
 impl Action {
-    pub const ALL: [Action; 17] = [
+    pub const ALL: [Action; 18] = [
         Action::Open,
+        Action::Home,
         Action::Library,
         Action::Filter,
         Action::Overview,
@@ -57,6 +59,7 @@ impl Action {
     fn id(self) -> &'static str {
         match self {
             Action::Open => "open",
+            Action::Home => "home",
             Action::Library => "library",
             Action::Filter => "filter",
             Action::Overview => "tab-overview",
@@ -79,6 +82,7 @@ impl Action {
     pub fn label(self) -> &'static str {
         match self {
             Action::Open => "Open books…",
+            Action::Home => "Home",
             Action::Library => "Show or hide the Library",
             Action::Filter => "Search box",
             Action::Overview => "Overview tab",
@@ -113,6 +117,9 @@ impl Action {
                  In a text box, the first press leaves the box."
             }
             Action::MarkKnown => "In the Words tab, or unmark it.",
+            Action::Home => {
+                "The start page: the book you're reading, today's reading and your totals."
+            }
             Action::Overview
             | Action::Characters
             | Action::Words
@@ -127,6 +134,7 @@ impl Action {
         let ctrl = Modifiers::COMMAND;
         let (m, k) = match self {
             Action::Open => (ctrl, Key::O),
+            Action::Home => (ctrl, Key::H),
             Action::Library => (ctrl, Key::L),
             Action::Filter => (ctrl, Key::F),
             Action::Overview => (ctrl, Key::Num1),

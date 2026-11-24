@@ -1,5 +1,13 @@
 # Changelog
 
+## [2026.11.24.05] - 2026-11-24
+
+### Added
+- **Home: hanstat now opens on a start page** instead of an empty window. It shows the book you're reading with a large cover, its chapter, how far through you are, the time left at your reading speed and a **Continue reading** button. Next to it, **Today** has a ring that fills towards your daily goal, today's characters and your reading streak; the goal can be set or changed there (**Set a goal…**). Below are your **Recently read** books (click a cover to read it; **Overview** on the cover opens its figures), this year's reading as a calendar a small square a day, and your totals: books finished, time and characters read, and words known.
+- **🏠 Home** in the toolbar (Ctrl+H) goes back to it from a book or the Library. On Home, the toolbar leaves out what only applies to an open book.
+- **A welcome page** when the Library is empty: a place to drop books, and the three steps to get started.
+- **Sharper covers.** Books get a larger cover for Home: new books when they are analysed, books already in the Library the first time Home shows them.
+
 ## [2026.11.24.04] - 2026-11-24
 
 ### Fixed

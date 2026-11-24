@@ -526,6 +526,8 @@ impl App {
             self.history_error = Some(e);
         }
         self.covers.remove(old);
+        self.home_view.forget(old);
+        self.home_view.forget(new);
         crate::reading_stats::rekey(old, new, |s| spine.get(s as usize).copied().unwrap_or(s));
         if let Err(e) = crate::reading_stats::save() {
             self.set_error("reading stats", e);

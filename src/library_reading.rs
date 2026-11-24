@@ -188,7 +188,37 @@ fn plural(n: impl Into<u64>, one: &str) -> String {
     format!("{} {one}{}", fmt_int(n), if n == 1 { "" } else { "s" })
 }
 
-fn day_hover(day: i32, d: &Day, goal: bool) -> String {
+/// The calendar's shades: no reading, then light to dark (blue).
+pub(crate) fn calendar_shades() -> [egui::Color32; 5] {
+    let c = palette::cat();
+    let base = c.base;
+    [
+        c.surface0,
+        palette::mix(c.blue, base, 0.35),
+        palette::mix(c.blue, base, 0.55),
+        palette::mix(c.blue, base, 0.78),
+        c.blue,
+    ]
+}
+
+/// A day's shade in [`calendar_shades`]: under 15 min, 15–30, 30–60, an
+/// hour or more.
+pub(crate) fn day_level(v: &Day) -> u8 {
+    let m = v.read_secs / 60.0;
+    if m < 1.0 && v.read_chars == 0 {
+        0
+    } else if m < 15.0 {
+        1
+    } else if m < 30.0 {
+        2
+    } else if m < 60.0 {
+        3
+    } else {
+        4
+    }
+}
+
+pub(crate) fn day_hover(day: i32, d: &Day, goal: bool) -> String {
     span_hover(rs::long_date(day), d, goal)
 }
 
@@ -346,15 +376,7 @@ impl App {
                 )
             })
             .collect();
-        let c = palette::cat();
-        let base = c.base;
-        let shades = [
-            c.surface0,
-            palette::mix(c.blue, base, 0.35),
-            palette::mix(c.blue, base, 0.55),
-            palette::mix(c.blue, base, 0.78),
-            c.blue,
-        ];
+        let shades = calendar_shades();
         let year_secs = rs::sum_range(&sum.days, first, first + n).read_secs;
         let shown = |p: &Period| p.start < first + n && p.end > first;
         let sub = match period {
@@ -390,18 +412,7 @@ impl App {
             let day = |i: i32| -> Option<CalDay> {
                 let d = first + i;
                 let v = sum.days.get(&d)?;
-                let m = v.read_secs / 60.0;
-                let level = if m < 1.0 && v.read_chars == 0 {
-                    0
-                } else if m < 15.0 {
-                    1
-                } else if m < 30.0 {
-                    2
-                } else if m < 60.0 {
-                    3
-                } else {
-                    4
-                };
+                let level = day_level(v);
                 let goal = sum.goal_days.contains(&d);
                 Some(CalDay {
                     level,
