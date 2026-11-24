@@ -1171,78 +1171,69 @@ mod tests {
         assert_eq!(scan_text(&c, 0, 16), "yyds");
     }
 
-    /// Five frequency lists on a long word: badges that do not fit go to the
-    /// next line whole (they used to wrap a letter a line in the leftover
-    /// width, and the header grew taller than the popup).
+    /// Frequency badges after a long headword: a badge that does not fit in
+    /// what is left of the line starts the next line whole, one line high.
+    /// (They used to wrap a letter a line in the leftover width, and the
+    /// header grew taller than the popup.) Checked against the font's own
+    /// row height, as CI's fonts differ from Windows'.
     #[test]
     fn freq_badges_wrap_whole() {
-        use hanstat::dict::lookup::{FreqBadge, Group};
         let names = ["Danmei", "BLCUcoll", "BLCUlit", "SUBTLEX-CH", "Wordfreq"];
-        let dicts: Vec<DictInfo> = names
-            .iter()
-            .map(|n| DictInfo {
-                id: n.to_string(),
-                title: n.to_string(),
-                styles: String::new(),
-                has_terms: false,
-                has_freq: true,
-                dir: Default::default(),
-                collapsed: false,
-            })
-            .collect();
-        let g = Group {
-            headword: "神通广大".into(),
-            reading: "shéntōngguǎngdà".into(),
-            matched: 4,
-            folded: false,
-            freqs: (0..names.len())
-                .map(|i| FreqBadge {
-                    dict: i,
-                    values: vec![hanstat::dict::store::Freq {
-                        reading: String::new(),
-                        value: 26819,
-                        display: "26819".into(),
-                    }],
-                    folded: false,
-                })
-                .collect(),
-            parts: vec![],
-        };
         let size = 18.0;
         let ctx = egui::Context::default();
         crate::install_fonts(&ctx);
-        let header = |width: f32, show_freq: bool| {
-            let mut row = Rect::NOTHING;
-            for _ in 0..2 {
-                let input = egui::RawInput {
-                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 1000.0))),
-                    ..Default::default()
-                };
-                let mut out = ctx.run_ui(input, |ui| {
-                    row = ui
-                        .allocate_ui_with_layout(
+        for width in [520.0_f32, 300.0, 200.0] {
+            // What a headword and reading leave: 40 px of the first line.
+            for lead in [width - 40.0, 0.0] {
+                let mut rects = vec![];
+                let mut left = 0.0;
+                let mut row_h = 0.0;
+                for _ in 0..2 {
+                    rects.clear();
+                    let input = egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 1000.0))),
+                        ..Default::default()
+                    };
+                    let mut out = ctx.run_ui(input, |ui| {
+                        ui.allocate_ui_with_layout(
                             vec2(width, 20.0),
                             egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
-                            |ui| header_text(ui, &g, &dicts, size, show_freq),
-                        )
-                        .response
-                        .rect;
-                });
-                out.textures_delta.clear();
+                            |ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                left = ui.max_rect().left();
+                                row_h = ui.fonts_mut(|f| {
+                                    f.row_height(&egui::FontId::proportional(size * 0.68))
+                                });
+                                if lead > 0.0 {
+                                    ui.allocate_exact_size(vec2(lead, size), Sense::hover());
+                                }
+                                for n in names {
+                                    rects.push(freq_badge(ui, format!("{n} 26819"), size).rect);
+                                }
+                            },
+                        );
+                    });
+                    out.textures_delta.clear();
+                }
+                for (n, r) in names.iter().zip(&rects) {
+                    assert!(
+                        r.height() <= row_h + 2.0 + 0.5,
+                        "width {width}, lead {lead}: {n} is {} tall, one line is {row_h}",
+                        r.height()
+                    );
+                    assert!(
+                        r.right() <= left + width + 0.5,
+                        "width {width}: {n} sticks out"
+                    );
+                }
+                if lead > 0.0 {
+                    assert!(
+                        (rects[0].left() - left).abs() < 0.5,
+                        "width {width}: the first badge starts the next line: {:?}",
+                        rects[0]
+                    );
+                }
             }
-            row
-        };
-        for width in [520.0_f32, 300.0, 200.0] {
-            let bare = header(width, false).height();
-            let row = header(width, true);
-            // At most one more line per list, each a badge high.
-            let most = bare + names.len() as f32 * (size * 0.68 * 1.4 + 8.0);
-            assert!(
-                row.height() <= most,
-                "width {width}: header {} tall, at most {most}",
-                row.height()
-            );
-            assert!(row.width() <= width + 0.5, "width {width}: {}", row.width());
         }
     }
 }
