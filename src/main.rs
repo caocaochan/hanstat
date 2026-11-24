@@ -173,7 +173,9 @@ fn install_fonts(ctx: &egui::Context) {
     let mut files: HashMap<&str, Option<egui::epaint::text::Blob>> = HashMap::new();
     for &(name, file, index) in candidates {
         let blob = files.entry(file).or_insert_with(|| {
-            let bytes = std::fs::read(dir.join(file)).ok()?;
+            let mut bytes = std::fs::read(dir.join(file)).ok()?;
+            // SimSun-ExtB's embedded bitmaps would be drawn white.
+            reader::fonts::hide_bitmap_tables(&mut bytes);
             Some(Arc::new(bytes) as egui::epaint::text::Blob)
         });
         if let Some(blob) = blob {
@@ -200,9 +202,10 @@ fn install_fonts(ctx: &egui::Context) {
         ("segoe-ui-semibold", "seguisb.ttf", 0, false),
         ("yahei-bold", "msyhbd.ttc", 0, false),
     ] {
-        let Ok(bytes) = std::fs::read(dir.join(file)) else {
+        let Ok(mut bytes) = std::fs::read(dir.join(file)) else {
             continue;
         };
+        reader::fonts::hide_bitmap_tables(&mut bytes);
         let blob = Arc::new(bytes) as egui::epaint::text::Blob;
         fonts.font_data.insert(
             name.to_owned(),

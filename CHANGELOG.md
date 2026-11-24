@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.24.04] - 2026-11-24
+
+### Fixed
+- **Chinese text in the reader takes the theme's colour with SimSun and MingLiU.** On a PC without Source Han Serif or Noto Serif, the reader's serif is SimSun (PMingLiU for Traditional), and its Chinese characters were drawn near-white on every theme, almost invisible on light pages; Latin letters and digits were fine. Fonts with built-in small-size bitmaps (SimSun, NSimSun, MingLiU, PMingLiU, MS Mincho, MS Gothic, Gulim, Batang) are now drawn from their outlines, in the theme's colour. Rare characters drawn from SimSun-ExtB anywhere in hanstat are fixed too. Other fonts are unchanged.
+
 ## [2026.11.24.03] - 2026-11-24
 
 ### Added

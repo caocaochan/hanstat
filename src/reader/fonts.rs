@@ -508,9 +508,72 @@ fn blob(face: &Face) -> Option<egui::epaint::text::Blob> {
             // SAFETY: font files are not changed while the app runs; a
             // replaced file keeps the mapped inode on every platform.
             let m = unsafe { memmap2::Mmap::map(&f) }.ok()?;
-            Some(Arc::new(m) as egui::epaint::text::Blob)
+            if !bitmap_tables(&m) {
+                return Some(Arc::new(m) as egui::epaint::text::Blob);
+            }
+            // A private copy-on-write mapping: only the table directory's
+            // page is copied, and the file is never written.
+            // SAFETY: as above.
+            let mut c = unsafe { memmap2::MmapOptions::new().map_copy(&f) }.ok()?;
+            hide_bitmap_tables(&mut c);
+            match c.make_read_only() {
+                Ok(m) => Some(Arc::new(m) as egui::epaint::text::Blob),
+                Err(_) => None,
+            }
         }
     }
+}
+
+/// Embedded bitmap tables (`EBDT`, `EBLC`, `EBSC`): black-and-white glyph
+/// bitmaps for small sizes, as in SimSun, MingLiU, MS Gothic and Gulim.
+const BITMAP_TABLES: [&[u8; 4]; 3] = [b"EBDT", b"EBLC", b"EBSC"];
+
+/// The table records (offset of each record) of every face in a font file.
+fn table_records(font: &[u8]) -> Vec<usize> {
+    let faces: Vec<usize> = if font.get(0..4) == Some(b"ttcf") {
+        let n = be32(font, 8).unwrap_or(0).min(64) as usize;
+        (0..n)
+            .filter_map(|i| be32(font, 12 + i * 4).map(|o| o as usize))
+            .collect()
+    } else {
+        vec![0]
+    };
+    let mut out = Vec::new();
+    for off in faces {
+        let n = be16(font, off + 4).unwrap_or(0) as usize;
+        for i in 0..n {
+            let r = off + 12 + i * 16;
+            if r + 16 <= font.len() {
+                out.push(r);
+            }
+        }
+    }
+    out
+}
+
+/// Whether any face of `font` has an embedded bitmap table.
+pub fn bitmap_tables(font: &[u8]) -> bool {
+    table_records(font)
+        .into_iter()
+        .any(|r| BITMAP_TABLES.iter().any(|t| font[r..r + 4] == t[..]))
+}
+
+/// Hide the embedded bitmap tables from egui, which takes any font with an
+/// `EBDT` table for a colour font: it draws each glyph that has a bitmap as
+/// an image in fixed white, never in the text's colour, so SimSun's Chinese
+/// is white on every theme. Renamed (`EBDT` → `EBDt`), the tables are
+/// unknown to egui and it draws the outlines. Lowercasing the last letter
+/// keeps the directory sorted, which table lookups rely on. Fonts without
+/// such tables are left as they are. Returns whether anything changed.
+pub fn hide_bitmap_tables(font: &mut [u8]) -> bool {
+    let mut changed = false;
+    for r in table_records(font) {
+        if BITMAP_TABLES.iter().any(|t| font[r..r + 4] == t[..]) {
+            font[r + 3] = font[r + 3].to_ascii_lowercase();
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// Install `serif` and `sans` (family names; empty: the app's own font) as
@@ -606,5 +669,81 @@ mod tests {
         );
         assert!(yahei.unwrap().has_bold());
         assert!(fams.iter().all(|f| f.name != "Arial"));
+    }
+
+    /// A font file's table directory with `tags`, one face or a collection.
+    fn directory(faces: &[&[&[u8; 4]]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let ttc = faces.len() > 1;
+        let head = if ttc { 12 + 4 * faces.len() } else { 0 };
+        if ttc {
+            out.extend(b"ttcf");
+            out.extend(0x0001_0000u32.to_be_bytes());
+            out.extend((faces.len() as u32).to_be_bytes());
+        }
+        let mut dirs = Vec::new();
+        for tags in faces {
+            let at = head + dirs.len();
+            if ttc {
+                out.extend((at as u32).to_be_bytes());
+            }
+            dirs.extend(0x0001_0000u32.to_be_bytes());
+            dirs.extend((tags.len() as u16).to_be_bytes());
+            dirs.extend([0; 6]);
+            for t in *tags {
+                dirs.extend(*t);
+                dirs.extend([0; 12]);
+            }
+        }
+        out.extend(dirs);
+        out
+    }
+
+    fn tags(font: &[u8]) -> Vec<String> {
+        super::table_records(font)
+            .into_iter()
+            .map(|r| String::from_utf8_lossy(&font[r..r + 4]).into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn hides_bitmap_tables_keeping_the_directory_sorted() {
+        let face: &[&[u8; 4]] = &[
+            b"DSIG", b"EBDT", b"EBLC", b"EBSC", b"GDEF", b"OS/2", b"glyf",
+        ];
+        let plain: &[&[u8; 4]] = &[b"OS/2", b"cmap", b"glyf"];
+        let mut f = directory(&[face, plain]);
+        assert!(super::bitmap_tables(&f));
+        assert!(super::hide_bitmap_tables(&mut f));
+        let t = tags(&f);
+        assert_eq!(
+            t,
+            [
+                "DSIG", "EBDt", "EBLc", "EBSc", "GDEF", "OS/2", "glyf", "OS/2", "cmap", "glyf"
+            ]
+        );
+        assert!(t[..7].is_sorted() && t[7..].is_sorted());
+        assert!(!super::bitmap_tables(&f));
+        assert!(!super::hide_bitmap_tables(&mut f));
+
+        let mut p = directory(&[plain]);
+        let before = p.clone();
+        assert!(!super::hide_bitmap_tables(&mut p));
+        assert_eq!(p, before);
+    }
+
+    /// SimSun's bitmaps are hidden; YaHei, which has none, is not touched.
+    #[test]
+    #[cfg(windows)]
+    fn system_fonts_with_and_without_bitmaps() {
+        let dir = std::path::PathBuf::from(std::env::var_os("WINDIR").unwrap()).join("Fonts");
+        let mut simsun = std::fs::read(dir.join("simsun.ttc")).unwrap();
+        assert!(super::bitmap_tables(&simsun));
+        assert!(super::hide_bitmap_tables(&mut simsun));
+        assert!(!super::bitmap_tables(&simsun));
+        let mut yahei = std::fs::read(dir.join("msyh.ttc")).unwrap();
+        let before = yahei.clone();
+        assert!(!super::hide_bitmap_tables(&mut yahei));
+        assert!(yahei == before);
     }
 }
