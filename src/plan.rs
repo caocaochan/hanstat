@@ -59,6 +59,7 @@ use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub mod stats;
@@ -295,21 +296,15 @@ impl Known {
     }
 }
 
-/// One book of the library, its words numbered across the library.
+/// One book of the library, its words numbered across the library. Its word
+/// data is shared, so a copy of the library (to set offsets or places) is
+/// cheap.
 #[derive(Clone, Debug)]
 pub struct LibBook {
     pub id: String,
     pub title: String,
     pub segmenter: String,
     pub variant: String,
-    /// (word, count), most frequent first.
-    words: Vec<(u32, u32)>,
-    /// Parallel to `words`: the word contains a name.
-    name: Vec<bool>,
-    /// Running words that are not names: what shares are taken of.
-    denom: u64,
-    /// The book's own spelling of a word, where it differs from the key.
-    spell: FxHashMap<u32, String>,
     /// The series it belongs to (numbered within the library) and its
     /// volume ([`series::Volume::number`]), if another book of the library
     /// is in that series.
@@ -318,19 +313,106 @@ pub struct LibBook {
     /// reading coverage under a fixed number), from its writing style
     /// ([`crate::style::target_offset`]); 0 by default.
     pub offset: f64,
+    /// Where the reader is in it, as a running word, and when it got there
+    /// (Unix time): a book started is read first ([`Library::set_reading`]).
+    pub reading: Option<(u64, u64)>,
+    data: Arc<BookData>,
+}
+
+impl std::ops::Deref for LibBook {
+    type Target = BookData;
+    fn deref(&self) -> &BookData {
+        &self.data
+    }
+}
+
+/// A book's words, numbered across the library.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BookData {
+    /// (word, count), most frequent first.
+    words: Vec<(u32, u32)>,
+    /// Parallel to `words`: the word contains a name.
+    name: Vec<bool>,
+    /// Running words that are not names: what shares are taken of.
+    denom: u64,
+    /// The book's own spelling of a word, where it differs from the key.
+    spell: FxHashMap<u32, String>,
     /// Its words as the profile counts them (each spelling apart, hapax
     /// included unless left out), most frequent first: what ✔ Mark read
     /// takes from and what meetings across books count.
     raw: Vec<(u32, u32)>,
     /// Where its words occur, if its profile has them.
     pos: Option<BookPos>,
-    /// Where the reader is in it, as a running word, and when it got there
-    /// (Unix time): a book started is read first ([`Library::set_reading`]).
-    pub reading: Option<(u64, u64)>,
+    /// Its words in the order they were first met in its profile: the order
+    /// that numbers them, so that a library built again with this book kept
+    /// ([`Source::Kept`]) numbers every word as one built from the files.
+    first: Vec<u32>,
+}
+
+impl BookData {
+    /// The same words, renumbered by `to` (parallel to `first`), in the order
+    /// a book read with those numbers has them.
+    fn renumbered(&self, to: &[u32]) -> BookData {
+        let map: FxHashMap<u32, u32> = self.first.iter().copied().zip(to.iter().copied()).collect();
+        let at = |w: u32| map[&w];
+        // Ties in count go by number (as when read), so the order may change.
+        let mut words: Vec<(usize, u32, u32)> = self
+            .words
+            .iter()
+            .enumerate()
+            .map(|(i, &(w, n))| (i, at(w), n))
+            .collect();
+        words.sort_unstable_by(|a, b| b.2.cmp(&a.2).then(a.1.cmp(&b.1)));
+        BookData {
+            name: words.iter().map(|w| self.name[w.0]).collect(),
+            pos: self.pos.as_ref().map(|p| BookPos {
+                sections: p.sections.clone(),
+                total: p.total,
+                words: words.iter().map(|w| p.words[w.0].clone()).collect(),
+            }),
+            words: words.iter().map(|w| (w.1, w.2)).collect(),
+            denom: self.denom,
+            spell: self
+                .spell
+                .iter()
+                .map(|(w, s)| (at(*w), s.clone()))
+                .collect(),
+            raw: self.raw.iter().map(|&(w, n)| (at(w), n)).collect(),
+            first: to.to_vec(),
+        }
+    }
+}
+
+/// A book for [`Library::rebuild`].
+pub enum Source {
+    /// Read from its profile, with where its words occur when known.
+    Read(Profile, Option<crate::profile::Positions>),
+    /// The book at this index in the earlier library, as it was read there.
+    Kept(usize),
+}
+
+/// The library's words, numbered as first met.
+#[derive(Default)]
+struct Numbering {
+    ids: FxHashMap<String, u32>,
+    vocab: Vec<String>,
+}
+
+impl Numbering {
+    /// The number of `key` (already folded).
+    fn key(&mut self, key: &str) -> u32 {
+        if let Some(&i) = self.ids.get(key) {
+            return i;
+        }
+        let i = self.vocab.len() as u32;
+        self.vocab.push(key.to_owned());
+        self.ids.insert(key.to_owned(), i);
+        i
+    }
 }
 
 /// [`crate::profile::Positions`] of a book, by the library's word numbers.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct BookPos {
     sections: Vec<crate::profile::PosSection>,
     total: u64,
@@ -397,7 +479,7 @@ impl LibBook {
 #[derive(Clone, Debug)]
 pub struct Library {
     pub fold: bool,
-    vocab: Vec<String>,
+    vocab: Arc<Vec<String>>,
     pub books: Vec<LibBook>,
 }
 
@@ -588,97 +670,64 @@ impl Library {
         skip_hapax: bool,
         books: Vec<(String, Profile, Option<crate::profile::Positions>)>,
     ) -> Library {
-        let mut ids: FxHashMap<String, u32> = FxHashMap::default();
-        let mut vocab: Vec<String> = Vec::new();
-        let mut intern = |w: &str| -> (u32, bool) {
-            let k = crate::anki::fold(w, fold);
-            let same = k == w;
-            if let Some(&i) = ids.get(&k) {
-                return (i, same);
-            }
-            let i = vocab.len() as u32;
-            vocab.push(k.clone());
-            ids.insert(k, i);
-            (i, same)
-        };
+        Self::rebuild(
+            fold,
+            skip_hapax,
+            books
+                .into_iter()
+                .map(|(t, p, pos)| (t, Source::Read(p, pos)))
+                .collect(),
+            None,
+        )
+    }
+
+    /// [`Library::build_with`], with books that have not changed since
+    /// `old` was built taken from it ([`Source::Kept`]) instead of read
+    /// again. `old` must have been built with the same `fold` and
+    /// `skip_hapax`. The library is the same as one built from the files.
+    pub fn rebuild(
+        fold: bool,
+        skip_hapax: bool,
+        books: Vec<(String, Source)>,
+        old: Option<&Library>,
+    ) -> Library {
+        debug_assert!(old.is_none_or(|o| o.fold == fold));
+        let mut num = Numbering::default();
         let mut out = Vec::new();
-        for (title, p, positions) in books {
-            // Single characters would match far too much (as on the Overview).
-            let names: Vec<&str> = p
-                .names
-                .iter()
-                .filter(|n| n.chars().count() >= 2)
-                .map(String::as_str)
-                .collect();
-            let ac = (!names.is_empty())
-                .then(|| aho_corasick::AhoCorasick::new(&names).ok())
-                .flatten();
-            let mut counts: FxHashMap<u32, (u32, bool)> = FxHashMap::default();
-            let mut spell: FxHashMap<u32, String> = FxHashMap::default();
-            let mut raw: Vec<(u32, u32)> = Vec::new();
-            let mut placed: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
-            // Before folding, so the same words go as on the Overview.
-            for (pi, (w, n)) in p
-                .words
-                .iter()
-                .enumerate()
-                .filter(|(_, (_, n))| !skip_hapax || *n > 1)
-            {
-                let (id, unfolded) = intern(w);
-                raw.push((id, *n));
-                if let Some(pos) = &positions {
-                    placed.entry(id).or_default().extend(&pos.words[pi]);
+        for (title, src) in books {
+            match src {
+                Source::Read(p, positions) => {
+                    out.push(Self::read_book(
+                        title, p, positions, fold, skip_hapax, &mut num,
+                    ));
                 }
-                let is_name = ac.as_ref().is_some_and(|a| a.is_match(w.as_str()));
-                let e = counts.entry(id).or_insert((0, false));
-                e.0 += n;
-                e.1 |= is_name;
-                // The book's most frequent spelling of a folded word is how it is shown.
-                if !unfolded && !spell.contains_key(&id) {
-                    spell.insert(id, w.clone());
+                Source::Kept(i) => {
+                    let old = old.expect("a kept book needs the library it is kept from");
+                    let o = &old.books[i];
+                    // Numbered as if read now: the same numbers unless an
+                    // earlier book changed.
+                    let to: Vec<u32> = o
+                        .first
+                        .iter()
+                        .map(|&w| num.key(&old.vocab[w as usize]))
+                        .collect();
+                    let data = if to == o.first {
+                        o.data.clone()
+                    } else {
+                        Arc::new(o.data.renumbered(&to))
+                    };
+                    out.push(LibBook {
+                        id: o.id.clone(),
+                        title,
+                        segmenter: o.segmenter.clone(),
+                        variant: o.variant.clone(),
+                        series: None,
+                        offset: 0.0,
+                        reading: None,
+                        data,
+                    });
                 }
             }
-            let mut words: Vec<(u32, u32, bool)> =
-                counts.into_iter().map(|(w, (n, nm))| (w, n, nm)).collect();
-            words.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-            let denom = words.iter().filter(|w| !w.2).map(|w| w.1 as u64).sum();
-            // Stable: equal counts keep the profile's order, as Mark read.
-            raw.sort_by_key(|x| std::cmp::Reverse(x.1));
-            let pos = positions.map(|ps| BookPos {
-                total: ps.total(),
-                words: words
-                    .iter()
-                    .map(|w| {
-                        // Spellings folded into one word: their sections merged.
-                        let mut v = placed.remove(&w.0).unwrap_or_default();
-                        v.sort_unstable_by_key(|x| x.0);
-                        v.dedup_by(|b, a| {
-                            let same = a.0 == b.0;
-                            if same {
-                                a.1 += b.1;
-                            }
-                            same
-                        });
-                        v
-                    })
-                    .collect(),
-                sections: ps.sections,
-            });
-            out.push(LibBook {
-                id: p.id,
-                title,
-                segmenter: p.segmenter,
-                variant: p.variant,
-                name: words.iter().map(|w| w.2).collect(),
-                words: words.iter().map(|w| (w.0, w.1)).collect(),
-                denom,
-                spell,
-                series: None,
-                offset: 0.0,
-                raw,
-                pos,
-                reading: None,
-            });
         }
         // Series: two or more books whose titles name one, at least one with
         // a volume number.
@@ -705,8 +754,104 @@ impl Library {
         }
         Library {
             fold,
-            vocab,
+            vocab: Arc::new(num.vocab),
             books: out,
+        }
+    }
+
+    /// One book read from its profile, its words numbered by `num`.
+    fn read_book(
+        title: String,
+        p: Profile,
+        positions: Option<crate::profile::Positions>,
+        fold: bool,
+        skip_hapax: bool,
+        num: &mut Numbering,
+    ) -> LibBook {
+        // Single characters would match far too much (as on the Overview).
+        let names: Vec<&str> = p
+            .names
+            .iter()
+            .filter(|n| n.chars().count() >= 2)
+            .map(String::as_str)
+            .collect();
+        let ac = (!names.is_empty())
+            .then(|| aho_corasick::AhoCorasick::new(&names).ok())
+            .flatten();
+        let mut counts: FxHashMap<u32, (u32, bool)> = FxHashMap::default();
+        let mut first: Vec<u32> = Vec::new();
+        let mut spell: FxHashMap<u32, String> = FxHashMap::default();
+        let mut raw: Vec<(u32, u32)> = Vec::new();
+        let mut placed: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
+        // Before folding, so the same words go as on the Overview.
+        for (pi, (w, n)) in p
+            .words
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, n))| !skip_hapax || *n > 1)
+        {
+            let k = crate::anki::fold(w, fold);
+            let unfolded = k == *w;
+            let id = num.key(&k);
+            raw.push((id, *n));
+            if let Some(pos) = &positions {
+                placed.entry(id).or_default().extend(&pos.words[pi]);
+            }
+            let is_name = ac.as_ref().is_some_and(|a| a.is_match(w.as_str()));
+            let e = counts.entry(id).or_insert_with(|| {
+                first.push(id);
+                (0, false)
+            });
+            e.0 += n;
+            e.1 |= is_name;
+            // The book's most frequent spelling of a folded word is how it is shown.
+            if !unfolded && !spell.contains_key(&id) {
+                spell.insert(id, w.clone());
+            }
+        }
+        let mut words: Vec<(u32, u32, bool)> =
+            counts.into_iter().map(|(w, (n, nm))| (w, n, nm)).collect();
+        words.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let denom = words.iter().filter(|w| !w.2).map(|w| w.1 as u64).sum();
+        // Stable: equal counts keep the profile's order, as Mark read.
+        raw.sort_by_key(|x| std::cmp::Reverse(x.1));
+        let pos = positions.map(|ps| BookPos {
+            total: ps.total(),
+            words: words
+                .iter()
+                .map(|w| {
+                    // Spellings folded into one word: their sections merged.
+                    let mut v = placed.remove(&w.0).unwrap_or_default();
+                    v.sort_unstable_by_key(|x| x.0);
+                    v.dedup_by(|b, a| {
+                        let same = a.0 == b.0;
+                        if same {
+                            a.1 += b.1;
+                        }
+                        same
+                    });
+                    v
+                })
+                .collect(),
+            sections: ps.sections,
+        });
+        LibBook {
+            id: p.id,
+            title,
+            segmenter: p.segmenter,
+            variant: p.variant,
+            series: None,
+            offset: 0.0,
+            reading: None,
+            data: Arc::new(BookData {
+                name: words.iter().map(|w| w.2).collect(),
+                words: words.iter().map(|w| (w.0, w.1)).collect(),
+                denom,
+                spell,
+                raw,
+                pos,
+                first,
+            }),
         }
     }
 
@@ -2066,6 +2211,200 @@ mod tests {
         let p = lib.evaluate(&k0, &pr, &[0, 1]);
         assert_eq!(p.steps[0].by_reading, 1);
         assert_eq!(p.steps[1].reached, 50.0);
+    }
+
+    /// The libraries hold the same numbered words, books and series.
+    fn same_library(a: &Library, b: &Library) {
+        assert_eq!(a.fold, b.fold);
+        assert_eq!(a.vocab, b.vocab);
+        assert_eq!(a.books.len(), b.books.len());
+        for (x, y) in a.books.iter().zip(&b.books) {
+            assert_eq!(
+                (&x.id, &x.title, &x.segmenter, &x.variant, &x.series),
+                (&y.id, &y.title, &y.segmenter, &y.variant, &y.series)
+            );
+            assert_eq!(*x.data, *y.data, "{}", x.id);
+        }
+    }
+
+    /// A book of `n` words drawn from a small pool (Traditional and
+    /// Simplified spellings, a name, tied counts), with positions when `pos`.
+    fn random_book(
+        id: &str,
+        seed: &mut u64,
+        n: usize,
+        pos: bool,
+    ) -> (String, Profile, Option<crate::profile::Positions>) {
+        use crate::profile::{PosSection, Positions};
+        const POOL: &[&str] = &[
+            "说",
+            "說",
+            "书",
+            "書",
+            "我们",
+            "他们",
+            "张三",
+            "张三说",
+            "天气",
+            "学校",
+            "學校",
+            "朋友",
+            "时间",
+            "時間",
+            "问题",
+            "問題",
+            "东西",
+            "東西",
+            "孩子",
+            "地方",
+            "工作",
+            "电话",
+            "電話",
+        ];
+        let mut next = || {
+            *seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (*seed >> 33) as usize
+        };
+        let mut words: Vec<(&str, u32)> = Vec::new();
+        for _ in 0..n {
+            let w = POOL[next() % POOL.len()];
+            if !words.iter().any(|x| x.0 == w) {
+                // Few distinct counts: many ties.
+                words.push((w, [1, 2, 3, 5, 5, 8][next() % 6]));
+            }
+        }
+        let (_, p) = profile(id, &words, &["张三"]);
+        let positions = pos.then(|| Positions {
+            sections: vec![
+                PosSection {
+                    href: Some("a.xhtml".into()),
+                    start: 0,
+                    words: 30,
+                },
+                PosSection {
+                    href: Some("b.xhtml".into()),
+                    start: 30,
+                    words: 70,
+                },
+            ],
+            words: p
+                .words
+                .iter()
+                .map(|(_, n)| match n / 2 {
+                    0 => vec![(1, *n)],
+                    h => vec![(0, h), (1, n - h)],
+                })
+                .collect(),
+        });
+        (
+            format!("{} 第{}卷", id.to_uppercase(), id.len()),
+            p,
+            positions,
+        )
+    }
+
+    #[test]
+    fn rebuilding_keeps_books_and_numbers_words_as_a_full_build() {
+        let mut seed = 7u64;
+        for fold in [true, false] {
+            for skip_hapax in [false, true] {
+                let mut books: Vec<(String, Profile, Option<crate::profile::Positions>)> = (0..6)
+                    .map(|i| random_book(&format!("b{i}"), &mut seed, 8 + i, i % 2 == 0))
+                    .collect();
+                let mut old = Library::build_with(fold, skip_hapax, books.clone());
+                for round in 0..40 {
+                    // Change one thing: a book's words, a book added, removed,
+                    // moved, or retitled.
+                    let changed: Option<String> = match round % 5 {
+                        0 => {
+                            let i = round % books.len();
+                            let id = books[i].1.id.clone();
+                            books[i] = random_book(&id, &mut seed, 10, round % 2 == 0);
+                            Some(id)
+                        }
+                        1 => {
+                            let id = format!("n{round}");
+                            books.insert(
+                                round % (books.len() + 1),
+                                random_book(&id, &mut seed, 9, true),
+                            );
+                            Some(id)
+                        }
+                        2 if books.len() > 2 => {
+                            books.remove(round % books.len());
+                            None
+                        }
+                        3 => {
+                            let b = books.remove(0);
+                            books.push(b);
+                            None
+                        }
+                        _ => {
+                            let i = round % books.len();
+                            books[i].0 = format!("Retitled {round} 第2卷");
+                            None
+                        }
+                    };
+                    let index: HashMap<&str, usize> = old
+                        .books
+                        .iter()
+                        .enumerate()
+                        .map(|(i, b)| (b.id.as_str(), i))
+                        .collect();
+                    let src: Vec<(String, Source)> = books
+                        .iter()
+                        .map(|(t, p, pos)| {
+                            let kept = (changed.as_deref() != Some(p.id.as_str()))
+                                .then(|| index.get(p.id.as_str()))
+                                .flatten();
+                            let s = match kept {
+                                Some(&i) => Source::Kept(i),
+                                None => Source::Read(p.clone(), pos.clone()),
+                            };
+                            (t.clone(), s)
+                        })
+                        .collect();
+                    let new = Library::rebuild(fold, skip_hapax, src, Some(&old));
+                    same_library(&new, &Library::build_with(fold, skip_hapax, books.clone()));
+                    old = new;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_kept_book_shares_its_words_when_numbered_alike() {
+        let mut seed = 3u64;
+        let books: Vec<_> = (0..4)
+            .map(|i| random_book(&format!("b{i}"), &mut seed, 12, true))
+            .collect();
+        let old = Library::build_with(true, false, books.clone());
+        // The last book read again: the others keep their numbers and data.
+        let src: Vec<(String, Source)> = books
+            .iter()
+            .enumerate()
+            .map(|(i, (t, p, pos))| {
+                let s = if i == 3 {
+                    Source::Read(p.clone(), pos.clone())
+                } else {
+                    Source::Kept(i)
+                };
+                (t.clone(), s)
+            })
+            .collect();
+        let new = Library::rebuild(true, false, src, Some(&old));
+        for i in 0..3 {
+            assert!(Arc::ptr_eq(&old.books[i].data, &new.books[i].data));
+        }
+        same_library(&new, &old);
+        // A copy to set offsets shares every book's words.
+        let mut copy = Arc::new(new);
+        let keep = copy.clone();
+        Arc::make_mut(&mut copy).set_offsets(|_| 1.0);
+        assert!(Arc::ptr_eq(&copy.vocab, &keep.vocab));
+        assert!(Arc::ptr_eq(&copy.books[0].data, &keep.books[0].data));
     }
 
     fn titled(title: &str, words: &[(&str, u32)]) -> (String, Profile) {

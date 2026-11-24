@@ -274,11 +274,14 @@ impl App {
             let _ = std::fs::remove_file(Counted::path());
             return;
         }
-        let cached = [self.stats.lib.as_ref(), self.plan.lib.as_ref()]
-            .into_iter()
-            .flatten()
-            .find(|(lk, _)| *lk == key)
-            .map(|(_, l)| l.clone());
+        let cached = [
+            self.stats.lib.as_ref().map(|(k, l)| (k, l)),
+            self.plan.lib.as_ref().map(|p| (&p.key, &p.lib)),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|(lk, _)| **lk == key)
+        .map(|(_, l)| l.clone());
         let titles: HashMap<&str, &str> = self
             .history
             .entries
@@ -334,10 +337,8 @@ impl App {
         };
         match rx.try_recv() {
             Ok(d) => {
-                // The reading path can reuse the library.
-                if self.plan.lib.as_ref().is_none_or(|(k, _)| *k != d.lib.0) {
-                    self.plan.lib = Some(d.lib.clone());
-                }
+                // Not for the reading path, which needs where words occur
+                // (this library is built without them).
                 self.stats.lib = Some(d.lib);
                 self.stats.error = d.saved.err();
                 self.stats.shown = Some(d.counted);

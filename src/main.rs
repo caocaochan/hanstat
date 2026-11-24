@@ -990,12 +990,116 @@ struct PlanState {
     /// History ids of the books with a profile but no word positions beside
     /// it, and what they were listed for.
     no_positions: Option<((u64, usize), HashSet<String>)>,
-    /// The library last built, and what from.
-    lib: Option<(LibKey, Arc<plan::Library>)>,
+    /// The library last built, what from, and the files read for it.
+    lib: Option<PlanLib>,
     /// What `result`, or the running job, was computed from.
     inputs: Option<PlanInputs>,
     result: Option<PlanDone>,
-    job: Option<(Receiver<PlanDone>, Arc<AtomicBool>)>,
+    job: Option<PlanJob>,
+    /// When the last plan was started (`egui` time).
+    started: f64,
+}
+
+/// A plan being made in the background.
+struct PlanJob {
+    rx: Receiver<PlanDone>,
+    cancel: Arc<AtomicBool>,
+    /// Its thread: the next plan waits for it, so only one runs at a time.
+    thread: std::thread::JoinHandle<()>,
+}
+
+/// While books are being analysed, each one finished changes the word data:
+/// the reading path is planned again at most this often (seconds), and not
+/// while a plan is still running, instead of after every book.
+const REPLAN_SECS: f64 = 10.0;
+
+/// A file as read: when it was last changed and its length (`None`: missing).
+type Stamp = Option<(std::time::SystemTime, u64)>;
+
+fn stamp(path: &Path) -> Stamp {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.modified().ok()?, m.len()))
+}
+
+/// The library of `books` (History id, title) for `key`, with where their
+/// words occur when that was saved with them. A book whose files are as
+/// `old` read them is taken from it; the others are read. `None` if
+/// cancelled.
+fn plan_library(
+    key: &LibKey,
+    books: Vec<(String, String)>,
+    history_path: &Path,
+    old: Option<PlanLib>,
+    cancel: &AtomicBool,
+) -> Option<PlanLib> {
+    let old = old.filter(|o| o.key.fold == key.fold && o.key.skip_hapax == key.skip_hapax);
+    let index: HashMap<&str, usize> = old.as_ref().map_or_else(HashMap::new, |o| {
+        o.lib
+            .books
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.id.as_str(), i))
+            .collect()
+    });
+    let mut files: HashMap<String, (Stamp, Stamp)> = HashMap::new();
+    let mut src: Vec<(String, plan::Source)> = Vec::new();
+    for (id, title) in books {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let p_path = profile::path_in(history_path, &id);
+        let pos_path = profile::positions_path_in(history_path, &id);
+        // Before reading: a file changed meanwhile is read again next time.
+        let seen = (stamp(&p_path), stamp(&pos_path));
+        let kept = old.as_ref().and_then(|o| {
+            let &i = index.get(id.as_str())?;
+            (o.files.get(&id) == Some(&seen)).then_some(i)
+        });
+        let s = match kept {
+            Some(i) => plan::Source::Kept(i),
+            None => {
+                let Some(p) = Profile::load(&p_path) else {
+                    continue;
+                };
+                let pos = profile::Positions::load(&pos_path, p.digest(), p.words.len());
+                plan::Source::Read(p, pos)
+            }
+        };
+        files.insert(id, seen);
+        src.push((title, s));
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    // Every book kept, in the same order: the same library.
+    if let Some(o) = &old
+        && src.len() == o.lib.books.len()
+        && src.iter().enumerate().all(|(i, (t, s))| {
+            matches!(s, plan::Source::Kept(k) if *k == i) && *t == o.lib.books[i].title
+        })
+    {
+        return Some(PlanLib {
+            key: key.clone(),
+            lib: o.lib.clone(),
+            files: Arc::new(files),
+        });
+    }
+    let lib = plan::Library::rebuild(key.fold, key.skip_hapax, src, old.as_ref().map(|o| &*o.lib));
+    Some(PlanLib {
+        key: key.clone(),
+        lib: Arc::new(lib),
+        files: Arc::new(files),
+    })
+}
+
+/// The reading path's library, with the profile and word-positions files
+/// each book was read from (by History id): a book whose files are as they
+/// were is taken from it when the library is built again.
+#[derive(Clone)]
+struct PlanLib {
+    key: LibKey,
+    lib: Arc<plan::Library>,
+    files: Arc<HashMap<String, (Stamp, Stamp)>>,
 }
 
 /// Writing-style ratings: those made, and the rater while the setting is on.
@@ -1058,9 +1162,35 @@ struct PlanInputs {
     read_counts: usize,
 }
 
+impl PlanInputs {
+    /// The same but for which books have word data, and that data: what
+    /// changes with each book a batch finishes.
+    fn same_but_word_data(&self, o: &PlanInputs) -> bool {
+        let PlanInputs {
+            lib,
+            knowledge,
+            params,
+            books: _,
+            manual,
+            offsets,
+            reading,
+            read_counts,
+        } = self;
+        (lib.fold, lib.skip_hapax) == (o.lib.fold, o.lib.skip_hapax)
+            && *knowledge == o.knowledge
+            && *params == o.params
+            && *manual == o.manual
+            && *offsets == o.offsets
+            && *reading == o.reading
+            && *read_counts == o.read_counts
+    }
+}
+
 struct PlanDone {
     key: LibKey,
     lib: Arc<plan::Library>,
+    /// What [`PlanLib::files`] says.
+    files: Arc<HashMap<String, (Stamp, Stamp)>>,
     path: plan::Path,
     /// Reading the book with the most words known first, then the next.
     naive: plan::Path,
@@ -6470,36 +6600,34 @@ impl App {
         ids
     }
 
-    /// Plan in the background; a running plan is cancelled.
+    /// Plan in the background; a running plan is cancelled, and this one
+    /// waits until it has stopped.
     fn start_plan(&mut self, inputs: PlanInputs, ctx: &egui::Context) {
-        if let Some((_, c)) = self.plan.job.take() {
-            c.store(true, Ordering::Relaxed);
-        }
+        let prev = self.plan.job.take().map(|j| {
+            j.cancel.store(true, Ordering::Relaxed);
+            j.thread
+        });
         self.plan.inputs = Some(inputs.clone());
+        self.plan.started = ctx.input(|i| i.time);
         if inputs.books.is_empty() {
             self.plan.result = None;
             return;
         }
-        let cached = self
-            .plan
-            .lib
-            .as_ref()
-            .filter(|(k, _)| *k == inputs.lib)
-            .map(|(_, l)| l.clone());
+        let old = self.plan.lib.clone();
         let titles: HashMap<&str, &str> = self
             .history
             .entries
             .iter()
             .map(|e| (e.id.as_str(), e.title.as_str()))
             .collect();
-        let files: Vec<(String, PathBuf)> = inputs
+        let books: Vec<(String, String)> = inputs
             .lib
             .ids
             .iter()
             .map(|id| {
                 (
+                    id.clone(),
                     titles.get(id.as_str()).unwrap_or(&"?").to_string(),
-                    self.history.profile(id),
                 )
             })
             .collect();
@@ -6510,27 +6638,20 @@ impl App {
         let c2 = cancel.clone();
         let (tx, rx) = channel();
         let ctx = ctx.clone();
-        std::thread::spawn(move || {
+        let thread = std::thread::spawn(move || {
+            // One plan at a time: the one replaced stops at its next check.
+            if let Some(h) = prev {
+                let _ = h.join();
+            }
             let t = std::time::Instant::now();
             let key = inputs.lib.clone();
-            let lib = cached.unwrap_or_else(|| {
-                // With where their words occur, when that was saved with them.
-                let books: Vec<(String, Profile, Option<profile::Positions>)> = files
-                    .into_iter()
-                    .filter_map(|(t, p)| Profile::load(&p).map(|p| (t, p)))
-                    .map(|(t, p)| {
-                        let pos = profile::Positions::load(
-                            &profile::positions_path_in(&history_path, &p.id),
-                            p.digest(),
-                            p.words.len(),
-                        );
-                        (t, p, pos)
-                    })
-                    .collect();
-                Arc::new(plan::Library::build_with(key.fold, key.skip_hapax, books))
-            });
-            // Writing style: a copy only when the offsets changed.
-            let mut lib = lib;
+            let Some(built) = plan_library(&key, books, &history_path, old, &c2) else {
+                return;
+            };
+            let files = built.files;
+            // Writing style: a copy only when the offsets changed (the
+            // books' word data is shared, not copied).
+            let mut lib = built.lib;
             let off: HashMap<&str, f64> = inputs
                 .offsets
                 .iter()
@@ -6547,6 +6668,9 @@ impl App {
                 .reading
                 .iter()
                 .filter_map(|(id, path, spine, offset, saved)| {
+                    if c2.load(Ordering::Relaxed) {
+                        return None;
+                    }
                     let b = lib.books.iter().find(|b| b.id == *id)?;
                     if !b.has_positions() {
                         return None;
@@ -6558,6 +6682,9 @@ impl App {
                     Some((id.as_str(), (b.running_word_at(href, f)?, *saved)))
                 })
                 .collect();
+            if c2.load(Ordering::Relaxed) {
+                return;
+            }
             let at = |b: &plan::LibBook| at.get(b.id.as_str()).copied();
             if lib.reading_differs(at) {
                 Arc::make_mut(&mut lib).set_reading(at);
@@ -6620,6 +6747,7 @@ impl App {
                 key,
                 known_words: k0.len(),
                 lib: lib.clone(),
+                files,
                 path,
                 naive,
                 optimised,
@@ -6627,16 +6755,20 @@ impl App {
             });
             ctx.request_repaint();
         });
-        self.plan.job = Some((rx, cancel));
+        self.plan.job = Some(PlanJob { rx, cancel, thread });
     }
 
     fn poll_plan(&mut self, ctx: &egui::Context) {
-        let Some((rx, _)) = &self.plan.job else {
+        let Some(job) = &self.plan.job else {
             return;
         };
-        match rx.try_recv() {
+        match job.rx.try_recv() {
             Ok(d) => {
-                self.plan.lib = Some((d.key.clone(), d.lib.clone()));
+                self.plan.lib = Some(PlanLib {
+                    key: d.key.clone(),
+                    lib: d.lib.clone(),
+                    files: d.files.clone(),
+                });
                 self.plan.result = Some(d);
                 self.plan.job = None;
             }
@@ -7384,7 +7516,24 @@ impl App {
             },
         };
         if self.plan.inputs.as_ref() != Some(&inputs) {
-            self.start_plan(inputs, ctx);
+            // While books are being analysed, only their word data changing:
+            // the plan running finishes, and the next waits a little.
+            let now = ctx.input(|i| i.time);
+            let wait = self.plan.started + REPLAN_SECS - now;
+            let hold = self.batch.is_some()
+                && self
+                    .plan
+                    .inputs
+                    .as_ref()
+                    .is_some_and(|i| i.same_but_word_data(&inputs))
+                && (self.plan.job.is_some() || wait > 0.0);
+            if hold {
+                if wait > 0.0 {
+                    ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
+                }
+            } else {
+                self.start_plan(inputs, ctx);
+            }
         }
         let entries: Vec<&history::Entry> = self.history.entries.iter().collect();
 

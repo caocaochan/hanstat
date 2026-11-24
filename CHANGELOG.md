@@ -1,5 +1,12 @@
 # Changelog
 
+## [2026.11.24.06] - 2026-11-24
+
+### Fixed
+- **The reading path no longer piles up work while the Library updates.** After an update, the Library analyses its books again in the background, and each book it finished started the reading path over from scratch, reading every book's word data again, while the earlier attempts kept going. With **Learn while reading** this could keep the path planning for minutes, slow the computer down and use enough memory for hanstat to close. Now only one plan runs at a time, a plan that is no longer needed stops at once, and while books are being analysed the path is planned again at most every 10 seconds (and right away once they're done). Switching between **Learn while reading** and **Study before each book** is quicker too.
+- **Only the books that changed are read again.** When the reading path is planned again, books whose word data hasn't changed are reused instead of read from disk. The path is the same as before.
+- **Learn while reading uses where words occur after visiting Library Stats.** Opening **Stats** before **Reading path** could leave the path estimating where every book's words occur ("N books use an estimate…") until hanstat was restarted.
+
 ## [2026.11.24.05] - 2026-11-24
 
 ### Added
