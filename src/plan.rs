@@ -730,27 +730,10 @@ impl Library {
             }
         }
         // Series: two or more books whose titles name one, at least one with
-        // a volume number.
+        // a volume number ([`Library::set_series`] adds the books' metadata).
         let vols: Vec<series::Volume> = out.iter().map(|b| series::parse(&b.title)).collect();
-        let mut groups: FxHashMap<&str, Vec<usize>> = FxHashMap::default();
-        for (i, v) in vols.iter().enumerate() {
-            if !v.key.is_empty() {
-                groups.entry(v.key.as_str()).or_default().push(i);
-            }
-        }
-        let mut groups: Vec<Vec<usize>> = groups
-            .into_values()
-            .filter(|m| m.len() > 1 && m.iter().any(|&i| vols[i].number.is_some()))
-            .collect();
-        groups.sort_unstable();
-        for (id, members) in groups.into_iter().enumerate() {
-            for i in members {
-                let n = vols[i]
-                    .number
-                    .clone()
-                    .unwrap_or_else(|| vec![series::UNNUMBERED]);
-                out[i].series = Some((id as u32, n));
-            }
+        for (b, s) in out.iter_mut().zip(series::group(&vols)) {
+            b.series = s;
         }
         Library {
             fold,
@@ -1459,6 +1442,32 @@ impl Library {
         Path {
             steps,
             params: *params,
+        }
+    }
+
+    /// The series of the books, each from its EPUB metadata (`meta`, by
+    /// History id) when it names one, else from its title ([`series::of`]).
+    pub fn series_with(
+        &self,
+        meta: impl Fn(&str) -> Option<series::Meta>,
+    ) -> Vec<Option<(u32, Vec<u32>)>> {
+        let vols: Vec<series::Volume> = self
+            .books
+            .iter()
+            .map(|b| series::of(&b.title, meta(&b.id).as_ref()))
+            .collect();
+        series::group(&vols)
+    }
+
+    /// Whether [`Library::set_series`] with these series would change anything.
+    pub fn series_differ(&self, s: &[Option<(u32, Vec<u32>)>]) -> bool {
+        self.books.iter().zip(s).any(|(b, s)| b.series != *s)
+    }
+
+    /// Set the books' series, as [`Library::series_with`] gives them.
+    pub fn set_series(&mut self, s: Vec<Option<(u32, Vec<u32>)>>) {
+        for (b, s) in self.books.iter_mut().zip(s) {
+            b.series = s;
         }
     }
 

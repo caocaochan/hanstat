@@ -1470,9 +1470,11 @@ dependencies = [
  "egui",
  "enum-map",
  "itertools 0.15.0",
+ "jiff",
  "log",
  "mime_guess2",
  "profiling",
+ "serde",
 ]
 
 [[package]]
@@ -1559,6 +1561,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4532960034c15ba2f55e9eee631040ecc473c32e6c4b200828c759840f13a06"
 dependencies = [
  "enum-map-derive",
+ "serde",
 ]
 
 [[package]]
@@ -2281,7 +2284,7 @@ dependencies = [
 
 [[package]]
 name = "hanstat"
-version = "2026.1124.7"
+version = "2026.1124.8"
 dependencies = [
  "aho-corasick",
  "candle-core",
@@ -2296,6 +2299,7 @@ dependencies = [
  "flate2",
  "image",
  "jieba-rs",
+ "jiff",
  "libc",
  "libloading 0.9.1",
  "ltp",
@@ -2664,6 +2668,44 @@ dependencies = [
  "include-flate",
  "jieba-macros",
  "rustc-hash 2.1.3",
+]
+
+[[package]]
+name = "jiff"
+version = "0.2.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "175dc66334db3b9ab9985bf8b61cfed50dc16d20964bb47f9e479adcae984a7f"
+dependencies = [
+ "jiff-core",
+ "jiff-static",
+ "js-sys",
+ "log",
+ "portable-atomic",
+ "portable-atomic-util",
+ "serde_core",
+ "wasm-bindgen",
+ "windows-link",
+]
+
+[[package]]
+name = "jiff-core"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e599b80292e597019b8b3e392de3f4bea2959ddfb8c7dff60e035e9e311a2c1b"
+dependencies = [
+ "log",
+]
+
+[[package]]
+name = "jiff-static"
+version = "0.2.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7b1af7547d47354bc438d797e3854601bde8f8d185780c5ba4ab27afa54f1ba"
+dependencies = [
+ "jiff-core",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

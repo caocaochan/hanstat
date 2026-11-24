@@ -528,6 +528,9 @@ impl App {
         self.covers.remove(old);
         self.home_view.forget(old);
         self.home_view.forget(new);
+        crate::chapter_lengths::forget(old);
+        crate::book_series::forget(old);
+        self.columns.rekey(old, new);
         crate::reading_stats::rekey(old, new, |s| spine.get(s as usize).copied().unwrap_or(s));
         if let Err(e) = crate::reading_stats::save() {
             self.set_error("reading stats", e);

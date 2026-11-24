@@ -24,9 +24,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 
+mod book_series;
+mod chapter_lengths;
 mod charts;
 mod duchinese;
 mod home;
+mod library_books;
+mod library_columns;
 mod library_reading;
 mod library_stats;
 mod palette;
@@ -40,6 +44,7 @@ mod shortcuts;
 mod style_scale;
 mod whats_new;
 
+use library_columns::HistCol;
 use library_stats::StatsState;
 use shortcuts::{Action, Shortcuts};
 use style_scale::StyleScale;
@@ -128,7 +133,16 @@ fn main() -> eframe::Result {
             app.tab = tab.unwrap_or(ui.tab);
             app.history_tab = ui.history_tab;
             app.history_sort = ui.history_sort;
-            app.library_hide_read = ui.library_hide_read;
+            if ui.library_hide_read && app.columns.cols.filter(HistCol::Read).is_none() {
+                app.columns.cols.set_filter(
+                    HistCol::Read,
+                    library_columns::Filter {
+                        values: false,
+                        ..Default::default()
+                    },
+                );
+                app.columns.save();
+            }
             app.char_sort = ui.char_sort;
             app.word_sort = ui.word_sort;
             app.shortcuts = Shortcuts::from_saved(&app.settings.shortcuts);
@@ -666,8 +680,8 @@ struct App {
     across: read_books::Across,
     /// Library Stats › Reading.
     reading_view: library_reading::ReadingView,
-    /// The Library's Books tab leaves out the books marked read.
-    library_hide_read: bool,
+    /// The Library's Books columns, filters and the user's own columns.
+    columns: library_books::ColumnsState,
     /// Which Library files and word data exist, checked in the background.
     exists: Exists,
     /// A book just removed from the Library, while it can be put back.
@@ -866,6 +880,9 @@ struct UiState {
     tab: Tab,
     history_tab: HistTab,
     history_sort: (HistCol, bool),
+    /// Read only, from builds before the Library's filters: becomes the
+    /// ✔ Read column's "not read" filter.
+    #[serde(skip_serializing)]
     library_hide_read: bool,
     char_sort: (CharCol, bool),
     word_sort: (WordCol, bool),
@@ -1160,6 +1177,9 @@ struct PlanInputs {
     /// Learning while reading, the word counts of the books read
     /// ([`read_books::Across::counts`], by `Arc` address; 0: none).
     read_counts: usize,
+    /// The series the books name in their metadata, by History id
+    /// ([`book_series`]).
+    series: Vec<(String, hanstat::series::Meta)>,
 }
 
 impl PlanInputs {
@@ -1175,6 +1195,7 @@ impl PlanInputs {
             offsets,
             reading,
             read_counts,
+            series,
         } = self;
         (lib.fold, lib.skip_hapax) == (o.lib.fold, o.lib.skip_hapax)
             && *knowledge == o.knowledge
@@ -1183,6 +1204,7 @@ impl PlanInputs {
             && *offsets == o.offsets
             && *reading == o.reading
             && *read_counts == o.read_counts
+            && *series == o.series
     }
 }
 
@@ -1261,22 +1283,6 @@ enum PlanAction {
     SaveList(usize),
     Optimise,
     Backfill,
-}
-
-/// Columns of the History table that sort.
-#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-enum HistCol {
-    Title,
-    Language,
-    Unique,
-    Known,
-    Chars,
-    Words,
-    Time,
-    Analysed,
-    Style,
-    Read,
-    Difficulty,
 }
 
 enum AnkiMsg {
@@ -1488,7 +1494,7 @@ impl Default for App {
             read_dialog: None,
             across: Default::default(),
             reading_view: Default::default(),
-            library_hide_read: false,
+            columns: library_books::ColumnsState::default(),
             exists: Exists::default(),
             removed: None,
             settings_window: false,
@@ -2898,6 +2904,7 @@ impl App {
     fn restart(&mut self, ctx: &egui::Context) {
         // The new copy reads the Library and known words: write them first.
         self.finish_removal();
+        self.columns.finish_delete();
         hanstat::saver::flush();
         let exe = match update::exe_path() {
             Ok(p) => p,
@@ -2984,7 +2991,7 @@ impl eframe::App for App {
                 tab: self.tab,
                 history_tab: self.history_tab,
                 history_sort: self.history_sort,
-                library_hide_read: self.library_hide_read,
+                library_hide_read: false,
                 char_sort: self.char_sort,
                 word_sort: self.word_sort,
                 window_size: self.window_size.map(<[f32; 2]>::from),
@@ -2999,6 +3006,7 @@ impl eframe::App for App {
             r.save();
         }
         self.finish_removal();
+        self.columns.finish_delete();
         hanstat::saver::flush();
         reading_stats::flush();
     }
@@ -3021,6 +3029,15 @@ impl eframe::App for App {
         }
         self.poll_batch(&ctx);
         self.poll_moves(&ctx);
+        // Each EPUB's series metadata, read once ([`book_series`]).
+        book_series::want(
+            self.history
+                .entries
+                .iter()
+                .filter(|e| e.stats.format == "EPUB")
+                .map(|e| (e.id.as_str(), e.path.as_path())),
+            &ctx,
+        );
         self.auto_refresh(&ctx);
         if self.show_history {
             let hist = &self.history;
@@ -3041,6 +3058,10 @@ impl eframe::App for App {
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_secs_f64(r.until - now));
             }
+        }
+        self.columns.tick(now, &ctx);
+        if let Some(e) = self.columns.error.take() {
+            self.set_error("columns", e);
         }
         if let Some(e) = hanstat::saver::take_error() {
             self.set_error("save", e);
@@ -3343,6 +3364,7 @@ impl eframe::App for App {
                 if undo {
                     self.undo_removal();
                 }
+                self.columns.undo_ui(ui);
                 // The space left of them, in that row (not the panel's height).
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true), |ui| {
                 if self.batch.is_some() {
@@ -4290,9 +4312,21 @@ fn open_with_system(path: &Path) -> Result<(), String> {
 }
 
 /// A Library book matches the search by its title or its file name.
-fn book_matches(q: &search::Query, title: &str, path: &Path) -> bool {
-    let name = path.file_name().map(|n| n.to_string_lossy());
-    q.matches(std::iter::once(title).chain(name.as_deref()))
+/// Whether a book matches the search: by its title, its file name or any
+/// of `more` (the user's own Text columns, on the Books tab).
+fn book_matches<'a>(
+    q: &search::Query,
+    title: &'a str,
+    path: &Path,
+    more: impl Iterator<Item = &'a str>,
+) -> bool {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+    let more: Vec<&str> = more.collect();
+    q.matches(
+        std::iter::once(title)
+            .chain(name.as_deref())
+            .chain(more.iter().copied()),
+    )
 }
 
 fn file_stem(p: &Path) -> String {
@@ -5777,7 +5811,8 @@ const METHOD: &[&str] = &[
 /// The Library search box's hover text.
 const LIBRARY_SEARCH_HOVER: &str = "Filters by title and file name. Letters need only appear in order (hp finds Harry Potter); \
      several words must all match. With * (any characters) or ? (one character) a word must match the whole title or \
-     file name: 三体* starts with 三体, *.txt ends with .txt. Case is ignored and 三體 finds 三体. Esc clears it.";
+     file name: 三体* starts with 三体, *.txt ends with .txt. Case is ignored and 三體 finds 三体. On Books, your own \
+     Text columns (☷ Columns…) are searched too, each word in any of them. Esc clears it.";
 
 impl App {
     /// Every book analysed before, as recorded when its analysis (or what
@@ -5822,9 +5857,8 @@ impl App {
                 {
                     self.library_filter.clear();
                 }
-                if self.history_tab == HistTab::Books && !self.known.settings.read.is_empty() {
-                    ui.checkbox(&mut self.library_hide_read, "Hide read")
-                        .on_hover_text("Leave out the books marked read");
+                if self.history_tab == HistTab::Books {
+                    self.columns_button(ui);
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -5906,444 +5940,7 @@ impl App {
             return;
         }
 
-        // Reading time at the speeds the Overview uses, as there.
-        let cpm = self.speeds();
-        let minutes = |s: &history::Stats| s.han_total as f64 / cpm;
-        let (col, desc) = self.history_sort;
-        let style_on = self.style_on();
-        let style_scores: HashMap<&str, f32> = if style_on {
-            self.style.store.current()
-        } else {
-            HashMap::new()
-        };
-        let style_scale = self.style_scale();
-        let style_skipped = &self.style.skipped;
-        let style_off: HashMap<&str, f64> = self
-            .history
-            .entries
-            .iter()
-            .map(|e| (e.id.as_str(), self.style_offset(&e.id)))
-            .collect();
-        let read_at = self.read_dates();
-        let hide_read = self.library_hide_read;
-        let du_now = history::now();
-        let du_tags: HashMap<&str, (String, u32)> = self
-            .history
-            .entries
-            .iter()
-            .filter_map(|e| {
-                self.du
-                    .library_tag(&e.path, du_now)
-                    .map(|t| (e.id.as_str(), t))
-            })
-            .collect();
-        let hist = &self.history;
-        let entries = &hist.entries;
-        let covers = &mut self.covers;
-        let exists = &self.exists;
-        let key = |i: usize| -> f64 {
-            let s = &entries[i].stats;
-            match col {
-                HistCol::Chars => s.han_total as f64,
-                HistCol::Words => s.words_total as f64,
-                HistCol::Unique => s.words_unique as f64,
-                // Books with nothing known sort below every percentage.
-                HistCol::Known => s.known.as_ref().map_or(-1.0, |k| k.running_words),
-                // Harder first when descending: the share known as counted for
-                // the difficulty (writing style included), the lower the harder.
-                // Books with nothing known sort below every book with a difficulty.
-                HistCol::Difficulty => s.known.as_ref().map_or(-1.0, |k| {
-                    let off = style_off
-                        .get(entries[i].id.as_str())
-                        .copied()
-                        .unwrap_or(0.0);
-                    100.0 - (k.running_words - off)
-                }),
-                HistCol::Time => minutes(s),
-                HistCol::Analysed => entries[i].analysed as f64,
-                // Books not read sort below every date.
-                HistCol::Read => read_at.get(&entries[i].id).map_or(-1.0, |&t| t as f64),
-                // Books not rated sort below every rating.
-                HistCol::Style => style_scores
-                    .get(entries[i].id.as_str())
-                    .map_or(-1.0, |&x| x as f64),
-                HistCol::Title | HistCol::Language => 0.0,
-            }
-        };
-        let lang_key = |i: usize| entries[i].stats.variant.as_str();
-        let query = search::Query::new(&self.library_filter);
-        let mut rows: Vec<usize> = (0..entries.len())
-            .filter(|&i| book_matches(&query, &entries[i].title, &entries[i].path))
-            .filter(|&i| !hide_read || !read_at.contains_key(&entries[i].id))
-            .collect();
-        match col {
-            // Each title lowercased once, not at every comparison.
-            HistCol::Title => {
-                rows.sort_by_cached_key(|&i| entries[i].title.to_lowercase());
-                if desc {
-                    rows.reverse();
-                }
-            }
-            _ => rows.sort_by(|&a, &b| {
-                let o = match col {
-                    HistCol::Language => lang_key(a).cmp(lang_key(b)),
-                    _ => key(a).total_cmp(&key(b)),
-                };
-                if desc { o.reverse() } else { o }
-            }),
-        }
-
-        if rows.is_empty() {
-            ui.label(
-                RichText::new(if hide_read && self.library_filter.is_empty() {
-                    "Every book is marked read."
-                } else {
-                    "No book matches the search."
-                })
-                .weak(),
-            );
-            return;
-        }
-        let now = history::now();
-        let mut open: Option<PathBuf> = None;
-        let mut read: Option<(PathBuf, String, bool)> = None;
-        let mut remove: Option<String> = None;
-        let mut mark_read: Option<String> = None;
-        let mut sort = None;
-        let dash = || RichText::new("–").weak();
-        // The other columns, and the ✕ column's least width.
-        let others = [
-            READ_COL, 90.0, 100.0, 100.0, 100.0, 80.0, 100.0, 80.0, 92.0, 36.0, 36.0,
-        ];
-        let style_col = if style_on { 130.0 } else { 0.0 };
-        let book_w = title_column_width(
-            ui,
-            // Every book, not the search's: the columns stay put while typing.
-            entries.iter().map(|e| e.title.as_str()),
-            others.iter().sum::<f32>() + style_col,
-            others.len() + style_on as usize,
-        );
-        TableBuilder::new(ui)
-            // Cells otherwise inherit the top-down layout: text sits at the row top.
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .striped(true)
-            .column(Column::exact(book_w).clip(true))
-            .column(Column::exact(READ_COL))
-            .column(Column::exact(90.0))
-            .columns(Column::exact(100.0), 3)
-            .column(Column::exact(80.0))
-            .column(Column::exact(100.0))
-            .columns(Column::exact(130.0), style_on as usize)
-            .column(Column::exact(80.0))
-            .column(Column::exact(92.0))
-            .column(Column::exact(36.0))
-            .column(Column::remainder())
-            .header(24.0, |mut h| {
-                let mut heads: Vec<(Option<HistCol>, &str, &str)> = vec![
-                    (Some(HistCol::Title), "Book", "The book's title, or its file name"),
-                    (None, "", ""),
-                    (Some(HistCol::Language), "Language", "Simplified or Traditional Chinese"),
-                    (
-                        Some(HistCol::Chars),
-                        "Characters",
-                        "Chinese characters",
-                    ),
-                    (Some(HistCol::Words), "Words", "Running words, as the segmenter counted them"),
-                    (Some(HistCol::Unique), "Unique words", "Distinct words"),
-                    (
-                        Some(HistCol::Known),
-                        "Known",
-                        "Running words you knew (Anki cards and the levels and word lists marked known) at the last analysis; names are left out",
-                    ),
-                    (Some(HistCol::Difficulty), "Difficulty", "From the share of running words known (and the writing style, while rated), as on the Overview"),
-                    (Some(HistCol::Time), "Reading", "Reading time at the speeds set on the Overview"),
-                    (Some(HistCol::Analysed), "Analysed", "When the book was last analysed"),
-                    (
-                        Some(HistCol::Read),
-                        "Read",
-                        "Mark a book read to count its most frequent words as known and take it off the reading path",
-                    ),
-                    (None, "", ""),
-                ];
-                if style_on {
-                    heads.insert(
-                        8,
-                        (
-                            Some(HistCol::Style),
-                            "Writing style",
-                            "How hard the prose is when you know its words, rated by a local AI model (⚙). The percentage compares it with the Library's rated books (50% is their median); the word is the model's own judgment. Chinese books only",
-                        ),
-                    );
-                }
-                for (c, t, hover) in heads {
-                    h.col(|ui| {
-                        let Some(c) = c else {
-                            ui.strong(t).on_hover_text(hover);
-                            return;
-                        };
-                        // Numbers and dates start largest first, text A–Z.
-                        let first_desc = !matches!(c, HistCol::Title | HistCol::Language);
-                        if let Some(s) = sort_header(ui, t, hover, c, (col, desc), first_desc) {
-                            sort = Some(s);
-                        }
-                    });
-                }
-            })
-            .body(|body| {
-                body.rows(COVER_ROW, rows.len(), |mut row| {
-                    let e = &entries[rows[row.index()]];
-                    let s = &e.stats;
-                    row.col(|ui| {
-                        let tex = covers
-                            .entry(e.id.clone())
-                            .or_insert_with(|| load_cover(ctx, &hist.cover(&e.id)));
-                        let (w, h) = COVER_SIZE;
-                        match tex {
-                            Some(t) => {
-                                // Fit the box, keeping the cover's proportions.
-                                let [tw, th] = t.size().map(|x| x as f32);
-                                let k = (w / tw).min(h / th);
-                                ui.allocate_ui(egui::vec2(w, h), |ui| {
-                                    ui.centered_and_justified(|ui| {
-                                        ui.add(
-                                            egui::Image::new(&*t)
-                                                .fit_to_exact_size(egui::vec2(tw * k, th * k))
-                                                .corner_radius(2.0),
-                                        )
-                                        .on_hover_ui(|ui| {
-                                            let k = 2.5 * k;
-                                            ui.add(
-                                                egui::Image::new(&*t)
-                                                    .fit_to_exact_size(egui::vec2(tw * k, th * k)),
-                                            );
-                                        });
-                                    });
-                                });
-                            }
-                            None => {
-                                ui.allocate_space(egui::vec2(w, h));
-                            }
-                        }
-                        ui.add_space(6.0);
-                        let mut hover = format!(
-                            "{}\n{} · {} · {} of {} sections included",
-                            e.path.display(),
-                            s.format,
-                            s.segmenter,
-                            s.sections_included,
-                            s.sections_total
-                        );
-                        if let Some(k) = &s.known {
-                            hover.push_str(&format!(
-                                "\nKnown from {}: {:.1}% of unique words ({} not known)",
-                                k.source,
-                                k.unique_words,
-                                fmt_int(k.unknown_words)
-                            ));
-                            hover.push_str(&format!(
-                                ", {:.1}% of unique characters",
-                                k.unique_chars
-                            ));
-                        }
-                        if s.words_for_98 > 0 {
-                            hover.push_str(&format!(
-                                "\n{} most frequent words cover 98% of the text",
-                                fmt_int(s.words_for_98)
-                            ));
-                        }
-                        let du_tag = du_tags.get(e.id.as_str());
-                        ui.vertical(|ui| {
-                            if du_tag.is_some() {
-                                ui.add_space(6.0);
-                            }
-                            if exists.get(&e.path) {
-                                if ui.link(&e.title).on_hover_text(hover).clicked() {
-                                    open = Some(e.path.clone());
-                                }
-                            } else {
-                                ui.label(RichText::new(&e.title).weak())
-                                    .on_hover_text(format!("{hover}\n\nThe file is no longer there."));
-                            }
-                            if let Some((progress, new)) = du_tag {
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 4.0;
-                                    ui.label(
-                                        RichText::new("DuChinese")
-                                            .small()
-                                            .color(palette::highlight()),
-                                    )
-                                    .on_hover_text("Imported from DuChinese: new chapters are added as they come out");
-                                    ui.label(
-                                        RichText::new(format!("· {progress}"))
-                                            .small()
-                                            .color(palette::weak()),
-                                    );
-                                    if *new > 0 {
-                                        ui.label(
-                                            RichText::new(format!("· {new} new"))
-                                                .small()
-                                                .color(palette::accent()),
-                                        );
-                                    }
-                                });
-                            }
-                        });
-                    });
-                    row.col(|ui| {
-                        // As on the Overview: the reader takes EPUBs.
-                        if s.format == "EPUB"
-                            && ui
-                                .add_enabled(exists.get(&e.path), egui::Button::new("📕 Read"))
-                                .on_hover_text("Read the book, with its layout and pictures")
-                                .on_disabled_hover_text("The file is no longer there")
-                                .clicked()
-                        {
-                            read = Some((
-                                e.path.clone(),
-                                e.id.clone(),
-                                s.variant == "Traditional",
-                            ));
-                        }
-                    });
-                    row.col(|ui| {
-                        let variant = match s.variant.as_str() {
-                            "Simplified" => Some(Variant::Simplified),
-                            "Traditional" => Some(Variant::Traditional),
-                            "Mixed" => Some(Variant::Mixed),
-                            _ => None,
-                        };
-                        ui.label(script_badge(variant).0);
-                    });
-                    row.col(|ui| {
-                        ui.label(fmt_int(s.han_total));
-                    });
-                    row.col(|ui| {
-                        ui.label(fmt_int(s.words_total));
-                    });
-                    row.col(|ui| {
-                        ui.label(fmt_int(s.words_unique));
-                    });
-                    match &s.known {
-                        Some(k) => {
-                            row.col(|ui| {
-                                ui.label(format!("{:.1}%", k.running_words))
-                                    .on_hover_text(format!("Known from {}", k.source));
-                            });
-                            row.col(|ui| {
-                                let off = style_off.get(e.id.as_str()).copied().unwrap_or(0.0);
-                                let counted = k.running_words - off;
-                                let d = Difficulty::from_percent(counted);
-                                let t = ui.label(RichText::new(d.label()).color(difficulty_color(d)));
-                                if off.abs() >= 0.05 {
-                                    t.on_hover_text(format!(
-                                        "{}\n{:.1}% known, {} {:.1} points for its writing style: counts as {counted:.1}%",
-                                        d.description(),
-                                        k.running_words,
-                                        if off > 0.0 { "less" } else { "plus" },
-                                        off.abs()
-                                    ));
-                                } else {
-                                    t.on_hover_text(d.description());
-                                }
-                            });
-                        }
-                        None => {
-                            row.col(|ui| {
-                                ui.label(dash()).on_hover_text(
-                                    "Nothing was marked known: Anki was off and no levels or word lists were ticked",
-                                );
-                            });
-                            row.col(|ui| {
-                                ui.label(dash());
-                            });
-                        }
-                    }
-                    if style_on {
-                        row.col(|ui| match style_scores.get(e.id.as_str()) {
-                            Some(&x) => {
-                                ui.label(format!("{} · {}", style_scale.pct(x), style::label(x)))
-                                    .on_hover_text(style_scale.hover(x));
-                            }
-                            None => {
-                                ui.label(dash()).on_hover_text(
-                                    style_skipped
-                                        .get(&e.id)
-                                        .map_or("Not rated yet", String::as_str),
-                                );
-                            }
-                        });
-                    }
-                    row.col(|ui| {
-                        let mins = minutes(s);
-                        ui.label(format!(
-                            "{}h {:02}m",
-                            (mins / 60.0) as u64,
-                            (mins % 60.0) as u64
-                        ));
-                    });
-                    row.col(|ui| {
-                        ui.label(history::age(e.analysed, now))
-                            .on_hover_text(history::date_time(e.analysed));
-                    });
-                    row.col(|ui| match read_at.get(&e.id) {
-                        Some(&t) => {
-                            if ui
-                                .button(RichText::new("✔").strong().color(palette::good()))
-                                .on_hover_text(format!(
-                                    "Marked read {} ({}). Click to change how many of its words count as known, or to unmark it.",
-                                    history::age(t, now),
-                                    history::date_time(t)
-                                ))
-                                .clicked()
-                            {
-                                mark_read = Some(e.id.clone());
-                            }
-                        }
-                        None => {
-                            let has_words = exists.get(&hist.profile(&e.id));
-                            if ui
-                                .add_enabled(has_words, egui::Button::new(RichText::new("✔").weak()))
-                                .on_hover_text("Mark read: count its most frequent words as known and take it off the reading path")
-                                .on_disabled_hover_text("No word data yet: open the book, or ⟳ Recalculate library")
-                                .clicked()
-                            {
-                                mark_read = Some(e.id.clone());
-                            }
-                        }
-                    });
-                    row.col(|ui| {
-                        // Apart from ✔, so as not to be hit instead of it.
-                        ui.add_space(6.0);
-                        if ui
-                            .small_button("✖")
-                            .on_hover_text(
-                                "Remove from the Library, with hanstat's copy of the book (the file you added it from is not touched); it can be put back for a few seconds",
-                            )
-                            .clicked()
-                        {
-                            remove = Some(e.id.clone());
-                        }
-                    });
-                });
-            });
-        if let Some(s) = sort {
-            self.history_sort = s;
-        }
-        if let Some(id) = mark_read {
-            self.open_read_dialog(&id);
-        }
-        if let Some(id) = remove {
-            self.remove_book(&id, ctx.input(|i| i.time));
-        }
-        if let Some(p) = open {
-            self.open(p, ctx);
-        }
-        if let Some((path, id, traditional)) = read {
-            match reader::Reader::open(&path, Some(&id), traditional, ctx) {
-                Ok(r) => self.reader = Some(r),
-                Err(e) => self.set_error("reader", e),
-            }
-        }
+        self.books_view(ui, ctx);
     }
 
     /// Copy the Library's books still read from elsewhere (added before it
@@ -6486,6 +6083,9 @@ impl App {
         if !self.history.entries.iter().any(|e| e.id == *id) {
             self.covers.remove(id);
             self.home_view.forget(id);
+            chapter_lengths::forget(id);
+            book_series::forget(id);
+            self.columns.forget(id);
             self.exists.set(self.history.profile(id), false);
         }
     }
@@ -6660,6 +6260,16 @@ impl App {
             let want = |id: &str| off.get(id).copied().unwrap_or(0.0);
             if lib.books.iter().any(|b| b.offset != want(&b.id)) {
                 Arc::make_mut(&mut lib).set_offsets(want);
+            }
+            // Series from the books' metadata, where they name one.
+            let meta: HashMap<&str, &hanstat::series::Meta> = inputs
+                .series
+                .iter()
+                .map(|(id, m)| (id.as_str(), m))
+                .collect();
+            let series = lib.series_with(|id| meta.get(id).map(|m| (*m).clone()));
+            if lib.series_differ(&series) {
+                Arc::make_mut(&mut lib).set_series(series);
             }
             // Where the reader is in each book started (learning while
             // reading): its EPUB file, the share of that file's text before
@@ -7514,6 +7124,12 @@ impl App {
             } else {
                 0
             },
+            series: {
+                let all = book_series::all();
+                have.iter()
+                    .filter_map(|id| Some((id.clone(), all.get(id)?.clone())))
+                    .collect()
+            },
         };
         if self.plan.inputs.as_ref() != Some(&inputs) {
             // While books are being analysed, only their word data changing:
@@ -7724,7 +7340,7 @@ impl App {
                 let b = &lib.books[path.steps[i].book];
                 query.is_empty()
                     || match by_id.get(b.id.as_str()) {
-                        Some(e) => book_matches(&query, &b.title, &e.path),
+                        Some(e) => book_matches(&query, &b.title, &e.path, std::iter::empty()),
                         None => query.matches([b.title.as_str()]),
                     }
             })

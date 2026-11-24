@@ -43,6 +43,10 @@ const NOT_ANALYSIS: &[&str] = &[
     "src/library_stats.rs",
     "src/library_reading.rs",
     "src/home.rs",
+    "src/chapter_lengths.rs",
+    "src/library_columns.rs",
+    "src/library_books.rs",
+    "src/book_series.rs",
     "src/png_report.rs",
     "src/raster.rs",
     "src/read_books.rs",
@@ -152,7 +156,26 @@ fn analysis_fingerprint() {
         "cargo:rustc-env=HANSTAT_COVERAGE_FINGERPRINT={:016x}",
         cov.0
     );
+
+    // `HANSTAT_READER_TEXT_FINGERPRINT`: how the reader counts a chapter's
+    // characters (its places are offsets in them). Chapter lengths saved by
+    // a build with another one are worked out again (`chapter_lengths.rs`).
+    let mut text = Fnv::new();
+    hash_files(&mut text, READER_TEXT_SOURCES);
+    println!(
+        "cargo:rustc-env=HANSTAT_READER_TEXT_FINGERPRINT={:016x}",
+        text.0
+    );
 }
+
+/// What `reader::tree::build` reads a chapter's text with.
+const READER_TEXT_SOURCES: &[&str] = &[
+    "src/reader/tree.rs",
+    "src/reader/markup.rs",
+    "src/reader/css.rs",
+    "src/reader/style.rs",
+    "src/reader/epub.rs",
+];
 
 /// Sources and data outside the analysis fingerprint that still change a
 /// Library row's counts or word data for the same book and settings.

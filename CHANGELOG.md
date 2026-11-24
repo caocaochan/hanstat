@@ -1,5 +1,19 @@
 # Changelog
 
+## [2026.11.24.08] - 2026-11-24
+
+### Added
+- **Choose the Library's columns.** **☷ Columns…** on Library › Books lets you reorder the columns (drag, or ▲▼), hide the default ones, and add more: Progress, Series, Unique characters, Words for 98%, Known unique words, Unknown words, Known unique characters, Time read, Reading speed, First read, Last read, Finished, Segmenter, Format and Sections. **Reset to default** puts them back.
+- **Your own columns.** Add columns of text, numbers, yes/no, a ★ rating or a date, and fill them in right in the table. A deleted column can be put back for a few seconds. The search box also finds books by your text columns, e.g. an Author column.
+- **Filter by any column.** Every column has a filter (⏷ funnel by its name): a range, a list to tick, dates, or text. Active filters show above the table and are kept when hanstat closes. **Hide read** is now the Read column's filter ("Not read"), and if it was on, it is set for you.
+- **Columns that don't fit go to further pages**, with ◀ ▶. The book, 📕 Read, ✔ and ✖ stay on every page.
+- **Progress column.** How far through each book you are in the reader (100% once finished or marked read).
+- **Series from the book's metadata.** EPUBs that name their series as calibre writes it (calibre:series, or EPUB 3 collections of type series) are grouped by that, with its volume number, on the reading path and in the Series column; other books still by their title.
+
+### Changed
+- **Each chapter's length is saved**, so Home shows how far you are without working it out again each time hanstat starts.
+- **The Library is analysed again once after this update** (a new component for the date picker); it happens in the background as after other updates.
+
 ## [2026.11.24.07] - 2026-11-24
 
 ### Fixed

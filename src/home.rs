@@ -4,7 +4,8 @@
 //! welcome page with a place to drop books instead.
 //!
 //! Its figures are the reader's ([`crate::reading_stats`]). How far through
-//! each book the reader is, and the large covers, are worked out on a
+//! each book the reader is (from the chapter lengths saved by
+//! [`crate::chapter_lengths`]), and the large covers, are worked out on a
 //! background thread the first time Home shows a book.
 
 use crate::library_reading::{calendar_shades, day_hover, day_level};
@@ -81,7 +82,7 @@ pub(crate) struct HomeView {
 struct BookInfo {
     /// Characters in each chapter, as the reader counts them (its places
     /// are offsets in these); `None`: not an EPUB the reader can open.
-    chapters: Option<Vec<usize>>,
+    chapters: Option<Arc<[usize]>>,
     /// The table of contents: spine index and label, in its order.
     toc: Vec<(usize, String)>,
     /// The large cover; `None`: there is none (the small one stands in).
@@ -91,7 +92,7 @@ struct BookInfo {
 /// A book's details, from the background thread.
 struct Found {
     id: String,
-    chapters: Option<Vec<usize>>,
+    chapters: Option<Arc<[usize]>>,
     toc: Vec<(usize, String)>,
     cover: Option<egui::ColorImage>,
 }
@@ -222,12 +223,7 @@ fn find(a: Ask) -> Found {
     if a.epub
         && let Ok(epub) = reader::epub::Epub::open(&a.path)
     {
-        chapters = Some(
-            epub.spine
-                .iter()
-                .map(|href| reader::chapter_text_len(&epub, href))
-                .collect(),
-        );
+        chapters = Some(crate::chapter_lengths::of_open(&a.id, &epub));
         toc = epub
             .toc
             .iter()
@@ -258,20 +254,6 @@ fn find(a: Ask) -> Found {
         toc,
         cover,
     }
-}
-
-/// How far through the book the place `at` is, 0..=1.
-fn through(chapters: &[usize], at: LeftAt) -> f32 {
-    let total: usize = chapters.iter().sum();
-    if total == 0 {
-        return 0.0;
-    }
-    let spine = (at.spine as usize).min(chapters.len());
-    let before: usize = chapters[..spine].iter().sum();
-    let here = chapters
-        .get(spine)
-        .map_or(0, |&n| (at.offset as usize).min(n));
-    ((before + here) as f32 / total as f32).clamp(0.0, 1.0)
 }
 
 /// The contents entry the chapter at `spine` comes under: the last entry
@@ -441,7 +423,7 @@ fn paint_cover(ui: &Ui, rect: Rect, tex: Option<&TextureHandle>, title: &str, id
 }
 
 /// A thin rounded bar `done` (0..=1) of the way.
-fn progress_bar(ui: &Ui, rect: Rect, done: f32) {
+pub(crate) fn progress_bar(ui: &Ui, rect: Rect, done: f32) {
     let c = palette::cat();
     let r = rect.height() / 2.0;
     ui.painter().rect_filled(rect, r, c.surface0);
@@ -616,7 +598,7 @@ impl App {
             }
             let at = b.at?;
             let info = books_info.get(&b.id)?.as_ref()?;
-            Some(through(info.chapters.as_ref()?, at))
+            Some(crate::chapter_lengths::through(info.chapters.as_ref()?, at))
         };
         let goal_edit = &mut view.goal_edit;
         egui::ScrollArea::vertical()
@@ -1535,23 +1517,6 @@ fn welcome(ui: &mut Ui, act: &mut Option<Act>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn through_counts_chapters_before_and_the_offset() {
-        let ch = [100, 300, 600];
-        let at = |spine, offset| LeftAt {
-            spine,
-            offset,
-            saved: 0,
-        };
-        assert_eq!(through(&ch, at(0, 0)), 0.0);
-        assert!((through(&ch, at(1, 150)) - 0.25).abs() < 1e-6);
-        assert_eq!(through(&ch, at(2, 600)), 1.0);
-        // A place past the end (the book changed) stays within the book.
-        assert_eq!(through(&ch, at(7, 5)), 1.0);
-        assert_eq!(through(&ch, at(1, 10_000)), 0.4);
-        assert_eq!(through(&[], at(0, 0)), 0.0);
-    }
 
     #[test]
     fn chapter_name_is_the_last_entry_at_or_before() {

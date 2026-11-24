@@ -1,6 +1,6 @@
 [package]
 name = "hanstat"
-version = "2026.1124.7"
+version = "2026.1124.8"
 edition = "2024"
 description = "Accurate character/word statistics for Chinese EPUB and TXT files"
 license = "MIT OR Apache-2.0"
@@ -27,11 +27,13 @@ chardetng = "1.0.0"
 cpal = "0.18.2"
 eframe = { version = "0.37.0", features = ["persistence"] }
 ego-tree = "0.11"
-egui_extras = "0.37.0"
+egui_extras = { version = "0.37.0", features = ["datepicker", "serde"] }
 encoding_rs = "0.8.44"
 flate2 = { version = "1.1.11", default-features = false, features = ["zlib-rs"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 jieba-rs = "0.11.0"
+# Library user columns of dates: the day type of egui_extras' date picker.
+jiff = { version = "0.2.46", default-features = false, features = ["std"] }
 libloading = "0.9.1"
 ltp = { version = "0.1.9", features = ["serialization", "near-char-type"] }
 memmap2 = "0.9"

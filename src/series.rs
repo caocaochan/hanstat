@@ -1,5 +1,6 @@
-//! Series and volume numbers read from book titles, so that the reading path
-//! keeps a series in order.
+//! Series and volume numbers read from book titles (or, for an EPUB that
+//! names its series in its metadata as calibre writes it, from there: [`of`]),
+//! so that the reading path keeps a series in order.
 //!
 //! A title is split into a **key** (the series: the title with its volume
 //! marker, bracketed tags, spaces and punctuation taken out, lowercased and
@@ -53,6 +54,202 @@ pub fn parse(title: &str) -> Volume {
         key: key_of(base),
         number: (!vols.is_empty()).then_some(vols),
     }
+}
+
+/// A book's series as its EPUB metadata gives it, the way calibre writes
+/// and reads it (`calibre/ebooks/metadata/opf3.py`, `read_series`):
+/// an EPUB 3 `belongs-to-collection` whose `collection-type` is `series`
+/// (its `group-position` the index), else the EPUB 2
+/// `calibre:series` / `calibre:series_index` metas.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Meta {
+    pub name: String,
+    /// 1 when missing or not a number, as calibre reads it.
+    pub index: f64,
+}
+
+/// The series in a package document's metadata, read as calibre reads it.
+pub fn from_opf(doc: &roxmltree::Document) -> Option<Meta> {
+    let metas: Vec<roxmltree::Node> = doc
+        .descendants()
+        .filter(|n| {
+            n.tag_name().name() == "meta"
+                && n.ancestors().any(|a| a.tag_name().name() == "metadata")
+        })
+        .collect();
+    let text = |n: &roxmltree::Node| n.text().unwrap_or("").trim().to_owned();
+    let refines = |id: &str, prop: &str| {
+        let want = format!("#{id}");
+        metas
+            .iter()
+            .find(|m| {
+                m.attribute("refines") == Some(want.as_str())
+                    && m.attribute("property") == Some(prop)
+            })
+            .map(&text)
+    };
+    // EPUB 3: the first collection of type `series` with a name.
+    for m in &metas {
+        if m.attribute("property") != Some("belongs-to-collection") {
+            continue;
+        }
+        let Some(id) = m.attribute("id") else {
+            continue;
+        };
+        let name = text(m);
+        if name.is_empty() || refines(id, "collection-type").as_deref() != Some("series") {
+            continue;
+        }
+        let index = refines(id, "group-position")
+            .and_then(|p| p.parse::<f64>().ok())
+            .filter(|x| x.is_finite())
+            .unwrap_or(1.0);
+        return Some(Meta { name, index });
+    }
+    // EPUB 2 (and calibre's older EPUB 3 output).
+    let named = |key: &'static str| {
+        metas
+            .iter()
+            .filter(move |m| m.attribute("name") == Some(key))
+            .filter_map(|m| m.attribute("content"))
+            .map(str::trim)
+            .collect::<Vec<_>>()
+    };
+    let name = named("calibre:series")
+        .into_iter()
+        .find(|c| !c.is_empty())?
+        .to_owned();
+    let index = named("calibre:series_index")
+        .into_iter()
+        .find_map(|c| c.parse::<f64>().ok().filter(|x| x.is_finite()))
+        .unwrap_or(1.0);
+    Some(Meta { name, index })
+}
+
+/// The series in the EPUB file `path`'s metadata (`None`: it names none).
+/// Reads only the ZIP directory, `container.xml` and the package document.
+pub fn read_epub(path: &std::path::Path) -> Result<Option<Meta>, String> {
+    use std::io::Read;
+    let f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut z = zip::ZipArchive::new(std::io::BufReader::new(f))
+        .map_err(|e| format!("{}: not an EPUB ({e})", path.display()))?;
+    let names: Vec<String> = z
+        .file_names()
+        .filter_map(|n| n.ok().map(|n| n.into_owned()))
+        .collect();
+    let mut read = |want: &str| -> Option<String> {
+        let real = names.iter().find(|n| n.eq_ignore_ascii_case(want))?.clone();
+        let mut entry = z.by_name(&real).ok()?;
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).ok()?;
+        Some(crate::extract::epub::decode_markup(&bytes).0)
+    };
+    let opts = || roxmltree::ParsingOptions {
+        allow_dtd: true,
+        ..Default::default()
+    };
+    let container = read("META-INF/container.xml").ok_or("no META-INF/container.xml")?;
+    let doc = roxmltree::Document::parse_with_options(&container, opts())
+        .map_err(|e| format!("container.xml: {e}"))?;
+    let opf_path = doc
+        .descendants()
+        .find(|n| n.tag_name().name() == "rootfile")
+        .and_then(|n| n.attribute("full-path"))
+        .ok_or("no rootfile in container.xml")?
+        .to_owned();
+    let opf = read(&opf_path).ok_or_else(|| format!("{opf_path} missing"))?;
+    let doc = roxmltree::Document::parse_with_options(&opf, opts())
+        .map_err(|e| format!("{opf_path}: {e}"))?;
+    Ok(from_opf(&doc))
+}
+
+/// The series and volume of a book: from its metadata when it names one
+/// (any volume marker in the title is then ignored), else from its title.
+/// With metadata a book always counts as numbered.
+pub fn of(title: &str, meta: Option<&Meta>) -> Volume {
+    match meta {
+        Some(m) => Volume {
+            key: key_of(&normalise(&m.name)),
+            number: Some(vec![meta_number(m.index)]),
+        },
+        None => parse(title),
+    }
+}
+
+/// A metadata index in tenths, within the numbered volumes.
+fn meta_number(index: f64) -> u32 {
+    (index * 10.0).round().clamp(0.0, (FINAL - 1) as f64) as u32
+}
+
+/// [`of`], with the series' name to show: the metadata's, or the title
+/// without its volume marker.
+pub fn named(title: &str, meta: Option<&Meta>) -> (Volume, String) {
+    if let Some(m) = meta {
+        return (of(title, meta), m.name.clone());
+    }
+    let n = normalise(title);
+    let t = n.trim_matches(is_sep);
+    let (base, vols) = parse_norm(t);
+    let v = Volume {
+        key: key_of(base),
+        number: (!vols.is_empty()).then_some(vols),
+    };
+    // `normalise` maps character to character unless lowercasing changes a
+    // length: then the original title's characters can be shown.
+    let start = n[..base.as_ptr() as usize - n.as_ptr() as usize]
+        .chars()
+        .count();
+    let len = base.chars().count();
+    let shown = if n.chars().count() == title.chars().count() {
+        title.chars().skip(start).take(len).collect::<String>()
+    } else {
+        base.to_owned()
+    };
+    let shown = shown
+        .trim_matches(|c: char| {
+            is_sep(c) || c == ':' || opening(c).is_some() || closing(c).is_some()
+        })
+        .to_owned();
+    (v, shown)
+}
+
+/// The series of each book: (series number, volume) for the books that
+/// share their series with another one, at least one of them numbered.
+/// Series are numbered in the order of their first book.
+pub fn group(vols: &[Volume]) -> Vec<Option<(u32, Vec<u32>)>> {
+    let mut groups: std::collections::HashMap<&str, Vec<usize>> = Default::default();
+    for (i, v) in vols.iter().enumerate() {
+        if !v.key.is_empty() {
+            groups.entry(v.key.as_str()).or_default().push(i);
+        }
+    }
+    let mut groups: Vec<Vec<usize>> = groups
+        .into_values()
+        .filter(|m| m.len() > 1 && m.iter().any(|&i| vols[i].number.is_some()))
+        .collect();
+    groups.sort_unstable();
+    let mut out = vec![None; vols.len()];
+    for (id, members) in groups.into_iter().enumerate() {
+        for i in members {
+            let n = vols[i].number.clone().unwrap_or_else(|| vec![UNNUMBERED]);
+            out[i] = Some((id as u32, n));
+        }
+    }
+    out
+}
+
+/// A volume as shown: `2`, `2.5`, `1·3` (part 3 of volume 1), `final`, `extra`.
+pub fn volume_label(number: &[u32]) -> String {
+    number
+        .iter()
+        .map(|&n| match n {
+            EXTRA => "extra".to_owned(),
+            FINAL => "final".to_owned(),
+            n if n % 10 == 0 => (n / 10).to_string(),
+            n => format!("{}.{}", n / 10, n % 10),
+        })
+        .collect::<Vec<_>>()
+        .join("·")
 }
 
 fn parse_norm(t: &str) -> (&str, Vec<u32>) {
@@ -657,6 +854,166 @@ mod tests {
         );
         assert_eq!(vol("Dune 2.5").1, Some(vec![2]));
         assert_eq!(parse("Dune 2.5").number, Some(vec![25]));
+    }
+
+    fn opf(meta: &str) -> Option<Meta> {
+        let xml = format!(
+            r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>X</dc:title>{meta}</metadata></package>"#
+        );
+        from_opf(&roxmltree::Document::parse(&xml).unwrap())
+    }
+
+    fn m(name: &str, index: f64) -> Option<Meta> {
+        Some(Meta {
+            name: name.into(),
+            index,
+        })
+    }
+
+    #[test]
+    fn metadata_epub3_collection() {
+        let e3 = r##"<meta property="belongs-to-collection" id="c01">三体</meta>
+            <meta refines="#c01" property="collection-type">series</meta>
+            <meta refines="#c01" property="group-position">2</meta>"##;
+        assert_eq!(opf(e3), m("三体", 2.0));
+    }
+
+    #[test]
+    fn metadata_epub2_calibre() {
+        let e2 = r#"<meta name="calibre:series" content="Dune"/><meta name="calibre:series_index" content="2.5"/>"#;
+        assert_eq!(opf(e2), m("Dune", 2.5));
+        // The index after the series (PocketBook order) and missing.
+        assert_eq!(
+            opf(
+                r#"<meta name="calibre:series_index" content="3"/><meta name="calibre:series" content="D"/>"#
+            ),
+            m("D", 3.0)
+        );
+        assert_eq!(
+            opf(r#"<meta name="calibre:series" content="D"/>"#),
+            m("D", 1.0)
+        );
+        assert_eq!(
+            opf(
+                r#"<meta name="calibre:series" content="D"/><meta name="calibre:series_index" content="x"/>"#
+            ),
+            m("D", 1.0)
+        );
+        assert_eq!(opf(r#"<meta name="calibre:series" content=" "/>"#), None);
+        assert_eq!(opf(""), None);
+    }
+
+    #[test]
+    fn metadata_epub3_wins_and_other_collections_are_not_series() {
+        let both = r##"<meta name="calibre:series" content="Old"/>
+            <meta property="belongs-to-collection" id="s">New</meta>
+            <meta refines="#s" property="collection-type">series</meta>"##;
+        assert_eq!(opf(both), m("New", 1.0));
+        let set = r##"<meta property="belongs-to-collection" id="s">Box</meta>
+            <meta refines="#s" property="collection-type">set</meta>
+            <meta name="calibre:series" content="Real"/>"##;
+        assert_eq!(opf(set), m("Real", 1.0));
+        let untyped = r##"<meta property="belongs-to-collection" id="s">Box</meta>"##;
+        assert_eq!(opf(untyped), None);
+    }
+
+    #[test]
+    fn metadata_wins_over_the_title_and_joins_title_series() {
+        let meta = Meta {
+            name: "三體".into(),
+            index: 2.5,
+        };
+        let v = of("黑暗森林 第九部", Some(&meta));
+        assert_eq!(v.number, Some(vec![25]));
+        assert_eq!(v.key, parse("三体2：黑暗森林").key);
+        assert_eq!(
+            of(
+                "x",
+                Some(&Meta {
+                    name: "S".into(),
+                    index: 0.0
+                })
+            )
+            .number,
+            Some(vec![0])
+        );
+        assert_eq!(
+            of(
+                "x",
+                Some(&Meta {
+                    name: "S".into(),
+                    index: -4.0
+                })
+            )
+            .number,
+            Some(vec![0])
+        );
+        // Two books in a metadata series group even with plain titles.
+        let s = Meta {
+            name: "Saga".into(),
+            index: 1.0,
+        };
+        let t = Meta {
+            name: "Saga".into(),
+            index: 2.0,
+        };
+        let g = group(&[
+            of("Alpha", Some(&s)),
+            of("Beta", Some(&t)),
+            of("Gamma", None),
+        ]);
+        assert_eq!(g[0], Some((0, vec![10])));
+        assert_eq!(g[1], Some((0, vec![20])));
+        assert_eq!(g[2], None);
+    }
+
+    #[test]
+    fn names_shown() {
+        assert_eq!(named("三体2：黑暗森林", None).1, "三体");
+        assert_eq!(named("Dune, Book 1", None).1, "Dune");
+        assert_eq!(named("SCI謎案集（第九部）", None).1, "SCI謎案集");
+        let meta = Meta {
+            name: "My Saga".into(),
+            index: 1.0,
+        };
+        assert_eq!(named("whatever", Some(&meta)).1, "My Saga");
+        assert_eq!(volume_label(&[20]), "2");
+        assert_eq!(volume_label(&[25]), "2.5");
+        assert_eq!(volume_label(&[10, 30]), "1·3");
+        assert_eq!(volume_label(&[EXTRA]), "extra");
+    }
+
+    /// Every EPUB under `HANSTAT_TEST_EPUBS` (a folder, searched
+    /// recursively) whose package document has series tags reads a series;
+    /// skipped without the folder.
+    #[test]
+    fn real_epubs_with_series_tags() {
+        let Some(dir) = std::env::var_os("HANSTAT_TEST_EPUBS") else {
+            return;
+        };
+        fn walk(d: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p
+                    .extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("epub"))
+                {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(std::path::Path::new(&dir), &mut files);
+        let mut tagged = 0;
+        for p in files {
+            let Ok(Some(m)) = read_epub(&p) else { continue };
+            tagged += 1;
+            assert!(!m.name.is_empty() && m.index >= 0.0, "{}", p.display());
+            eprintln!("{} → {} #{}", p.display(), m.name, m.index);
+        }
+        eprintln!("{tagged} with a series");
     }
 
     #[test]
