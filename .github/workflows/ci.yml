@@ -75,10 +75,16 @@ jobs:
       # is on PATH, and on the runner that run picked up lib.exe from an MSVC
       # version no longer installed (2026-11-24: cl.exe 14.52, lib.exe 14.51).
       # Without ninja, CMake uses the Visual Studio generator, which finds
-      # its own toolset.
+      # its own toolset. A libopus build directory restored from the cache
+      # that was configured for Ninja is removed: CMake won't switch an
+      # existing build directory to another generator.
       - name: Keep Ninja off PATH
         shell: pwsh
-        run: Get-Command ninja -All -ErrorAction SilentlyContinue | ForEach-Object { Remove-Item $_.Source -Force }
+        run: |
+          Get-Command ninja -All -ErrorAction SilentlyContinue | ForEach-Object { Remove-Item $_.Source -Force }
+          Get-ChildItem target -Recurse -Filter CMakeCache.txt -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match 'opusic-sys' -and (Select-String -Path $_.FullName -Pattern 'CMAKE_GENERATOR:INTERNAL=Ninja' -Quiet) } |
+            ForEach-Object { "Removing $($_.DirectoryName)"; Remove-Item $_.DirectoryName -Recurse -Force }
 
       - name: Cache segmentation models
         uses: actions/cache@v6
