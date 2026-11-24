@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.24.03] - 2026-11-24
+
+### Fixed
+- **Frequency ranks no longer squeeze the popup.** With several frequency lists, a rank that didn't fit at the end of the popup's first line was squashed into the space left, one letter per line, and made the header so tall that the definitions were pushed out of sight. A rank that doesn't fit now starts the next line.
+
 ## [2026.11.24.02] - 2026-11-24
 
 ### Added

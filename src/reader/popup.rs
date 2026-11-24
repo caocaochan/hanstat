@@ -1124,21 +1124,31 @@ fn header_text(
             } else {
                 format!("{name} {v}")
             };
-            egui::Frame::new()
-                .fill(mocha::SURFACE0)
-                .corner_radius(4.0)
-                .inner_margin(egui::Margin::symmetric(5, 1))
-                .show(ui, |ui| {
-                    ui.label(RichText::new(text).size(size * 0.68).color(TEAL));
-                })
-                .response
-                .on_hover_text(if b.folded {
-                    "The rank of the Simplified form: this list has none for the Traditional one"
-                } else {
-                    "Frequency rank"
-                });
+            freq_badge(ui, text, size).on_hover_text(if b.folded {
+                "The rank of the Simplified form: this list has none for the Traditional one"
+            } else {
+                "Frequency rank"
+            });
         }
     }
+}
+
+/// One frequency rank, laid out whole before it is placed. A badge that does
+/// not fit in what is left of the line goes to the next line; it only wraps
+/// inside when it is wider than a whole line. (An `egui::Frame` here took the
+/// rest of the line, however narrow, and its label wrapped a letter a line.)
+fn freq_badge(ui: &mut egui::Ui, text: String, size: f32) -> egui::Response {
+    let pad = vec2(5.0, 1.0);
+    let line = (ui.max_rect().width() - 2.0 * pad.x).max(size);
+    let font = egui::FontId::proportional(size * 0.68);
+    let galley = ui.fonts_mut(|f| f.layout(text, font, TEAL, line));
+    let (rect, resp) = ui.allocate_exact_size(galley.size() + 2.0 * pad, Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        p.rect_filled(rect, 4.0, mocha::SURFACE0);
+        p.galley(rect.min + pad, galley, TEAL);
+    }
+    resp
 }
 
 #[cfg(test)]
@@ -1159,5 +1169,80 @@ mod tests {
         assert_eq!(scan_text(&c, 99, 16), "");
         let c: Vec<char> = "yyds 666".chars().collect();
         assert_eq!(scan_text(&c, 0, 16), "yyds");
+    }
+
+    /// Five frequency lists on a long word: badges that do not fit go to the
+    /// next line whole (they used to wrap a letter a line in the leftover
+    /// width, and the header grew taller than the popup).
+    #[test]
+    fn freq_badges_wrap_whole() {
+        use hanstat::dict::lookup::{FreqBadge, Group};
+        let names = ["Danmei", "BLCUcoll", "BLCUlit", "SUBTLEX-CH", "Wordfreq"];
+        let dicts: Vec<DictInfo> = names
+            .iter()
+            .map(|n| DictInfo {
+                id: n.to_string(),
+                title: n.to_string(),
+                styles: String::new(),
+                has_terms: false,
+                has_freq: true,
+                dir: Default::default(),
+                collapsed: false,
+            })
+            .collect();
+        let g = Group {
+            headword: "神通广大".into(),
+            reading: "shéntōngguǎngdà".into(),
+            matched: 4,
+            folded: false,
+            freqs: (0..names.len())
+                .map(|i| FreqBadge {
+                    dict: i,
+                    values: vec![hanstat::dict::store::Freq {
+                        reading: String::new(),
+                        value: 26819,
+                        display: "26819".into(),
+                    }],
+                    folded: false,
+                })
+                .collect(),
+            parts: vec![],
+        };
+        let size = 18.0;
+        let ctx = egui::Context::default();
+        crate::install_fonts(&ctx);
+        let header = |width: f32, show_freq: bool| {
+            let mut row = Rect::NOTHING;
+            for _ in 0..2 {
+                let input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 1000.0))),
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(input, |ui| {
+                    row = ui
+                        .allocate_ui_with_layout(
+                            vec2(width, 20.0),
+                            egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+                            |ui| header_text(ui, &g, &dicts, size, show_freq),
+                        )
+                        .response
+                        .rect;
+                });
+                out.textures_delta.clear();
+            }
+            row
+        };
+        for width in [520.0_f32, 300.0, 200.0] {
+            let bare = header(width, false).height();
+            let row = header(width, true);
+            // At most one more line per list, each a badge high.
+            let most = bare + names.len() as f32 * (size * 0.68 * 1.4 + 8.0);
+            assert!(
+                row.height() <= most,
+                "width {width}: header {} tall, at most {most}",
+                row.height()
+            );
+            assert!(row.width() <= width + 0.5, "width {width}: {}", row.width());
+        }
     }
 }
