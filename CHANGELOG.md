@@ -5,9 +5,10 @@
 ### Fixed
 - **Large Anki collections open on Linux.** hanstat reads a private copy of the collection, and that copy went into the temp folder, which on many Linux systems (Fedora, Arch, Debian 13 and others) lives in RAM and holds at most half of it. A collection of several hundred MB could fail with "No space left on device" even with plenty of disk space. The copy now goes into hanstat's cache folder on disk (`~/.cache/hanstat/anki-copy` on Linux, hanstat's own folder on Windows and macOS).
 - **Clearer message when there isn't room for the copy.** hanstat checks the free space first and says how much the copy needs and how much is free. A copy that fails partway now says it could not be copied, instead of that the collection could not be read.
-- **Copies left behind are removed at start.** If hanstat closed unexpectedly, its copy of the collection stayed behind for up to a day and several could pile up. Now any copy no running hanstat is using is removed when hanstat starts, as are copies left in the temp folder by earlier versions.
+- **Copies left behind are removed.** If hanstat closed unexpectedly, its copy of the collection stayed behind for up to a day and several could pile up. Now copies no running hanstat is using are removed (all but the one kept for the collection you use), as are copies left in the temp folder by earlier versions.
 
 ### Changed
+- **The Anki collection is no longer copied in full each time.** hanstat keeps its copy between runs and, when the collection has changed, writes only the parts Anki changed; when it hasn't changed (no reviews since last time), the copy is used as it is. This uses as much disk space as the collection for as long as Anki statistics are on; turning them off removes the copy when hanstat next starts.
 - **Known-word shares in the Library are refreshed once** after this update, from the saved word data (no new analysis).
 
 ## [2026.11.24.08] - 2026-11-24

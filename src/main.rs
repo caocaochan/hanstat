@@ -1747,7 +1747,7 @@ impl App {
             // Clears copies left behind by earlier runs before making its own.
             self.anki_open(ctx);
         } else {
-            std::thread::spawn(|| anki::remove_stale_copies(&anki::copies_root()));
+            std::thread::spawn(|| anki::remove_stale_copies(&anki::copies_root(), None));
         }
     }
 

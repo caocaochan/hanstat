@@ -3,7 +3,9 @@
 //! The collection is never opened in place: Anki keeps it open with an
 //! exclusive lock while running, so `collection.anki2` (and its `-wal`, which
 //! holds changes not yet checkpointed) are copied to a private folder under
-//! [`copies_root`] and read from there. Nothing is ever written back.
+//! [`copies_root`] and read from there. Nothing is ever written back. The copy
+//! is kept between runs and brought up to date by writing only the blocks of
+//! the file Anki changed, or nothing when the collection hasn't changed.
 //!
 //! Classification follows Anki's own Card Counts definitions: a review card is
 //! *mature* when its interval is ≥ 21 days and *young* otherwise; learning and
@@ -394,18 +396,22 @@ impl SegConfig {
 
 /// A private copy of a collection, in its own folder under [`copies_root`].
 /// The folder's lock file stays locked for as long as the copy is in use, so
-/// another hanstat (or a later run) can tell a live copy from one left behind
-/// by a crash. The folder is deleted when the copy is dropped.
-struct TempCopy {
+/// another hanstat (or a later run) can tell a live copy from an idle or
+/// abandoned one. A kept copy stays on disk when dropped, to be brought up to
+/// date next time; any other copy is deleted.
+struct CopyGuard {
     dir: PathBuf,
     lock: Option<std::fs::File>,
+    keep: bool,
 }
 
-impl Drop for TempCopy {
+impl Drop for CopyGuard {
     fn drop(&mut self) {
         // Closed first: Windows cannot delete a folder holding an open file.
         drop(self.lock.take());
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if !self.keep {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -413,8 +419,9 @@ impl Drop for TempCopy {
 pub struct Collection {
     pub info: std::sync::Arc<CollectionInfo>,
     conn: Connection,
-    // Declared after `conn` so the database is closed before the folder is removed.
-    _tmp: TempCopy,
+    // Declared after `conn` so the database is closed before the folder is
+    // unlocked (and, for a temporary copy, removed).
+    _tmp: CopyGuard,
 }
 
 static COPY_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -428,6 +435,17 @@ pub fn copies_root() -> PathBuf {
 }
 
 const LOCK_FILE: &str = "lock";
+/// In a kept copy: what it was last brought up to date from.
+const SOURCE_FILE: &str = "source.txt";
+const DB_FILE: &str = "collection.anki2";
+/// Kept copies are `kept-<hash of the collection's path>`; every other
+/// folder is a temporary copy, `<process id>-<n>`.
+const KEPT_PREFIX: &str = "kept-";
+/// A kept copy is compared with the collection in blocks this large, and only
+/// blocks that differ are written.
+const BLOCK: usize = 1 << 20;
+/// Attempts at a copy that the collection didn't change in the middle of.
+const SYNC_TRIES: usize = 3;
 
 /// Headroom on top of the files themselves: SQLite's `-shm` and growth while
 /// the copied WAL is replayed.
@@ -456,23 +474,275 @@ fn human_bytes(n: u64) -> String {
     }
 }
 
-/// Copies `path` (and its `-wal`, if not empty) into a new locked folder under
-/// `root`, after clearing copies left behind there. Returns the copy's guard and
-/// the copied database.
-fn make_copy(path: &Path, root: &Path) -> Result<(TempCopy, PathBuf), String> {
-    let src_len = std::fs::metadata(path)
-        .map_err(|e| format!("Cannot read Anki collection {}: {e}", path.display()))?
-        .len();
-    let mut wal = path.as_os_str().to_owned();
-    wal.push("-wal");
-    let wal = PathBuf::from(wal);
-    let wal_len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+fn wal_of(db: &Path) -> PathBuf {
+    let mut s = db.as_os_str().to_owned();
+    s.push("-wal");
+    PathBuf::from(s)
+}
 
-    remove_stale_copies(root);
-    std::fs::create_dir_all(root).map_err(|e| format!("Cannot create {}: {e}", root.display()))?;
+fn shm_of(db: &Path) -> PathBuf {
+    let mut s = db.as_os_str().to_owned();
+    s.push("-shm");
+    PathBuf::from(s)
+}
+
+/// A file's size, modification time and first bytes (all zero for no
+/// file): what tells whether it changed since a kept copy was made. The first
+/// bytes catch a WAL that Anki restarted at the same size within the clock's
+/// resolution (its header's salts change each time).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Stamp {
+    len: u64,
+    mtime_ns: u128,
+    head: u64,
+}
+
+fn stamp(p: &Path) -> std::io::Result<Stamp> {
+    let m = match std::fs::metadata(p) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Stamp::default()),
+        Err(e) => return Err(e),
+    };
+    let mtime_ns = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    let mut head = [0u8; 32];
+    let n = match std::fs::File::open(p) {
+        Ok(mut f) => read_full(&mut f, &mut head)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Stamp::default()),
+        Err(e) => return Err(e),
+    };
+    Ok(Stamp {
+        len: m.len(),
+        mtime_ns,
+        head: crate::dict::xxh64::xxh64(&head[..n], 0),
+    })
+}
+
+/// What [`SOURCE_FILE`] holds for a copy of `path` made at these stamps.
+fn source_record(path: &Path, db: Stamp, wal: Stamp) -> String {
+    format!(
+        "{}\n{} {} {:016x}\n{} {} {:016x}\n",
+        path.display(),
+        db.len,
+        db.mtime_ns,
+        db.head,
+        wal.len,
+        wal.mtime_ns,
+        wal.head
+    )
+}
+
+/// The kept copy's folder for the collection at `path`.
+fn kept_dir(root: &Path, path: &Path) -> PathBuf {
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    root.join(format!(
+        "{KEPT_PREFIX}{:016x}",
+        crate::dict::xxh64::xxh64(key.as_os_str().as_encoded_bytes(), 0)
+    ))
+}
+
+/// How a copy came about, for the tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CopyReport {
+    /// The kept copy (false: a temporary one, as the kept one was in use).
+    kept: bool,
+    /// Nothing had changed since the kept copy was last brought up to date.
+    unchanged: bool,
+    /// Bytes of the database written.
+    written: u64,
+}
+
+enum Side {
+    Source,
+    Copy,
+}
+
+/// Fills `buf` from `r` as far as the file goes; the number of bytes read.
+fn read_full(r: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match r.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(n)
+}
+
+/// Makes `dst` the same as `src`, writing only the [`BLOCK`]s that differ.
+/// Returns the bytes written.
+fn delta_copy(src: &Path, dst: &Path) -> Result<u64, (Side, std::io::Error)> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut s = std::fs::File::open(src).map_err(|e| (Side::Source, e))?;
+    let mut d = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dst)
+        .map_err(|e| (Side::Copy, e))?;
+    let mut a = vec![0u8; BLOCK];
+    let mut b = vec![0u8; BLOCK];
+    let (mut pos, mut written) = (0u64, 0u64);
+    loop {
+        let n = read_full(&mut s, &mut a).map_err(|e| (Side::Source, e))?;
+        if n == 0 {
+            break;
+        }
+        let same = d
+            .seek(SeekFrom::Start(pos))
+            .and_then(|_| read_full(&mut d, &mut b[..n]))
+            .map_err(|e| (Side::Copy, e))?
+            == n
+            && a[..n] == b[..n];
+        if !same {
+            d.seek(SeekFrom::Start(pos))
+                .and_then(|_| d.write_all(&a[..n]))
+                .map_err(|e| (Side::Copy, e))?;
+            written += n as u64;
+        }
+        pos += n as u64;
+        if n < BLOCK {
+            break;
+        }
+    }
+    d.set_len(pos).map_err(|e| (Side::Copy, e))?;
+    Ok(written)
+}
+
+/// Brings the copy in `dir` up to date with the collection at `path` (and its
+/// `-wal`): nothing at all when [`SOURCE_FILE`] says it already is, else only
+/// the blocks that differ, so an empty `dir` gets a full copy.
+fn sync_copy(path: &Path, dir: &Path) -> Result<CopyReport, String> {
+    let read_err =
+        |p: &Path, e: std::io::Error| format!("Cannot read Anki collection {}: {e}", p.display());
+    let wal = wal_of(path);
+    let db = dir.join(DB_FILE);
+    let record = dir.join(SOURCE_FILE);
+    let stamps = || -> Result<(Stamp, Stamp), String> {
+        Ok((
+            stamp(path).map_err(|e| read_err(path, e))?,
+            stamp(&wal).map_err(|e| read_err(&wal, e))?,
+        ))
+    };
+    let (mut s_db, mut s_wal) = stamps()?;
+    if s_db.len == 0 {
+        return Err(read_err(path, std::io::ErrorKind::NotFound.into()));
+    }
+    // A -shm from the last reader is never reused: SQLite builds it again.
+    let _ = std::fs::remove_file(shm_of(&db));
+    if db.exists()
+        && std::fs::read_to_string(&record).is_ok_and(|r| r == source_record(path, s_db, s_wal))
+    {
+        return Ok(CopyReport {
+            kept: true,
+            unchanged: true,
+            written: 0,
+        });
+    }
+    // Gone until the copy is whole again, so a copy cut short is never taken
+    // for an up-to-date one.
+    let _ = std::fs::remove_file(&record);
+
+    let have = std::fs::metadata(&db).map_or(0, |m| m.len());
     // The WAL is counted twice: once copied, once replayed into the database.
-    let need = src_len + 2 * wal_len + COPY_SLACK;
-    check_space(need, crate::dict::manage::free_space(root), root)?;
+    let need = s_db.len.saturating_sub(have) + 2 * s_wal.len + COPY_SLACK;
+    check_space(need, crate::dict::manage::free_space(dir), dir)?;
+    let copy_err = |what: &Path, e: std::io::Error| {
+        let mut msg = format!("Cannot copy {} into {}: {e}", what.display(), dir.display());
+        if e.kind() == std::io::ErrorKind::StorageFull {
+            msg.push_str(&format!(
+                " (needs about {}; free up space there or set XDG_CACHE_HOME to a folder on a larger disk)",
+                human_bytes(need)
+            ));
+        }
+        msg
+    };
+
+    let mut written = 0;
+    for attempt in 1..=SYNC_TRIES {
+        written += delta_copy(path, &db).map_err(|(side, e)| match side {
+            Side::Source => read_err(path, e),
+            Side::Copy => copy_err(path, e),
+        })?;
+        let dst_wal = wal_of(&db);
+        let _ = std::fs::remove_file(&dst_wal);
+        if s_wal.len > 0 {
+            std::fs::copy(&wal, &dst_wal).map_err(|e| copy_err(&wal, e))?;
+        }
+        let (now_db, now_wal) = stamps()?;
+        if (now_db, now_wal) == (s_db, s_wal) {
+            std::fs::write(&record, source_record(path, s_db, s_wal))
+                .map_err(|e| copy_err(path, e))?;
+            break;
+        }
+        // Anki wrote to the collection while it was being copied: once more,
+        // which only writes what changed. After the last try the copy is used
+        // as it is (as hanstat always did) but not recorded as up to date.
+        if attempt == SYNC_TRIES {
+            break;
+        }
+        (s_db, s_wal) = (now_db, now_wal);
+    }
+    Ok(CopyReport {
+        kept: true,
+        unchanged: false,
+        written,
+    })
+}
+
+/// Locks the kept copy's folder for this process; `None` if another copy of
+/// hanstat is using it.
+fn take_kept(dir: &Path) -> Result<Option<std::fs::File>, String> {
+    // Twice, in case another hanstat clearing stale copies removed the folder
+    // between creating it and locking it.
+    for _ in 0..2 {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
+        let lock_path = dir.join(LOCK_FILE);
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| format!("Cannot create {}: {e}", lock_path.display()))?;
+        match f.try_lock() {
+            Ok(()) if lock_path.exists() => return Ok(Some(f)),
+            Ok(()) => continue,
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(format!("Cannot lock {}: {e}", lock_path.display()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// A private, locked copy of the collection at `path` under `root`: the kept
+/// copy, brought up to date, or, while another hanstat is using that, a
+/// temporary full copy. Copies no running hanstat is using are cleared first.
+fn make_copy(path: &Path, root: &Path) -> Result<(CopyGuard, PathBuf, CopyReport), String> {
+    std::fs::metadata(path)
+        .map_err(|e| format!("Cannot read Anki collection {}: {e}", path.display()))?;
+    remove_stale_copies(root, Some(path));
+    std::fs::create_dir_all(root).map_err(|e| format!("Cannot create {}: {e}", root.display()))?;
+
+    let kept = kept_dir(root, path);
+    if let Some(lock) = take_kept(&kept)? {
+        let guard = CopyGuard {
+            dir: kept.clone(),
+            lock: Some(lock),
+            keep: true,
+        };
+        let report = sync_copy(path, &kept)?;
+        return Ok((guard, kept.join(DB_FILE), report));
+    }
 
     let dir = root.join(format!(
         "{}-{}",
@@ -482,36 +752,25 @@ fn make_copy(path: &Path, root: &Path) -> Result<(TempCopy, PathBuf), String> {
     // A folder left by an earlier process with the same id is stale.
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir(&dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
-    let mut guard = TempCopy {
+    let mut guard = CopyGuard {
         dir: dir.clone(),
         lock: None,
+        keep: false,
     };
     let lock = std::fs::File::create(dir.join(LOCK_FILE))
         .map_err(|e| format!("Cannot create {}: {e}", dir.join(LOCK_FILE).display()))?;
     lock.lock()
         .map_err(|e| format!("Cannot lock {}: {e}", dir.join(LOCK_FILE).display()))?;
     guard.lock = Some(lock);
-
-    let copy_err = |what: &Path, e: std::io::Error| {
-        let mut msg = format!(
-            "Cannot copy {} into {}: {e}",
-            what.display(),
-            dir.display()
-        );
-        if e.kind() == std::io::ErrorKind::StorageFull {
-            msg.push_str(&format!(
-                " (needs about {}; free up space there or set XDG_CACHE_HOME to a folder on a larger disk)",
-                human_bytes(need)
-            ));
-        }
-        msg
-    };
-    let db = dir.join("collection.anki2");
-    std::fs::copy(path, &db).map_err(|e| copy_err(path, e))?;
-    if wal_len > 0 {
-        std::fs::copy(&wal, dir.join("collection.anki2-wal")).map_err(|e| copy_err(&wal, e))?;
-    }
-    Ok((guard, db))
+    let report = sync_copy(path, &dir)?;
+    Ok((
+        guard,
+        dir.join(DB_FILE),
+        CopyReport {
+            kept: false,
+            ..report
+        },
+    ))
 }
 
 fn sql_err(e: rusqlite::Error) -> String {
@@ -525,11 +784,19 @@ impl Collection {
 
     /// [`Collection::open`], with the private copy made under `root`.
     fn open_in(path: &Path, root: &Path) -> Result<Collection, String> {
-        let (guard, db) = make_copy(path, root)?;
+        let (guard, db, _) = make_copy(path, root)?;
         // Read-write only so SQLite can replay the copied WAL into its own index.
         let conn = Connection::open_with_flags(
             &db,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(sql_err)?;
+        // Closing must not fold the copied WAL into the database: the kept
+        // copy's database then stays byte for byte Anki's, and the next update
+        // writes only what Anki changed.
+        conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
         )
         .map_err(sql_err)?;
         // Anki's name columns use a custom collation; register an equivalent.
@@ -878,14 +1145,17 @@ fn all_deck_ids(conn: &Connection) -> Result<Vec<(i64, String)>, String> {
 
 /// Copies left behind by a crashed run, older than a day.
 /// Deletes private copies no running hanstat is using: under `root`, every
-/// folder whose lock file can be locked (its owner has exited or crashed),
-/// however old; and every copy from before 2026.11.25, which went into the temp
-/// folder as `hanstat-anki-*` with no lock file.
-pub fn remove_stale_copies(root: &Path) {
+/// temporary copy whose lock file can be locked (its owner has exited or
+/// crashed), however old, and every kept copy not in use except the one for
+/// `keep` (so with `None`, all of them: Anki statistics are off); and every
+/// copy from before 2026.11.25, which went into the temp folder as
+/// `hanstat-anki-*` with no lock file.
+pub fn remove_stale_copies(root: &Path, keep: Option<&Path>) {
+    let keep = keep.map(|p| kept_dir(root, p));
     if let Ok(rd) = std::fs::read_dir(root) {
         for e in rd.flatten() {
             let dir = e.path();
-            if !dir.is_dir() {
+            if !dir.is_dir() || keep.as_ref() == Some(&dir) {
                 continue;
             }
             let lock = dir.join(LOCK_FILE);
@@ -1553,42 +1823,164 @@ mod tests {
         assert!(check_space(900 << 20, None, dir).is_ok());
         assert!(check_space(900 << 20, Some(1 << 30), dir).is_ok());
         let e = check_space(900 << 20, Some(300 << 20), dir).unwrap_err();
-        assert!(e.contains("needs 900 MB") && e.contains("only 300 MB free"), "{e}");
+        assert!(
+            e.contains("needs 900 MB") && e.contains("only 300 MB free"),
+            "{e}"
+        );
+    }
+
+    /// Writes `bytes` to `p` and moves its modified time on, so a change is
+    /// seen even within the clock's resolution.
+    fn write_at(p: &Path, bytes: &[u8], secs: u64) {
+        std::fs::write(p, bytes).unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+        f.set_modified(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + secs),
+        )
+        .unwrap();
+    }
+
+    /// 3.5 blocks of bytes that differ from block to block.
+    fn sample_db() -> Vec<u8> {
+        (0..BLOCK * 7 / 2)
+            .map(|i| (i % 251) as u8 ^ (i / BLOCK) as u8)
+            .collect()
     }
 
     #[test]
-    fn copies_are_locked_and_stale_ones_cleared() {
-        let base = copy_root("live");
+    fn kept_copy_writes_only_what_changed() {
+        let base = copy_root("kept");
         let src = base.join("collection.anki2");
-        std::fs::write(&src, b"db").unwrap();
-        std::fs::write(base.join("collection.anki2-wal"), b"wal").unwrap();
+        let src_wal = wal_of(&src);
+        let mut bytes = sample_db();
+        write_at(&src, &bytes, 1);
+        write_at(&src_wal, b"wal one", 1);
+        let root = base.join("copies");
+
+        let (g, db, r) = make_copy(&src, &root).unwrap();
+        assert_eq!(
+            r,
+            CopyReport {
+                kept: true,
+                unchanged: false,
+                written: bytes.len() as u64
+            }
+        );
+        assert_eq!(std::fs::read(&db).unwrap(), bytes);
+        assert_eq!(std::fs::read(wal_of(&db)).unwrap(), b"wal one");
+        let dir = g.dir.clone();
+        drop(g);
+        assert!(dir.exists(), "a kept copy stays when dropped");
+
+        // Nothing changed: nothing is read or written.
+        let (g, _, r) = make_copy(&src, &root).unwrap();
+        assert_eq!(
+            r,
+            CopyReport {
+                kept: true,
+                unchanged: true,
+                written: 0
+            }
+        );
+        drop(g);
+
+        // One byte in the third block and the WAL: one block written.
+        bytes[2 * BLOCK + 5] ^= 0xff;
+        write_at(&src, &bytes, 2);
+        write_at(&src_wal, b"wal two!", 2);
+        let (g, db, r) = make_copy(&src, &root).unwrap();
+        assert_eq!(
+            r,
+            CopyReport {
+                kept: true,
+                unchanged: false,
+                written: BLOCK as u64
+            }
+        );
+        assert_eq!(std::fs::read(&db).unwrap(), bytes);
+        assert_eq!(std::fs::read(wal_of(&db)).unwrap(), b"wal two!");
+        drop(g);
+
+        // Shorter (Anki's Check Database), and the WAL checkpointed away.
+        bytes.truncate(BLOCK + 10);
+        write_at(&src, &bytes, 3);
+        std::fs::remove_file(&src_wal).unwrap();
+        let (g, db, r) = make_copy(&src, &root).unwrap();
+        assert_eq!(r.written, 0, "the first blocks were already the same");
+        assert_eq!(std::fs::read(&db).unwrap(), bytes);
+        assert!(!wal_of(&db).exists());
+        drop(g);
+
+        // A copy cut short (no record) is compared again, not trusted.
+        std::fs::remove_file(dir.join(SOURCE_FILE)).unwrap();
+        std::fs::write(&db, b"half").unwrap();
+        let (_g, db, r) = make_copy(&src, &root).unwrap();
+        assert!(!r.unchanged);
+        assert_eq!(std::fs::read(&db).unwrap(), bytes);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn kept_copy_in_use_gives_a_temporary_one() {
+        let base = copy_root("busy");
+        let src = base.join("collection.anki2");
+        write_at(&src, b"db", 1);
+        let root = base.join("copies");
+
+        let (kept, _, r) = make_copy(&src, &root).unwrap();
+        assert!(r.kept);
+        // As on Reload while a job still holds the first copy.
+        let (temp, db, r) = make_copy(&src, &root).unwrap();
+        assert!(!r.kept);
+        assert_eq!(std::fs::read(&db).unwrap(), b"db");
+        assert!(
+            kept.dir.exists(),
+            "clearing stale copies left the one in use"
+        );
+        let temp_dir = temp.dir.clone();
+        drop(temp);
+        assert!(!temp_dir.exists());
+        let kept_dir = kept.dir.clone();
+        drop(kept);
+        assert!(kept_dir.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn stale_copies_cleared() {
+        let base = copy_root("stale");
+        let src = base.join("collection.anki2");
+        write_at(&src, b"db", 1);
         let root = base.join("copies");
 
         // Left behind by a crash: a lock file nobody holds.
         let crashed = root.join("1-0");
         std::fs::create_dir_all(&crashed).unwrap();
         std::fs::write(crashed.join(LOCK_FILE), b"").unwrap();
-        std::fs::write(crashed.join("collection.anki2"), b"old").unwrap();
         // Being set up by another process: no lock file yet, just made.
         let starting = root.join("2-0");
         std::fs::create_dir_all(&starting).unwrap();
+        // Another collection's kept copy, not in use.
+        let other = root.join(format!("{KEPT_PREFIX}0000000000000001"));
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join(LOCK_FILE), b"").unwrap();
 
-        let (live, db) = make_copy(&src, &root).unwrap();
-        assert!(!crashed.exists(), "an unlocked copy is stale whatever its age");
+        let (g, _, _) = make_copy(&src, &root).unwrap();
+        assert!(
+            !crashed.exists(),
+            "an unlocked copy is stale whatever its age"
+        );
         assert!(starting.exists(), "a folder being set up is left alone");
-        assert_eq!(std::fs::read(&db).unwrap(), b"db");
-        assert_eq!(std::fs::read(db.with_file_name("collection.anki2-wal")).unwrap(), b"wal");
+        assert!(!other.exists(), "only the open collection's copy is kept");
+        let kept = g.dir.clone();
 
-        // A second copy (as on Reload while a job still holds the first)
-        // must not clear the first.
-        let (second, _) = make_copy(&src, &root).unwrap();
-        assert!(live.dir.exists());
-        let first_dir = live.dir.clone();
-        drop(live);
-        assert!(!first_dir.exists());
-        let second_dir = second.dir.clone();
-        drop(second);
-        assert!(!second_dir.exists());
+        // In use: kept even when no collection is to be kept.
+        remove_stale_copies(&root, None);
+        assert!(kept.exists());
+        drop(g);
+        // Statistics off: idle kept copies go.
+        remove_stale_copies(&root, None);
+        assert!(!kept.exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 
