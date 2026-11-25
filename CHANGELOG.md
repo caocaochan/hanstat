@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.25.09] - 2026-11-25
+
+### Fixed
+- **Series are recognised in more titles, in the right order.** In the Reading path, “Thirty-Six Stratagems 1: …” to “6: …” are now one series in volume order (before, the “Six” of the name was taken as volume 6 for all of them, so they could be read in any order). “Journey to the West 3: Havoc in Heaven (Part 1)” and “Three Kingdoms 7: The Battle of Red Cliffs (Part One)” now join their series as parts of volume 3 and 7. A **Prologue** (also 序章, 楔子, 前传) comes before volume 1, and an **Epilogue** (also 尾声) after the volume it follows (“Three Kingdoms 3 Epilogue” between 3 and 4). A number word in a subtitle (“I’m a Cat 4: Three Cakes”) is no longer taken as a part.
+
 ## [2026.11.25.08] - 2026-11-25
 
 ### Added
