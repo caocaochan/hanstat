@@ -1427,6 +1427,20 @@ fn popup_themes() {
         }
     }
     assert_eq!(r.dict.levels.len(), 2, "a child popup");
+    // The Anki buttons stay clear of the scroll bar, even hovered (at its
+    // widest), in both popups.
+    let scroll = d.ctx.style_of(d.ctx.theme()).spacing.scroll;
+    for (level, l) in r.dict.levels.iter().enumerate() {
+        let (buttons, entries) = &l.drawn;
+        assert!(!buttons.is_empty(), "popup {level} has Anki buttons");
+        let bar_left = entries.right() - scroll.bar_width;
+        for b in buttons {
+            assert!(
+                b.right() + scroll.bar_inner_margin <= bar_left + 0.5,
+                "popup {level}: a button at {b:?} reaches the scroll bar (from x {bar_left})"
+            );
+        }
+    }
     assert_eq!(r.dict.levels[1].result.text, "日月");
     let held = d.ctx.input(|i| i.pointer.hover_pos()).unwrap();
     let mut themes = vec![

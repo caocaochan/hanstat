@@ -129,6 +129,10 @@ pub struct Level {
     fresh: bool,
     /// How far its entries are scrolled.
     pub scroll_y: f32,
+    /// Where its Anki buttons and its entries' scroll area (the bar at its
+    /// right) were drawn.
+    #[cfg(test)]
+    pub drawn: (Vec<Rect>, Rect),
 }
 
 impl Level {
@@ -439,6 +443,8 @@ impl Popup {
                     raised: false,
                     fresh: true,
                     scroll_y: 0.0,
+                    #[cfg(test)]
+                    drawn: (Vec::new(), Rect::NOTHING),
                 });
             }
         }
@@ -720,9 +726,13 @@ impl Popup {
         };
         let pivot = egui::Align2::LEFT_TOP;
         let inner_w = width - 24.0;
+        // The entries leave the scroll bar room at their right: it floats
+        // over them (as wide as `bar_width` when hovered).
+        let bar = ctx.style_of(ctx.theme()).spacing.scroll;
+        let content_w = inner_w - bar.bar_width - bar.bar_inner_margin;
         let mut entry_params = params.clone();
         entry_params.base = size;
-        entry_params.content_w = inner_w;
+        entry_params.content_w = content_w;
         entry_params.page_h = 1.0e6;
         entry_params.line_spacing = 1.2;
         // Sans-serif throughout, whatever family a dictionary names.
@@ -767,6 +777,8 @@ impl Popup {
         let ppp = ctx.pixels_per_point();
         let fresh = self.levels[level].fresh;
         let mut scroll_y = 0.0;
+        #[cfg(test)]
+        let mut drawn = (Vec::new(), Rect::NOTHING);
         let renderer = &mut self.renderer;
         let lvl = &self.levels[level];
         let area = egui::Area::new(popup_id(level))
@@ -801,9 +813,11 @@ impl Popup {
                         if fresh {
                             scroll_area = scroll_area.vertical_scroll_offset(0.0);
                         }
-                        scroll_area.show(ui, |ui| {
+                        let _shown = scroll_area.show(ui, |ui| {
                             scroll_y = (ui.clip_rect().top() - ui.cursor().top()).max(0.0);
                             ui.spacing_mut().item_spacing.y = 4.0;
+                            // Headers (their Anki buttons) and rules too.
+                            ui.set_max_width(content_w);
                             if scroll != 0 {
                                 ui.scroll_with_delta(vec2(0.0, -(scroll as f32) * size * 3.0));
                             }
@@ -819,11 +833,13 @@ impl Popup {
                                         CardButton::Setup
                                     }
                                 });
-                                if let Some(c) =
-                                    header(ui, gi, g, &dicts, size, show_freq, card, look)
-                                {
-                                    card_click = Some(c);
+                                let (click, _button) =
+                                    header(ui, gi, g, &dicts, size, show_freq, card, look);
+                                if click.is_some() {
+                                    card_click = click;
                                 }
+                                #[cfg(test)]
+                                drawn.0.extend(_button);
                                 for (pi, p) in g.parts.iter().enumerate() {
                                     let Some(dict) = dicts.get(p.dict) else {
                                         continue;
@@ -864,9 +880,9 @@ impl Popup {
                                     let clip = ui.clip_rect();
                                     if ui.cursor().top() > clip.bottom() + max_h {
                                         let h = lvl.heights.get(&(gi, pi)).copied().unwrap_or_else(
-                                            || estimate(&p.glossaries, inner_w, size),
+                                            || estimate(&p.glossaries, content_w, size),
                                         );
-                                        ui.allocate_exact_size(vec2(inner_w, h), Sense::hover());
+                                        ui.allocate_exact_size(vec2(content_w, h), Sense::hover());
                                         continue;
                                     }
                                     let empty = HashSet::new();
@@ -880,7 +896,7 @@ impl Popup {
                                     );
                                     heights.push(((gi, pi), e.height));
                                     let (rect, _) = ui.allocate_exact_size(
-                                        vec2(inner_w, e.height.max(1.0)),
+                                        vec2(content_w, e.height.max(1.0)),
                                         Sense::hover(),
                                     );
                                     if !ui.is_rect_visible(rect) {
@@ -955,6 +971,10 @@ impl Popup {
                                 }
                             }
                         });
+                        #[cfg(test)]
+                        {
+                            drawn.1 = _shown.inner_rect;
+                        }
                     });
                 // The grip in the corner away from the word: dragging it
                 // resizes every popup (down and right, or up and right).
@@ -1021,6 +1041,10 @@ impl Popup {
         l.fresh = false;
         l.scroll_y = scroll_y;
         l.rect = Some(area.response.rect);
+        #[cfg(test)]
+        {
+            l.drawn = drawn;
+        }
         l.heights.extend(heights);
         if let Some(b) = toggle_bar
             && !l.bars.remove(&b)
@@ -1055,7 +1079,7 @@ fn estimate(gl: &[hanstat::dict::lookup::Gloss], width: f32, size: f32) -> f32 {
 }
 
 /// A group's headword, reading and frequency ranks, and its Anki button at
-/// the right.
+/// the right (a click on it, and where it is).
 #[allow(clippy::too_many_arguments)]
 fn header(
     ui: &mut egui::Ui,
@@ -1066,7 +1090,7 @@ fn header(
     show_freq: bool,
     card: Option<CardButton>,
     look: &Look,
-) -> Option<CardClick> {
+) -> (Option<CardClick>, Option<Rect>) {
     let top = ui.cursor().min;
     let full = ui.available_width();
     let side = (size * 1.45).round();
@@ -1076,14 +1100,16 @@ fn header(
         egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
         |ui| header_text(ui, g, dicts, size, show_freq, look),
     );
-    let card = card?;
+    let Some(card) = card else {
+        return (None, None);
+    };
     // Beside the headword, on the first line.
     let line = row.response.rect.height().min(size * 1.55 * 1.4);
     let rect = Rect::from_min_size(
         pos2(top.x + full - side, top.y + ((line - side) / 2.0).max(0.0)),
         vec2(side, side),
     );
-    card_button(ui, rect, gi, card, look)
+    (card_button(ui, rect, gi, card, look), Some(rect))
 }
 
 /// An entry's Anki button: + to add (greyed out when the word is already in
