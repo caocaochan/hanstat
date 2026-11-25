@@ -5,7 +5,7 @@
 use super::layout::ChapterLayout;
 use super::theme::Theme;
 use super::tracker::{Frame, Pause, Place, State};
-use super::{Geometry, Reader, tts};
+use super::{Geometry, Reader, goal_sound, tts};
 use crate::fmt_int;
 use crate::reading_stats::{self as rs, BookStats, Day, Goal, Summary};
 use eframe::egui::{self, FontId, Rect, RichText, pos2};
@@ -39,6 +39,8 @@ pub(super) struct Cache {
     goal_seen: Option<(GoalKey, bool)>,
     /// When the goal-met glow started ([`rs::now`]).
     pub(super) glow_since: Option<f64>,
+    /// The goal-met sound being made, and the voices for it.
+    pub(super) sound: goal_sound::State,
 }
 
 /// What a goal's "met" is about: the day, the goal, whether listening counts.
@@ -46,55 +48,6 @@ type GoalKey = (i32, Option<Goal>, bool);
 
 /// How long the goal-met glow lasts, in seconds.
 pub(super) const GLOW_SECS: f64 = 5.0;
-
-/// What the goal-met sound says: `assets/goal-met.opus`, read by the
-/// designed local voice Citrus (made by the ignored test
-/// `goal_cheer_takes`).
-pub(super) const CHEER_TEXT: &str = "宝贝！你好厉害哦！你完成今天的目标啦！";
-
-/// The goal-met sound: Ogg Opus, 24 kHz mono, about 4 s.
-const CHEER: &[u8] = include_bytes!("../../assets/goal-met.opus");
-
-/// How long read aloud pauses for the goal-met sound: the sound, and a
-/// little for the device to open.
-fn cheer_pause() -> f64 {
-    static SECS: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
-        tts::opus::decode(CHEER.to_vec()).map_or(4.0, |(pcm, rate)| pcm.len() as f64 / rate as f64)
-    });
-    *SECS + 0.4
-}
-
-/// Goal-met sounds played (tests play none).
-#[cfg(test)]
-pub(super) static CHEERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(test)]
-fn play_cheer() {
-    CHEERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Play the goal-met sound on its own output, beside read aloud if that is
-/// playing, off the UI thread. Without a sound device it stays silent.
-#[cfg(not(test))]
-fn play_cheer() {
-    let _ = std::thread::Builder::new()
-        .name("goal-met-sound".into())
-        .spawn(|| {
-            let Ok((pcm, rate)) = tts::opus::decode(CHEER.to_vec()) else {
-                return;
-            };
-            let Ok(out) = tts::audio::Output::open(Arc::new(|| {})) else {
-                return;
-            };
-            out.push(0, tts::audio::resample(&pcm, rate, out.rate));
-            // The stream plays while `out` lives: until the clip is heard.
-            let start = std::time::Instant::now();
-            while !out.queued().is_empty() && !out.failed() && start.elapsed().as_secs() < 15 {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(150));
-        });
-}
 
 /// The line under the pages.
 pub(super) struct Line {
@@ -314,12 +267,21 @@ impl Reader {
                 self.stats.glow_since = Some(now);
             }
             if sound {
-                play_cheer();
-                // Not over read aloud: it pauses, and goes on after.
-                self.tts.pause_until(now + cheer_pause());
+                let secs = goal_sound::play(&self.stats.settings);
+                // Not over read aloud: it pauses, and goes on after (with a
+                // little for the sound device to open).
+                self.tts.pause_until(now + secs + 0.4);
             }
         }
         self.stats.goal_seen = Some((key, met || was == Some(true)));
+        // A sound of the reader's own made: it plays from now on.
+        if let Some(made) = self.stats.sound.poll() {
+            rs::update_meta(|s| s.settings.goal_sound_made = made);
+            self.stats.unsaved = true;
+            if self.persist {
+                self.stats_save(now);
+            }
+        }
         if let Some(left) = self.tts.sound_pause(now, &self.settings.tts) {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(left + 0.01));
         }
@@ -646,6 +608,7 @@ impl Reader {
             self.stats_open = !self.stats_open;
             self.stats.confirm_discard = false;
             self.stats.goal_edit = None;
+            self.stats.sound.forget_voices();
         }
         let mut open = self.stats_open;
         egui::Popup::menu(&button)
@@ -970,10 +933,19 @@ impl Reader {
                         ui.end_row();
                         ui.label("");
                         ui.checkbox(&mut set.goal_sound, "Play a sound when it's met")
-                            .on_hover_text(format!(
-                                "A voice says \u{201c}{CHEER_TEXT}\u{201d} when today's goal is reached while reading",
-                            ));
+                            .on_hover_text(
+                                "A voice cheers when today's goal is reached while reading: the built-in one, or one of yours saying your own message",
+                            );
                         ui.end_row();
+                        if set.goal_sound {
+                            self.stats.sound.rows(
+                                ui,
+                                &mut set,
+                                &self.settings.tts.local,
+                                muted,
+                                th.red,
+                            );
+                        }
                     });
             });
         let goal_now = goal.map_or((0, 0), |g| (g.minutes, g.chars));
@@ -1011,15 +983,5 @@ mod tests {
         assert_eq!(super::mins(3600.0 + 300.0), "1 h 05 min");
         assert_eq!(super::speed_text(300, 59.0), None);
         assert_eq!(super::speed_text(300, 60.0).as_deref(), Some("300/min"));
-    }
-
-    #[test]
-    fn goal_met_sound_decodes() {
-        let (pcm, rate) = super::tts::opus::decode(super::CHEER.to_vec()).unwrap();
-        assert_eq!(rate, super::tts::opus::RATE);
-        let secs = pcm.len() as f64 / rate as f64;
-        assert!((3.5..4.5).contains(&secs), "{secs} s");
-        let peak = pcm.iter().fold(0f32, |m, s| m.max(s.abs()));
-        assert!((0.3..1.0).contains(&peak), "peak {peak}");
     }
 }

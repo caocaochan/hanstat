@@ -10,6 +10,7 @@ mod css;
 mod dicts_ui;
 pub(crate) mod epub;
 pub(crate) mod fonts;
+mod goal_sound;
 mod images;
 mod layout;
 mod markup;

@@ -2451,7 +2451,7 @@ fn write_pcm_wav(path: &Path, pcm: &[i16], rate: u32) {
     std::fs::write(path, wav).unwrap();
 }
 
-/// Takes of the goal-met sound ([`super::stats_ui::CHEER_TEXT`]) read by a
+/// Takes of the goal-met sound ([`super::goal_sound::CHEER_TEXT`]) read by a
 /// designed local voice, to choose the one shipped as
 /// `assets/goal-met.opus`. `CHEER_VOICE`: the designed voice's id (its
 /// folder in `LOCALAPPDATA`'s hanstat/voices); `CHEER_DIR`: where each take
@@ -2473,7 +2473,7 @@ fn goal_cheer_takes() {
     let n: u32 = env("CHEER_TAKES").and_then(|v| v.parse().ok()).unwrap_or(6);
     for take in 0..n {
         s.seed = take;
-        let pcm = tts::local::preview(super::stats_ui::CHEER_TEXT, &s).unwrap();
+        let pcm = tts::local::preview(super::goal_sound::CHEER_TEXT, &s).unwrap();
         let secs = pcm.len() as f64 / tts::opus::RATE as f64;
         write_pcm_wav(&dir.join(format!("take-{take}.wav")), &pcm, tts::opus::RATE);
         let ogg = tts::opus::encode(&pcm).unwrap();
@@ -2933,6 +2933,86 @@ fn shown_text(d: &Driver) -> Vec<String> {
     out
 }
 
+/// Where the last frame shows `text` (a whole label): its centre.
+fn text_center(d: &Driver, text: &str) -> Option<Pos2> {
+    fn walk(s: &egui::Shape, text: &str) -> Option<Pos2> {
+        match s {
+            egui::Shape::Text(t) if t.galley.text() == text => {
+                Some(Rect::from_min_size(t.pos, t.galley.size()).center())
+            }
+            egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, text)),
+            _ => None,
+        }
+    }
+    d.last
+        .as_ref()?
+        .shapes
+        .iter()
+        .find_map(|c| walk(&c.shape, text))
+}
+
+/// The goal-met sound's settings in the Stats panel: the built-in sound
+/// first (no message to type), then a voice of the reader's chosen: its
+/// message, the count against the limit, Make and Play, and that the
+/// built-in sound plays until it is made.
+#[test]
+#[ignore = "opens the reader with the system fonts and dictionary settings"]
+fn goal_sound_settings() {
+    use crate::reading_stats as rs;
+    let temp = tempfile::tempdir().unwrap();
+    rs::set_test_clock(Some(1_790_000_000.0));
+    rs::reset_for_test(rs::ReadingStats::default());
+    let mut d = Driver::new();
+    let mut r = stats_book(&mut d, temp.path());
+    r.stats.sound.set_voices(vec![
+        ("designed:abc".into(), "Citrus".into()),
+        (
+            "speaker:vivian".into(),
+            "Vivian — bright young woman".into(),
+        ),
+    ]);
+    r.stats_open = true;
+    d.idle(&mut r, 10);
+    let header = text_center(&d, "Settings").expect("Settings header");
+    d.click(&mut r, header);
+    let texts = shown_text(&d);
+    d.snap("goal-sound-built-in");
+    for want in [
+        "Play a sound when it's met",
+        "Voice",
+        "Built in (Citrus)",
+        "▶ Play",
+    ] {
+        assert!(texts.iter().any(|t| t == want), "{want:?} not in {texts:?}");
+    }
+    assert!(
+        !texts.iter().any(|t| t == "Make" || t == "Says"),
+        "{texts:?}"
+    );
+
+    rs::update_meta(|s| s.settings.goal_sound_voice = Some("speaker:vivian".into()));
+    d.idle(&mut r, 10);
+    let texts = shown_text(&d);
+    d.snap("goal-sound-own-voice");
+    for want in [
+        "Vivian — bright young woman",
+        "Says",
+        super::goal_sound::CHEER_TEXT,
+        "19/20",
+        "Make",
+        "Not made yet: the built-in sound plays until it is.",
+    ] {
+        assert!(texts.iter().any(|t| t == want), "{want:?} not in {texts:?}");
+    }
+    let set = rs::with(|s| s.settings.clone());
+    assert_eq!(
+        set.goal_sound_text,
+        super::goal_sound::CHEER_TEXT,
+        "starts with the built-in words"
+    );
+    rs::set_test_clock(None);
+}
+
 /// Hover text on parts of the reader that have no label of their own: the
 /// goal bar along the foot of the page, the page number and the Aa button.
 #[test]
@@ -3005,7 +3085,7 @@ fn goal_glow() {
         },
         ..Default::default()
     });
-    let cheers = || super::stats_ui::CHEERS.load(std::sync::atomic::Ordering::Relaxed);
+    let cheers = || super::goal_sound::PLAYED.load(std::sync::atomic::Ordering::Relaxed);
     let c0 = cheers();
     let mut d = Driver::new();
     let mut r = stats_book(&mut d, temp.path());

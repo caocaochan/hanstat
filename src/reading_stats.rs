@@ -43,6 +43,14 @@ pub struct TrackerSettings {
     pub goal_glow: bool,
     /// A voice says so when the reader sees today's goal met.
     pub goal_sound: bool,
+    /// The sound's voice: `None` the built-in sound; else a local voice
+    /// (`designed:<id>` or `speaker:<id>`) saying `goal_sound_text`.
+    pub goal_sound_voice: Option<String>,
+    /// What that voice says (empty: the built-in sound's words).
+    pub goal_sound_text: String,
+    /// The voice and message the kept sound (`goal-sound.opus` in the
+    /// app's folder) was made for: it plays only while they are chosen.
+    pub goal_sound_made: String,
 }
 
 impl Default for TrackerSettings {
@@ -55,6 +63,9 @@ impl Default for TrackerSettings {
             goal_listening: false,
             goal_glow: true,
             goal_sound: true,
+            goal_sound_voice: None,
+            goal_sound_text: String::new(),
+            goal_sound_made: String::new(),
         }
     }
 }
