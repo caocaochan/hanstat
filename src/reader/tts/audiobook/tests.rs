@@ -53,7 +53,7 @@ fn dialog_expands_when_chapters_load_and_the_save_button_is_visible() {
     };
     let ctx = egui::Context::default();
     let mut frame = |height| {
-        ctx.run_ui(
+        let mut out = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -62,7 +62,10 @@ fn dialog_expands_when_chapters_load_and_the_save_button_is_visible() {
                 ..egui::RawInput::default()
             },
             |ui| assert!(matches!(dialog.show(ui.ctx()), Action::Keep)),
-        )
+        );
+        // Nothing draws the textures: egui asserts they are not dropped unseen.
+        out.textures_delta.clear();
+        out
     };
     frame(750.0);
     frame(750.0);
@@ -141,19 +144,21 @@ fn chapter_list_reopens_at_the_top_and_keeps_scroll_during_selection() {
     };
     let frame = |form: &mut Form| {
         let mut result = 0.0;
-        let _ = ctx.run_ui(input(), |ui| {
+        ctx.run_ui(input(), |ui| {
             let id = ui.make_persistent_id(egui::IdSalt::new(CHAPTER_SCROLL));
             form.show(ui, false);
             result = egui::scroll_area::State::load(&ctx, id)
                 .unwrap()
                 .clamped_offset()
                 .y;
-        });
+        })
+        .textures_delta
+        .clear();
         result
     };
     let mut form = chapter_list_form();
     assert_eq!(frame(&mut form), 0.0);
-    let _ = ctx.run_ui(input(), |ui| {
+    ctx.run_ui(input(), |ui| {
         let scroll = egui::ScrollArea::vertical()
             .id_salt(CHAPTER_SCROLL)
             .max_height(150.0)
@@ -163,7 +168,9 @@ fn chapter_list_reopens_at_the_top_and_keeps_scroll_during_selection() {
                 ui.scroll_with_delta(egui::vec2(0.0, -100.0));
             });
         assert_eq!(scroll.state.clamped_offset().y, 100.0);
-    });
+    })
+    .textures_delta
+    .clear();
     assert_eq!(frame(&mut form), 100.0);
     form.selected[0] = false;
     assert_eq!(frame(&mut form), 100.0);
