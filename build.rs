@@ -34,6 +34,7 @@ const NOT_ANALYSIS: &[&str] = &[
     "src/bin",
     "src/history.rs",
     "src/books.rs",
+    "src/book_cache.rs",
     "src/history",
     "src/profile.rs",
     "src/plan.rs",
@@ -146,6 +147,15 @@ fn analysis_fingerprint() {
     lib.item(format!("{:016x}", h.0).as_bytes());
     hash_files(&mut lib, LIBRARY_SOURCES);
     println!("cargo:rustc-env=HANSTAT_LIBRARY_FINGERPRINT={:016x}", lib.0);
+
+    let mut extraction = Fnv::new();
+    hash_files(&mut extraction, &["src/extract"]);
+    extraction.item(manifest.join("\n").as_bytes());
+    extraction.item(lines.join("\n").as_bytes());
+    println!(
+        "cargo:rustc-env=HANSTAT_EXTRACTION_FINGERPRINT={:016x}",
+        extraction.0
+    );
 
     // `HANSTAT_COVERAGE_FINGERPRINT`: how a row's known-word shares are
     // worked out from its word data. A row recorded by a build with another

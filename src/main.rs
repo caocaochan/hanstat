@@ -7,7 +7,7 @@ use hanstat::anki::{self, BookCoverage, ByStatus, Difficulty, Status};
 use hanstat::books;
 use hanstat::cache::Cache;
 use hanstat::discover::{self, Candidate};
-use hanstat::extract::{self, Book, EncodingChoice, SectionKind};
+use hanstat::extract::{Book, EncodingChoice, SectionKind};
 use hanstat::history::{self, History};
 use hanstat::known;
 use hanstat::plan;
@@ -367,6 +367,8 @@ impl Tab {
 struct Loaded {
     book: Arc<Book>,
     prep: Arc<Prepared>,
+    included: Vec<bool>,
+    built: BuiltReport,
     /// SHA-256 of the file, which identifies the book in the history.
     file_id: Option<String>,
     /// The book's copy in the Library's folder, used from now on; the file
@@ -374,6 +376,31 @@ struct Loaded {
     path: PathBuf,
     /// Why it could not be copied.
     copy_error: Option<String>,
+}
+
+struct BuiltReport {
+    report: Report,
+    char_cum: Vec<f64>,
+    word_cum: Vec<f64>,
+}
+
+impl BuiltReport {
+    fn new(book: &Book, prep: &Prepared, included: &[bool], fold: bool) -> Self {
+        let report = analyze::build_report(book, prep, included, fold);
+        let char_cum = cumulative(report.char_freq.iter().map(|x| x.1), report.han_total);
+        let word_cum = cumulative(report.word_freq.iter().map(|x| x.1), report.words_total);
+        Self {
+            report,
+            char_cum,
+            word_cum,
+        }
+    }
+}
+
+struct ProfileJob {
+    cancel: Arc<AtomicBool>,
+    changed: Arc<AtomicBool>,
+    rx: Receiver<Result<(), String>>,
 }
 
 /// Library books added before it kept copies of its books, being copied
@@ -595,6 +622,8 @@ struct App {
     word_cum: Vec<f64>,
 
     job: Option<Job>,
+    report_job: Option<(Receiver<BuiltReport>, egui::Context)>,
+    report_revision: u64,
     /// Errors shown above the content until dismissed, each under a key
     /// saying where it came from, so a new error replaces only its own kind.
     errors: Vec<(&'static str, String)>,
@@ -662,9 +691,11 @@ struct App {
     history_tab: HistTab,
     plan: PlanState,
     stats: StatsState,
-    /// What the open book's profile was last written from (id, hash), so
-    /// that it is written again only when its words or names change.
-    profile_written: Option<(String, u64)>,
+    /// The report revision and names last submitted for its word data.
+    profile_requested: Option<(u64, HashSet<String>)>,
+    /// A replacement inherits any writes already made by a job for its book.
+    profile_jobs: HashMap<String, ProfileJob>,
+    profile_writes: Arc<Mutex<()>>,
     /// Bumped whenever a profile is written or removed: the reading path reloads.
     profiles_version: u64,
     batch: Option<Batch>,
@@ -728,6 +759,7 @@ struct App {
     whats_new: Option<whats_new::WhatsNew>,
     /// The book open in the reader, which then fills the window.
     reader: Option<reader::Reader>,
+    reader_dictionary: reader::DictionarySession,
     audiobook: Option<reader::Audiobook>,
     /// DuChinese stories: the window, imports and their updates.
     du: duchinese::DuState,
@@ -1068,7 +1100,8 @@ fn plan_library(
         let pos_path = profile::positions_path_in(history_path, &id);
         // Before reading: a file changed meanwhile is read again next time.
         let seen = (stamp(&p_path), stamp(&pos_path));
-        let kept = old.as_ref().and_then(|o| {
+        let pending = hanstat::saver::is_pending(&p_path) || hanstat::saver::is_pending(&pos_path);
+        let kept = old.as_ref().filter(|_| !pending).and_then(|o| {
             let &i = index.get(id.as_str())?;
             (o.files.get(&id) == Some(&seen)).then_some(i)
         });
@@ -1447,6 +1480,8 @@ impl Default for App {
             char_cum: Vec::new(),
             word_cum: Vec::new(),
             job: None,
+            report_job: None,
+            report_revision: 0,
             errors: Vec::new(),
             tab: Tab::Overview,
             char_filter: String::new(),
@@ -1485,7 +1520,9 @@ impl Default for App {
             history_tab: HistTab::Books,
             plan: PlanState::default(),
             stats: StatsState::load(),
-            profile_written: None,
+            profile_requested: None,
+            profile_jobs: HashMap::new(),
+            profile_writes: Default::default(),
             profiles_version: 0,
             batch: None,
             settings: Settings::load(),
@@ -1517,6 +1554,7 @@ impl Default for App {
             window_stack: Vec::new(),
             whats_new: None,
             reader: None,
+            reader_dictionary: Default::default(),
             audiobook: None,
             du: duchinese::DuState::default(),
         }
@@ -1539,6 +1577,12 @@ impl App {
         if let Some(j) = self.job.take() {
             j.cancel.store(true, Ordering::Relaxed);
         }
+        // Reuse extraction only for a rerun with the same path and encoding.
+        let cached = self
+            .book
+            .clone()
+            .filter(|_| self.path.as_deref() == Some(path.as_path()));
+        let current_sections = cached.as_ref().map(|_| self.included.clone());
         self.path = Some(path.clone());
         self.clear_error("open");
         let (tx, rx) = channel();
@@ -1552,17 +1596,19 @@ impl App {
         let words = self.user_words.clone();
         // Imported word lists join words the segmenter split.
         let known_words = self.known.settings.segmenter_words();
-        // Reuse the already-extracted book if only segmentation options changed.
-        let cached = self
-            .book
-            .clone()
-            .filter(|_| self.path.as_deref() == Some(path.as_path()));
+        let saved_sections: HashMap<_, _> = self
+            .history
+            .entries
+            .iter()
+            .filter_map(|e| e.sections.clone().map(|s| (e.id.clone(), s)))
+            .collect();
+        let fold = self.fold_chars();
         let books_dir = self.history.books();
         std::thread::spawn(move || {
             let res = (|| {
                 let book = match cached {
                     Some(b) => b,
-                    None => Arc::new(extract::load(&path, enc)?),
+                    None => Arc::new(hanstat::book_cache::load(&path, enc, cache.as_ref())?),
                 };
                 // First use of a model: download it (pinned + checksummed) with visible progress.
                 let (tr, si) = analyze::detect_variant(&book);
@@ -1625,9 +1671,22 @@ impl App {
                         let _ = history::save_large_cover(cover, &large);
                     }
                 }
+                let included = current_sections
+                    .or_else(|| {
+                        file_id
+                            .as_ref()
+                            .and_then(|id| saved_sections.get(id).cloned())
+                    })
+                    .filter(|s| s.len() == book.sections.len())
+                    .unwrap_or_else(|| {
+                        book.sections.iter().map(|s| s.default_included()).collect()
+                    });
+                let built = BuiltReport::new(&book, &prep, &included, fold);
                 Ok(Loaded {
                     book,
                     prep: Arc::new(prep),
+                    included,
+                    built,
                     file_id,
                     path,
                     copy_error,
@@ -1661,6 +1720,14 @@ impl App {
         self.book = None;
         self.prep = None;
         self.report = None;
+        self.report_job = None;
+        if let Some(c) = self.discover_cancel.take() {
+            c.store(true, Ordering::Relaxed);
+        }
+        self.discover_due = None;
+        self.suggest_rx = None;
+        self.suggestions = None;
+        self.selected.clear();
         self.encoding = EncodingChoice::Auto;
         self.start(path, ctx.clone());
     }
@@ -1675,23 +1742,69 @@ impl App {
         }
     }
 
-    fn rebuild_report(&mut self) {
-        if let (Some(b), Some(p)) = (&self.book, &self.prep) {
-            let r = analyze::build_report(b, p, &self.included, self.fold_chars());
-            self.char_cum = cumulative(r.char_freq.iter().map(|x| x.1), r.han_total);
-            self.word_cum = cumulative(r.word_freq.iter().map(|x| x.1), r.words_total);
-            // Word discovery depends on the included sections and the
-            // segmenter's output: the one running is out of date, and the
-            // next starts after a pause (`start_discovery`).
-            if let Some(c) = self.discover_cancel.take() {
-                c.store(true, Ordering::Relaxed);
+    fn rebuild_report(&mut self, ctx: &egui::Context) {
+        if self.report_job.is_some() {
+            return;
+        }
+        let (Some(book), Some(prep)) = (self.book.clone(), self.prep.clone()) else {
+            return;
+        };
+        let (tx, rx) = channel();
+        self.report_job = Some((rx, ctx.clone()));
+        let included = self.included.clone();
+        let fold = self.fold_chars();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(BuiltReport::new(&book, &prep, &included, fold));
+            ctx.request_repaint();
+        });
+    }
+
+    fn publish_report(&mut self, built: BuiltReport, ctx: &egui::Context) {
+        if let Some(c) = self.discover_cancel.take() {
+            c.store(true, Ordering::Relaxed);
+        }
+        self.suggest_rx = None;
+        self.discover_due = Some(std::time::Instant::now() + DISCOVER_DELAY);
+        self.char_cum = built.char_cum;
+        self.word_cum = built.word_cum;
+        self.report = Some(built.report);
+        self.report_id = self.book_id.clone();
+        self.report_revision += 1;
+        self.report_gen += 1;
+        self.refresh_anki_coverage(ctx);
+    }
+
+    fn poll_report(&mut self, wait: bool) {
+        while let Some((rx, ctx)) = self.report_job.take() {
+            let ready = if wait {
+                rx.recv().ok()
+            } else {
+                match rx.try_recv() {
+                    Ok(built) => Some(built),
+                    Err(TryRecvError::Empty) => {
+                        self.report_job = Some((rx, ctx));
+                        return;
+                    }
+                    Err(TryRecvError::Disconnected) => None,
+                }
+            };
+            let Some(built) = ready else { return };
+            if built.report.chars_folded == self.fold_chars()
+                && built
+                    .report
+                    .sections
+                    .iter()
+                    .map(|s| s.included)
+                    .eq(self.included.iter().copied())
+            {
+                self.publish_report(built, &ctx);
+                return;
             }
-            self.suggest_rx = None;
-            self.discover_due = Some(std::time::Instant::now() + DISCOVER_DELAY);
-            self.report = Some(r);
-            self.report_id = self.book_id.clone();
-            self.report_gen += 1;
-            self.refresh_anki_coverage();
+            self.rebuild_report(&ctx);
+            if !wait {
+                return;
+            }
         }
     }
 
@@ -1741,7 +1854,7 @@ impl App {
         let (k, warn) = known::Settings::load();
         self.known.settings = k;
         self.known.error = warn;
-        self.refresh_anki_coverage();
+        self.refresh_anki_coverage(ctx);
         self.anki.profiles = anki::find_profiles();
         if self.anki.settings.enabled && self.anki.settings.collection.is_some() {
             // Clears copies left behind by earlier runs before making its own.
@@ -1772,14 +1885,14 @@ impl App {
         self.anki.dirty = false;
         self.anki.busy = "Reading Anki collection…";
         let (tx, rx) = channel();
-        let ctx = ctx.clone();
+        let wake = ctx.clone();
         std::thread::spawn(move || {
             let _ = tx.send(AnkiMsg::Opened(anki::Collection::open(&path)));
-            ctx.request_repaint();
+            wake.request_repaint();
         });
         // Replacing the receiver discards any job still running for the old collection.
         self.anki.rx = Some(rx);
-        self.refresh_anki_coverage();
+        self.refresh_anki_coverage(ctx);
     }
 
     /// Sentence fields are segmented like the current book.
@@ -1801,7 +1914,7 @@ impl App {
         };
         if !self.anki.settings.has_selection() {
             self.anki.knowledge = None;
-            self.refresh_anki_coverage();
+            self.refresh_anki_coverage(ctx);
             return;
         }
         self.anki.busy = "Classifying Anki notes…";
@@ -1826,14 +1939,15 @@ impl App {
         self.anki_rebuild(ctx);
         // "Match Traditional ↔ Simplified" also decides how the book's
         // characters are counted.
-        if self
-            .report
-            .as_ref()
-            .is_some_and(|r| r.chars_folded != self.fold_chars())
+        if self.report_job.is_some()
+            || self
+                .report
+                .as_ref()
+                .is_some_and(|r| r.chars_folded != self.fold_chars())
         {
-            self.rebuild_report();
+            self.rebuild_report(ctx);
         } else {
-            self.refresh_anki_coverage();
+            self.refresh_anki_coverage(ctx);
         }
     }
 
@@ -1874,7 +1988,7 @@ impl App {
             AnkiMsg::Built(b) => match *b {
                 Ok(k) => {
                     self.anki.knowledge = Some(Arc::new(k));
-                    self.refresh_anki_coverage();
+                    self.refresh_anki_coverage(ctx);
                     if std::mem::take(&mut self.anki.dirty) {
                         self.anki_rebuild(ctx);
                     }
@@ -1904,7 +2018,7 @@ impl App {
         self.known.merged_from = Some(from);
     }
 
-    fn refresh_anki_coverage(&mut self) {
+    fn refresh_anki_coverage(&mut self, ctx: &egui::Context) {
         self.update_merged();
         // Names don't count against the difficulty: the user dictionary plus
         // the recommended Suggested words (once discovery has finished).
@@ -1927,44 +2041,77 @@ impl App {
         if r.anki.is_none() {
             self.anki_filter = AnkiFilter::All;
         }
-        self.record_history(&names);
+        self.record_history(&names, ctx);
     }
 
     /// Save the Overview's numbers as the book's history entry, replacing
     /// the one from an earlier analysis, and its words for the reading path
     /// when they changed. `names`: as left out of the difficulty.
-    fn record_history(&mut self, names: &HashSet<String>) {
+    fn record_history(&mut self, names: &HashSet<String>, ctx: &egui::Context) {
         let (Some(r), Some(id), Some(path)) = (&self.report, &self.report_id, &self.path) else {
             return;
         };
-        let digest = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::hash::DefaultHasher::new();
-            id.hash(&mut h);
-            r.segmenter.label().hash(&mut h);
-            (r.words_total, r.words_unique).hash(&mut h);
-            self.included.hash(&mut h);
-            let mut n: Vec<&String> = names.iter().collect();
-            n.sort_unstable();
-            n.hash(&mut h);
-            h.finish()
-        };
-        let profile_path = self.history.profile(id);
-        let profile = (self.profile_written.as_ref() != Some(&(id.clone(), digest))
-            || !profile_path.is_file())
-        .then(|| Profile::from_report(id, r, names));
-        // Where its words occur, with the profile they were made with.
-        let pos_path = self.history.positions(id);
-        let positions = match (&self.book, &self.prep) {
-            (Some(b), Some(prep)) if profile.is_some() || !pos_path.is_file() => Some((
-                profile::Positions::from_analysis(b, prep, &self.included, &r.word_freq),
-                profile.as_ref().map_or_else(
-                    || Profile::from_report(id, r, names).digest(),
-                    |p| p.digest(),
-                ),
-            )),
-            _ => None,
-        };
+        let requested = self
+            .profile_requested
+            .as_ref()
+            .is_some_and(|(rev, saved_names)| *rev == self.report_revision && saved_names == names);
+        if !requested && let (Some(book), Some(prep)) = (&self.book, &self.prep) {
+            let profile = Profile::from_report(id, r, names);
+            let (book, prep) = (book.clone(), prep.clone());
+            let included: Vec<_> = r.sections.iter().map(|s| s.included).collect();
+            let profile_path = self.history.profile(id);
+            let pos_path = self.history.positions(id);
+            let (tx, rx) = channel();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let changed = self.profile_jobs.remove(id).map_or_else(
+                || Arc::new(AtomicBool::new(false)),
+                |old| {
+                    old.cancel.store(true, Ordering::Release);
+                    old.changed
+                },
+            );
+            self.profile_jobs.insert(
+                id.clone(),
+                ProfileJob {
+                    cancel: cancel.clone(),
+                    changed: changed.clone(),
+                    rx,
+                },
+            );
+            let writes = self.profile_writes.clone();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let result = (|| {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+                    let positions =
+                        profile::Positions::from_analysis(&book, &prep, &included, &profile.words);
+                    let digest = profile.digest();
+                    let _write = writes.lock().unwrap_or_else(|e| e.into_inner());
+                    if cancel.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    let profile_changed =
+                        Profile::load(&profile_path).map(|p| p.digest()) != Some(digest);
+                    if profile_changed {
+                        profile.save(&profile_path)?;
+                        changed.store(true, Ordering::Release);
+                    }
+                    let positions_changed =
+                        profile::Positions::load(&pos_path, digest, profile.words.len()).as_ref()
+                            != Some(&positions);
+                    if positions_changed {
+                        positions.save(&pos_path, digest)?;
+                        changed.store(true, Ordering::Release);
+                    }
+                    Ok(())
+                })();
+                let _ = tx.send(result);
+                ctx.request_repaint();
+            });
+            self.profile_requested = Some((self.report_revision, names.clone()));
+        }
         let entry = history::Entry {
             id: id.clone(),
             path: std::path::absolute(path).unwrap_or_else(|_| path.clone()),
@@ -1984,22 +2131,48 @@ impl App {
         if let Err(e) = self.history.record(entry, touch) {
             self.history_error = Some(e);
         }
-        if let Some(p) = profile {
-            match p.save(&profile_path) {
-                Ok(()) => {
-                    self.exists.set(profile_path, true);
-                    self.profile_written = Some((p.id, digest));
-                    self.profiles_version += 1;
+    }
+
+    fn poll_profiles(&mut self, wait: bool) {
+        self.profile_jobs.retain(|id, job| {
+            let result = if wait {
+                job.rx.recv().ok()
+            } else {
+                match job.rx.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Empty) => return true,
+                    Err(TryRecvError::Disconnected) => None,
                 }
-                Err(e) => self.history_error = Some(e),
+            };
+            if job.changed.load(Ordering::Acquire) {
+                self.exists.set(self.history.profile(id), true);
+                self.profiles_version += 1;
             }
+            if let Some(Err(err)) = result {
+                if self.report_id.as_ref() == Some(id) {
+                    self.profile_requested = None;
+                }
+                self.history_error = Some(err);
+            }
+            false
+        });
+    }
+
+    fn finish_profile_for(&mut self, id: &str) {
+        if let Some(job) = self.profile_jobs.remove(id) {
+            job.cancel.store(true, Ordering::Release);
         }
-        if let Some((pos, digest)) = positions {
-            match pos.save(&pos_path, digest) {
-                // The reading path reads them.
-                Ok(()) => self.profiles_version += 1,
-                Err(e) => self.history_error = Some(e),
-            }
+        if self.report_id.as_deref() == Some(id) {
+            self.profile_requested = None;
+        }
+        let _write = self
+            .profile_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if hanstat::saver::is_pending(&self.history.profile(id))
+            || hanstat::saver::is_pending(&self.history.positions(id))
+        {
+            hanstat::saver::flush();
         }
     }
 
@@ -2269,7 +2442,7 @@ impl App {
                 self.suggestions = Some(v);
                 self.suggest_rx = None;
                 // The recommended ones are left out of the difficulty.
-                self.refresh_anki_coverage();
+                self.refresh_anki_coverage(ctx);
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100))
@@ -2688,7 +2861,7 @@ impl App {
                 // The open book now; the reading path and Library statistics
                 // rebuild on their own (their key has the setting), and the
                 // other books' rows are updated in the background.
-                self.refresh_anki_coverage();
+                self.refresh_anki_coverage(ctx);
             }
             ui.label(
                 RichText::new(
@@ -2960,6 +3133,8 @@ impl App {
         // The new copy reads the Library and known words: write them first.
         self.finish_removal();
         self.columns.finish_delete();
+        self.poll_report(true);
+        self.poll_profiles(true);
         hanstat::saver::flush();
         let exe = match update::exe_path() {
             Ok(p) => p,
@@ -2985,25 +3160,21 @@ impl App {
             self.job = None;
             match res {
                 Ok(l) => {
+                    self.report_job = None;
                     let same_book = self.book.as_ref().is_some_and(|b| Arc::ptr_eq(b, &l.book));
                     if !same_book || self.included.len() != l.book.sections.len() {
-                        // The sections chosen when the book was last analysed, if any.
-                        let n = l.book.sections.len();
-                        let saved = l.file_id.as_ref().and_then(|id| {
-                            self.history
-                                .entries
-                                .iter()
-                                .find(|e| e.id == *id)
-                                .and_then(|e| e.sections_for(n))
-                                .map(<[bool]>::to_vec)
-                        });
-                        self.included = saved.unwrap_or_else(|| {
-                            l.book
-                                .sections
-                                .iter()
-                                .map(|s| s.default_included())
-                                .collect()
-                        });
+                        self.included = l
+                            .file_id
+                            .as_ref()
+                            .and_then(|id| {
+                                self.history
+                                    .entries
+                                    .iter()
+                                    .find(|e| &e.id == id)
+                                    .and_then(|e| e.sections_for(l.book.sections.len()))
+                            })
+                            .unwrap_or(&l.included)
+                            .to_vec();
                     }
                     if !same_book {
                         self.cpm = None;
@@ -3021,7 +3192,13 @@ impl App {
                         None => self.clear_error("copy"),
                     }
                     self.history_touch = true;
-                    self.rebuild_report();
+                    if self.included == l.included
+                        && l.built.report.chars_folded == self.fold_chars()
+                    {
+                        self.publish_report(l.built, ctx);
+                    } else {
+                        self.rebuild_report(ctx);
+                    }
                     // Anki sentences must be segmented like this book.
                     if self.anki.col.is_some()
                         && self.anki.built_with.as_ref() != Some(&self.anki_seg_config())
@@ -3062,15 +3239,24 @@ impl eframe::App for App {
         }
         self.finish_removal();
         self.columns.finish_delete();
+        self.poll_report(true);
+        self.poll_profiles(true);
         hanstat::saver::flush();
         reading_stats::flush();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        match ctx.cumulative_frame_nr() {
+            0 => ctx.request_repaint(),
+            1 => reader::prefetch(&ctx, &mut self.reader_dictionary),
+            _ => {}
+        }
         palette::set_dark(ui.visuals().dark_mode);
         let now = ctx.input(|i| i.time);
         self.poll_job(&ctx);
+        self.poll_report(false);
+        self.poll_profiles(false);
         self.poll_suggestions(&ctx);
         self.start_discovery(&ctx);
         self.poll_anki(&ctx);
@@ -3293,7 +3479,7 @@ impl eframe::App for App {
                             .on_hover_text(format!("Go back to {} where you left it", b.title))
                             .clicked()
                         {
-                            match reader::Reader::open(&b.path, Some(&b.id), b.traditional, &ctx) {
+                            match reader::Reader::open(&b.path, Some(&b.id), b.traditional, &ctx, &mut self.reader_dictionary) {
                                 Ok(r) => self.reader = Some(r),
                                 Err(e) => self.set_error("reader", e),
                             }
@@ -3585,10 +3771,12 @@ impl eframe::App for App {
             match dialog.show(&ctx) {
                 reader::AudiobookAction::Keep => self.audiobook = Some(dialog),
                 reader::AudiobookAction::Close => {}
-                reader::AudiobookAction::Read(reading) => match reading.open(&ctx) {
-                    Ok(reader) => self.reader = Some(reader),
-                    Err(error) => self.set_error("reader", error),
-                },
+                reader::AudiobookAction::Read(reading) => {
+                    match reading.open(&ctx, &mut self.reader_dictionary) {
+                        Ok(reader) => self.reader = Some(reader),
+                        Err(error) => self.set_error("reader", error),
+                    }
+                }
             }
         }
         // Asked for but not drawn (no filter shown): not kept for later.
@@ -3602,6 +3790,7 @@ impl App {
     /// (none open and none on its way).
     fn on_home(&self) -> bool {
         let opening = self.job.is_some()
+            || self.report_job.is_some()
             || self
                 .batch
                 .as_ref()
@@ -4303,16 +4492,16 @@ impl App {
             });
         self.known.window = open;
         if changed {
-            self.known_changed();
+            self.known_changed(ctx);
         }
     }
 
     /// Levels, lists or marked words changed: save them and recompute coverage.
-    fn known_changed(&mut self) {
+    fn known_changed(&mut self, ctx: &egui::Context) {
         if let Err(e) = self.known.settings.save() {
             self.known.error = Some(e);
         }
-        self.refresh_anki_coverage();
+        self.refresh_anki_coverage(ctx);
     }
 
     /// True if the open book was segmented with other imported word lists
@@ -4939,7 +5128,13 @@ impl App {
                 .report
                 .as_ref()
                 .is_some_and(|r| r.variant == Variant::Traditional);
-            match reader::Reader::open(&path, self.report_id.as_deref(), traditional, &ctx) {
+            match reader::Reader::open(
+                &path,
+                self.report_id.as_deref(),
+                traditional,
+                &ctx,
+                &mut self.reader_dictionary,
+            ) {
                 Ok(r) => self.reader = Some(r),
                 Err(e) => self.set_error("reader", e),
             }
@@ -5429,13 +5624,13 @@ impl App {
             format!("Unmarked {shown}")
         };
         self.toast = Some((msg, ui.input(|i| i.time) + 3.0));
-        self.known_changed();
+        self.known_changed(ui.ctx());
     }
 
     fn sections(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
         ui.horizontal(|ui| {
-            ui.label("Untick sections to exclude them (cover, copyright, TOC, ads…). Totals update instantly.");
+            ui.label("Untick sections to exclude them (cover, copyright, TOC, ads…).");
             if ui.button("Include all").clicked() {
                 self.included.iter_mut().for_each(|x| *x = true);
                 changed = true;
@@ -5488,7 +5683,7 @@ impl App {
                     let i = row.index();
                     let s = &r.sections[i];
                     row.col(|ui| {
-                        let mut v = s.included;
+                        let mut v = self.included[i];
                         if ui.checkbox(&mut v, "").changed() {
                             toggles.push(i);
                         }
@@ -5498,7 +5693,7 @@ impl App {
                     });
                     row.col(|ui| {
                         let t = RichText::new(&s.label);
-                        ui.label(if s.included {
+                        ui.label(if self.included[i] {
                             t
                         } else {
                             t.weak().strikethrough()
@@ -5535,7 +5730,7 @@ impl App {
             changed = true;
         }
         if changed {
-            self.rebuild_report();
+            self.rebuild_report(ui.ctx());
         }
     }
 
@@ -5821,7 +6016,7 @@ impl App {
                 }
             });
         if clear_cache && let Some(cache) = self.cache.clone() {
-            if let Err(e) = cache.clear() {
+            if let Err(e) = cache.clear().and(hanstat::book_cache::clear(&cache)) {
                 self.set_error("cache", e);
             }
             self.cache_usage = cache.usage();
@@ -6134,8 +6329,9 @@ impl App {
     fn finish_removal(&mut self) {
         let Some(r) = self.removed.take() else { return };
         let id = &r.entry.id;
-        self.history.forget(id);
         if !self.history.entries.iter().any(|e| e.id == *id) {
+            self.finish_profile_for(id);
+            self.history.forget(id);
             self.covers.remove(id);
             self.home_view.forget(id);
             chapter_lengths::forget(id);
@@ -6230,7 +6426,10 @@ impl App {
             .history
             .entries
             .iter()
-            .filter(|e| self.history.profile(&e.id).is_file())
+            .filter(|e| {
+                let path = self.history.profile(&e.id);
+                hanstat::saver::is_pending(&path) || path.is_file()
+            })
             .map(|e| e.id.clone())
             .collect();
         self.plan.have = Some((key, ids.clone()));
@@ -6249,7 +6448,10 @@ impl App {
         let ids: HashSet<String> = self
             .plan_have()
             .into_iter()
-            .filter(|id| !self.history.positions(id).is_file())
+            .filter(|id| {
+                let path = self.history.positions(id);
+                !hanstat::saver::is_pending(&path) && !path.is_file()
+            })
             .collect();
         self.plan.no_positions = Some((key, ids.clone()));
         ids
@@ -6716,6 +6918,7 @@ impl App {
         let fold_chars = self.fold_chars();
         let history_path = History::path();
         let books_dir = self.history.books();
+        let profile_writes = self.profile_writes.clone();
         // Books opened again keep the sections chosen for them, found by id
         // (the entry's path is the Library's copy, not the file opened).
         let saved_sections: HashMap<String, Vec<bool>> = if mode == BatchMode::Open {
@@ -6801,6 +7004,7 @@ impl App {
                     // Written only when it changed, so the reading path is
                     // not rebuilt for nothing.
                     let p = Profile::from_report(&id, &r, &names);
+                    let write = profile_writes.lock().unwrap_or_else(|e| e.into_inner());
                     let p_path = profile::path_in(&history_path, &id);
                     let mut changed =
                         Profile::load(&p_path).map(|o| o.digest()) != Some(p.digest());
@@ -6817,6 +7021,7 @@ impl App {
                         // The reading path reads them.
                         changed = true;
                     }
+                    drop(write);
                     // A book opened is copied into the Library's folder; the
                     // Library's own books are copied there at start
                     // (`App::move_books`).

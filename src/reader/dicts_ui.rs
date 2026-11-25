@@ -243,9 +243,8 @@ impl Manager {
         }
     }
 
-    /// Take in finished jobs and checks; reload the popup's dictionaries
-    /// after any change. Call every frame.
-    pub fn poll(&mut self, ctx: &egui::Context, popup: &Popup, settings: &Settings) {
+    /// Take in finished jobs and checks. Call every frame.
+    pub fn poll(&mut self, ctx: &egui::Context) {
         let done = self.jobs.take_finished();
         if !done.is_empty() {
             for (label, r) in done {
@@ -255,7 +254,6 @@ impl Manager {
                 });
             }
             self.refresh();
-            popup.reload(settings.freq_sort.clone());
         }
         if let Some(rx) = &self.checking
             && let Ok(n) = rx.try_recv()

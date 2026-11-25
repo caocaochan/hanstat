@@ -36,6 +36,16 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+pub(crate) use popup::DictionarySession;
+
+pub(crate) fn prefetch(ctx: &egui::Context, dictionary: &mut DictionarySession) {
+    fonts::prefetch();
+    let root = hanstat::dict::root();
+    if hanstat::dict::format::Manifest::path(&root).is_file() {
+        dictionary.prefetch(ctx, root, Settings::load().freq_sort);
+    }
+}
 use style::LineStyle;
 use tree::Chapter;
 
@@ -216,6 +226,7 @@ pub struct Reader {
     want: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     layouts: HashMap<usize, Arc<ChapterLayout>>,
+    layout_work: Option<(usize, layout::LayoutWork)>,
     params: Option<Params>,
     images: images::Images,
     fonts: Option<fonts::Installed>,
@@ -287,8 +298,9 @@ impl Reader {
         book_id: Option<&str>,
         traditional: bool,
         ctx: &egui::Context,
+        dictionary: &mut DictionarySession,
     ) -> Result<Reader, String> {
-        Self::open_at(path, book_id, traditional, None, ctx)
+        Self::open_at(path, book_id, traditional, None, ctx, dictionary)
     }
 
     fn open_with_voice(
@@ -298,8 +310,16 @@ impl Reader {
         spine: usize,
         speech: &tts::Speech,
         ctx: &egui::Context,
+        dictionary: &mut DictionarySession,
     ) -> Result<Reader, String> {
-        Self::open_at(path, Some(book_id), traditional, Some((spine, speech)), ctx)
+        Self::open_at(
+            path,
+            Some(book_id),
+            traditional,
+            Some((spine, speech)),
+            ctx,
+            dictionary,
+        )
     }
 
     fn open_at(
@@ -308,6 +328,7 @@ impl Reader {
         traditional: bool,
         start: Option<(usize, &tts::Speech)>,
         ctx: &egui::Context,
+        dictionary: &mut DictionarySession,
     ) -> Result<Reader, String> {
         let epub = Arc::new(Epub::open(path)?);
         let mut settings = Settings::load();
@@ -369,7 +390,7 @@ impl Reader {
                         let Some(i) = next else { return };
                         let ch = tree::build(&epub, &epub.spine[i], &mut sheets);
                         chapters.lock().unwrap()[i] = Some(Arc::new(ch));
-                        if (i as isize - cur).abs() <= 1 {
+                        if (i as isize - want.load(Ordering::Relaxed) as isize).abs() <= 1 {
                             ctx.request_repaint();
                         }
                     }
@@ -385,7 +406,7 @@ impl Reader {
             &book_id,
             ctx,
         );
-        let mut dict = popup::Popup::new(ctx, settings.freq_sort.clone());
+        let mut dict = popup::Popup::new(ctx, settings.freq_sort.clone(), dictionary);
         dict.cards.book = Arc::from(epub.title.as_str());
         dict.sync_cards(&settings.anki);
         let mut dicts = dicts_ui::Manager::new(ctx, &dict);
@@ -418,6 +439,7 @@ impl Reader {
             want,
             stop,
             layouts: HashMap::new(),
+            layout_work: None,
             params: None,
             fonts: None,
             generation: 0,
@@ -501,7 +523,10 @@ impl Reader {
     /// Fonts as chosen; reinstalled when the choice changes. `None` until the
     /// font scan is done and egui has the families.
     fn fonts_ready(&mut self, ctx: &egui::Context) -> Option<fonts::Installed> {
-        let fams = fonts::families()?;
+        let Some(fams) = fonts::families() else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            return None;
+        };
         let serif = self
             .settings
             .serif
@@ -520,6 +545,7 @@ impl Reader {
             self.generation += 1;
             self.fonts = Some(fonts::install(ctx, &fams, &serif, &sans, self.generation));
             self.layouts.clear();
+            self.layout_work = None;
         }
         let f = self.fonts.clone()?;
         let active = ctx.fonts(|v| v.definitions().families.contains_key(&f.serif));
@@ -538,15 +564,32 @@ impl Reader {
         if g.spread { 2 } else { 1 }
     }
 
-    /// The layout of chapter `i`, made now if its tree is ready.
-    fn layout(&mut self, ctx: &egui::Context, i: usize) -> Option<Arc<ChapterLayout>> {
+    /// Advance the layout of chapter `i` if its tree is ready.
+    fn layout(
+        &mut self,
+        ctx: &egui::Context,
+        i: usize,
+        deadline: std::time::Instant,
+    ) -> Option<Arc<ChapterLayout>> {
         if let Some(l) = self.layouts.get(&i) {
             return Some(l.clone());
         }
         let ch = self.chapter(i)?;
         let params = self.params.clone()?;
-        let images = &mut self.images;
-        let l = ctx.fonts_mut(|f| layout::layout(&ch, &params, f, images));
+        if self
+            .layout_work
+            .as_ref()
+            .is_none_or(|(spine, _)| *spine != i)
+        {
+            self.layout_work = Some((i, layout::LayoutWork::default()));
+        }
+        let (_, work) = self.layout_work.as_mut().unwrap();
+        let l = ctx.fonts_mut(|f| work.advance(&ch, &params, f, &mut self.images, Some(deadline)));
+        let Some(l) = l else {
+            ctx.request_repaint();
+            return None;
+        };
+        self.layout_work = None;
         let l = Arc::new(l);
         self.layouts.insert(i, l.clone());
         // Keep the open chapter and its neighbours.
@@ -588,13 +631,14 @@ impl Reader {
     }
 
     fn next(&mut self, g: &Geometry) {
+        let Some(l) = self.layouts.get(&self.spine) else {
+            return;
+        };
         self.forward = true;
         self.turned_at = self.now;
         self.tracker.turned();
         let step = self.step(g);
-        if let Some(l) = self.layouts.get(&self.spine)
-            && self.page + step < l.pages.len()
-        {
+        if self.page + step < l.pages.len() {
             self.page += step;
             self.offset = l.page_offset(self.page);
             return;
@@ -602,21 +646,22 @@ impl Reader {
         if self.spine + 1 < self.epub.spine.len() {
             self.go_chapter(self.spine + 1, Target::Offset(0));
             self.save();
-        } else if self.layouts.contains_key(&self.spine) {
+        } else {
             self.stats_finish();
         }
     }
 
     fn prev(&mut self, g: &Geometry) {
+        let Some(l) = self.layouts.get(&self.spine) else {
+            return;
+        };
         self.forward = false;
         self.turned_at = self.now;
         self.tracker.turned();
         let step = self.step(g);
         if self.page >= step {
             self.page -= step;
-            if let Some(l) = self.layouts.get(&self.spine) {
-                self.offset = l.page_offset(self.page);
-            }
+            self.offset = l.page_offset(self.page);
             return;
         }
         if self.spine > 0 {
@@ -755,6 +800,8 @@ impl Reader {
 
     /// Draw the reader. `false` once it is closed.
     pub fn ui(&mut self, ui: &mut egui::Ui) -> bool {
+        use std::time::{Duration, Instant};
+        let frame_start = Instant::now();
         let ctx = ui.ctx().clone();
         let now = ctx.input(|i| i.time);
         self.now = now;
@@ -767,7 +814,7 @@ impl Reader {
         self.dict.theme.clone_from(&self.settings.popup_theme);
         self.dict.poll();
         self.dict.anchor = None;
-        self.dicts.poll(&ctx, &self.dict, &self.settings);
+        self.dicts.poll(&ctx);
         self.tts.poll(&self.settings.tts);
         // Dictionaries dropped on the reader are imported.
         let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
@@ -954,6 +1001,7 @@ impl Reader {
                 if settled {
                     self.params = Some(params);
                     self.layouts.clear();
+                    self.layout_work = None;
                     self.drawn = Some(g);
                     self.target.get_or_insert(Target::Offset(self.offset));
                 } else {
@@ -962,7 +1010,7 @@ impl Reader {
             }
             let g = self.drawn.unwrap_or(g);
             geom_for_keys = Some(g);
-            let Some(l) = self.layout(&ctx, self.spine) else {
+            let Some(l) = self.layout(&ctx, self.spine, Instant::now() + Duration::from_millis(4)) else {
                 centered_note(ui, area, "Opening…");
                 return;
             };
@@ -1305,20 +1353,6 @@ impl Reader {
                 self.go_chapter(spine, Target::Src(src));
                 self.save();
                 ctx.request_repaint();
-                return;
-            }
-            // Lay out the next chapter once the reader has been idle a moment,
-            // so turning into it is instant and the work never delays a turn.
-            let idle = now - self.turned_at > 0.5;
-            if self.target.is_none()
-                && self.spine + 1 < self.epub.spine.len()
-                && !self.layouts.contains_key(&(self.spine + 1))
-            {
-                if idle {
-                    let _ = self.layout(&ctx, self.spine + 1);
-                } else {
-                    ctx.request_repaint_after(std::time::Duration::from_millis(550));
-                }
             }
         });
 
@@ -1448,6 +1482,30 @@ impl Reader {
                 .show(&ctx, |ui| ui.label(e));
         }
         self.goal_met_effects(&ctx);
+
+        // Navigation and popups take their turn before speculative pagination.
+        // If the reader moves into this chapter, layout continues from here.
+        let next = self.spine + 1;
+        if open
+            && self.target.is_none()
+            && next < self.epub.spine.len()
+            && self.layouts.contains_key(&self.spine)
+            && !self.layouts.contains_key(&next)
+        {
+            let wait = 0.5 - (now - self.turned_at);
+            let deadline = frame_start + Duration::from_millis(6);
+            if wait > 0.0 {
+                ctx.request_repaint_after(Duration::from_secs_f64(wait));
+            } else if menus_open
+                || self.dict.is_open()
+                || ctx.input(|i| !i.events.is_empty())
+                || Instant::now() >= deadline
+            {
+                ctx.request_repaint_after(Duration::from_millis(50));
+            } else {
+                let _ = self.layout(&ctx, next, deadline);
+            }
+        }
         open
     }
 

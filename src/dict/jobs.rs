@@ -171,6 +171,9 @@ pub fn run_import(
         .unload(vec![id.clone()])
         .and_then(|_| manage::swap(root, &id))
         .and_then(|_| manage::add_to_manifest(root, &id));
+    // A job may finish after its reader has closed. The shared lookup worker
+    // still needs to reopen the dictionary, even when no window polls the job.
+    unloader.refresh();
     if std::env::var_os("HANSTAT_DICT_TIMING").is_some() {
         eprintln!("{}: unloaded and swapped in {:?}", meta.title, t.elapsed());
     }

@@ -1,5 +1,12 @@
 # Changelog
 
+## [2026.11.25.11] - 2026-11-25
+
+### Changed
+- **The Reader opens faster and stays responsive while laying out chapters.** Font discovery starts after the first app frame, dictionaries stay loaded when you switch books, and chapter layout can continue over several frames.
+- **Reopening an EPUB's Overview is faster.** Once an EPUB has been opened, hanstat can reuse its extracted text while the file's contents match. Report construction and the Library's word-profile work run in the background.
+- **Reading Path is faster for large libraries.** Candidate books and series are scored in parallel. The same inputs produce the same reading order.
+
 ## [2026.11.25.10] - 2026-11-25
 
 ### Fixed

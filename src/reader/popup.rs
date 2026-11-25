@@ -22,7 +22,7 @@ use hanstat::dict::lookup::{DictInfo, Lookup};
 use hanstat::dict::service::{Reply, Service};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// The key held to look up the word under the pointer.
@@ -143,8 +143,71 @@ impl Level {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct DictionarySession(Option<Arc<Mutex<SessionLookup>>>);
+
+struct SessionLookup {
+    worker: Service,
+    freq_sort: Option<String>,
+    loaded: Option<Reply>,
+    root: std::path::PathBuf,
+    dictionaries: Vec<DictionaryFile>,
+}
+
+#[derive(PartialEq, Eq)]
+struct DictionaryFile {
+    id: String,
+    enabled: bool,
+    collapsed: bool,
+    modified: Option<std::time::SystemTime>,
+}
+
+fn dictionary_files(root: &std::path::Path) -> Vec<DictionaryFile> {
+    use hanstat::dict::format::{META, Manifest};
+    Manifest::load(root)
+        .dicts
+        .into_iter()
+        .map(|d| {
+            let modified = std::fs::metadata(root.join(&d.id).join(META))
+                .and_then(|m| m.modified())
+                .ok();
+            DictionaryFile {
+                id: d.id,
+                enabled: d.enabled,
+                collapsed: d.collapsed,
+                modified,
+            }
+        })
+        .collect()
+}
+
+impl DictionarySession {
+    pub(super) fn prefetch(
+        &mut self,
+        ctx: &egui::Context,
+        root: std::path::PathBuf,
+        freq_sort: Option<String>,
+    ) {
+        self.0.get_or_insert_with(|| {
+            let ctx = ctx.clone();
+            let worker = Service::start(
+                root.clone(),
+                freq_sort.clone(),
+                Arc::new(move || ctx.request_repaint()),
+            );
+            Arc::new(Mutex::new(SessionLookup {
+                worker,
+                freq_sort,
+                loaded: None,
+                dictionaries: dictionary_files(&root),
+                root,
+            }))
+        });
+    }
+}
+
 pub struct Popup {
-    service: Service,
+    service: Arc<Mutex<SessionLookup>>,
     renderer: Renderer,
     pub dicts: Vec<DictInfo>,
     pub scan_len: usize,
@@ -334,20 +397,46 @@ enum CardClick {
 }
 
 impl Popup {
-    pub fn new(ctx: &egui::Context, freq_sort: Option<String>) -> Popup {
-        Self::with_root(ctx, freq_sort, hanstat::dict::root())
+    pub fn new(
+        ctx: &egui::Context,
+        freq_sort: Option<String>,
+        session: &mut DictionarySession,
+    ) -> Popup {
+        session.prefetch(ctx, hanstat::dict::root(), freq_sort.clone());
+        let mut popup = Self::with_service(ctx, session.0.as_ref().unwrap().clone());
+        let loaded = {
+            let mut service = popup.service.lock().unwrap();
+            let dictionaries = dictionary_files(&service.root);
+            if freq_sort != service.freq_sort || dictionaries != service.dictionaries {
+                service.worker.reload(freq_sort.clone());
+                service.freq_sort = freq_sort;
+                service.dictionaries = dictionaries;
+            }
+            service.loaded.clone()
+        };
+        if let Some(reply) = loaded {
+            popup.take(reply);
+        }
+        popup.poll();
+        popup
     }
 
+    #[cfg(test)]
     pub(super) fn with_root(
         ctx: &egui::Context,
         freq_sort: Option<String>,
         root: std::path::PathBuf,
     ) -> Popup {
-        let c = ctx.clone();
+        let mut session = DictionarySession::default();
+        session.prefetch(ctx, root, freq_sort);
+        Self::with_service(ctx, session.0.unwrap())
+    }
+
+    fn with_service(ctx: &egui::Context, service: Arc<Mutex<SessionLookup>>) -> Popup {
         let c2 = ctx.clone();
         Popup {
             cards: Cards::new(Arc::new(move || c2.request_repaint())),
-            service: Service::start(root, freq_sort, Arc::new(move || c.request_repaint())),
+            service,
             renderer: Renderer::new(),
             dicts: Vec::new(),
             scan_len: 0,
@@ -388,14 +477,20 @@ impl Popup {
     }
 
     pub fn reload(&self, freq_sort: Option<String>) {
-        self.service.reload(freq_sort);
+        let mut service = self.service.lock().unwrap();
+        service.worker.reload(freq_sort.clone());
+        service.freq_sort = freq_sort;
+        service.dictionaries = dictionary_files(&service.root);
     }
 
     pub fn unloader(&self) -> hanstat::dict::service::Unloader {
-        self.service.unloader()
+        self.service.lock().unwrap().worker.unloader()
     }
 
     fn take(&mut self, r: Reply) {
+        if matches!(r, Reply::Loaded { .. }) {
+            self.service.lock().unwrap().loaded = Some(r.clone());
+        }
         match r {
             Reply::Loaded {
                 dicts,
@@ -452,7 +547,9 @@ impl Popup {
 
     /// Take in the lookup thread's answers (and the Anki thread's).
     pub fn poll(&mut self) {
-        while let Some(r) = self.service.try_recv() {
+        loop {
+            let reply = self.service.lock().unwrap().worker.try_recv();
+            let Some(r) = reply else { break };
             self.take(r);
         }
         self.cards.poll();
@@ -477,7 +574,7 @@ impl Popup {
         anchor: Option<Rect>,
         sentence: Option<Arc<Sentence>>,
     ) {
-        let id = self.service.lookup(text);
+        let id = self.service.lock().unwrap().worker.lookup(text);
         self.asked = Some(Asked {
             id,
             origin,
@@ -486,7 +583,8 @@ impl Popup {
         });
         let deadline = std::time::Instant::now() + WAIT;
         while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
-            let Some(r) = self.service.recv_timeout(left) else {
+            let reply = self.service.lock().unwrap().worker.recv_timeout(left);
+            let Some(r) = reply else {
                 break;
             };
             let answered = matches!(&r, Reply::Lookup { id: got, .. } if *got == id);

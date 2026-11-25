@@ -390,6 +390,11 @@ struct Flow<'a, 'f> {
     ch: &'a Chapter,
     fonts: &'a mut FontsView<'f>,
     images: &'a mut Images,
+    state: &'a mut FlowState,
+}
+
+#[derive(Default)]
+struct FlowState {
     items: Vec<Item>,
     units: Vec<Unit>,
     decos: Vec<(f32, f32, usize)>,
@@ -408,34 +413,93 @@ struct Flow<'a, 'f> {
     boxes: Vec<InBox>,
 }
 
+struct BlockFrame {
+    next_child: usize,
+    first_inline: bool,
+    x: f32,
+    width: f32,
+    left: f32,
+    total: f32,
+    top: f32,
+    bottom_pad: f32,
+    bottom_margin: f32,
+    border: [f32; 4],
+    deco_slot: Option<usize>,
+}
+
+/// A chapter laid out across frames using the same fonts and geometry.
+#[derive(Default)]
+pub struct LayoutWork {
+    state: FlowState,
+    stack: Vec<BlockFrame>,
+}
+
+impl LayoutWork {
+    pub fn advance(
+        &mut self,
+        ch: &Chapter,
+        p: &Params,
+        fonts: &mut FontsView<'_>,
+        images: &mut Images,
+        deadline: Option<std::time::Instant>,
+    ) -> Option<ChapterLayout> {
+        let mut flow = Flow {
+            p,
+            ch,
+            fonts,
+            images,
+            state: &mut self.state,
+        };
+        if self.stack.is_empty() {
+            self.stack
+                .push(flow.start_block(&ch.root, 0.0, p.content_w));
+        }
+        while let Some((frame, parents)) = self.stack.split_last_mut() {
+            let mut block = &ch.root;
+            for parent in parents {
+                let Child::Block(child) = &block.children[parent.next_child - 1] else {
+                    unreachable!("only a block puts a frame on the stack");
+                };
+                block = child;
+            }
+            let child = if matches!(block.kind, BlockKind::Flow) {
+                block.children.get(frame.next_child)
+            } else {
+                None
+            };
+            let (x, width) = (frame.x, frame.width);
+            match child {
+                Some(Child::Block(child)) => {
+                    frame.next_child += 1;
+                    self.stack.push(flow.start_block(child, x, width));
+                }
+                Some(Child::Inline(items)) => {
+                    flow.inline(items, block.style, x, width, frame.first_inline);
+                    frame.first_inline = false;
+                    frame.next_child += 1;
+                }
+                None => flow.end_block(block, self.stack.pop().unwrap()),
+            }
+            if !self.stack.is_empty() && deadline.is_some_and(|t| std::time::Instant::now() >= t) {
+                return None;
+            }
+        }
+        Some(finish(std::mem::take(&mut self.state), p.page_h))
+    }
+}
+
 pub fn layout(
     ch: &Chapter,
     p: &Params,
     fonts: &mut FontsView<'_>,
     images: &mut Images,
 ) -> ChapterLayout {
-    let mut f = Flow {
-        p,
-        ch,
-        fonts,
-        images,
-        items: Vec::new(),
-        units: Vec::new(),
-        decos: Vec::new(),
-        links: Vec::new(),
-        y: 0.0,
-        margin_pos: 0.0,
-        margin_neg: 0.0,
-        break_next: false,
-        text: 0,
-        han: 0,
-        pending_anchors: Vec::new(),
-        anchors: HashMap::new(),
-        struts: HashMap::new(),
-        hits: Hits::default(),
-        boxes: Vec::new(),
-    };
-    f.block(&ch.root, 0.0, p.content_w);
+    LayoutWork::default()
+        .advance(ch, p, fonts, images, None)
+        .unwrap()
+}
+
+fn finish(mut f: FlowState, page_h: f32) -> ChapterLayout {
     let last = f.units.len().saturating_sub(1);
     for a in std::mem::take(&mut f.pending_anchors) {
         f.anchors.entry(a).or_insert(last);
@@ -445,7 +509,7 @@ pub fn layout(
     let mut cur: Option<(f32, usize)> = None;
     for (i, u) in f.units.iter().enumerate() {
         if let Some((y0, first)) = cur
-            && (u.break_before || u.bottom - y0 > p.page_h + 0.5)
+            && (u.break_before || u.bottom - y0 > page_h + 0.5)
         {
             pages.push(Page {
                 y0,
@@ -525,22 +589,22 @@ impl Flow<'_, '_> {
 
     fn add_margin(&mut self, m: f32) {
         if m >= 0.0 {
-            self.margin_pos = self.margin_pos.max(m);
+            self.state.margin_pos = self.state.margin_pos.max(m);
         } else {
-            self.margin_neg = self.margin_neg.min(m);
+            self.state.margin_neg = self.state.margin_neg.min(m);
         }
     }
 
     fn flush_margin(&mut self) {
-        self.y += self.margin_pos + self.margin_neg;
-        self.margin_pos = 0.0;
-        self.margin_neg = 0.0;
+        self.state.y += self.state.margin_pos + self.state.margin_neg;
+        self.state.margin_pos = 0.0;
+        self.state.margin_neg = 0.0;
     }
 
     fn force_break(&mut self) {
-        self.break_next = true;
-        self.margin_pos = 0.0;
-        self.margin_neg = 0.0;
+        self.state.break_next = true;
+        self.state.margin_pos = 0.0;
+        self.state.margin_neg = 0.0;
     }
 
     fn push_unit(
@@ -552,21 +616,21 @@ impl Flow<'_, '_> {
         chars: usize,
         han: u32,
     ) {
-        let i = self.units.len();
-        for a in std::mem::take(&mut self.pending_anchors) {
-            self.anchors.entry(a).or_insert(i);
+        let i = self.state.units.len();
+        for a in std::mem::take(&mut self.state.pending_anchors) {
+            self.state.anchors.entry(a).or_insert(i);
         }
-        self.units.push(Unit {
+        self.state.units.push(Unit {
             top,
             bottom,
             items,
-            break_before: std::mem::take(&mut self.break_next),
+            break_before: std::mem::take(&mut self.state.break_next),
             image_only,
-            text: self.text,
-            han: self.han,
+            text: self.state.text,
+            han: self.state.han,
         });
-        self.text += chars;
-        self.han += han;
+        self.state.text += chars;
+        self.state.han += han;
     }
 
     fn family(&self, s: &Style) -> (FontFamily, bool) {
@@ -656,7 +720,7 @@ impl Flow<'_, '_> {
 
     /// (height, baseline) of an empty line in this style.
     fn strut(&mut self, id: StyleId) -> (f32, f32) {
-        if let Some(s) = self.struts.get(&id) {
+        if let Some(s) = self.state.struts.get(&id) {
             return *s;
         }
         let mut job = LayoutJob::default();
@@ -667,29 +731,24 @@ impl Flow<'_, '_> {
         );
         let g = self.fonts.layout_job(job);
         let v = (g.size().y, baseline(&g));
-        self.struts.insert(id, v);
+        self.state.struts.insert(id, v);
         v
     }
 
-    fn block(&mut self, b: &Block, x: f32, avail: f32) {
+    fn start_block(&mut self, b: &Block, x: f32, avail: f32) -> BlockFrame {
         let s = self.style(b.style).clone();
         if let Some(id) = &b.id {
-            self.pending_anchors.push(id.clone());
+            self.state.pending_anchors.push(id.clone());
         }
         if s.break_before {
             self.force_break();
         }
         let base = self.p.base;
-        let m: Vec<Option<f32>> = s.margin.iter().map(|l| l.resolve(base, avail)).collect();
-        let pad: Vec<f32> = s
-            .padding
-            .iter()
-            .map(|l| l.px(base, avail).max(0.0))
-            .collect();
+        let m = s.margin.map(|l| l.resolve(base, avail));
+        let pad = s.padding.map(|l| l.px(base, avail).max(0.0));
         let b_kind_rule = matches!(b.kind, BlockKind::Rule);
-        let bw: Vec<f32> = s
+        let bw = s
             .border
-            .iter()
             // A rule's border is the rule itself (see `rule`).
             .map(|b| {
                 if b.visible() && !b_kind_rule {
@@ -697,8 +756,7 @@ impl Flow<'_, '_> {
                 } else {
                     0.0
                 }
-            })
-            .collect();
+            });
         let horizontal_extra = pad[1] + pad[3] + bw[1] + bw[3];
         let ml = m[3].unwrap_or(0.0);
         let mr = m[1].unwrap_or(0.0);
@@ -725,40 +783,56 @@ impl Flow<'_, '_> {
         if decorated || pad[0] > 0.0 || bw[0] > 0.0 {
             self.flush_margin();
         }
-        let top = self.y;
-        self.y += bw[0] + pad[0];
+        let top = self.state.y;
+        self.state.y += bw[0] + pad[0];
         let deco_slot = if decorated {
-            self.items.push(Item::Fill {
+            self.state.items.push(Item::Fill {
                 rect: Rect::NOTHING,
                 color: Color32::TRANSPARENT,
                 radius: 0.0,
             });
-            Some(self.items.len() - 1)
+            Some(self.state.items.len() - 1)
         } else {
             None
         };
         let x0 = left + bw[3] + pad[3];
         match &b.kind {
-            BlockKind::Flow => {
-                let mut first_inline = true;
-                for c in &b.children {
-                    match c {
-                        Child::Block(cb) => self.block(cb, x0, w),
-                        Child::Inline(items) => {
-                            self.inline(items, b.style, x0, w, first_inline);
-                            first_inline = false;
-                        }
-                    }
-                }
-            }
+            BlockKind::Flow => {}
             BlockKind::Image(img) => self.block_image(img, &s, x0, w),
             BlockKind::Rule => self.rule(&s, x0, w),
         }
-        if pad[2] > 0.0 || bw[2] > 0.0 || decorated {
+        BlockFrame {
+            next_child: 0,
+            first_inline: true,
+            x: x0,
+            width: w,
+            left,
+            total,
+            top,
+            bottom_pad: pad[2],
+            bottom_margin: m[2].unwrap_or(0.0),
+            border: bw,
+            deco_slot,
+        }
+    }
+
+    fn end_block(&mut self, b: &Block, frame: BlockFrame) {
+        let s = self.style(b.style).clone();
+        let BlockFrame {
+            left,
+            total,
+            top,
+            bottom_pad,
+            bottom_margin,
+            border: bw,
+            deco_slot,
+            ..
+        } = frame;
+        if bottom_pad > 0.0 || bw[2] > 0.0 || deco_slot.is_some() {
             self.flush_margin();
         }
-        self.y += pad[2] + bw[2];
-        let bottom = self.y;
+        self.state.y += bottom_pad + bw[2];
+        let bottom = self.state.y;
         if let Some(slot) = deco_slot {
             let rect = Rect::from_min_max(pos2(left, top), pos2(left + total, bottom));
             if let Some(bg) = s.background.filter(|c| !near_white(*c)) {
@@ -768,12 +842,12 @@ impl Flow<'_, '_> {
                 } else {
                     bg
                 };
-                self.items[slot] = Item::Fill {
+                self.state.items[slot] = Item::Fill {
                     rect,
                     color: bg,
                     radius: s.radius * self.p.base,
                 };
-                self.decos.push((top, bottom, slot));
+                self.state.decos.push((top, bottom, slot));
             }
             for (i, b) in s.border.iter().enumerate() {
                 if bw[i] == 0.0 {
@@ -807,17 +881,19 @@ impl Flow<'_, '_> {
                         })
                     })
                     .unwrap_or(self.p.rule);
-                self.items.push(Item::Line {
+                self.state.items.push(Item::Line {
                     a,
                     b: z,
                     width: bw[i],
                     color,
                     style: b.style,
                 });
-                self.decos.push((top, bottom, self.items.len() - 1));
+                self.state
+                    .decos
+                    .push((top, bottom, self.state.items.len() - 1));
             }
         }
-        self.add_margin(m[2].unwrap_or(0.0));
+        self.add_margin(bottom_margin);
         if s.break_after {
             self.force_break();
         }
@@ -900,15 +976,15 @@ impl Flow<'_, '_> {
             }
             _ => x0 + (w - size.x) / 2.0,
         };
-        let rect = Rect::from_min_size(pos2(x, self.y), size);
-        self.items.push(Item::Image {
+        let rect = Rect::from_min_size(pos2(x, self.state.y), size);
+        self.state.items.push(Item::Image {
             rect,
             path: img.path.clone(),
         });
-        let n = self.items.len();
-        let top = self.y;
-        self.y += size.y;
-        self.push_unit(top, self.y, n - 1..n, true, 0, 0);
+        let n = self.state.items.len();
+        let top = self.state.y;
+        self.state.y += size.y;
+        self.push_unit(top, self.state.y, n - 1..n, true, 0, 0);
     }
 
     fn rule(&mut self, s: &Style, x0: f32, w: f32) {
@@ -933,8 +1009,8 @@ impl Flow<'_, '_> {
                 })
             })
             .unwrap_or(self.p.rule);
-        let top = self.y;
-        self.items.push(Item::Line {
+        let top = self.state.y;
+        self.state.items.push(Item::Line {
             a: pos2(x0, top + width / 2.0),
             b: pos2(x0 + w, top + width / 2.0),
             width,
@@ -945,9 +1021,9 @@ impl Flow<'_, '_> {
                 LineStyle::Solid
             },
         });
-        let n = self.items.len();
-        self.y += width;
-        self.push_unit(top, self.y, n - 1..n, false, 0, 0);
+        let n = self.state.items.len();
+        self.state.y += width;
+        self.push_unit(top, self.state.y, n - 1..n, false, 0, 0);
     }
 
     /// Lay out an inline box's content on one line, within `avail`:
@@ -1082,7 +1158,7 @@ impl Flow<'_, '_> {
     /// Draw inline box `k` with its content on the baseline `at.y`, from `at.x`.
     fn emit_box(&mut self, k: usize, at: Pos2) {
         let (pieces, style, size, base, inset) = {
-            let b = &self.boxes[k];
+            let b = &self.state.boxes[k];
             (b.pieces.clone(), b.style, b.size, b.base, b.inset)
         };
         let s = self.ch.styles[style as usize].clone();
@@ -1095,7 +1171,7 @@ impl Flow<'_, '_> {
             } else {
                 bg
             };
-            self.items.push(Item::Fill {
+            self.state.items.push(Item::Fill {
                 rect,
                 color: bg,
                 radius,
@@ -1114,7 +1190,7 @@ impl Flow<'_, '_> {
                 }
             });
             let width = (b.width * self.p.base).max(0.75);
-            self.items.push(Item::Frame {
+            self.state.items.push(Item::Frame {
                 rect: rect.shrink(width / 2.0),
                 radius,
                 width,
@@ -1124,12 +1200,12 @@ impl Flow<'_, '_> {
         let origin = rect.min + inset;
         for p in pieces {
             match p {
-                BoxPiece::Text { galley, x, y } => self.items.push(Item::Text {
+                BoxPiece::Text { galley, x, y } => self.state.items.push(Item::Text {
                     pos: origin + vec2(x, y),
                     galley,
                     faux: None,
                 }),
-                BoxPiece::Image { path, x, y, size } => self.items.push(Item::Image {
+                BoxPiece::Image { path, x, y, size } => self.state.items.push(Item::Image {
                     rect: Rect::from_min_size(origin + vec2(x, y), size),
                     path,
                 }),
@@ -1147,7 +1223,7 @@ impl Flow<'_, '_> {
         let mut anchors: Vec<(usize, String)> = Vec::new();
         let mut ruby_open: Option<usize> = None;
         let mut widths: HashMap<(char, StyleId), f32> = HashMap::new();
-        self.boxes.clear();
+        self.state.boxes.clear();
         for it in items {
             match it {
                 Inline::Text {
@@ -1217,10 +1293,10 @@ impl Flow<'_, '_> {
                 Inline::Box { items, style, link } => {
                     let (b, lead, trail) = self.inline_box(items, *style, w);
                     let outer = b.size.x;
-                    self.boxes.push(b);
+                    self.state.boxes.push(b);
                     atoms.push(Atom {
                         ch: '\u{FFFC}',
-                        kind: AKind::Box(self.boxes.len() - 1),
+                        kind: AKind::Box(self.state.boxes.len() - 1),
                         style: *style,
                         link: *link,
                         ruby: ruby_open,
@@ -1248,7 +1324,7 @@ impl Flow<'_, '_> {
         }
         if atoms.is_empty() {
             for (_, id) in anchors {
-                self.pending_anchors.push(id);
+                self.state.pending_anchors.push(id);
             }
             return;
         }
@@ -1313,7 +1389,7 @@ impl Flow<'_, '_> {
                 .is_some_and(|(at, _)| *at < next.max(start + 1))
             {
                 let (_, id) = anchor_iter.next().unwrap();
-                self.pending_anchors.push(id);
+                self.state.pending_anchors.push(id);
             }
             self.line(
                 &atoms[start..end],
@@ -1331,7 +1407,7 @@ impl Flow<'_, '_> {
             line_no += 1;
         }
         for (_, id) in anchor_iter {
-            self.pending_anchors.push(id);
+            self.state.pending_anchors.push(id);
         }
     }
 
@@ -1445,7 +1521,7 @@ impl Flow<'_, '_> {
                 continue;
             }
             if let AKind::Box(k) = first.kind {
-                let b = &self.boxes[k];
+                let b = &self.state.boxes[k];
                 above = above.max(b.base);
                 below = below.max(b.size.y - b.base);
                 out.push(Seg {
@@ -1533,13 +1609,13 @@ impl Flow<'_, '_> {
         }
         // Emit.
         self.flush_margin();
-        let top = self.y;
+        let top = self.state.y;
         let baseline_y = top + above;
-        let first_item = self.items.len();
+        let first_item = self.state.items.len();
         let mut ruby_drawn = std::collections::HashSet::new();
         for s in out {
             if let Some((k, size)) = s.img {
-                self.items.push(Item::Image {
+                self.state.items.push(Item::Image {
                     rect: Rect::from_min_size(pos2(s.x, baseline_y - size.y), size),
                     path: imgs[k].0.path.clone(),
                 });
@@ -1563,14 +1639,14 @@ impl Flow<'_, '_> {
                     let x_end = xs[z_local - 1] + atoms[z_local - 1].w;
                     let rx = (x_start + x_end - rg.size().x) / 2.0;
                     let ry = baseline_y - s.ascent - rg.size().y;
-                    self.items.push(Item::Text {
+                    self.state.items.push(Item::Text {
                         pos: pos2(rx, ry),
                         galley: rg.clone(),
                         faux: None,
                     });
                 }
             }
-            self.items.push(Item::Text {
+            self.state.items.push(Item::Text {
                 pos,
                 galley: g,
                 faux: s.faux,
@@ -1578,7 +1654,7 @@ impl Flow<'_, '_> {
         }
         let bottom = baseline_y + below;
         // Links.
-        let unit = self.units.len();
+        let unit = self.state.units.len();
         let mut i = 0;
         while i < atoms.len() {
             if let Some(l) = atoms[i].link {
@@ -1588,7 +1664,7 @@ impl Flow<'_, '_> {
                 }
                 let rect =
                     Rect::from_min_max(pos2(xs[i], top), pos2(xs[j - 1] + atoms[j - 1].w, bottom));
-                self.links.push(Link {
+                self.state.links.push(Link {
                     rect,
                     target: l,
                     unit,
@@ -1599,17 +1675,17 @@ impl Flow<'_, '_> {
             }
         }
         // Characters, for the dictionary.
-        let start = self.hits.x.len() as u32;
+        let start = self.state.hits.x.len() as u32;
         for (i, a) in atoms.iter().enumerate() {
             if a.kind == AKind::Char && a.src != NO_SRC {
-                self.hits.x.push(xs[i]);
-                self.hits.w.push(a.w);
-                self.hits.src.push(a.src);
+                self.state.hits.x.push(xs[i]);
+                self.state.hits.w.push(a.w);
+                self.state.hits.src.push(a.src);
             }
         }
-        let len = self.hits.x.len() as u32 - start;
+        let len = self.state.hits.x.len() as u32 - start;
         if len > 0 {
-            self.hits.lines.push(HitLine {
+            self.state.hits.lines.push(HitLine {
                 top,
                 bottom,
                 glyph_top: baseline_y - strut_base,
@@ -1627,8 +1703,8 @@ impl Flow<'_, '_> {
             .iter()
             .filter(|a| a.kind == AKind::Char && a.src != NO_SRC && hanstat::chars::is_han(a.ch))
             .count() as u32;
-        let n = self.items.len();
-        self.y = bottom;
+        let n = self.state.items.len();
+        self.state.y = bottom;
         self.push_unit(top, bottom, first_item..n, false, chars, han);
     }
 }
@@ -1656,6 +1732,10 @@ mod tests {
 
     /// A document laid out with the app's fonts, `cols` characters of 20 px wide.
     fn lay_out_html(html: &str, cols: f32) -> (Chapter, ChapterLayout) {
+        lay_out_html_in_steps(html, cols, false)
+    }
+
+    fn lay_out_html_in_steps(html: &str, cols: f32, sliced: bool) -> (Chapter, ChapterLayout) {
         use super::super::tree::{Source, build_doc, ua_rules};
         let ctx = eframe::egui::Context::default();
         // The bundled LXGW WenKai first: the same glyphs on every machine
@@ -1707,8 +1787,51 @@ mod tests {
             dark: false,
         };
         let mut images = Images::with_source("test", Arc::new(|_: &str| None));
-        let l = ctx.fonts_mut(|f| layout(&ch, &p, f, &mut images));
+        let l = if sliced {
+            let mut work = LayoutWork::default();
+            let mut result = None;
+            let mut frames = 0;
+            loop {
+                ctx.run_ui(Default::default(), |ui| {
+                    if result.is_none() {
+                        result = ui.ctx().fonts_mut(|f| {
+                            work.advance(&ch, &p, f, &mut images, Some(std::time::Instant::now()))
+                        });
+                    }
+                })
+                .textures_delta
+                .clear();
+                frames += 1;
+                if let Some(layout) = result {
+                    assert!(frames > 1);
+                    break layout;
+                }
+                assert!(frames < 100, "the chapter never finished");
+            }
+        } else {
+            ctx.fonts_mut(|f| layout(&ch, &p, f, &mut images))
+        };
         (ch, l)
+    }
+
+    #[test]
+    fn nested_blocks_keep_the_same_layout_across_frames() {
+        let html = r#"<html><body><div style="margin: 1em; padding: 1em; background: #afa">
+            <section><p>第一段。</p><p id="next">第二段，<strong>有点长有点长有点长</strong>。</p></section>
+            <p>最后一段。</p></div></body></html>"#;
+        let (chapter, full) = lay_out_html(html, 12.0);
+        let (_, sliced) = lay_out_html_in_steps(html, 12.0, true);
+        assert_eq!(full.items.len(), sliced.items.len());
+        assert_eq!(full.decos, sliced.decos);
+        assert_eq!(full.page_of_anchor("next"), sliced.page_of_anchor("next"));
+        assert_eq!(full.pages.len(), sliced.pages.len());
+        for page in 0..full.pages.len() {
+            let range = 0..chapter.chars.len() as u32;
+            assert_eq!(
+                full.char_rects(page, range.clone()),
+                sliced.char_rects(page, range)
+            );
+        }
     }
 
     /// The text is indexed in layout order with block boundaries, and the

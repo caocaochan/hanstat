@@ -147,6 +147,46 @@ fn epub_adversarial() {
 /// Folded, a book that mixes scripts counts 說 and 说 as one character,
 /// shown as the book more often writes it; unfolded, as two.
 #[test]
+fn epub_cache_reuses_exact_contents_and_refreshes_changed_files() {
+    use hanstat::{book_cache, cache::Cache};
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = Cache::at(tmp.path().join("cache"));
+    let first = tmp.path().join("test.epub");
+    let moved = tmp.path().join("moved.epub");
+    let epub = |body: &str| {
+        build_epub(&[
+            ("META-INF/container.xml", CONTAINER),
+            ("OEBPS/content.opf", OPF),
+            ("OEBPS/Text/nav.xhtml", NAV),
+            ("OEBPS/Text/ch 1.xhtml", body),
+            ("OEBPS/Text/notes.xhtml", NOTES),
+        ])
+    };
+    let body = "<html><body><p>我们。</p></body></html>";
+    std::fs::write(&first, epub(body)).unwrap();
+    let initial = book_cache::load(&first, EncodingChoice::Auto, Some(&cache)).unwrap();
+    let saved = cache.dir().join("epub-text");
+    assert_eq!(std::fs::read_dir(&saved).unwrap().count(), 1);
+
+    std::fs::rename(first, &moved).unwrap();
+    let reopened = book_cache::load(&moved, EncodingChoice::Auto, Some(&cache)).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&initial).unwrap(),
+        serde_json::to_vec(&reopened).unwrap()
+    );
+    assert_eq!(std::fs::read_dir(&saved).unwrap().count(), 1);
+
+    let changed = body.replace("我们", "他们");
+    std::fs::write(&moved, epub(&changed)).unwrap();
+    let updated = book_cache::load(&moved, EncodingChoice::Auto, Some(&cache)).unwrap();
+    assert_eq!(updated.sections[1].paragraphs, ["他们。"]);
+    assert_eq!(std::fs::read_dir(&saved).unwrap().count(), 2);
+
+    book_cache::clear(&cache).unwrap();
+    assert_eq!(std::fs::read_dir(&saved).unwrap().count(), 0);
+}
+
+#[test]
 fn chars_fold_across_scripts() {
     let text = "第一章\n他說話。他說了。我说。\n";
     let book = extract::txt::load(text.as_bytes(), EncodingChoice::Auto);

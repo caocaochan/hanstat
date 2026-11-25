@@ -202,7 +202,14 @@ impl Driver {
     }
 
     fn open(&self, book: &str) -> Reader {
-        let mut r = Reader::open(Path::new(book), Some("ui-test"), false, &self.ctx).unwrap();
+        let mut r = Reader::open(
+            Path::new(book),
+            Some("ui-test"),
+            false,
+            &self.ctx,
+            &mut DictionarySession::default(),
+        )
+        .unwrap();
         r.persist = false;
         r
     }
@@ -584,7 +591,9 @@ fn reader_text_selection() {
     .unwrap();
     manage::swap(&root, id).unwrap();
     manage::add_to_manifest(&root, id).unwrap();
-    r.dict = popup::Popup::with_root(&d.ctx, None, root);
+    let mut dictionary = DictionarySession::default();
+    dictionary.prefetch(&d.ctx, root, None);
+    r.dict = popup::Popup::new(&d.ctx, None, &mut dictionary);
 
     let footnote = displayed_char(&r, 0).center();
     let since = Instant::now();
@@ -601,6 +610,12 @@ fn reader_text_selection() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert_eq!(r.dict.highlight(1), Some((0, 2)));
+    r.dict = popup::Popup::new(&d.ctx, None, &mut dictionary);
+    assert!(
+        r.dict.has_terms(),
+        "a new popup already has the session's dictionaries"
+    );
+    assert!(!r.dict.is_open(), "a new book has no outstanding lookup");
     r.dict.unloader().unload(vec![id.into()]).unwrap();
 }
 

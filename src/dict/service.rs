@@ -14,9 +14,11 @@ use std::time::Duration;
 enum Request {
     Lookup { id: u64, text: String },
     Reload { freq_sort: Option<String> },
+    Refresh,
     Unload { ids: Vec<String>, done: Sender<()> },
 }
 
+#[derive(Clone)]
 pub enum Reply {
     Lookup {
         id: u64,
@@ -102,6 +104,11 @@ impl Service {
 pub struct Unloader(Sender<Request>);
 
 impl Unloader {
+    /// Reopen the dictionaries after a job finishes putting files in place.
+    pub fn refresh(&self) {
+        let _ = self.0.send(Request::Refresh);
+    }
+
     pub fn unload(&self, ids: Vec<String>) -> Result<(), String> {
         let (done, wait) = channel();
         self.0
@@ -153,8 +160,10 @@ fn worker(
                         micros: t.elapsed().as_micros() as u64,
                     }
                 }
-                Request::Reload { freq_sort: f } => {
-                    freq_sort = f;
+                Request::Reload { .. } | Request::Refresh => {
+                    if let Request::Reload { freq_sort: wanted } = r {
+                        freq_sort = wanted;
+                    }
                     // Drop the old maps before opening the files again.
                     drop(std::mem::replace(&mut engine, Engine::empty()));
                     let (e, errors) = Engine::load(&root, freq_sort.as_deref());

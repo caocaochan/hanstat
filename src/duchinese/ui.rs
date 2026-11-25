@@ -477,7 +477,7 @@ impl App {
                 .enumerate()
                 .map(|(i, c)| at.get(c.lesson.as_str()).copied().unwrap_or(i as u32))
                 .collect();
-            self.du_rekey(old, &id, &map);
+            self.du_rekey(old, &id, &map, ctx);
         }
         let added = before.as_ref().map_or(0, |b| {
             record.chapters.len().saturating_sub(b.chapters.len())
@@ -510,7 +510,13 @@ impl App {
                 .find(|e| store::same_file(&e.path, &path))
             {
                 let traditional = e.stats.variant == "Traditional";
-                match crate::reader::Reader::open(&path, Some(&e.id), traditional, ctx) {
+                match crate::reader::Reader::open(
+                    &path,
+                    Some(&e.id),
+                    traditional,
+                    ctx,
+                    &mut self.reader_dictionary,
+                ) {
                     Ok(r) => self.reader = Some(r),
                     Err(e) => self.set_error("reader", e),
                 }
@@ -521,7 +527,8 @@ impl App {
     /// Book `old` is now `new` (rebuilt): its Library row, reading stats,
     /// place, read mark, reading path entries and writing-style rating
     /// follow it. `spine`: where each old chapter now is.
-    fn du_rekey(&mut self, old: &str, new: &str, spine: &[u32]) {
+    fn du_rekey(&mut self, old: &str, new: &str, spine: &[u32], ctx: &egui::Context) {
+        self.finish_profile_for(old);
         if let Err(e) = self.history.rekey(old, new) {
             self.history_error = Some(e);
         }
@@ -537,12 +544,14 @@ impl App {
         }
         // The mark keeps the words it took: new chapters add none.
         let (old_s, new_s) = (old.to_owned(), new.to_owned());
-        self.edit_known(move |k| match k.read.iter_mut().find(|b| b.id == old_s) {
-            Some(b) => {
-                b.id = new_s;
-                true
+        self.edit_known(ctx, move |k| {
+            match k.read.iter_mut().find(|b| b.id == old_s) {
+                Some(b) => {
+                    b.id = new_s;
+                    true
+                }
+                None => false,
             }
-            None => false,
         });
         let st = &mut self.plan.settings;
         let mut changed = false;
@@ -717,7 +726,13 @@ impl App {
         let Some(e) = self.du_entry(r) else { return };
         let (path, id) = (e.path.clone(), e.id.clone());
         let traditional = e.stats.variant == "Traditional";
-        match crate::reader::Reader::open(&path, Some(&id), traditional, ctx) {
+        match crate::reader::Reader::open(
+            &path,
+            Some(&id),
+            traditional,
+            ctx,
+            &mut self.reader_dictionary,
+        ) {
             Ok(r) => self.reader = Some(r),
             Err(e) => self.du.error = Some(e),
         }

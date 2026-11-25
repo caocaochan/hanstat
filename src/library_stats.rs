@@ -385,7 +385,7 @@ impl App {
                 format!("Unmarked {shown}")
             };
             self.toast = Some((msg, ui.input(|i| i.time) + 3.0));
-            self.known_changed();
+            self.known_changed(ui.ctx());
         }
     }
 

@@ -752,7 +752,13 @@ impl App {
         match act {
             Some(Act::Read(i)) => {
                 let Some(b) = books.get(i) else { return };
-                match reader::Reader::open(&b.path, Some(&b.id), b.traditional, ctx) {
+                match reader::Reader::open(
+                    &b.path,
+                    Some(&b.id),
+                    b.traditional,
+                    ctx,
+                    &mut self.reader_dictionary,
+                ) {
                     Ok(r) => self.reader = Some(r),
                     Err(e) => self.set_error("reader", e),
                 }

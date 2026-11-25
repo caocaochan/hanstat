@@ -1599,17 +1599,19 @@ impl Library {
             let mut cands: Vec<(Key, usize, usize)> = beam
                 .par_iter()
                 .enumerate()
-                .flat_map_iter(|(si, s)| {
+                .flat_map(|(si, s)| {
                     let earlier = &earlier;
                     let in_block = &in_block;
                     books
-                        .iter()
-                        .filter(move |&&b| {
+                        .par_iter()
+                        .with_min_len(8)
+                        .copied()
+                        .filter(move |&b| {
                             !in_block[b]
                                 && !in_done(&s.done, b)
                                 && earlier[b].iter().all(|&a| in_done(&s.done, a))
                         })
-                        .map(move |&b| (si, b))
+                        .map(move |b| (si, b))
                 })
                 .map(|(si, b)| {
                     let s = &beam[si];
@@ -1640,11 +1642,13 @@ impl Library {
             let mut whole: Vec<(Key, usize, usize)> = beam
                 .par_iter()
                 .enumerate()
-                .flat_map_iter(|(si, s)| {
+                .flat_map(|(si, s)| {
                     let blocks = &blocks;
-                    (0..blocks.len())
-                        .filter(move |&bi| !blocks[bi].iter().any(|&b| in_done(&s.done, b)))
-                        .map(move |bi| (si, bi))
+                    blocks
+                        .par_iter()
+                        .enumerate()
+                        .filter(move |(_, block)| !block.iter().any(|&b| in_done(&s.done, b)))
+                        .map(move |(bi, _)| (si, bi))
                 })
                 .map(|(si, bi)| {
                     let k = self.advance_key(&beam[si], &blocks[bi], params, known0);

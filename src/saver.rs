@@ -154,6 +154,10 @@ pub fn read(path: &Path) -> std::io::Result<Vec<u8>> {
     std::fs::read(path)
 }
 
+pub fn is_pending(path: &Path) -> bool {
+    lock().pending.contains_key(path)
+}
+
 /// Wait until every queued file is written.
 pub fn flush() {
     let mut st = lock();

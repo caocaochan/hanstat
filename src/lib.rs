@@ -1,6 +1,7 @@
 pub mod analyze;
 pub mod anki;
 pub mod anki_connect;
+pub mod book_cache;
 pub mod books;
 pub mod cache;
 pub mod chars;

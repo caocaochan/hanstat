@@ -330,7 +330,11 @@ pub(crate) struct Reading {
 }
 
 impl Reading {
-    pub fn open(self, ctx: &egui::Context) -> Result<Reader, String> {
+    pub fn open(
+        self,
+        ctx: &egui::Context,
+        dictionary: &mut crate::reader::DictionarySession,
+    ) -> Result<Reader, String> {
         Reader::open_with_voice(
             &self.source.path,
             &self.source.id,
@@ -338,6 +342,7 @@ impl Reading {
             self.spine,
             &self.speech,
             ctx,
+            dictionary,
         )
     }
 }

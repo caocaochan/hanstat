@@ -1003,7 +1003,13 @@ impl App {
             match a {
                 Act::Open(p) => self.open(p, ctx),
                 Act::Read(path, id, traditional) => {
-                    match crate::reader::Reader::open(&path, Some(&id), traditional, ctx) {
+                    match crate::reader::Reader::open(
+                        &path,
+                        Some(&id),
+                        traditional,
+                        ctx,
+                        &mut self.reader_dictionary,
+                    ) {
                         Ok(r) => self.reader = Some(r),
                         Err(e) => self.set_error("reader", e),
                     }

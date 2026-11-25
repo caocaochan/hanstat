@@ -129,9 +129,13 @@ impl App {
 
     /// Change the known words with `f` (which says whether it changed
     /// anything), save them, and bring what depends on them up to date.
-    pub(crate) fn edit_known(&mut self, f: impl FnOnce(&mut known::Settings) -> bool) {
+    pub(crate) fn edit_known(
+        &mut self,
+        ctx: &egui::Context,
+        f: impl FnOnce(&mut known::Settings) -> bool,
+    ) {
         if f(&mut self.known.settings) {
-            self.known_changed();
+            self.known_changed(ctx);
             if let Some(e) = &self.known.error {
                 self.history_error = Some(e.clone());
             }
@@ -425,7 +429,7 @@ impl App {
                     fmt_int(b.words.len() as u64),
                     fmt_int(b.added as u64)
                 );
-                self.edit_known(|k| {
+                self.edit_known(ctx, |k| {
                     let changed = k.read_book(&b.id) != Some(&b);
                     k.set_read(b);
                     changed
@@ -434,7 +438,7 @@ impl App {
             }
             Some(ReadAct::Unmark) => {
                 self.read_dialog = None;
-                self.edit_known(|k| k.unset_read(&id));
+                self.edit_known(ctx, |k| k.unset_read(&id));
                 // Marked again, it is copied again as it is then.
                 let _ = std::fs::remove_file(hanstat::profile::read_copy_path_in(
                     &history::History::path(),
@@ -482,7 +486,7 @@ impl App {
             self.across.counts = Arc::new(done.counts);
             self.across.missing = done.missing;
             let words = done.words;
-            self.edit_known(|k| {
+            self.edit_known(ctx, |k| {
                 let changed = k.across != words;
                 k.across = words;
                 changed

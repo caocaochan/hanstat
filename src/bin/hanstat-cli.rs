@@ -1157,10 +1157,12 @@ fn main() {
         std::process::exit(2);
     };
     let t0 = std::time::Instant::now();
-    let book = extract::load(&file, EncodingChoice::Auto).unwrap_or_else(|e| {
-        eprintln!("{e}");
-        std::process::exit(1)
-    });
+    let cache = hanstat::cache::Cache::open().filter(|_| !no_cache);
+    let book = hanstat::book_cache::load(&file, EncodingChoice::Auto, cache.as_ref())
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1)
+        });
     let t_load = t0.elapsed();
     let anki_col = open_anki();
     let known_lists = ka.resolve();
@@ -1184,7 +1186,6 @@ fn main() {
             std::process::exit(1);
         }
     }
-    let cache = hanstat::cache::Cache::open().filter(|_| !no_cache);
     let analyse = |words: &[String]| {
         analyze::analyze_book_cached(&book, kind, words, &seg_known, cache.as_ref(), &|_, _| {})
             .unwrap_or_else(|e| {
