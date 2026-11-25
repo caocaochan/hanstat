@@ -1,5 +1,11 @@
 # Changelog
 
+## [2026.11.25.06] - 2026-11-25
+
+### Added
+- **A glow when you reach your daily goal.** When today's reading goal is met while you read, a rainbow glow runs round the edge of the window for 5 seconds. It shows once a day: not again for paging back under the goal and on, and not when you open a book with the goal already met. A minutes goal shows it as the time is up, without waiting for a page turn. Turn it off under **Stats › Settings** in the reader.
+- **Listening can count toward the daily goal.** Settings (⚙) has a new **Daily reading goal** option, **Count listening (read aloud) as reading time**. With it on, time and characters while read aloud plays count toward the goal and its streak, in the reader, on Home and in Library Stats. Reading speed and days read still leave listening out. Off by default.
+
 ## [2026.11.25.05] - 2026-11-25
 
 ### Added
