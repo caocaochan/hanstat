@@ -9,6 +9,7 @@ use crate::reader::stats_mins as mins;
 use crate::reading_stats::{self as rs, Day, Summary};
 use crate::{App, fmt_int, palette};
 use eframe::egui::{self, RichText};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 const CHART_HEIGHT: f32 = 200.0;
@@ -343,6 +344,9 @@ impl App {
         self.reading_calendar(ui, &sum, period);
         ui.add_space(8.0);
         if period.is_none_or(|p| p.unit != Unit::Day) {
+            if let Some(id) = self.reading_running(ui, &sum, &set, period) {
+                self.open_book_id(&id, ui.ctx());
+            }
             self.reading_amounts(ui, &sum, period);
             ui.add_space(8.0);
             reading_speeds(ui, &sum, period);
@@ -859,6 +863,395 @@ fn reading_tiles(
     tile_grid(ui, tiles);
 }
 
+/// A book's title for a chart note: in 《》 when it is Chinese, cut short.
+fn note_title(t: &str) -> String {
+    const MAX: usize = 16;
+    let mut s: String = t.trim().chars().take(MAX).collect();
+    if t.trim().chars().count() > MAX {
+        s.push('…');
+    }
+    if s.chars().any(hanstat::chars::is_han) {
+        format!("《{s}》")
+    } else {
+        s
+    }
+}
+
+/// Labels under a running total over days `first..end`: days, Mondays,
+/// or month starts every 1–24 months, as many as `width` has room for.
+fn running_ticks(first: i32, end: i32, width: f32) -> Vec<(i32, String)> {
+    let span = end - first;
+    let room = ((width / 80.0) as i32).max(2);
+    let day_label = |d: i32| {
+        let (_, m, dd) = rs::civil(d as i64);
+        format!("{dd} {}", MONTHS[m as usize - 1])
+    };
+    if span <= room {
+        return (first..end).map(|d| (d, day_label(d))).collect();
+    }
+    // Mondays, every week or every other one.
+    for step in [7, 14] {
+        if span <= step * room {
+            let mut d = first + (7 - rs::weekday(first) as i32) % 7;
+            let mut v = Vec::new();
+            while d < end {
+                v.push((d, day_label(d)));
+                d += step;
+            }
+            return v;
+        }
+    }
+    let (y0, m0, _) = rs::civil(first as i64);
+    let (y1, _, _) = rs::civil(end as i64 - 1);
+    // Month starts in range, on multiples of `step` counted from January
+    // so labels land on the same months every year.
+    let at_step = |step: i64| {
+        let mut k = y0 * 12 + m0 as i64 - 1;
+        if month_start(y0, m0 as i64) < first {
+            k += 1;
+        }
+        while k % step != 0 {
+            k += 1;
+        }
+        let mut v = Vec::new();
+        loop {
+            let (y, m) = (k.div_euclid(12), k.rem_euclid(12) + 1);
+            let d = month_start(y, m);
+            if d >= end {
+                break v;
+            }
+            let name = MONTHS[m as usize - 1];
+            let label = if y0 == y1 {
+                name.to_owned()
+            } else if step >= 12 {
+                y.to_string()
+            } else {
+                format!("{name} {y}")
+            };
+            v.push((d, label));
+            k += step;
+        }
+    };
+    [1, 2, 3, 4, 6, 12, 24, 48]
+        .into_iter()
+        .map(at_step)
+        .find(|v| v.len() as i32 <= room)
+        .unwrap_or_default()
+}
+
+/// A book marked read with dates given by hand: its characters are spread
+/// over days `from..=to`.
+struct Dated {
+    id: String,
+    title: String,
+    from: i32,
+    to: i32,
+    han: u64,
+}
+
+/// A book on the running total: characters by day, (timed by the reader,
+/// spread over dates given by hand).
+struct RunBook {
+    id: String,
+    title: String,
+    days: BTreeMap<i32, (f64, f64)>,
+    /// Finished in the reader (Unix time).
+    finished: Option<u64>,
+    by_hand: Option<(i32, i32)>,
+}
+
+/// The books read in the reader, and those marked read with dates: what
+/// the reader didn't time of a dated book (its characters less those timed)
+/// is spread evenly over its dates.
+fn run_books(sum: &Summary, dated: &[Dated]) -> Vec<RunBook> {
+    let mut out: Vec<RunBook> = sum
+        .books
+        .iter()
+        .map(|(id, b)| RunBook {
+            id: id.clone(),
+            title: b.title.clone(),
+            days: b
+                .days
+                .iter()
+                .filter(|(_, d)| d.read_chars > 0)
+                .map(|(k, d)| (*k, (d.read_chars as f64, 0.0)))
+                .collect(),
+            finished: b.finished,
+            by_hand: None,
+        })
+        .collect();
+    for m in dated {
+        let i = match out.iter().position(|b| b.id == m.id) {
+            Some(i) => i,
+            None => {
+                out.push(RunBook {
+                    id: m.id.clone(),
+                    title: m.title.clone(),
+                    days: BTreeMap::new(),
+                    finished: None,
+                    by_hand: None,
+                });
+                out.len() - 1
+            }
+        };
+        let b = &mut out[i];
+        let timed: f64 = b.days.values().map(|d| d.0).sum();
+        let left = (m.han as f64 - timed).max(0.0);
+        let n = (m.to - m.from + 1).max(1);
+        for d in m.from..m.from + n {
+            b.days.entry(d).or_default().1 += left / n as f64;
+        }
+        b.by_hand = Some((m.from, m.to));
+        if b.title.trim().is_empty() {
+            b.title = m.title.clone();
+        }
+    }
+    out
+}
+
+impl App {
+    /// The Overview of Library book `id`, if its file is still there.
+    fn open_book_id(&mut self, id: &str, ctx: &egui::Context) {
+        if self.report.is_some() && self.report_id.as_deref() == Some(id) {
+            self.show_history = false;
+            self.home = false;
+            return;
+        }
+        if let Some(e) = self.history.entries.iter().find(|e| e.id == id)
+            && e.path.exists()
+        {
+            self.open(e.path.clone(), ctx);
+        }
+    }
+
+    /// The path of Library book `id`, if its file is still there.
+    fn book_path(&self, id: &str) -> Option<&std::path::Path> {
+        self.history
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.path.as_path())
+            .filter(|p| p.exists())
+    }
+
+    /// Books marked read with dates given by hand, for [`run_books`].
+    fn dated_marks(&self, day_start_hour: u32) -> Vec<Dated> {
+        self.known
+            .settings
+            .read
+            .iter()
+            .filter(|m| m.started.is_some() || m.finished.is_some())
+            .filter_map(|m| {
+                let han = if m.han > 0 {
+                    m.han
+                } else {
+                    let e = self.history.entries.iter().find(|e| e.id == m.id)?;
+                    e.stats.han_total
+                };
+                let marked = rs::local_day(m.read as f64, day_start_hour);
+                let a = m.started.or(m.finished)?;
+                let b = m.finished.unwrap_or(marked).max(a);
+                Some(Dated {
+                    id: m.id.clone(),
+                    title: m.title.clone(),
+                    from: a,
+                    to: b,
+                    han,
+                })
+            })
+            .collect()
+    }
+
+    /// Characters read, added up day by day, with each book noted where half
+    /// of what was read of it (in the period) had been read. Books marked
+    /// read with dates add their characters spread over those days. Returns
+    /// the id of the book whose note was clicked.
+    fn reading_running(
+        &self,
+        ui: &mut egui::Ui,
+        sum: &Summary,
+        set: &rs::TrackerSettings,
+        period: Option<Period>,
+    ) -> Option<String> {
+        let all = run_books(sum, &self.dated_marks(set.day_start_hour));
+        let first_read = all
+            .iter()
+            .filter_map(|b| b.days.keys().next())
+            .min()
+            .copied();
+        let (first, end) = match period {
+            // A week at least, so a first day or two isn't one steep line.
+            None => (
+                first_read.unwrap_or(sum.today).min(sum.today - 6),
+                sum.today + 1,
+            ),
+            Some(p) => (p.start, p.end.min(sum.today + 1).max(p.start + 1)),
+        };
+        let mut by_day: BTreeMap<i32, f64> = BTreeMap::new();
+        for b in &all {
+            for (d, (r, h)) in b.days.range(first..end) {
+                *by_day.entry(*d).or_default() += r + h;
+            }
+        }
+        let steps: Vec<(i32, f64)> = by_day.into_iter().filter(|s| s.1 > 0.0).collect();
+        let total = steps.iter().map(|s| s.1).sum::<f64>().round() as u64;
+        let sub = match period {
+            None => match first_read {
+                Some(d) => format!(
+                    "{} characters since {}, added up day by day",
+                    fmt_int(total),
+                    rs::long_date(d)
+                ),
+                None => String::new(),
+            },
+            Some(p) => format!(
+                "{} characters {} {}, added up day by day",
+                fmt_int(total),
+                p.prep(),
+                p.label()
+            ),
+        };
+        // Each book: (characters read in range, the day half of them were
+        // read, first and last day read in range, the book).
+        let mut books: Vec<(f64, i32, i32, i32, &RunBook)> = all
+            .iter()
+            .filter_map(|b| {
+                let days: Vec<(i32, f64)> = b
+                    .days
+                    .range(first..end)
+                    .map(|(k, (r, h))| (*k, r + h))
+                    .filter(|d| d.1 > 0.0)
+                    .collect();
+                let n: f64 = days.iter().map(|d| d.1).sum();
+                if n < 0.5 {
+                    return None;
+                }
+                let mut acc = 0.0;
+                let half = days
+                    .iter()
+                    .find(|(_, c)| {
+                        acc += c;
+                        acc * 2.0 >= n
+                    })
+                    .map_or(days[0].0, |d| d.0);
+                Some((n, half, days[0].0, days[days.len() - 1].0, b))
+            })
+            .collect();
+        books.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let notes: Vec<charts::Note> = books
+            .iter()
+            .map(|&(n, half, a, z, b)| {
+                let when = if a == z {
+                    format!("on {}", rs::long_date(a))
+                } else {
+                    format!("{} – {}", rs::long_date(a), rs::long_date(z))
+                };
+                let mut hover = format!(
+                    "{}\n{} characters read {when}",
+                    b.title.trim(),
+                    fmt_int(n.round() as u64)
+                );
+                if let Some((from, to)) = b.by_hand {
+                    hover.push_str(&format!(
+                        "\nRead {} – {} (dates given in Mark read): its characters are spread evenly over those days{}",
+                        rs::date(from),
+                        rs::date(to),
+                        if b.days.values().any(|d| d.0 > 0.0) {
+                            ", less what the reader timed"
+                        } else {
+                            ""
+                        }
+                    ));
+                }
+                if let Some(f) = b.finished {
+                    hover.push_str(&format!(
+                        "\nFinished in the reader {}",
+                        rs::long_date(rs::local_day(f as f64, 0))
+                    ));
+                }
+                let link = self.book_path(&b.id).is_some();
+                if link {
+                    hover.push_str("\nClick to open it");
+                }
+                charts::Note {
+                    x: half as f64 + 0.5,
+                    text: note_title(&b.title),
+                    hover,
+                    link,
+                }
+            })
+            .collect();
+        let mut clicked = None;
+        card(ui, "Characters read over time", &sub, |ui| {
+            if total == 0 {
+                ui.label(
+                    RichText::new(match period {
+                        Some(p) => format!("No characters read {} {}.", p.prep(), p.label()),
+                        None => "No characters read yet.".to_owned(),
+                    })
+                    .color(palette::weak()),
+                );
+                return;
+            }
+            let ticks = running_ticks(first, end, ui.available_width() - 62.0);
+            // Running totals by day, for the hover.
+            let mut running = Vec::with_capacity(steps.len());
+            let mut acc = 0.0;
+            for (d, v) in &steps {
+                acc += v;
+                running.push((*d, acc));
+            }
+            let hover = |day: i32, _: f64| {
+                let i = running.partition_point(|r| r.0 <= day);
+                let so_far = if i == 0 { 0.0 } else { running[i - 1].1 };
+                let mut t = format!(
+                    "{}\n{} characters so far",
+                    rs::long_date(day),
+                    fmt_int(so_far.round() as u64)
+                );
+                let mut any = false;
+                for (.., b) in &books {
+                    let Some((r, h)) = b.days.get(&day) else {
+                        continue;
+                    };
+                    if r + h < 0.5 {
+                        continue;
+                    }
+                    any = true;
+                    t.push_str(&format!(
+                        "\n+{} {}{}",
+                        fmt_int((r + h).round() as u64),
+                        b.title.trim(),
+                        if *h > 0.0 {
+                            " (spread over its dates)"
+                        } else {
+                            ""
+                        }
+                    ));
+                }
+                if !any {
+                    t.push_str("\nNothing read that day");
+                }
+                t
+            };
+            clicked = charts::running_total(
+                ui,
+                charts::Running {
+                    first,
+                    end,
+                    steps: &steps,
+                    notes: &notes,
+                    ticks: &ticks,
+                    color: palette::cat().mauve,
+                    height: 320.0,
+                },
+                &hover,
+            );
+        });
+        clicked.map(|i| books[i].4.id.clone())
+    }
+}
+
 /// Reading speed by week (the last half year, or a year's weeks) or by
 /// day (a month or a week).
 fn reading_speeds(ui: &mut egui::Ui, sum: &Summary, period: Option<Period>) {
@@ -1130,5 +1523,77 @@ mod tests {
         let ok = |d: i32| ![3, 7].contains(&d);
         assert_eq!(longest_run(0, 10, ok), 3);
         assert_eq!(longest_run(5, 5, ok), 0);
+    }
+
+    #[test]
+    fn dated_books_spread_what_the_reader_did_not_time() {
+        let mut sum = Summary::default();
+        let mut row = rs::BookRow {
+            title: "长风渡".into(),
+            ..Default::default()
+        };
+        row.days.insert(
+            10,
+            Day {
+                read_chars: 1000,
+                ..Default::default()
+            },
+        );
+        sum.books.push(("a".into(), row));
+        let dated = |id: &str, from, to, han| Dated {
+            id: id.into(),
+            title: "书".into(),
+            from,
+            to,
+            han,
+        };
+        let b = run_books(&sum, &[dated("a", 10, 13, 5000), dated("b", 20, 20, 300)]);
+        assert_eq!(b.len(), 2);
+        // 5,000 less the 1,000 timed, over four days.
+        assert_eq!(b[0].days[&10], (1000.0, 1000.0));
+        assert_eq!(b[0].days[&13], (0.0, 1000.0));
+        assert_eq!(b[0].by_hand, Some((10, 13)));
+        // Not read in the reader: all on its one day.
+        assert_eq!(b[1].days[&20], (0.0, 300.0));
+        // Timed past its length: nothing more is added.
+        let b = run_books(&sum, &[dated("a", 10, 11, 800)]);
+        assert_eq!(b[0].days[&11], (0.0, 0.0));
+    }
+
+    #[test]
+    fn running_ticks_pick_days_weeks_or_months() {
+        let labels = |v: Vec<(i32, String)>| v.into_iter().map(|t| t.1).collect::<Vec<_>>();
+        // A week, room for every day.
+        let mon = day(2026, 11, 23);
+        assert_eq!(
+            labels(running_ticks(mon, mon + 3, 800.0)),
+            ["23 Nov", "24 Nov", "25 Nov"]
+        );
+        // A month: Mondays.
+        let nov = day(2026, 11, 1);
+        assert_eq!(
+            labels(running_ticks(nov, day(2026, 12, 1), 400.0)),
+            ["2 Nov", "9 Nov", "16 Nov", "23 Nov", "30 Nov"]
+        );
+        // Two months in 400 px: every other Monday.
+        let t = running_ticks(nov, nov + 60, 400.0);
+        assert_eq!(t.len(), 5, "{t:?}");
+        assert_eq!(t[1].0 - t[0].0, 14);
+        // A year: month names alone.
+        let t = running_ticks(day(2026, 1, 1), day(2027, 1, 1), 1000.0);
+        assert_eq!(t[0], (day(2026, 1, 1), "Jan".to_owned()));
+        assert_eq!(t.len(), 12);
+        // Four years from mid-March: months with years, from April, every
+        // few months counted from January.
+        let t = running_ticks(day(2023, 3, 15), day(2027, 3, 1), 900.0);
+        assert!(t.len() <= 11, "{t:?}");
+        assert!(t[0].0 >= day(2023, 3, 15));
+        assert!(
+            t.iter().all(|(_, s)| s.ends_with(char::is_numeric)),
+            "{t:?}"
+        );
+        assert_eq!(t[0].1, "Jul 2023");
+        assert_eq!(note_title("死亡万花筒"), "《死亡万花筒》");
+        assert_eq!(note_title("Journey to the West"), "Journey to the W…");
     }
 }

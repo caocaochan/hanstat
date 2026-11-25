@@ -241,6 +241,20 @@ pub struct ReadBook {
     pub words: Vec<String>,
     /// How many of them were not known yet when the book was marked.
     pub added: usize,
+    /// When it was read, if given by hand: days since 1970-01-01. Library
+    /// Stats spreads its characters evenly over these days.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished: Option<i32>,
+    /// Its Chinese characters when it was marked (0: marked before this
+    /// was kept).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub han: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// The words a read book teaches: of its words occurring at least

@@ -81,6 +81,27 @@ pub(crate) struct ReadDialog {
     across_job: Option<((u8, u32), Receiver<usize>)>,
     /// Traditional and Simplified spellings count as one word.
     fold: bool,
+    /// When it was read (day numbers), if given.
+    started: Option<i32>,
+    finished: Option<i32>,
+    /// What 📆 Set picks for each: the first and last day read in the
+    /// reader, or today.
+    reader_days: (i32, i32),
+    /// The book's Chinese characters.
+    han: u64,
+}
+
+/// The dates picked in the Mark read window, or what is wrong with them.
+fn check_dates(started: Option<i32>, finished: Option<i32>, today: i32) -> Result<(), String> {
+    if started.max(finished).is_some_and(|d| d > today) {
+        return Err("A date is after today.".to_owned());
+    }
+    if let (Some(a), Some(b)) = (started, finished)
+        && b < a
+    {
+        return Err("The book is finished before it is started.".to_owned());
+    }
+    Ok(())
 }
 
 /// Anki (if on) plus the levels, word lists, marked words and books read:
@@ -138,6 +159,22 @@ impl App {
                 .to_owned()
         });
         let running = p.words.iter().map(|(_, n)| *n as u64).sum();
+        let reader_days = {
+            use crate::reading_stats as rs;
+            let now = rs::now();
+            rs::with(|s| {
+                let today = rs::local_day(now, s.settings.day_start_hour);
+                let days = s.books.get(id).map(|b| {
+                    let mut read = b.days.iter().filter(|(_, d)| d.read_chars > 0);
+                    let first = read.next().map(|(k, _)| *k);
+                    (first, read.next_back().map(|(k, _)| *k).or(first))
+                });
+                match days {
+                    Some((Some(a), Some(b))) => (a, b),
+                    _ => (today, today),
+                }
+            })
+        };
         let others: Vec<(Counts, Vec<String>)> = k
             .read
             .iter()
@@ -161,13 +198,17 @@ impl App {
                 .as_ref()
                 .map_or(self.plan.settings.read_min_count, |m| m.min_count),
             before,
-            marked: mark.map(|m| m.read),
+            marked: mark.as_ref().map(|m| m.read),
             note,
             others: Arc::new(others),
             across_now: Arc::new(across_now),
             across_new: None,
             across_job: None,
             fold: self.anki.settings.match_across_scripts,
+            started: mark.as_ref().and_then(|m| m.started),
+            finished: mark.as_ref().and_then(|m| m.finished),
+            reader_days,
+            han: e.stats.han_total,
         });
     }
 
@@ -298,8 +339,35 @@ impl App {
                 );
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
+                    ui.label("Read from");
+                    let (a, b) = d.reader_days;
+                    let tip_a = format!("{}; change it with the calendar", crate::reading_stats::long_date(a));
+                    let tip_b = format!("{}; change it with the calendar", crate::reading_stats::long_date(b));
+                    crate::library_books::day_picker_from(ui, &mut d.started, "read_started", a, &tip_a);
+                    ui.label("to");
+                    crate::library_books::day_picker_from(ui, &mut d.finished, "read_finished", b, &tip_b);
+                    ui.label(RichText::new("(optional)").weak()).on_hover_text(
+                        "When you read it, if not (only) in hanstat's reader: Library Stats' \
+                         \"Characters read over time\" spreads the book's characters evenly over these days, \
+                         less what the reader timed. A start alone runs to the day it was marked read; \
+                         a finish alone is one day.",
+                    );
+                });
+                let today = {
+                    let now = crate::reading_stats::now();
+                    crate::reading_stats::with(|s| {
+                        crate::reading_stats::local_day(now, s.settings.day_start_hour)
+                    })
+                };
+                let dates = check_dates(d.started, d.finished, today);
+                if let Err(e) = &dates {
+                    ui.colored_label(crate::palette::warn(), e);
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
                     let label = if d.marked.is_some() { "Save" } else { "✔ Mark read" };
-                    if ui.button(label).clicked() {
+                    if ui.add_enabled(dates.is_ok(), egui::Button::new(label)).clicked()
+                    {
                         let words: Vec<String> = sel.iter().map(|(w, _)| w.clone()).collect();
                         act = Some(ReadAct::Mark(ReadBook {
                             id: d.id.clone(),
@@ -309,6 +377,9 @@ impl App {
                             min_count: d.min_count,
                             words,
                             added: new.len(),
+                            started: d.started,
+                            finished: d.finished,
+                            han: d.han,
                         }));
                     }
                     if let Some(t) = d.marked {
@@ -610,4 +681,19 @@ enum ReadAct {
     Mark(ReadBook),
     Unmark,
     Cancel,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dates_are_checked() {
+        assert!(check_dates(None, None, 100).is_ok());
+        assert!(check_dates(Some(90), Some(100), 100).is_ok());
+        assert!(check_dates(Some(90), None, 100).is_ok());
+        assert!(check_dates(Some(101), None, 100).is_err());
+        assert!(check_dates(None, Some(101), 100).is_err());
+        assert!(check_dates(Some(95), Some(90), 100).is_err());
+    }
 }

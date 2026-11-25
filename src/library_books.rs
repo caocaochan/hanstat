@@ -418,6 +418,17 @@ fn from_date(d: jiff::civil::Date) -> i32 {
 
 /// A date picker for an optional day: "Set" when there is none, ✖ to clear.
 fn day_picker(ui: &mut egui::Ui, day: &mut Option<i32>, salt: &str) -> bool {
+    day_picker_from(ui, day, salt, today(), "Today; change it with the calendar")
+}
+
+/// [`day_picker`] whose "Set" picks `start` (`tip` says which day that is).
+pub(crate) fn day_picker_from(
+    ui: &mut egui::Ui,
+    day: &mut Option<i32>,
+    salt: &str,
+    start: i32,
+    tip: &str,
+) -> bool {
     let mut changed = false;
     match *day {
         Some(d) => {
@@ -434,12 +445,8 @@ fn day_picker(ui: &mut egui::Ui, day: &mut Option<i32>, salt: &str) -> bool {
             }
         }
         None => {
-            if ui
-                .button("📆 Set")
-                .on_hover_text("Today; change it with the calendar")
-                .clicked()
-            {
-                *day = Some(today());
+            if ui.button("📆 Set").on_hover_text(tip).clicked() {
+                *day = Some(start);
                 changed = true;
             }
         }

@@ -1,5 +1,11 @@
 # Changelog
 
+## [2026.11.25.02] - 2026-11-25
+
+### Added
+- **Characters read over time.** Library Stats › Reading has a new chart: your running total of Chinese characters read, added up day by day, with each book labelled on the curve where you had read half of it. Hover over the curve for the total on a day and what you read that day; click a book's label (or its dot) to open the book. It follows the All time / Year / Month / Week picker, and its dates run by day, week or month depending on how much reading there is to show.
+- **Start and finish dates in Mark read.** When marking a book read you can now pick when you read it (both optional, with the same calendar as the Library's date columns). The new chart spreads that book's characters evenly over those days, less whatever the reader already timed, so books read on paper or in another app count too. A start date alone runs to the day you marked it read; a finish date alone counts as one day. Only the chart uses these dates: time, speed and streaks stay what the reader measured.
+
 ## [2026.11.25.01] - 2026-11-25
 
 ### Added

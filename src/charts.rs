@@ -45,8 +45,12 @@ struct Canvas {
 }
 
 fn canvas(ui: &mut egui::Ui, height: f32) -> Canvas {
+    canvas_sensing(ui, height, egui::Sense::hover())
+}
+
+fn canvas_sensing(ui: &mut egui::Ui, height: f32, sense: egui::Sense) -> Canvas {
     let w = ui.available_width().max(200.0);
-    let (response, painter) = ui.allocate_painter(Vec2::new(w, height), egui::Sense::hover());
+    let (response, painter) = ui.allocate_painter(Vec2::new(w, height), sense);
     let r = response.rect;
     let plot = Rect::from_min_max(
         pos2(r.left() + LEFT, r.top() + TOP),
@@ -603,6 +607,223 @@ pub fn calendar(ui: &mut egui::Ui, cal: Calendar<'_>, day: &dyn Fn(i32) -> Optio
     }
 }
 
+/// A note on a [`running_total`] curve: `x` (in days) is where its dot sits
+/// on the curve.
+pub struct Note {
+    pub x: f64,
+    pub text: String,
+    pub hover: String,
+    /// A click on its label or dot is reported.
+    pub link: bool,
+}
+
+/// What a [`running_total`] shows.
+pub struct Running<'a> {
+    /// Days `first..end` along the x axis.
+    pub first: i32,
+    pub end: i32,
+    /// Amounts by day (sorted, inside `first..end`): each adds to the
+    /// curve over its day.
+    pub steps: &'a [(i32, f64)],
+    /// Most important first: those with no room are left out.
+    pub notes: &'a [Note],
+    /// Labels under the x axis: day and text.
+    pub ticks: &'a [(i32, String)],
+    pub color: Color32,
+    pub height: f32,
+}
+
+/// A running total over days, rising with each day's amount, with notes
+/// on leader lines placed clear of each other and of the curve. `hover(day,
+/// total)`: the text for a day. Returns the linked note clicked, if any.
+pub fn running_total(
+    ui: &mut egui::Ui,
+    r: Running<'_>,
+    hover: &dyn Fn(i32, f64) -> String,
+) -> Option<usize> {
+    let c = canvas_sensing(ui, r.height, egui::Sense::click());
+    let total: f64 = r.steps.iter().map(|s| s.1).sum();
+    let (top, ticks) = nice_ticks(total);
+    c.y_axis(0.0, top, &ticks, &compact);
+    c.baseline();
+    let span = (r.end - r.first).max(1) as f64;
+    let px = |d: f64| c.plot.left() + ((d - r.first as f64) / span) as f32 * c.plot.width();
+    let day_at = |x: f32| r.first as f64 + ((x - c.plot.left()) / c.plot.width()) as f64 * span;
+    for (d, s) in r.ticks {
+        let x = px(*d as f64);
+        c.painter.vline(
+            x,
+            c.plot.bottom()..=c.plot.bottom() + 3.0,
+            Stroke::new(1.0, c.weak),
+        );
+        c.x_label(x, s);
+    }
+    // The curve's corners, in days: flat between days read, rising over
+    // each day read.
+    let mut pts: Vec<(f64, f64)> = vec![(r.first as f64, 0.0)];
+    let mut sum = 0.0;
+    for &(d, v) in r.steps {
+        if v <= 0.0 {
+            continue;
+        }
+        pts.push((d as f64, sum));
+        sum += v;
+        pts.push((d as f64 + 1.0, sum));
+    }
+    pts.push((r.end as f64, sum));
+    // The total at day `d`, between corners.
+    let at = |d: f64| -> f64 {
+        let i = pts.partition_point(|p| p.0 <= d);
+        if i == 0 {
+            return 0.0;
+        }
+        if i >= pts.len() {
+            return sum;
+        }
+        let (a, b) = (pts[i - 1], pts[i]);
+        if b.0 > a.0 {
+            a.1 + (b.1 - a.1) * (d - a.0) / (b.0 - a.0)
+        } else {
+            b.1
+        }
+    };
+    let screen: Vec<Pos2> = pts
+        .iter()
+        .map(|&(d, v)| pos2(px(d), c.y(v, 0.0, top)))
+        .collect();
+    // A light fill under the curve, one quad per stretch.
+    let mut mesh = egui::Mesh::default();
+    let fill = r.color.gamma_multiply(0.12);
+    for w in screen.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if b.x - a.x < 0.01 {
+            continue;
+        }
+        let i = mesh.vertices.len() as u32;
+        for p in [a, b, pos2(b.x, c.plot.bottom()), pos2(a.x, c.plot.bottom())] {
+            mesh.colored_vertex(p, fill);
+        }
+        mesh.add_triangle(i, i + 1, i + 2);
+        mesh.add_triangle(i, i + 2, i + 3);
+    }
+    c.painter.add(mesh);
+    c.painter.line(screen.clone(), Stroke::new(2.5, r.color));
+
+    // The curve rises left to right, so a label is clear of it when its
+    // bottom is above the curve at its right edge, or its top below the
+    // curve at its left edge.
+    let curve_y = |x: f32| c.y(at(day_at(x)), 0.0, top);
+    let font = FontId::proportional(12.0);
+    let area = c.plot.shrink2(Vec2::new(2.0, 2.0));
+    let mut taken: Vec<Rect> = Vec::new();
+    let mut placed: Vec<(usize, Pos2, Option<Rect>)> = Vec::new();
+    for (i, n) in r.notes.iter().enumerate() {
+        let x = n.x.clamp(r.first as f64, r.end as f64);
+        let dot = pos2(px(x), c.y(at(x), 0.0, top));
+        let g = c
+            .painter
+            .layout_no_wrap(n.text.clone(), font.clone(), c.text);
+        let size = g.size() + Vec2::new(4.0, 2.0);
+        let mut best = None;
+        // Alternate the preferred side so neighbours spread out.
+        let sides = if i % 2 == 0 {
+            [true, false]
+        } else {
+            [false, true]
+        };
+        'search: for dist in [16.0, 30.0, 46.0, 64.0, 86.0, 112.0, 142.0, 176.0] {
+            for above in sides {
+                for slide in [0.3, 0.0, 0.8] {
+                    let rect = if above {
+                        let right = dot.x - dist * slide + size.x * 0.35;
+                        Rect::from_min_size(pos2(right - size.x, dot.y - dist - size.y), size)
+                    } else {
+                        let left = dot.x + dist * slide - size.x * 0.35;
+                        Rect::from_min_size(pos2(left, dot.y + dist), size)
+                    };
+                    let dx = (area.left() - rect.left()).max(0.0)
+                        + (area.right() - rect.right()).min(0.0);
+                    let rect = rect.translate(Vec2::new(dx, 0.0));
+                    if !area.contains_rect(rect) {
+                        continue;
+                    }
+                    let clear = if above {
+                        rect.bottom() < curve_y(rect.right()) - 4.0
+                    } else {
+                        rect.top() > curve_y(rect.left()) + 4.0
+                    };
+                    let free = !taken.iter().any(|t| t.intersects(rect.expand(3.0)))
+                        && !placed.iter().any(|(_, p, _)| rect.expand(4.0).contains(*p));
+                    if clear && free && !rect.expand(4.0).contains(dot) {
+                        best = Some(rect);
+                        break 'search;
+                    }
+                }
+            }
+        }
+        if let Some(rect) = best {
+            taken.push(rect);
+            let end = pos2(
+                dot.x.clamp(rect.left(), rect.right()),
+                dot.y.clamp(rect.top(), rect.bottom()),
+            );
+            c.painter
+                .line_segment([dot, end], Stroke::new(1.0, c.weak.gamma_multiply(0.8)));
+            c.painter.galley(rect.min + Vec2::new(2.0, 1.0), g, c.text);
+        }
+        placed.push((i, dot, best));
+    }
+    for (_, dot, _) in &placed {
+        c.painter.circle(*dot, 3.5, r.color, Stroke::new(1.5, c.bg));
+    }
+
+    let pointer = c.response.hover_pos();
+    let on_note = pointer.and_then(|m| {
+        placed
+            .iter()
+            .find(|(_, dot, rect)| dot.distance(m) < 8.0 || rect.is_some_and(|r| r.contains(m)))
+            .map(|(i, dot, rect)| (*i, *dot, *rect))
+    });
+    let mut clicked = None;
+    let text = if let Some((i, dot, rect)) = on_note {
+        c.painter
+            .circle(dot, 5.5, r.color, Stroke::new(2.0, c.text));
+        if r.notes[i].link {
+            c.response
+                .ctx
+                .set_cursor_icon(egui::CursorIcon::PointingHand);
+            if let Some(rect) = rect {
+                c.painter.hline(
+                    rect.x_range().shrink(2.0),
+                    rect.bottom() - 1.0,
+                    Stroke::new(1.0, c.text),
+                );
+            }
+            if c.response.clicked() {
+                clicked = Some(i);
+            }
+        }
+        Some(r.notes[i].hover.clone())
+    } else {
+        pointer.filter(|m| c.plot.contains(*m)).map(|m| {
+            let day = (day_at(m.x).floor() as i32).clamp(r.first, (r.end - 1).max(r.first));
+            let x = px(day as f64 + 1.0);
+            let v = at(day as f64 + 1.0);
+            c.painter
+                .vline(x, c.plot.y_range(), Stroke::new(1.0, c.weak));
+            c.painter.circle(
+                pos2(x, c.y(v, 0.0, top)),
+                4.5,
+                r.color,
+                Stroke::new(1.5, c.text),
+            );
+            hover(day, v)
+        })
+    };
+    c.hover(text);
+    clicked
+}
+
 /// 950, 1.2k, 35k, 1.4M.
 pub fn compact(v: f64) -> String {
     let a = v.abs();
@@ -675,6 +896,36 @@ mod tests {
                     120.0,
                 );
                 stacked_bar(ui, &[(0, Color32::RED, "a".into())]);
+                let note = |x| Note {
+                    x,
+                    text: "《书》".into(),
+                    hover: "n".into(),
+                    link: x > 5.0,
+                };
+                for (first, end, steps, notes) in [
+                    (5, 5, vec![], vec![]),
+                    (5, 6, vec![(5, 100.0)], vec![note(5.5)]),
+                    (
+                        0,
+                        400,
+                        (0..400).step_by(3).map(|d| (d, 500.0)).collect(),
+                        (0..40).map(|i| note(i as f64 * 10.0)).collect(),
+                    ),
+                ] {
+                    let _ = running_total(
+                        ui,
+                        Running {
+                            first,
+                            end,
+                            steps: &steps,
+                            notes: &notes,
+                            ticks: &[(first, "Jan".into())],
+                            color: Color32::BLUE,
+                            height: 200.0,
+                        },
+                        &|d, v| format!("{d} {v}"),
+                    );
+                }
                 let shades = [Color32::GRAY; 5];
                 for (wd, n) in [(0, 365), (6, 366), (3, 1)] {
                     let cal = Calendar {
