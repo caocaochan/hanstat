@@ -1206,13 +1206,23 @@ impl Reader {
                         th.muted,
                     );
                 }
-                painter_free(ui).text(
+                let folio = painter_free(ui).text(
                     pos2(page_rect.center().x, page_rect.bottom() - g.inset.y * 0.5),
                     egui::Align2::CENTER_CENTER,
                     format!("{} / {}", idx + 1, l.pages.len()),
                     small,
                     th.muted,
                 );
+                ui.interact(
+                    folio.expand(3.0),
+                    egui::Id::unique(("reader-folio", side)),
+                    egui::Sense::hover(),
+                )
+                .on_hover_text(format!(
+                    "Page {} of {} in this chapter (pages change with the window, text size and margins)",
+                    idx + 1,
+                    l.pages.len()
+                ));
             }
             // Reading stats under the pages: the session (a click pauses or
             // starts timing) and the time left.
@@ -1570,8 +1580,9 @@ impl Reader {
         // keeps one open popup per window, so opening a font list (a popup)
         // would close a popup panel. It ignores clicks and closes with its
         // button, Esc or a click on the page.
-        let button =
-            ui.selectable_label(self.settings_open, RichText::new("Aa").size(15.0).strong());
+        let button = ui
+            .selectable_label(self.settings_open, RichText::new("Aa").size(15.0).strong())
+            .on_hover_text("Theme, fonts, text size, line spacing, margins and pages");
         if button.clicked() {
             self.settings_open = !self.settings_open;
         }

@@ -14,3 +14,5 @@
 *.part
 # Local Yomitan dictionaries (data/CEDICT-words.txt is built from one; see examples/cedict_words.rs)
 /dicts/
+# Plans and notes in docs/ stay local (docs/screenshot.png is published)
+/docs/*.md

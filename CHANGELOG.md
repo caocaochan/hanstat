@@ -1,5 +1,14 @@
 # Changelog
 
+## [2026.11.25.01] - 2026-11-25
+
+### Added
+- **Hover text for the reader's unlabelled parts.** The thin bar along the foot of the pages is your daily reading goal; hovering over it now shows how far you are (e.g. "12 of 30 min, 1,200 of 5,000 characters") and, with both a minutes and a characters goal, that it follows whichever is further behind. The page number explains that it counts pages in the chapter, and **Aa** says what its panel holds.
+- **Hover text for Home's Today ring.** It explains that the number is minutes read today across all books and how much of today's goal the ring shows.
+
+### Changed
+- **The toolbar's buttons are in a new order.** Where you go comes first: 🏠 Home, 📖 Library, 📕 Reader, then 📂 Open…, then the book's settings as before (Segmenter, forced words, Anki, Encoding for TXT books, Known). 💾 Export now sits at the far right. In a narrow window the buttons wrap onto a second line and Export stays at the top right.
+
 ## [2026.11.25.00] - 2026-11-25
 
 ### Fixed

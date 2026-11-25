@@ -3136,82 +3136,12 @@ impl eframe::App for App {
 
         let on_home = self.on_home();
         egui::Panel::top("toolbar").frame(palette::bar(true)).show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                palette::compact(ui);
-                if ui
-                    .button("📂 Open…")
-                    .on_hover_text(self.shortcuts.hint(&ctx, Action::Open, "Open a book, or select several: each is analysed and added to the Library, and the last one is shown"))
-                    .clicked()
-                {
-                    self.open_dialog(&ctx);
-                }
-                if ui
-                    .selectable_label(on_home, "🏠 Home")
-                    .on_hover_text(self.shortcuts.hint(&ctx, Action::Home, "The book you're reading, today's reading and your totals"))
-                    .clicked()
-                {
-                    self.go_home();
-                }
-                // Home has no book: what applies to one isn't offered there.
-                if !on_home {
-                    ui.separator();
-                    ui.label("Segmenter:");
-                    let before = self.segmenter;
-                    egui::ComboBox::from_id_salt("seg").selected_text(self.segmenter.label()).show_ui(ui, |ui| {
-                        for k in SegmenterKind::ALL {
-                            ui.selectable_value(&mut self.segmenter, k, k.label()).on_hover_text(k.description());
-                        }
-                    });
-                    // While a book is being analysed, that analysis stops
-                    // and the book is analysed again with the new choice.
-                    if before != self.segmenter {
-                        self.rerun(&ctx, false);
-                    }
-
-                    let hover = "Words always segmented as single words, saved between runs. Add them here or from the Suggested words tab.";
-                    if ui
-                        .selectable_label(self.forced_window, format!("📖 {} forced words", self.user_words.len()))
-                        .on_hover_text(self.shortcuts.hint(&ctx, Action::ForcedWords, hover))
-                        .clicked()
-                    {
-                        self.forced_window = !self.forced_window;
-                    }
-                }
-
-                ui.separator();
-                let anki_label = match &self.anki.knowledge {
-                    Some(k) if self.anki.settings.enabled => format!(
-                        "🃏 Anki: {} known words",
-                        fmt_int(k.summary.words.known())
-                    ),
-                    _ => "🃏 Anki…".to_owned(),
-                };
-                if ui
-                    .selectable_label(self.anki.window, anki_label)
-                    .on_hover_text(self.shortcuts.hint(&ctx, Action::Anki, "Compare the book with your Anki cards (young and mature)"))
-                    .clicked()
-                {
-                    self.toggle_anki(&ctx);
-                }
-
-                let is_txt =
-                    !on_home && self.book.as_ref().is_some_and(|b| b.format == "TXT");
-                if is_txt {
-                    ui.separator();
-                    ui.label("Encoding:");
-                    let before = self.encoding;
-                    egui::ComboBox::from_id_salt("enc").selected_text(self.encoding.label()).show_ui(ui, |ui| {
-                        for e in EncodingChoice::ALL {
-                            ui.selectable_value(&mut self.encoding, e, e.label());
-                        }
-                    });
-                    if before != self.encoding {
-                        self.rerun(&ctx, true);
-                    }
-                }
-
+            palette::compact(ui);
+            // 💾 Export at the right; the rest fills the space left of it, on
+            // more lines when it doesn't fit on one (as in the status bar).
+            let row = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+            ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.report.is_some() || !self.history.entries.is_empty() {
-                    ui.separator();
                     let mut image = None;
                     ui.menu_button("💾 Export", |ui| {
                         let busy = self.image_busy();
@@ -3286,49 +3216,119 @@ impl eframe::App for App {
                         self.export_image(&ctx, what);
                     }
                 }
-
-                ui.separator();
-                let label = if self.known.settings.is_empty() {
-                    "📚 HSK, TOCFL & word lists…".to_owned()
-                } else {
-                    format!("📚 Known: {}", self.known.settings.label())
-                };
-                let hover = "Mark HSK 3.0, HSK 2.0 or TOCFL levels and imported word lists as known, in addition to your Anki cards";
-                if ui
-                    .selectable_label(self.known.window, label)
-                    .on_hover_text(self.shortcuts.hint(&ctx, Action::KnownWords, hover))
-                    .clicked()
-                {
-                    self.known.window = !self.known.window;
-                }
-
-                ui.separator();
-                if ui
-                    .selectable_label(
-                        self.show_history,
-                        format!("📖 Library ({})", self.history.entries.len()),
-                    )
-                    .on_hover_text(self.shortcuts.hint(&ctx, Action::Library, "Every book analysed before, with its statistics, and a reading path through them"))
-                    .clicked()
-                {
-                    self.show_history = !self.show_history;
-                }
-                let last = self.last_read();
-                let reader_button = ui.add_enabled(last.is_some(), egui::Button::new("📕 Reader"));
-                if let Some(b) = last {
-                    if reader_button
-                        .on_hover_text(format!("Go back to {} where you left it", b.title))
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true), |ui| {
+                    if ui
+                        .selectable_label(on_home, "🏠 Home")
+                        .on_hover_text(self.shortcuts.hint(&ctx, Action::Home, "The book you're reading, today's reading and your totals"))
                         .clicked()
                     {
-                        match reader::Reader::open(&b.path, Some(&b.id), b.traditional, &ctx) {
-                            Ok(r) => self.reader = Some(r),
-                            Err(e) => self.set_error("reader", e),
+                        self.go_home();
+                    }
+                    if ui
+                        .selectable_label(
+                            self.show_history,
+                            format!("📖 Library ({})", self.history.entries.len()),
+                        )
+                        .on_hover_text(self.shortcuts.hint(&ctx, Action::Library, "Every book analysed before, with its statistics, and a reading path through them"))
+                        .clicked()
+                    {
+                        self.show_history = !self.show_history;
+                    }
+                    let last = self.last_read();
+                    let reader_button = ui.add_enabled(last.is_some(), egui::Button::new("📕 Reader"));
+                    if let Some(b) = last {
+                        if reader_button
+                            .on_hover_text(format!("Go back to {} where you left it", b.title))
+                            .clicked()
+                        {
+                            match reader::Reader::open(&b.path, Some(&b.id), b.traditional, &ctx) {
+                                Ok(r) => self.reader = Some(r),
+                                Err(e) => self.set_error("reader", e),
+                            }
+                        }
+                    } else {
+                        reader_button.on_disabled_hover_text("No Library book read in the reader yet");
+                    }
+                    if ui
+                        .button("📂 Open…")
+                        .on_hover_text(self.shortcuts.hint(&ctx, Action::Open, "Open a book, or select several: each is analysed and added to the Library, and the last one is shown"))
+                        .clicked()
+                    {
+                        self.open_dialog(&ctx);
+                    }
+                    // Home has no book: what applies to one isn't offered there.
+                    if !on_home {
+                        ui.separator();
+                        ui.label("Segmenter:");
+                        let before = self.segmenter;
+                        egui::ComboBox::from_id_salt("seg").selected_text(self.segmenter.label()).show_ui(ui, |ui| {
+                            for k in SegmenterKind::ALL {
+                                ui.selectable_value(&mut self.segmenter, k, k.label()).on_hover_text(k.description());
+                            }
+                        });
+                        // While a book is being analysed, that analysis stops
+                        // and the book is analysed again with the new choice.
+                        if before != self.segmenter {
+                            self.rerun(&ctx, false);
+                        }
+
+                        let hover = "Words always segmented as single words, saved between runs. Add them here or from the Suggested words tab.";
+                        if ui
+                            .selectable_label(self.forced_window, format!("📖 {} forced words", self.user_words.len()))
+                            .on_hover_text(self.shortcuts.hint(&ctx, Action::ForcedWords, hover))
+                            .clicked()
+                        {
+                            self.forced_window = !self.forced_window;
                         }
                     }
-                } else {
-                    reader_button.on_disabled_hover_text("No Library book read in the reader yet");
-                }
 
+                    ui.separator();
+                    let anki_label = match &self.anki.knowledge {
+                        Some(k) if self.anki.settings.enabled => format!(
+                            "🃏 Anki: {} known words",
+                            fmt_int(k.summary.words.known())
+                        ),
+                        _ => "🃏 Anki…".to_owned(),
+                    };
+                    if ui
+                        .selectable_label(self.anki.window, anki_label)
+                        .on_hover_text(self.shortcuts.hint(&ctx, Action::Anki, "Compare the book with your Anki cards (young and mature)"))
+                        .clicked()
+                    {
+                        self.toggle_anki(&ctx);
+                    }
+
+                    let is_txt =
+                        !on_home && self.book.as_ref().is_some_and(|b| b.format == "TXT");
+                    if is_txt {
+                        ui.separator();
+                        ui.label("Encoding:");
+                        let before = self.encoding;
+                        egui::ComboBox::from_id_salt("enc").selected_text(self.encoding.label()).show_ui(ui, |ui| {
+                            for e in EncodingChoice::ALL {
+                                ui.selectable_value(&mut self.encoding, e, e.label());
+                            }
+                        });
+                        if before != self.encoding {
+                            self.rerun(&ctx, true);
+                        }
+                    }
+
+                    ui.separator();
+                    let label = if self.known.settings.is_empty() {
+                        "📚 HSK, TOCFL & word lists…".to_owned()
+                    } else {
+                        format!("📚 Known: {}", self.known.settings.label())
+                    };
+                    let hover = "Mark HSK 3.0, HSK 2.0 or TOCFL levels and imported word lists as known, in addition to your Anki cards";
+                    if ui
+                        .selectable_label(self.known.window, label)
+                        .on_hover_text(self.shortcuts.hint(&ctx, Action::KnownWords, hover))
+                        .clicked()
+                    {
+                        self.known.window = !self.known.window;
+                    }
+                });
             });
         });
 

@@ -2561,6 +2561,68 @@ fn reading_stats_tracker() {
     rs::set_test_clock(None);
 }
 
+/// Every text in the last frame's shapes, tooltips included.
+fn shown_text(d: &Driver) -> Vec<String> {
+    fn walk(s: &egui::Shape, out: &mut Vec<String>) {
+        match s {
+            egui::Shape::Text(t) => out.push(t.galley.text().to_owned()),
+            egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for c in &d.last.as_ref().expect("a frame ran").shapes {
+        walk(&c.shape, &mut out);
+    }
+    out
+}
+
+/// Hover text on parts of the reader that have no label of their own: the
+/// goal bar along the foot of the page, the page number and the Aa button.
+#[test]
+#[ignore = "opens the reader with the system fonts and dictionary settings"]
+fn reader_hover_texts() {
+    use crate::reading_stats as rs;
+    let temp = tempfile::tempdir().unwrap();
+    rs::set_test_clock(Some(1_790_000_000.0));
+    rs::reset_for_test(rs::ReadingStats {
+        goals: vec![rs::Goal {
+            from_day: 0,
+            minutes: 30,
+            chars: 1000,
+        }],
+        ..Default::default()
+    });
+    let mut d = Driver::new();
+    let mut r = stats_book(&mut d, temp.path());
+    let g = r.last_geom.expect("pages drawn");
+    let page = g.pages[0];
+    let aa = r.probe.aa.expect("Aa drawn");
+    for (name, at, want) in [
+        (
+            "hover-goal",
+            pos2(page.center().x - 100.0, page.bottom() - 1.0),
+            "Today's reading goal: 0 of 30 min, 0 of 1,000 characters. The bar follows whichever is further behind.",
+        ),
+        (
+            "hover-folio",
+            pos2(page.center().x, page.bottom() - g.inset.y * 0.5),
+            "Page 1 of 3 in this chapter",
+        ),
+        ("hover-aa", aa.center(), "Theme, fonts, text size"),
+    ] {
+        d.frame(&mut r, vec![egui::Event::PointerMoved(at)]);
+        d.idle(&mut r, 60);
+        let texts = shown_text(&d);
+        d.snap(name);
+        assert!(
+            texts.iter().any(|t| t.contains(want)),
+            "{name}: {want:?} not in {texts:?}"
+        );
+    }
+    rs::set_test_clock(None);
+}
+
 /// Reader places against the analysis's sections, which the reading path
 /// maps them onto ([`hanstat::profile::Positions::running_word_at`]): every
 /// spine file with text is a section of the same path, holding the same

@@ -41,7 +41,37 @@ pub(super) struct Line {
     left_short: String,
     left_hover: String,
     pub(super) right: Option<(String, String, String)>,
-    goal: Option<f32>,
+    /// Today's goal: how far (0..=1) and the bar's hover text.
+    goal: Option<(f32, String)>,
+}
+
+/// The goal bar's hover text: what it measures and where today stands.
+fn goal_hover(g: &Goal, d: &Day) -> String {
+    let mut need = Vec::new();
+    if g.minutes > 0 {
+        need.push(format!(
+            "{} of {} min",
+            (d.read_secs / 60.0).floor(),
+            g.minutes
+        ));
+    }
+    if g.chars > 0 {
+        need.push(format!(
+            "{} of {} characters",
+            fmt_int(d.read_chars),
+            fmt_int(g.chars)
+        ));
+    }
+    let mut s = format!(
+        "Today's reading goal: {}{}.",
+        need.join(", "),
+        if g.met(d) { " — met" } else { "" }
+    );
+    if need.len() == 2 {
+        s.push_str(" The bar follows whichever is further behind.");
+    }
+    s.push_str(" Reading in every book counts; read aloud doesn't. Set the goal in Stats.");
+    s
 }
 
 /// Where the speed for "time left" comes from: set by hand, or the best
@@ -335,7 +365,10 @@ impl Reader {
             );
             (full, short, hover)
         });
-        let goal = self.stats.goal.map(|g| g.progress(&self.today_now(now)));
+        let goal = self.stats.goal.map(|g| {
+            let d = self.today_now(now);
+            (g.progress(&d), goal_hover(&g, &d))
+        });
         Some(Line {
             left,
             left_short,
@@ -346,7 +379,7 @@ impl Reader {
     }
 
     /// Draw the line under the pages; returns the clickable part (the
-    /// session) and the time-left part with their hover text.
+    /// session), the time-left part and the goal bar with their hover text.
     pub(super) fn draw_stats_line(
         ui: &egui::Ui,
         th: &Theme,
@@ -385,13 +418,16 @@ impl Reader {
             p.galley(pos, gal, th.muted);
             out.push((r, hover.clone(), false));
         }
-        // Today's goal: a hairline along the foot of the pages.
-        if let Some(f) = line.goal {
+        // Today's goal: a hairline along the foot of the pages, its hover
+        // area the whole width and a few points taller, so it can be found.
+        if let Some((f, hover)) = &line.goal {
             let x0 = first.left();
             let x1 = last.right();
             let yy = first.bottom() - 2.0;
             let r = Rect::from_min_max(pos2(x0, yy), pos2(x0 + (x1 - x0) * f, yy + 2.0));
             p.rect_filled(r, 0.0, th.accent.gamma_multiply(0.75));
+            let area = Rect::from_min_max(pos2(x0, yy - 4.0), pos2(x1, first.bottom() + 2.0));
+            out.push((area, hover.clone(), false));
         }
         out
     }
