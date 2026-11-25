@@ -460,6 +460,9 @@ pub struct Tts {
     /// The dictionary popup was open last frame, and paused the reading.
     popup_open: bool,
     paused_by_popup: bool,
+    /// Paused for a sound over it (the daily goal met) until then
+    /// ([`crate::reading_stats::now`]), and resumed after.
+    paused_until: Option<f64>,
 }
 
 impl Tts {
@@ -504,6 +507,7 @@ impl Tts {
             last_visible: false,
             popup_open: false,
             paused_by_popup: false,
+            paused_until: None,
         }
     }
 
@@ -663,6 +667,7 @@ impl Tts {
     /// Read from the sentence holding character `src` of chapter `spine`.
     pub fn play_from(&mut self, spine: usize, src: u32, s: &TtsSettings) {
         self.paused_by_popup = false;
+        self.paused_until = None;
         if s.source == Source::Azure {
             self.load_key();
         } else {
@@ -703,9 +708,47 @@ impl Tts {
         }
     }
 
+    /// Pause the reading until `until` ([`crate::reading_stats::now`]),
+    /// for a sound to be heard over it; [`Self::sound_pause`] resumes it.
+    pub fn pause_until(&mut self, until: f64) {
+        if self.paused_until.is_some() {
+            self.paused_until = Some(until);
+        } else if matches!(self.now.state, State::Loading | State::Playing)
+            && let Some(e) = &self.engine
+        {
+            e.send(Cmd::Pause);
+            self.now.state = State::Paused;
+            self.paused_until = Some(until);
+        }
+    }
+
+    /// Once a frame: resume a reading paused by [`Self::pause_until`] once
+    /// its time is up; if the popup, which pauses it (if set), is open
+    /// then, it stays paused until the popup closes. The seconds left, to
+    /// wake for.
+    pub fn sound_pause(&mut self, now: f64, s: &TtsSettings) -> Option<f64> {
+        let until = self.paused_until?;
+        if self.now.state == State::Stopped {
+            self.paused_until = None;
+            return None;
+        }
+        if now < until {
+            return Some(until - now);
+        }
+        self.paused_until = None;
+        if self.popup_open && s.pause_for_popup {
+            self.paused_by_popup = true;
+        } else if let Some(e) = &self.engine {
+            e.send(Cmd::Resume);
+            self.now.state = State::Loading;
+        }
+        None
+    }
+
     pub fn toggle_pause(&mut self) {
-        // Paused or resumed by hand: the popup leaves it so.
+        // Paused or resumed by hand: the popup and a sound leave it so.
         self.paused_by_popup = false;
+        self.paused_until = None;
         if let Some(e) = &self.engine {
             match self.now.state {
                 State::Paused => e.send(Cmd::Resume),
@@ -717,6 +760,7 @@ impl Tts {
 
     pub fn stop(&mut self) {
         self.paused_by_popup = false;
+        self.paused_until = None;
         if let Some(e) = &self.engine {
             e.send(Cmd::Stop);
         }
@@ -1493,6 +1537,59 @@ mod tests {
                     .unwrap();
             }
         }
+    }
+
+    /// A sound's pause: resumed when its time is up; not after a pause or
+    /// resume by hand, or a stop; kept for the popup if it is open then.
+    /// (The engine is idle: the states are what the reader tells it.)
+    #[test]
+    fn sound_pause_resumes_after_and_yields_to_the_hand_and_the_popup() {
+        let ctx = egui::Context::default();
+        let s = TtsSettings::default();
+        let mut tts = Tts::new(
+            Arc::new(Mutex::new(Vec::new())),
+            Vec::new(),
+            false,
+            "",
+            "pause-test",
+            &ctx,
+        );
+        // Not reading aloud: nothing to pause.
+        tts.pause_until(10.0);
+        assert_eq!(tts.paused_until, None);
+        tts.engine(&s);
+
+        tts.now.state = State::Playing;
+        tts.pause_until(10.0);
+        assert_eq!(tts.state(), State::Paused);
+        assert_eq!(tts.sound_pause(6.0, &s), Some(4.0));
+        assert_eq!(tts.state(), State::Paused);
+        assert_eq!(tts.sound_pause(10.0, &s), None);
+        assert_eq!(tts.state(), State::Loading, "resumed");
+        assert_eq!(tts.paused_until, None);
+
+        // Paused (or resumed) by hand meanwhile: left so.
+        tts.now.state = State::Playing;
+        tts.pause_until(20.0);
+        tts.toggle_pause();
+        assert_eq!(tts.sound_pause(25.0, &s), None);
+        assert_eq!(tts.state(), State::Paused, "not resumed");
+
+        // The popup open when the time is up: it resumes once it closes.
+        tts.now.state = State::Playing;
+        tts.popup(false, &s);
+        tts.pause_until(30.0);
+        tts.popup(true, &s);
+        assert_eq!(tts.sound_pause(31.0, &s), None);
+        assert_eq!(tts.state(), State::Paused, "kept for the popup");
+        tts.popup(false, &s);
+        assert_eq!(tts.state(), State::Loading, "resumed with the popup closed");
+
+        // Stopped meanwhile: forgotten.
+        tts.now.state = State::Playing;
+        tts.pause_until(40.0);
+        tts.stop();
+        assert_eq!(tts.paused_until, None);
     }
 
     fn split(s: &str) -> Vec<String> {

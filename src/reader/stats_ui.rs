@@ -47,6 +47,55 @@ type GoalKey = (i32, Option<Goal>, bool);
 /// How long the goal-met glow lasts, in seconds.
 pub(super) const GLOW_SECS: f64 = 5.0;
 
+/// What the goal-met sound says: `assets/goal-met.opus`, read by the
+/// designed local voice Citrus (made by the ignored test
+/// `goal_cheer_takes`).
+pub(super) const CHEER_TEXT: &str = "宝贝！你好厉害哦！你完成今天的目标啦！";
+
+/// The goal-met sound: Ogg Opus, 24 kHz mono, about 4 s.
+const CHEER: &[u8] = include_bytes!("../../assets/goal-met.opus");
+
+/// How long read aloud pauses for the goal-met sound: the sound, and a
+/// little for the device to open.
+fn cheer_pause() -> f64 {
+    static SECS: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
+        tts::opus::decode(CHEER.to_vec()).map_or(4.0, |(pcm, rate)| pcm.len() as f64 / rate as f64)
+    });
+    *SECS + 0.4
+}
+
+/// Goal-met sounds played (tests play none).
+#[cfg(test)]
+pub(super) static CHEERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn play_cheer() {
+    CHEERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Play the goal-met sound on its own output, beside read aloud if that is
+/// playing, off the UI thread. Without a sound device it stays silent.
+#[cfg(not(test))]
+fn play_cheer() {
+    let _ = std::thread::Builder::new()
+        .name("goal-met-sound".into())
+        .spawn(|| {
+            let Ok((pcm, rate)) = tts::opus::decode(CHEER.to_vec()) else {
+                return;
+            };
+            let Ok(out) = tts::audio::Output::open(Arc::new(|| {})) else {
+                return;
+            };
+            out.push(0, tts::audio::resample(&pcm, rate, out.rate));
+            // The stream plays while `out` lives: until the clip is heard.
+            let start = std::time::Instant::now();
+            while !out.queued().is_empty() && !out.failed() && start.elapsed().as_secs() < 15 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        });
+}
+
 /// The line under the pages.
 pub(super) struct Line {
     pub(super) left: String,
@@ -236,34 +285,49 @@ impl Reader {
         }
     }
 
-    /// Last in a frame, once the page's characters are counted: start the
-    /// glow when today's goal turns met, wake when a minutes goal will be,
-    /// and draw the glow over the whole window while it lasts.
-    pub(super) fn goal_glow(&mut self, ctx: &egui::Context) {
+    /// Last in a frame, once the page's characters are counted: when
+    /// today's goal turns met, start the glow and play the sound (each if
+    /// on); wake when a minutes goal will be met; draw the glow over the
+    /// whole window while it lasts.
+    pub(super) fn goal_met_effects(&mut self, ctx: &egui::Context) {
         let now = rs::now();
         self.stats_refresh(now);
         let day = self.stats.settings.goal_day(&self.today_now(now));
         let goal = self.stats.goal;
         let met = goal.is_some_and(|g| g.met(&day));
         let key = (self.stats.today, goal, self.stats.settings.goal_listening);
+        let (glow, sound) = (
+            self.stats.settings.goal_glow,
+            self.stats.settings.goal_sound,
+        );
         // The first look (a book opened, a new day, the goal or what counts
         // changed) only notes where today stands. Once met, it stays met
         // for that look, so paging back under the goal and on again doesn't
-        // glow twice.
+        // celebrate twice.
         let was = self
             .stats
             .goal_seen
             .filter(|(k, _)| *k == key)
             .map(|(_, m)| m);
-        if was == Some(false) && met && self.stats.settings.goal_glow {
-            self.stats.glow_since = Some(now);
+        if was == Some(false) && met {
+            if glow {
+                self.stats.glow_since = Some(now);
+            }
+            if sound {
+                play_cheer();
+                // Not over read aloud: it pauses, and goes on after.
+                self.tts.pause_until(now + cheer_pause());
+            }
         }
         self.stats.goal_seen = Some((key, met || was == Some(true)));
+        if let Some(left) = self.tts.sound_pause(now, &self.settings.tts) {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(left + 0.01));
+        }
         // A minutes goal is met by time going by, with no input to draw a
         // frame: wake for it once the characters (if any) are there.
         if let Some(g) = goal
             && !met
-            && self.stats.settings.goal_glow
+            && (glow || sound)
             && self.tracker.running()
             && g.minutes > 0
             && day.read_chars >= g.chars
@@ -277,7 +341,7 @@ impl Reader {
             return;
         };
         let t = now - since;
-        if !(0.0..GLOW_SECS).contains(&t) || !self.stats.settings.goal_glow {
+        if !(0.0..GLOW_SECS).contains(&t) || !glow {
             self.stats.glow_since = None;
             return;
         }
@@ -904,6 +968,12 @@ impl Reader {
                                 "A rainbow border for 5 seconds when today's goal is reached while reading",
                             );
                         ui.end_row();
+                        ui.label("");
+                        ui.checkbox(&mut set.goal_sound, "Play a sound when it's met")
+                            .on_hover_text(format!(
+                                "A voice says \u{201c}{CHEER_TEXT}\u{201d} when today's goal is reached while reading",
+                            ));
+                        ui.end_row();
                     });
             });
         let goal_now = goal.map_or((0, 0), |g| (g.minutes, g.chars));
@@ -941,5 +1011,15 @@ mod tests {
         assert_eq!(super::mins(3600.0 + 300.0), "1 h 05 min");
         assert_eq!(super::speed_text(300, 59.0), None);
         assert_eq!(super::speed_text(300, 60.0).as_deref(), Some("300/min"));
+    }
+
+    #[test]
+    fn goal_met_sound_decodes() {
+        let (pcm, rate) = super::tts::opus::decode(super::CHEER.to_vec()).unwrap();
+        assert_eq!(rate, super::tts::opus::RATE);
+        let secs = pcm.len() as f64 / rate as f64;
+        assert!((3.5..4.5).contains(&secs), "{secs} s");
+        let peak = pcm.iter().fold(0f32, |m, s| m.max(s.abs()));
+        assert!((0.3..1.0).contains(&peak), "peak {peak}");
     }
 }

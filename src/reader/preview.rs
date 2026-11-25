@@ -2451,6 +2451,37 @@ fn write_pcm_wav(path: &Path, pcm: &[i16], rate: u32) {
     std::fs::write(path, wav).unwrap();
 }
 
+/// Takes of the goal-met sound ([`super::stats_ui::CHEER_TEXT`]) read by a
+/// designed local voice, to choose the one shipped as
+/// `assets/goal-met.opus`. `CHEER_VOICE`: the designed voice's id (its
+/// folder in `LOCALAPPDATA`'s hanstat/voices); `CHEER_DIR`: where each take
+/// goes, as .wav (to listen to) and .opus; `CHEER_TAKES`: how many (6). The
+/// sampling is the reader's for Citrus on 2026-11-25 (temperature 0.7,
+/// sub-temperature 0.8); each take another seed. `HANSTAT_MODEL_DIR` with
+/// the design/base model.
+#[test]
+#[ignore]
+fn goal_cheer_takes() {
+    let dir = std::path::PathBuf::from(env("CHEER_DIR").expect("set CHEER_DIR"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut s = tts::local::LocalSettings {
+        designed: Some(env("CHEER_VOICE").expect("set CHEER_VOICE")),
+        temperature: 0.7,
+        sub_temperature: 0.8,
+        ..Default::default()
+    };
+    let n: u32 = env("CHEER_TAKES").and_then(|v| v.parse().ok()).unwrap_or(6);
+    for take in 0..n {
+        s.seed = take;
+        let pcm = tts::local::preview(super::stats_ui::CHEER_TEXT, &s).unwrap();
+        let secs = pcm.len() as f64 / tts::opus::RATE as f64;
+        write_pcm_wav(&dir.join(format!("take-{take}.wav")), &pcm, tts::opus::RATE);
+        let ogg = tts::opus::encode(&pcm).unwrap();
+        std::fs::write(dir.join(format!("take-{take}.opus")), &ogg).unwrap();
+        eprintln!("take {take}: {secs:.2} s, {} KB Opus", ogg.len() / 1024);
+    }
+}
+
 /// How well local-voice chunks are cut into sentences, on real audio: the
 /// chunks of `CUT_SPINES` (comma-separated, at most `CUT_CHUNKS` each, 12 by
 /// default) are made once with the model in `HANSTAT_MODEL_DIR` and kept in
@@ -2948,11 +2979,12 @@ fn reader_hover_texts() {
     rs::set_test_clock(None);
 }
 
-/// The goal-met glow: it starts on the turn that meets a characters goal,
-/// rings the window's edge in many hues and leaves the page alone, is gone
-/// after 5 s, doesn't come back for paging under the goal and on again or
-/// for opening a book with the goal met, and a minutes goal wakes the
-/// reader for it with no input.
+/// The goal-met glow and sound: they start on the turn that meets a
+/// characters goal; the glow rings the window's edge in many hues and
+/// leaves the page alone, and is gone after 5 s. Neither comes back for
+/// paging under the goal and on again or for opening a book with the goal
+/// met; a minutes goal wakes the reader for them with no input; each can be
+/// turned off on its own. (The sound is counted, not played, in tests.)
 #[test]
 #[ignore = "opens the reader with the system fonts and dictionary settings"]
 fn goal_glow() {
@@ -2973,16 +3005,20 @@ fn goal_glow() {
         },
         ..Default::default()
     });
+    let cheers = || super::stats_ui::CHEERS.load(std::sync::atomic::Ordering::Relaxed);
+    let c0 = cheers();
     let mut d = Driver::new();
     let mut r = stats_book(&mut d, temp.path());
     assert_eq!(r.stats.glow_since, None);
     d.key(&mut r, Key::ArrowRight);
     assert_eq!(r.tracker.totals.read_chars, 40);
+    assert_eq!(cheers(), c0, "40 of 50");
     assert_eq!(r.stats.glow_since, None, "40 of 50");
     rs::set_test_clock(Some(t0 + 20.0));
     d.key(&mut r, Key::ArrowRight);
     assert_eq!(r.tracker.totals.read_chars, 60);
     assert_eq!(r.stats.glow_since, Some(t0 + 20.0), "met on this turn");
+    assert_eq!(cheers(), c0 + 1, "the sound once");
 
     // Two seconds in: bright, many-hued edges; the middle as without it.
     rs::set_test_clock(Some(t0 + 22.0));
@@ -3022,6 +3058,7 @@ fn goal_glow() {
     d.key(&mut r, Key::ArrowRight);
     assert_eq!(r.tracker.totals.read_chars, 60);
     assert_eq!(r.stats.glow_since, None, "no second glow");
+    assert_eq!(cheers(), c0 + 1, "no second sound");
 
     // Opened again with the goal met: no glow.
     r.end_stats();
@@ -3029,6 +3066,7 @@ fn goal_glow() {
     let mut r = stats_book(&mut d, temp.path());
     d.idle(&mut r, 5);
     assert_eq!(r.stats.glow_since, None, "met before the book opened");
+    assert_eq!(cheers(), c0 + 1, "met before the book opened");
 
     // A minutes goal set now (not met yet) is met by time alone: the
     // reader asks for a frame when it will be, and glows then.
@@ -3043,8 +3081,9 @@ fn goal_glow() {
     rs::set_test_clock(Some(rs::now() + 1.0));
     d.quiet(&mut r, 1);
     assert!(r.stats.glow_since.is_some(), "met by time");
+    assert_eq!(cheers(), c0 + 2, "met by time");
 
-    // Turned off: a goal met later glows no more.
+    // The glow turned off: a goal met later only sounds.
     r.end_stats();
     drop(r);
     rs::update_meta(|s| {
@@ -3057,6 +3096,20 @@ fn goal_glow() {
     let met = rs::with(|s| s.summary(today).goal_days.contains(&today));
     assert!(met, "goal met");
     assert_eq!(r.stats.glow_since, None, "glow turned off");
+    assert_eq!(cheers(), c0 + 3, "the sound still on");
+
+    // The sound turned off too: a goal met later does nothing.
+    let read = rs::with(|s| s.summary(today).days[&today].read_chars);
+    rs::update_meta(|s| {
+        s.settings.goal_sound = false;
+        s.set_goal(today, 0, read + 1);
+    });
+    d.idle(&mut r, 2);
+    d.key(&mut r, Key::ArrowRight);
+    let met = rs::with(|s| s.summary(today).goal_days.contains(&today));
+    assert!(met, "goal met again");
+    assert_eq!(r.stats.glow_since, None, "glow off");
+    assert_eq!(cheers(), c0 + 3, "sound off");
     rs::set_test_clock(None);
 }
 

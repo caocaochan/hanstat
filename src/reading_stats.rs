@@ -41,6 +41,8 @@ pub struct TrackerSettings {
     pub goal_listening: bool,
     /// A rainbow glow around the window when the reader sees today's goal met.
     pub goal_glow: bool,
+    /// A voice says so when the reader sees today's goal met.
+    pub goal_sound: bool,
 }
 
 impl Default for TrackerSettings {
@@ -52,6 +54,7 @@ impl Default for TrackerSettings {
             live_line: true,
             goal_listening: false,
             goal_glow: true,
+            goal_sound: true,
         }
     }
 }
@@ -1371,6 +1374,7 @@ mod tests {
         assert!(!s.auto_start);
         assert!(!s.goal_listening);
         assert!(s.goal_glow);
+        assert!(s.goal_sound);
     }
 
     #[test]
