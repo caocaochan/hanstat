@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [2026.11.25.05] - 2026-11-25
 
 ### Added
 - **Popup theme.** The reader's **Aa** panel has a new setting under Theme: the dictionary popup can follow the pages' theme (**Same as pages**) or use any of the reader's themes, light or dark, whatever the pages use. It changes an open popup at once, child popups included. Everything in the popup takes the theme's colours: the headword, readings and glossaries, links and tags, frequency ranks, the Anki **+** button, the dictionaries' bars and the scroll bars. Black-and-white glyph images in a dictionary are shown light only in a dark popup. If you already used the reader, your popup stays Catppuccin Mocha, as it was, until you choose another; new installs start with Same as pages.
