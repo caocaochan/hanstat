@@ -615,6 +615,34 @@ pub struct Note {
     pub hover: String,
     /// A click on its label or dot is reported.
     pub link: bool,
+    /// Days `a..b` it covers: a bar in the strip under the chart.
+    pub span: Option<(f64, f64)>,
+}
+
+/// Rows for spans `a..b` (in days), first come first: a span goes on the
+/// first row free by its start, one day of overlap allowed (a book started
+/// the day the last one ended). Past `max` rows, the row that frees first.
+fn span_rows(spans: &[Option<(f64, f64)>], max: usize) -> (Vec<usize>, usize) {
+    let mut order: Vec<usize> = (0..spans.len()).filter(|&i| spans[i].is_some()).collect();
+    order.sort_by(|&a, &b| spans[a].unwrap().0.total_cmp(&spans[b].unwrap().0));
+    let mut ends: Vec<f64> = Vec::new();
+    let mut row = vec![0; spans.len()];
+    for i in order {
+        let (a, b) = spans[i].unwrap();
+        let k = match ends.iter().position(|&e| e <= a + 1.0) {
+            Some(k) => k,
+            None if ends.len() < max.max(1) => {
+                ends.push(f64::MIN);
+                ends.len() - 1
+            }
+            None => (0..ends.len())
+                .min_by(|&x, &y| ends[x].total_cmp(&ends[y]))
+                .unwrap_or(0),
+        };
+        ends[k] = ends[k].max(b);
+        row[i] = k;
+    }
+    (row, ends.len())
 }
 
 /// What a [`running_total`] shows.
@@ -634,7 +662,8 @@ pub struct Running<'a> {
 }
 
 /// A running total over days, rising with each day's amount, with notes
-/// on leader lines placed clear of each other and of the curve. `hover(day,
+/// on leader lines placed clear of each other and of the curve, and under
+/// it a strip of the notes' spans, one row per overlap. `hover(day,
 /// total)`: the text for a day. Returns the linked note clicked, if any.
 pub fn running_total(
     ui: &mut egui::Ui,
@@ -777,15 +806,93 @@ pub fn running_total(
         c.painter.circle(*dot, 3.5, r.color, Stroke::new(1.5, c.bg));
     }
 
-    let pointer = c.response.hover_pos();
-    let on_note = pointer.and_then(|m| {
-        placed
-            .iter()
-            .find(|(_, dot, rect)| dot.distance(m) < 8.0 || rect.is_some_and(|r| r.contains(m)))
-            .map(|(i, dot, rect)| (*i, *dot, *rect))
+    // The strip: each note's span as a bar, books read side by side on
+    // rows of their own.
+    const ROW: f32 = 7.0;
+    const ROW_GAP: f32 = 3.0;
+    let spans: Vec<Option<(f64, f64)>> = r.notes.iter().map(|n| n.span).collect();
+    let (rows, n_rows) = span_rows(&spans, 6);
+    let strip = (n_rows > 0).then(|| {
+        let h = 8.0 + n_rows as f32 * (ROW + ROW_GAP);
+        ui.allocate_painter(Vec2::new(c.response.rect.width(), h), egui::Sense::click())
     });
+    let bar = |i: usize, top: f32| -> Option<Rect> {
+        let (a, b) = r.notes[i].span?;
+        let (x0, x1) = (px(a.max(r.first as f64)), px(b.min(r.end as f64)));
+        let x1 = x1.max(x0 + 2.0);
+        let y = top + 8.0 + rows[i] as f32 * (ROW + ROW_GAP);
+        Some(Rect::from_min_max(
+            pos2(x0 + 0.5, y),
+            pos2(x1 - 0.5, y + ROW),
+        ))
+    };
+    let on_bar = strip.as_ref().and_then(|(resp, _)| {
+        let m = resp.hover_pos()?;
+        (0..r.notes.len()).find(|&i| {
+            bar(i, resp.rect.top()).is_some_and(|b| b.expand2(Vec2::new(1.0, 1.5)).contains(m))
+        })
+    });
+
+    let pointer = c.response.hover_pos();
+    let on_note = pointer
+        .and_then(|m| {
+            placed
+                .iter()
+                .find(|(_, dot, rect)| dot.distance(m) < 8.0 || rect.is_some_and(|r| r.contains(m)))
+                .map(|(i, ..)| *i)
+        })
+        .or(on_bar);
+    if let Some((resp, painter)) = &strip {
+        let top = resp.rect.top();
+        painter.text(
+            pos2(c.plot.left() - 6.0, top + 8.0 + ROW / 2.0),
+            Align2::RIGHT_CENTER,
+            "Books",
+            small(),
+            c.weak,
+        );
+        // Neighbours on a row alternate shades.
+        let mut by_row: Vec<Vec<usize>> = vec![Vec::new(); n_rows];
+        for i in 0..r.notes.len() {
+            if r.notes[i].span.is_some() {
+                by_row[rows[i]].push(i);
+            }
+        }
+        for row in &mut by_row {
+            row.sort_by(|&a, &b| {
+                r.notes[a]
+                    .span
+                    .unwrap()
+                    .0
+                    .total_cmp(&r.notes[b].span.unwrap().0)
+            });
+            for (k, &i) in row.iter().enumerate() {
+                let Some(b) = bar(i, top) else { continue };
+                let shade = if k % 2 == 0 { 0.85 } else { 0.45 };
+                let hot = on_note == Some(i);
+                painter.rect_filled(
+                    b,
+                    2.0,
+                    if hot {
+                        r.color
+                    } else {
+                        r.color.gamma_multiply(shade)
+                    },
+                );
+                if hot {
+                    painter.rect_stroke(
+                        b.expand(1.0),
+                        2.0,
+                        Stroke::new(1.5, c.text),
+                        StrokeKind::Outside,
+                    );
+                }
+            }
+        }
+    }
     let mut clicked = None;
-    let text = if let Some((i, dot, rect)) = on_note {
+    let text = if let Some(i) = on_note {
+        let (_, dot, rect) = placed[i];
         c.painter
             .circle(dot, 5.5, r.color, Stroke::new(2.0, c.text));
         if r.notes[i].link {
@@ -799,7 +906,8 @@ pub fn running_total(
                     Stroke::new(1.0, c.text),
                 );
             }
-            if c.response.clicked() {
+            let strip_click = on_bar == Some(i) && strip.as_ref().is_some_and(|(s, _)| s.clicked());
+            if c.response.clicked() || strip_click {
                 clicked = Some(i);
             }
         }
@@ -820,7 +928,16 @@ pub fn running_total(
             hover(day, v)
         })
     };
-    c.hover(text);
+    match (on_bar, strip) {
+        (Some(_), Some((resp, _))) => {
+            if let Some(t) = text {
+                resp.on_hover_ui_at_pointer(|ui| {
+                    ui.label(t);
+                });
+            }
+        }
+        _ => c.hover(text),
+    }
     clicked
 }
 
@@ -901,6 +1018,7 @@ mod tests {
                     text: "《书》".into(),
                     hover: "n".into(),
                     link: x > 5.0,
+                    span: Some((x - 3.0, x + 20.0)),
                 };
                 for (first, end, steps, notes) in [
                     (5, 5, vec![], vec![]),
@@ -955,6 +1073,18 @@ mod tests {
             });
             out.textures_delta.clear();
         }
+    }
+
+    #[test]
+    fn spans_take_rows_by_overlap() {
+        let s = |a: f64, b: f64| Some((a, b));
+        // Back to back (sharing a day) on one row; side by side on two.
+        let (rows, n) = span_rows(&[s(0.0, 10.0), s(9.0, 20.0), s(5.0, 15.0), None], 6);
+        assert_eq!((rows[0], rows[1], rows[2], n), (0, 0, 1, 2));
+        // Past the limit: the row that frees first.
+        let (rows, n) = span_rows(&[s(0.0, 30.0), s(1.0, 10.0), s(2.0, 40.0)], 2);
+        assert_eq!((rows[2], n), (1, 2));
+        assert_eq!(span_rows(&[None], 6).1, 0);
     }
 
     #[test]

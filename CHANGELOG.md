@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.25.03] - 2026-11-25
+
+### Added
+- **A Books strip under "Characters read over time".** Under the chart's dates, each book is a bar from the first to the last day you read it. Books read at the same time sit on rows of their own, so reading several at once shows at a glance; books read one after another share a row. Hovering a bar highlights that book on the curve (and hovering a book on the curve highlights its bar); clicking a bar opens the book. Books whose label didn't fit on the chart still get a bar.
+
 ## [2026.11.25.02] - 2026-11-25
 
 ### Added

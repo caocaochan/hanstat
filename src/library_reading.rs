@@ -1178,6 +1178,7 @@ impl App {
                     text: note_title(&b.title),
                     hover,
                     link,
+                    span: Some((a as f64, z as f64 + 1.0)),
                 }
             })
             .collect();
