@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.25.07] - 2026-11-25
+
+### Added
+- **A voice cheers when you reach your daily goal.** Along with the glow, a voice says “宝贝！你好厉害哦！你完成今天的目标啦！” when today's goal is met while you read. If read aloud is playing, it pauses for the cheer and goes on after; pausing or stopping it yourself meanwhile leaves it so. Turn the sound off under **Stats › Settings** in the reader, apart from the glow.
+
 ## [2026.11.25.06] - 2026-11-25
 
 ### Added
