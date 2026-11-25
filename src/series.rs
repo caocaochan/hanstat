@@ -19,6 +19,9 @@
 //!   `上`, `中`, `下`, `上册`, `前篇`, `後編`, `续`;
 //! - English: `Vol. 2`, `Volume II`, `Book 3`, `Part Two`, `No. 4`, `#5`,
 //!   `Season 2`, `Tome 2`;
+//! - a prologue (`序章`, `前传`, `Prologue`), before volume 1, and a final
+//!   part (`终章`, `Epilogue`), after every volume (`Title 3 Epilogue`:
+//!   after 3);
 //! - extras (`番外`, `外传`, `特别篇`), which come after every volume.
 //!
 //! To keep ordinary titles whole, a marker joined to the title without a
@@ -260,24 +263,18 @@ fn parse_norm(t: &str) -> (&str, Vec<u32>) {
             return (b, v);
         }
     }
-    // At the end.
+    // At the end; a volume before a subtitle as well comes first
+    // (`Title 3: Subtitle (Part 1)` is 3·1).
     let (base, vols) = peel(t);
     if !vols.is_empty() {
+        if let Some((b, mut outer)) = before_subtitle(base) {
+            outer.extend(vols);
+            return (b, outer);
+        }
         return (base, vols);
     }
-    // Before a subtitle: the first separator, or the first place a number
-    // is followed by a subtitle without one (`破云2吞海`), after which the
-    // title so far ends in a marker.
-    let mut prev = None;
-    for (i, c) in t.char_indices() {
-        let after_number = prev.is_some_and(numeral) && class(c) == Class::Other && !numeral(c);
-        if is_sep(c) || c == ':' || after_number {
-            let (b, v) = peel(&t[..i]);
-            if !v.is_empty() && !key_of(b).is_empty() {
-                return (b, v);
-            }
-        }
-        prev = Some(c);
+    if let Some(found) = before_subtitle(t) {
+        return found;
     }
     // At the start.
     if let Some((v, rest)) = leading(t) {
@@ -287,6 +284,43 @@ fn parse_norm(t: &str) -> (&str, Vec<u32>) {
         return (b, vols);
     }
     (base, vols)
+}
+
+/// A marker before a subtitle: at the first separator, or the first place a
+/// number is followed by a subtitle without one (`破云2吞海`), after which
+/// the title so far ends in a marker. Markers after it up to the next
+/// separator other than a space belong to it (`Title 3 Epilogue: Subtitle`
+/// is 3·final; `Title 4: Three Cakes` is 4).
+fn before_subtitle(t: &str) -> Option<(&str, Vec<u32>)> {
+    let mut prev = None;
+    let mut found: Option<(&str, Vec<u32>)> = None;
+    for (i, c) in t.char_indices() {
+        let after_number = prev.is_some_and(numeral) && class(c) == Class::Other && !numeral(c);
+        if is_sep(c) || c == ':' || after_number {
+            let (b, v) = peel(&t[..i]);
+            match &found {
+                None if !v.is_empty() && !key_of(b).is_empty() => found = Some((b, v)),
+                Some((fb, fv)) if v.len() > fv.len() && key_of(b) == key_of(fb) => {
+                    found = Some((b, v))
+                }
+                _ => {}
+            }
+            if found.is_some() && !c.is_whitespace() {
+                break;
+            }
+        }
+        prev = Some(c);
+    }
+    found
+}
+
+/// A hyphen joining two words (`thirty-six`, `spider-man`): not a separator
+/// a volume can follow.
+fn in_word_hyphen(before: &str, next: char) -> bool {
+    let mut cs = before.chars().rev();
+    matches!(cs.next(), Some('-' | '‐' | '–'))
+        && cs.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && next.is_ascii_alphabetic()
 }
 
 /// Full-width ASCII to ASCII, ideographic space to space, Traditional to
@@ -473,6 +507,9 @@ fn trailing(t: &str) -> Option<(Vec<u32>, &str)> {
         let (before, suffix) = t.split_at(i);
         let a = before.chars().next_back().unwrap();
         let b = suffix.chars().next().unwrap();
+        if in_word_hyphen(before, b) {
+            continue;
+        }
         let ctx = match (class(a), class(b)) {
             (Class::Sep, _) | (_, Class::Sep) => Ctx::Apart,
             (Class::Digit, Class::Digit) | (Class::Latin, Class::Latin) => continue,
@@ -589,8 +626,11 @@ fn marker(s: &str, ctx: Ctx) -> Option<Vec<u32>> {
             "续" | "续集" | "续篇" | "sequel" => {
                 return Some(vec![20]);
             }
-            "完结篇" | "终章" | "最终章" | "最终卷" | "最终回" | "finale" | "final" =>
-            {
+            "序章" | "序幕" | "楔子" | "前传" | "prologue" | "prequel" => {
+                return Some(vec![0]);
+            }
+            "完结篇" | "终章" | "最终章" | "最终卷" | "最终回" | "尾声" | "finale" | "final"
+            | "epilogue" => {
                 return Some(vec![FINAL]);
             }
             "番外" | "番外篇" | "番外集" | "外传" | "特别篇" | "extra" | "extras"
@@ -828,6 +868,60 @@ mod tests {
             &["Re︰從零開始的異世界生活01", "Re:从零开始的异世界生活 02"],
             &[1, 2],
         );
+    }
+
+    /// DuChinese course titles (catalogue read 2026-11-25).
+    #[test]
+    fn duchinese_titles() {
+        let in_order = |titles: &[&str]| {
+            let vs: Vec<Volume> = titles.iter().map(|t| parse(t)).collect();
+            for (t, v) in titles.iter().zip(&vs) {
+                assert_eq!(v.key, vs[0].key, "{t}: key");
+                assert!(v.number.is_some(), "{t}: no volume");
+            }
+            for (w, t) in vs.windows(2).zip(&titles[1..]) {
+                assert!(w[0].number < w[1].number, "{t}: out of order");
+            }
+        };
+        in_order(&[
+            "Thirty-Six Stratagems 1: The Disappearing Casino",
+            "Thirty-Six Stratagems 2: He Is My Person",
+            "Thirty-Six Stratagems 3: Heard Through the Grapevine",
+            "Thirty-Six Stratagems 4: I Am Brother Hai",
+            "Thirty-Six Stratagems 5: Murder Case",
+            "Thirty-Six Stratagems 6: Don’t Mess With My People",
+        ]);
+        in_order(&[
+            "Journey to the West 1: Birth of the Stone Monkey",
+            "Journey to the West 2: Great Sage Equal to Heaven",
+            "Journey to the West 3: Havoc in Heaven (Part 1)",
+        ]);
+        in_order(&[
+            "Three Kingdoms Prologue: Oath of the Peach Garden",
+            "Three Kingdoms 1: The Beauty Trap",
+            "Three Kingdoms 2: Battle of Xuzhou",
+            "Three Kingdoms 3: Heroes",
+            "Three Kingdoms 3 Epilogue: Friends",
+            "Three Kingdoms 4: Master of Jiangdong",
+            "Three Kingdoms 5: Thatched Cottage",
+            "Three Kingdoms 6: Sun–Liu Alliance",
+            "Three Kingdoms 7: The Battle of Red Cliffs  (Part One)",
+            "Three Kingdoms 7: The Battle of Red Cliffs (Part Two)",
+            "Three Kingdoms 8: Reunification of the Three Kingdoms Under Jin",
+        ]);
+        in_order(&["I’m a Cat 1: What is Home?", "I’m a Cat 6: We Can Try"]);
+        // A number word in the subtitle is not a part.
+        for (t, n) in [
+            ("I’m a Cat 4: Three Cakes", 4),
+            ("Newbie Course 4: Three People Walking Together", 4),
+            ("Thirty-Six Stratagems 4: I Am Brother Hai", 4),
+            ("Dune 7 - Two Towers Again", 7),
+        ] {
+            assert_eq!(vol(t).1, Some(vec![n]), "{t}");
+        }
+        // A hyphen inside a word does not start a volume.
+        assert_eq!(vol("The House at Number Thirty-Three").1, None);
+        assert_eq!(vol("Spider-Man Two").0, "spiderman");
     }
 
     #[test]
