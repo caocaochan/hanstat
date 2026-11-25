@@ -334,10 +334,15 @@ impl Theme {
 /// One theme in the chooser: a strip of its page with its name in its ink,
 /// and dots of its link, highlight and read-aloud colours.
 pub fn swatch(ui: &mut egui::Ui, t: &Theme, selected: bool) -> egui::Response {
+    swatch_as(ui, t, t.name, selected)
+}
+
+/// [`swatch`] with another name on it.
+pub fn swatch_as(ui: &mut egui::Ui, t: &Theme, name: &str, selected: bool) -> egui::Response {
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 30.0), egui::Sense::click());
     resp.widget_info(|| {
-        egui::WidgetInfo::selected(egui::Role::Button, ui.is_enabled(), selected, t.name)
+        egui::WidgetInfo::selected(egui::Role::Button, ui.is_enabled(), selected, name)
     });
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
@@ -354,7 +359,7 @@ pub fn swatch(ui: &mut egui::Ui, t: &Theme, selected: bool) -> egui::Response {
         p.text(
             r.left_center() + egui::vec2(10.0, 0.0),
             egui::Align2::LEFT_CENTER,
-            t.name,
+            name,
             egui::FontId::proportional(14.0),
             t.ink,
         );

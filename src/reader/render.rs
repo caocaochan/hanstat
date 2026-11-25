@@ -8,6 +8,7 @@
 use super::css::RuleSet;
 use super::images::Images;
 use super::layout::{self, ChapterLayout, Params};
+use super::popup::Look;
 use super::tree::{self, Chapter, Source};
 use eframe::egui;
 use hanstat::dict::lookup::{DictInfo, Gloss};
@@ -16,25 +17,31 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 /// The popup's own defaults, after the user-agent sheet and before the
-/// dictionary's sheet.
+/// dictionary's sheet, in `look`'s colours.
 /// Compact: dictionaries without a sheet of their own (CC-CEDICT) would get
-/// the browser spacing, 1em around every list. Colours: Catppuccin Mocha.
-pub const POPUP_SHEET: &str = r#"
-body { margin: 0; padding: 0 }
-.entry { margin: 0 0 0.3em 0 }
-.tags { font-size: 0.72em; color: #9399b2; margin-right: 0.4em }
-ul, ol, menu, dir { margin: 0.05em 0; padding-left: 1.1em }
-ul.glossary { list-style-type: disc }
-li { margin: 0 }
-p, dl, figure { margin: 0.15em 0 }
-blockquote { margin: 0.15em 0 0.15em 1em }
-h1, h2, h3, h4, h5, h6 { margin: 0.2em 0 }
-details { margin: 0.1em 0 }
-summary, a[href] { color: #89b4fa }
-table { margin: 0.1em 0 }
-[data-sc-cccedict="headword"] { display: inline; font-size: 0.82em; color: #a6adc8; margin: 0 0.3em 0 0 }
-.sep { color: #7f849c }
-"#;
+/// the browser spacing, 1em around every list.
+fn popup_sheet(look: &Look) -> String {
+    let hex = |c: egui::Color32| format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b());
+    let (subtle, faint, link) = (hex(look.subtle), hex(look.faint), hex(look.link));
+    format!(
+        r#"
+body {{ margin: 0; padding: 0 }}
+.entry {{ margin: 0 0 0.3em 0 }}
+.tags {{ font-size: 0.72em; color: {subtle}; margin-right: 0.4em }}
+ul, ol, menu, dir {{ margin: 0.05em 0; padding-left: 1.1em }}
+ul.glossary {{ list-style-type: disc }}
+li {{ margin: 0 }}
+p, dl, figure {{ margin: 0.15em 0 }}
+blockquote {{ margin: 0.15em 0 0.15em 1em }}
+h1, h2, h3, h4, h5, h6 {{ margin: 0.2em 0 }}
+details {{ margin: 0.1em 0 }}
+summary, a[href] {{ color: {link} }}
+table {{ margin: 0.1em 0 }}
+[data-sc-cccedict="headword"] {{ display: inline; font-size: 0.82em; color: {subtle}; margin: 0 0.3em 0 0 }}
+.sep {{ color: {faint} }}
+"#
+    )
+}
 
 const CACHE: usize = 160;
 
@@ -74,6 +81,8 @@ pub struct Renderer {
     pub images: Images,
     /// Each dictionary's folder, for its images.
     dirs: Arc<Mutex<HashMap<String, PathBuf>>>,
+    /// The theme `ua` and the entries kept are in.
+    theme: &'static str,
 }
 
 impl Renderer {
@@ -87,18 +96,34 @@ impl Renderer {
                 let dir = d.lock().unwrap().get(id)?.clone();
                 hanstat::dict::store::read_media(&dir, rest)
             }),
-        )
-        .invert_grey();
-        Renderer {
-            ua: Arc::new(tree::rules(&format!(
-                "{}\n{POPUP_SHEET}",
-                super::style::UA_SHEET
-            ))),
+        );
+        let mut r = Renderer {
+            ua: Arc::new(RuleSet::default()),
             sheets: HashMap::new(),
             cache: Vec::new(),
             images,
             dirs,
+            theme: "",
+        };
+        r.set_look(&Look::of(&super::theme::THEMES[0]));
+        r
+    }
+
+    /// Draw in `look`: the popup's sheet in its colours, the entries laid
+    /// out again (their colours are in their layout), greyscale images
+    /// light on a dark popup.
+    pub fn set_look(&mut self, look: &Look) {
+        if self.theme == look.theme.id {
+            return;
         }
+        self.theme = look.theme.id;
+        self.ua = Arc::new(tree::rules(&format!(
+            "{}\n{}",
+            super::style::UA_SHEET,
+            popup_sheet(look)
+        )));
+        self.cache.clear();
+        self.images.set_invert_grey(look.theme.dark);
     }
 
     /// The dictionaries changed: their sheets and folders are read again.

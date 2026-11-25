@@ -15,6 +15,7 @@
 use super::anki::{Cards, Sentence, Source, Status};
 use super::layout::Params;
 use super::render::Renderer;
+use super::theme::{self, Theme};
 use super::tree::LinkTarget;
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, Sense, Vec2, pos2, vec2};
 use hanstat::dict::lookup::{DictInfo, Lookup};
@@ -165,6 +166,8 @@ pub struct Popup {
     warmed: bool,
     /// Anki cards: the entries' **+** buttons.
     pub cards: Cards,
+    /// The popup's theme as saved: [`SAME_AS_PAGES`] or a theme's id.
+    pub theme: String,
 }
 
 /// The text a lookup reads from `src`: up to `max` characters, stopping at a
@@ -203,51 +206,114 @@ pub fn scan_text(chars: &[char], src: usize, max: usize) -> String {
         .collect()
 }
 
-/// Catppuccin Mocha, the popup's colours.
-pub mod mocha {
-    use eframe::egui::Color32;
-    pub const CRUST: Color32 = Color32::from_rgb(0x11, 0x11, 0x1b);
-    pub const MANTLE: Color32 = Color32::from_rgb(0x18, 0x18, 0x25);
-    pub const BASE: Color32 = Color32::from_rgb(0x1e, 0x1e, 0x2e);
-    pub const SURFACE0: Color32 = Color32::from_rgb(0x31, 0x32, 0x44);
-    pub const SURFACE1: Color32 = Color32::from_rgb(0x45, 0x47, 0x5a);
-    pub const SURFACE2: Color32 = Color32::from_rgb(0x58, 0x5b, 0x70);
-    pub const OVERLAY1: Color32 = Color32::from_rgb(0x7f, 0x84, 0x9c);
-    pub const SUBTEXT1: Color32 = Color32::from_rgb(0xba, 0xc2, 0xde);
-    pub const TEXT: Color32 = Color32::from_rgb(0xcd, 0xd6, 0xf4);
-    pub const BLUE: Color32 = Color32::from_rgb(0x89, 0xb4, 0xfa);
-    pub const GREEN: Color32 = Color32::from_rgb(0xa6, 0xe3, 0xa1);
-    pub const RED: Color32 = Color32::from_rgb(0xf3, 0x8b, 0xa8);
-    pub const TEAL: Color32 = Color32::from_rgb(0x94, 0xe2, 0xd5);
-    pub const YELLOW: Color32 = Color32::from_rgb(0xf9, 0xe2, 0xaf);
+/// `Settings::popup_theme` for a popup in the reader's own theme.
+pub const SAME_AS_PAGES: &str = "pages";
+
+/// The theme the popup is drawn in: the one saved as `choice`, or the
+/// pages' theme (for [`SAME_AS_PAGES`], or a theme removed since).
+pub fn popup_theme(ctx: &egui::Context, choice: &str) -> &'static Theme {
+    theme::THEMES
+        .iter()
+        .find(|t| t.id == choice)
+        .unwrap_or_else(|| theme::get(ctx))
 }
 
-/// egui's widgets in the popup (scroll bars, the bars that open and close).
-fn popup_visuals() -> egui::Visuals {
-    let mut v = egui::Visuals::dark();
-    v.override_text_color = Some(mocha::TEXT);
-    v.panel_fill = mocha::BASE;
-    v.window_fill = mocha::BASE;
-    v.extreme_bg_color = mocha::CRUST;
-    v.faint_bg_color = mocha::MANTLE;
-    v.hyperlink_color = mocha::BLUE;
-    v.selection.bg_fill = mocha::BLUE.gamma_multiply(0.35);
-    for (w, c) in [
-        (&mut v.widgets.inactive, mocha::SURFACE0),
-        (&mut v.widgets.hovered, mocha::SURFACE1),
-        (&mut v.widgets.active, mocha::SURFACE2),
-        (&mut v.widgets.open, mocha::SURFACE1),
-    ] {
-        w.bg_fill = c;
-        w.weak_bg_fill = c;
-        w.fg_stroke = egui::Stroke::new(1.0, mocha::SUBTEXT1);
+/// The popup's colours, from a reader theme. Its fills are the theme's page,
+/// desk and bar, and three surfaces of its text over its page at 11, 22 and
+/// 33 % (Catppuccin's surface0–2 are its text over its base at about those,
+/// so the Catppuccin themes get their own surfaces). Its text and accents are
+/// the theme's, unchanged; the themes have no green, so an added card's ✔ is
+/// their cyan (the closest hue they have).
+#[derive(Clone, Copy)]
+pub struct Look {
+    pub theme: &'static Theme,
+    /// The popup.
+    pub base: Color32,
+    /// Behind scroll bars.
+    pub crust: Color32,
+    /// Behind a greyed-out button.
+    pub mantle: Color32,
+    /// Badges and buttons; hovered; rules, a grip at rest.
+    pub surface0: Color32,
+    pub surface1: Color32,
+    pub surface2: Color32,
+    /// The dictionaries' bars, separators.
+    pub faint: Color32,
+    /// Readings, tags, the Anki button.
+    pub subtle: Color32,
+    /// The headword.
+    pub text: Color32,
+    /// The glossaries.
+    pub ink: Color32,
+    pub link: Color32,
+    /// A word looked up in the popup (see-through).
+    pub yellow: Color32,
+    /// Frequency ranks, a card that can be added.
+    pub teal: Color32,
+    /// A card added.
+    pub green: Color32,
+    pub red: Color32,
+}
+
+impl Look {
+    pub fn of(t: &'static Theme) -> Look {
+        let surface = |a| theme::mix(t.text, t.page, a);
+        Look {
+            theme: t,
+            base: t.page,
+            crust: t.desk,
+            mantle: t.bar,
+            surface0: surface(0.11),
+            surface1: surface(0.22),
+            surface2: surface(0.33),
+            faint: t.muted,
+            subtle: t.subtle,
+            text: t.text,
+            ink: t.ink,
+            link: t.accent,
+            yellow: t.yellow,
+            teal: t.cyan,
+            green: t.cyan,
+            red: t.red,
+        }
     }
-    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, mocha::SURFACE0);
-    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, mocha::TEXT);
-    v
-}
 
-const TEAL: Color32 = mocha::TEAL;
+    /// egui's widgets in the popup (scroll bars, the bars that open and close).
+    fn visuals(&self) -> egui::Visuals {
+        let mut v = if self.theme.dark {
+            egui::Visuals::dark()
+        } else {
+            egui::Visuals::light()
+        };
+        v.override_text_color = Some(self.text);
+        v.panel_fill = self.base;
+        v.window_fill = self.base;
+        v.extreme_bg_color = self.crust;
+        v.faint_bg_color = self.mantle;
+        v.hyperlink_color = self.link;
+        v.selection.bg_fill = self.link.gamma_multiply(0.35);
+        for (w, c) in [
+            (&mut v.widgets.inactive, self.surface0),
+            (&mut v.widgets.hovered, self.surface1),
+            (&mut v.widgets.active, self.surface2),
+            (&mut v.widgets.open, self.surface1),
+        ] {
+            w.bg_fill = c;
+            w.weak_bg_fill = c;
+            w.fg_stroke = egui::Stroke::new(1.0, self.subtle);
+        }
+        v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, self.surface0);
+        v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, self.text);
+        v
+    }
+
+    /// The word a child popup was opened for.
+    fn child_mark(&self) -> Color32 {
+        // As the page marks the word looked up: a little stronger on light.
+        self.yellow
+            .gamma_multiply(if self.theme.dark { 0.3 } else { 0.38 })
+    }
+}
 
 /// An entry's Anki button, as drawn.
 enum CardButton<'a> {
@@ -262,7 +328,6 @@ enum CardClick {
     Browse(i64),
     Setup,
 }
-const FAINT: Color32 = mocha::OVERLAY1;
 
 impl Popup {
     pub fn new(ctx: &egui::Context, freq_sort: Option<String>) -> Popup {
@@ -293,6 +358,7 @@ impl Popup {
             size: None,
             size_changed: false,
             warmed: false,
+            theme: SAME_AS_PAGES.to_owned(),
         }
     }
 
@@ -548,6 +614,8 @@ impl Popup {
         key: LookupKey,
         now: f64,
     ) {
+        let look = Look::of(popup_theme(ctx, &self.theme));
+        self.renderer.set_look(&look);
         self.renderer.images.next_frame();
         self.renderer.images.poll(ctx);
         let screen = ctx.content_rect();
@@ -589,7 +657,7 @@ impl Popup {
             // A word looked up in this popup: its child popup replaces any
             // above it, and is drawn in this frame (the loop goes on to it).
             if let Some((text, origin, anchor)) = self.draw_level(
-                ctx, level, anchor, w, content_h, size, params, show_freq, key_held,
+                ctx, level, anchor, w, content_h, size, params, show_freq, key_held, &look,
             ) {
                 let link = matches!(origin, Origin::Link(_));
                 if !self.asked_for(origin) && (link || self.rested(origin, key, now, ctx)) {
@@ -625,6 +693,7 @@ impl Popup {
         params: &Params,
         show_freq: bool,
         key_held: bool,
+        look: &Look,
     ) -> Option<(String, Origin, Rect)> {
         let screen = ctx.content_rect();
         // A fixed height: its entries scroll inside.
@@ -661,11 +730,11 @@ impl Popup {
         entry_params.fonts.serif = entry_params.fonts.sans.clone();
         entry_params.fonts.serif_bold = entry_params.fonts.sans_bold.clone();
         entry_params.fonts.serif_faux_bold = entry_params.fonts.sans_faux_bold;
-        entry_params.text = mocha::TEXT;
-        entry_params.link = mocha::BLUE;
-        entry_params.rule = mocha::SURFACE2;
+        entry_params.text = look.ink;
+        entry_params.link = look.link;
+        entry_params.rule = look.surface2;
         // Dictionaries' colours as they are (as before themes).
-        entry_params.page = mocha::BASE;
+        entry_params.page = look.base;
         entry_params.dark = false;
         let result = self.levels[level].result.clone();
         // The word a child popup was opened for: (group, part, src, len).
@@ -707,16 +776,16 @@ impl Popup {
             .pivot(pivot)
             .constrain(true)
             .show(ctx, |ui| {
-                *ui.visuals_mut() = popup_visuals();
+                *ui.visuals_mut() = look.visuals();
                 let frame = egui::Frame::new()
-                    .fill(mocha::BASE)
-                    .stroke(egui::Stroke::new(1.0, mocha::SURFACE1))
+                    .fill(look.base)
+                    .stroke(egui::Stroke::new(1.0, look.surface1))
                     .corner_radius(8)
                     .shadow(egui::epaint::Shadow {
                         offset: [0, 4],
                         blur: 18,
                         spread: 0,
-                        color: Color32::from_black_alpha(90),
+                        color: Color32::from_black_alpha(if look.theme.dark { 90 } else { 40 }),
                     })
                     .inner_margin(egui::Margin::symmetric(12, 10))
                     .show(ui, |ui| {
@@ -750,7 +819,9 @@ impl Popup {
                                         CardButton::Setup
                                     }
                                 });
-                                if let Some(c) = header(ui, gi, g, &dicts, size, show_freq, card) {
+                                if let Some(c) =
+                                    header(ui, gi, g, &dicts, size, show_freq, card, look)
+                                {
                                     card_click = Some(c);
                                 }
                                 for (pi, p) in g.parts.iter().enumerate() {
@@ -772,7 +843,9 @@ impl Popup {
                                     );
                                     let bar = ui.add(
                                         egui::Label::new(
-                                            RichText::new(label).size(size * 0.72).color(FAINT),
+                                            RichText::new(label)
+                                                .size(size * 0.72)
+                                                .color(look.faint),
                                         )
                                         .sense(Sense::click()),
                                     );
@@ -822,15 +895,14 @@ impl Popup {
                                             painter.rect_filled(
                                                 r.translate(off),
                                                 3.0,
-                                                mocha::YELLOW.gamma_multiply(0.3),
+                                                look.child_mark(),
                                             );
                                         }
                                     }
                                     for item in &e.layout.items {
                                         super::paint_item(
                                             &mut renderer.images,
-                                            // Its fallbacks as before themes.
-                                            &super::theme::THEMES[0],
+                                            look.theme,
                                             &painter,
                                             item,
                                             off,
@@ -905,9 +977,9 @@ impl Popup {
                     resize = Some(vec2(d.x, if down { d.y } else { -d.y }));
                 }
                 let c = if g.hovered() || g.dragged() {
-                    mocha::SUBTEXT1
+                    look.subtle
                 } else {
-                    mocha::SURFACE2
+                    look.surface2
                 };
                 let p = ui.painter();
                 for k in 1..=3 {
@@ -993,6 +1065,7 @@ fn header(
     size: f32,
     show_freq: bool,
     card: Option<CardButton>,
+    look: &Look,
 ) -> Option<CardClick> {
     let top = ui.cursor().min;
     let full = ui.available_width();
@@ -1001,7 +1074,7 @@ fn header(
     let row = ui.allocate_ui_with_layout(
         vec2(full - reserve, ui.spacing().interact_size.y),
         egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
-        |ui| header_text(ui, g, dicts, size, show_freq),
+        |ui| header_text(ui, g, dicts, size, show_freq, look),
     );
     let card = card?;
     // Beside the headword, on the first line.
@@ -1010,51 +1083,57 @@ fn header(
         pos2(top.x + full - side, top.y + ((line - side) / 2.0).max(0.0)),
         vec2(side, side),
     );
-    card_button(ui, rect, gi, card)
+    card_button(ui, rect, gi, card, look)
 }
 
 /// An entry's Anki button: + to add (greyed out when the word is already in
 /// Anki), ✔ once added (opens it in Anki's browser).
-fn card_button(ui: &mut egui::Ui, rect: Rect, gi: usize, card: CardButton) -> Option<CardClick> {
+fn card_button(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    gi: usize,
+    card: CardButton,
+    look: &Look,
+) -> Option<CardClick> {
     let (label, fg, enabled, tip, click): (&str, Color32, bool, String, Option<CardClick>) =
         match card {
             CardButton::Setup => (
                 "+",
-                mocha::SUBTEXT1,
+                look.subtle,
                 true,
                 "Add to Anki: choose a deck, note type and fields first".into(),
                 Some(CardClick::Setup),
             ),
             CardButton::Status(None | Some(Status::Checking)) => (
                 "+",
-                mocha::SUBTEXT1,
+                look.subtle,
                 true,
                 "Add to Anki".into(),
                 Some(CardClick::Add(gi)),
             ),
             CardButton::Status(Some(Status::CanAdd)) => (
                 "+",
-                TEAL,
+                look.teal,
                 true,
                 "Add to Anki".into(),
                 Some(CardClick::Add(gi)),
             ),
             CardButton::Status(Some(Status::Duplicate)) => {
-                ("+", mocha::SURFACE2, false, "Already in Anki".into(), None)
+                ("+", look.surface2, false, "Already in Anki".into(), None)
             }
             CardButton::Status(Some(Status::Adding)) => {
-                ("…", mocha::SUBTEXT1, false, "Adding…".into(), None)
+                ("…", look.subtle, false, "Adding…".into(), None)
             }
             CardButton::Status(Some(Status::Added(id))) => (
                 "✔",
-                mocha::GREEN,
+                look.green,
                 true,
                 "Added. Click to see it in Anki's browser".into(),
                 Some(CardClick::Browse(*id)),
             ),
             CardButton::Status(Some(Status::Failed(e))) => (
                 "+",
-                mocha::RED,
+                look.red,
                 true,
                 format!("{e}\nClick to try adding it anyway"),
                 Some(CardClick::Add(gi)),
@@ -1067,11 +1146,11 @@ fn card_button(ui: &mut egui::Ui, rect: Rect, gi: usize, card: CardButton) -> Op
     };
     let resp = ui.interact(rect, ui.scope_id().with(("anki-card", gi)), sense);
     let bg = if !enabled {
-        mocha::MANTLE
+        look.mantle
     } else if resp.hovered() {
-        mocha::SURFACE1
+        look.surface1
     } else {
-        mocha::SURFACE0
+        look.surface0
     };
     let p = ui.painter();
     p.rect_filled(rect, 5.0, bg);
@@ -1096,18 +1175,19 @@ fn header_text(
     dicts: &[DictInfo],
     size: f32,
     show_freq: bool,
+    look: &Look,
 ) {
     ui.spacing_mut().item_spacing.x = 8.0;
     ui.label(
         RichText::new(&g.headword)
             .size(size * 1.55)
-            .color(mocha::TEXT),
+            .color(look.text),
     );
     if g.reading != g.headword && !g.reading.is_empty() {
         ui.label(
             RichText::new(&g.reading)
                 .size(size * 1.05)
-                .color(mocha::SUBTEXT1),
+                .color(look.subtle),
         );
     }
     if show_freq {
@@ -1124,7 +1204,7 @@ fn header_text(
             } else {
                 format!("{name} {v}")
             };
-            freq_badge(ui, text, size).on_hover_text(if b.folded {
+            freq_badge(ui, text, size, look).on_hover_text(if b.folded {
                 "The rank of the Simplified form: this list has none for the Traditional one"
             } else {
                 "Frequency rank"
@@ -1137,16 +1217,16 @@ fn header_text(
 /// not fit in what is left of the line goes to the next line; it only wraps
 /// inside when it is wider than a whole line. (An `egui::Frame` here took the
 /// rest of the line, however narrow, and its label wrapped a letter a line.)
-fn freq_badge(ui: &mut egui::Ui, text: String, size: f32) -> egui::Response {
+fn freq_badge(ui: &mut egui::Ui, text: String, size: f32, look: &Look) -> egui::Response {
     let pad = vec2(5.0, 1.0);
     let line = (ui.max_rect().width() - 2.0 * pad.x).max(size);
     let font = egui::FontId::proportional(size * 0.68);
-    let galley = ui.fonts_mut(|f| f.layout(text, font, TEAL, line));
+    let galley = ui.fonts_mut(|f| f.layout(text, font, look.teal, line));
     let (rect, resp) = ui.allocate_exact_size(galley.size() + 2.0 * pad, Sense::hover());
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
-        p.rect_filled(rect, 4.0, mocha::SURFACE0);
-        p.galley(rect.min + pad, galley, TEAL);
+        p.rect_filled(rect, 4.0, look.surface0);
+        p.galley(rect.min + pad, galley, look.teal);
     }
     resp
 }
@@ -1180,6 +1260,7 @@ mod tests {
     fn freq_badges_wrap_whole() {
         let names = ["Danmei", "BLCUcoll", "BLCUlit", "SUBTLEX-CH", "Wordfreq"];
         let size = 18.0;
+        let look = Look::of(&theme::THEMES[0]);
         let ctx = egui::Context::default();
         crate::install_fonts(&ctx);
         for width in [520.0_f32, 300.0, 200.0] {
@@ -1208,7 +1289,9 @@ mod tests {
                                     ui.allocate_exact_size(vec2(lead, size), Sense::hover());
                                 }
                                 for n in names {
-                                    rects.push(freq_badge(ui, format!("{n} 26819"), size).rect);
+                                    rects.push(
+                                        freq_badge(ui, format!("{n} 26819"), size, &look).rect,
+                                    );
                                 }
                             },
                         );

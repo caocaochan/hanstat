@@ -22,6 +22,8 @@ struct Tex {
     used: u64,
 }
 
+type Decoded = (String, bool, Option<(ColorImage, bool)>);
+
 /// Reads a file's bytes by path.
 pub type Source = Arc<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>;
 
@@ -36,8 +38,9 @@ pub struct Images {
     tex: HashMap<String, Tex>,
     pending: HashSet<String>,
     failed: HashSet<String>,
-    tx: Sender<(String, Option<(ColorImage, bool)>)>,
-    rx: Receiver<(String, Option<(ColorImage, bool)>)>,
+    /// Decoded: (path, inverted, image and whether it is at full size).
+    tx: Sender<Decoded>,
+    rx: Receiver<Decoded>,
     frame: u64,
 }
 
@@ -46,10 +49,14 @@ impl Images {
         Images::with_source("reader", Arc::new(move |p: &str| epub.read(p)))
     }
 
-    /// Greyscale images inverted (light on dark).
-    pub fn invert_grey(mut self) -> Images {
-        self.invert_grey = true;
-        self
+    /// Greyscale images inverted (light on dark), or not: the images
+    /// decoded the other way are dropped and decoded again when drawn.
+    pub fn set_invert_grey(&mut self, on: bool) {
+        if self.invert_grey != on {
+            self.invert_grey = on;
+            self.tex.clear();
+            self.pending.clear();
+        }
     }
 
     pub fn with_source(name: &str, read: Source) -> Images {
@@ -88,7 +95,11 @@ impl Images {
     /// Take in decoded images; `true` if any arrived.
     pub fn poll(&mut self, ctx: &egui::Context) -> bool {
         let mut any = false;
-        while let Ok((path, img)) = self.rx.try_recv() {
+        while let Ok((path, inverted, img)) = self.rx.try_recv() {
+            if inverted != self.invert_grey {
+                // Asked before the popup's theme changed.
+                continue;
+            }
             self.pending.remove(&path);
             any = true;
             match img {
@@ -146,7 +157,7 @@ impl Images {
             let p = path.to_owned();
             rayon::spawn(move || {
                 let img = read(&p).and_then(|b| decode(&b, px, invert));
-                let _ = tx.send((p, img));
+                let _ = tx.send((p, invert, img));
             });
         }
         let t = self.tex.get_mut(path)?;

@@ -736,6 +736,12 @@ impl Cards {
         self.statuses.get(&key_of(g))
     }
 
+    /// Show `g` as `s`, whatever Anki says (tests).
+    #[cfg(test)]
+    pub fn set_status(&mut self, g: &Group, s: Status) {
+        self.statuses.insert(key_of(g), s);
+    }
+
     /// Check the entries of popup `level` (a channel send; Anki answers on
     /// the worker).
     pub fn check(&mut self, level: usize, lookup: &Arc<Lookup>, sentence: Option<&Arc<Sentence>>) {

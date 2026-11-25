@@ -308,6 +308,18 @@ impl Driver {
         open
     }
 
+    /// The last frame as a picture, saved as `name`.png in `READER_OUT`
+    /// too, if set.
+    fn shot(&mut self, name: &str) -> crate::raster::Scene {
+        let mut out = self.last.take().expect("a frame drawn");
+        let scene = self.screen.picture(&self.ctx, &mut out, self.size);
+        if let Some(dir) = &self.out_dir {
+            std::fs::create_dir_all(dir).unwrap();
+            scene.write_png(&dir.join(format!("{name}.png"))).unwrap();
+        }
+        scene
+    }
+
     /// Save the last frame as `name`.png in `READER_OUT`, if set.
     fn snap(&mut self, name: &str) {
         let (Some(dir), Some(mut out)) = (self.out_dir.clone(), self.last.take()) else {
@@ -1218,6 +1230,275 @@ fn dictionary_popup() {
     assert!(!r.dict.is_open(), "turning the page closes the popup");
     assert_ne!((r.spine, r.page), page);
     r.close(&d.ctx);
+}
+
+/// Import a small dictionary of `files` as `id` under `root`.
+fn import_test_dict(dir: &Path, root: &Path, id: &str, files: &[(&str, &str)]) {
+    use hanstat::dict::{import, manage};
+    let zip = dir.join(format!("{id}.zip"));
+    write_zip(&zip, files);
+    import::import(
+        &zip,
+        &manage::tmp_dir(root, id),
+        &import::Progress::default(),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
+    manage::swap(root, id).unwrap();
+    manage::add_to_manifest(root, id).unwrap();
+}
+
+/// The popup in the themes: the Aa panel's popup theme box lists "Same as
+/// pages" and every theme, a click on one saves it and the open popup takes
+/// its colours at once. With small dictionaries made here (tags, a list, a
+/// cross-reference, a closed `<details>`, a collapsed dictionary, a
+/// frequency rank, Anki buttons in each state, a child popup), one PNG per
+/// theme in `READER_OUT`: `READER_POPUP_THEMES` (comma-separated ids)
+/// adds themes to the light and dark ones always shown.
+#[test]
+#[ignore = "opens the reader with the system fonts and dictionary settings"]
+fn popup_themes() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut d = Driver::new();
+    let (mut r, _) = selection_book(&mut d, temp.path());
+    assert_eq!(r.settings.popup_theme, popup::SAME_AS_PAGES, "the default");
+
+    // The chooser: "Same as pages", then every theme.
+    let aa = r.probe.aa.expect("Aa drawn");
+    d.click(&mut r, aa.center());
+    let theme_box = r.probe.theme_box.expect("Aa opens the panel");
+    let popup_box = r.probe.popup_theme_box.expect("the popup theme box");
+    assert!(
+        (popup_box.top() - theme_box.bottom()).abs() < 16.0 && popup_box.left() == theme_box.left(),
+        "right under Theme: {theme_box:?} {popup_box:?}"
+    );
+    d.click(&mut r, popup_box.center());
+    assert_eq!(r.probe.popup_theme_items.len(), theme::THEMES.len());
+    let same = r.probe.popup_same.expect("Same as pages listed");
+    d.idle(&mut r, 10);
+    assert!(
+        r.probe.popup_theme_items.iter().all(|(_, _, shown)| *shown),
+        "the whole list shows without scrolling"
+    );
+    d.snap("popup-theme-list");
+    let mocha = theme::index("catppuccin-mocha");
+    let (item, _, _) = *r
+        .probe
+        .popup_theme_items
+        .iter()
+        .find(|(_, i, _)| *i == mocha)
+        .unwrap();
+    d.click(&mut r, item.center());
+    assert_eq!(r.settings.popup_theme, "catppuccin-mocha");
+    assert!(r.probe.popup_theme_items.is_empty(), "the list closes");
+    assert!(r.probe.theme_box.is_some(), "the panel stays open");
+    assert_eq!(
+        theme::get(&d.ctx).id,
+        theme::THEMES[0].id,
+        "the pages keep theirs"
+    );
+    let popup_box = r.probe.popup_theme_box.unwrap();
+    d.click(&mut r, popup_box.center());
+    assert!(r.probe.popup_same.is_some_and(|s| s == same));
+    d.click(&mut r, same.center());
+    assert_eq!(r.settings.popup_theme, popup::SAME_AS_PAGES);
+    assert!(d.key(&mut r, Key::Escape));
+    assert!(r.probe.theme_box.is_none(), "Esc closes the panel");
+
+    // Dictionaries: a rich one, a collapsed one and a frequency list.
+    let root = temp.path().join("dictionaries");
+    let rich = r#"[{"type":"structured-content","content":[{"tag":"ul","content":[{"tag":"li","content":"mountains and rivers; landscape"},{"tag":"li","content":["see ",{"tag":"a","href":"?query=日月","content":"日月"}]},{"tag":"li","content":"as in 日月山川"}]},{"tag":"details","content":[{"tag":"summary","content":"Examples"},"山川秀丽"]}]}]"#;
+    let terms = format!(
+        r#"[["山川","shānchuān","n","",9,{rich},1,"★"],["山川","sānchuān","","",8,["mountain and river (literal)"],2,""],["山川","shānzhuān","","",7,["a place name"],3,""],["山川","shānchuan","","",6,["(dialect) hills"],4,""],["日月","rìyuè","n","",5,["sun and moon","time"],5,""]]"#
+    );
+    import_test_dict(
+        temp.path(),
+        &root,
+        "0000000000000001",
+        &[
+            (
+                "index.json",
+                r#"{"title":"Test","revision":"1","format":3}"#,
+            ),
+            ("term_bank_1.json", &terms),
+        ],
+    );
+    import_test_dict(
+        temp.path(),
+        &root,
+        "0000000000000002",
+        &[
+            (
+                "index.json",
+                r#"{"title":"Collapsed","revision":"1","format":3}"#,
+            ),
+            (
+                "term_bank_1.json",
+                r#"[["山川","shānchuān","","",1,["hidden until opened"],1,""]]"#,
+            ),
+        ],
+    );
+    import_test_dict(
+        temp.path(),
+        &root,
+        "0000000000000003",
+        &[
+            (
+                "index.json",
+                r#"{"title":"Freq","revision":"1","format":3}"#,
+            ),
+            (
+                "term_meta_bank_1.json",
+                r#"[["山川","freq",1234],["日月","freq",567]]"#,
+            ),
+        ],
+    );
+    hanstat::dict::manage::edit_manifest(&root, |m| {
+        for e in &mut m.dicts {
+            e.collapsed = e.id == "0000000000000002";
+        }
+    })
+    .unwrap();
+    r.dict = popup::Popup::with_root(&d.ctx, None, root);
+    // Anki buttons, against nothing (a closed port): every check fails.
+    r.settings.anki = anki::CardSettings {
+        url: "http://127.0.0.1:9".into(),
+        deck: "Test".into(),
+        model: "Basic".into(),
+        fields: vec![("Front".into(), "{expression}".into())],
+        ..Default::default()
+    };
+    r.dict.sync_cards(&r.settings.anki);
+
+    let word = displayed_char(&r, 0).center();
+    let shift = egui::Modifiers::SHIFT;
+    let since = Instant::now();
+    while r
+        .dict
+        .levels
+        .first()
+        .is_none_or(|l| l.result.groups.len() < 4)
+    {
+        d.frame_with(&mut r, vec![egui::Event::PointerMoved(word)], shift);
+        assert!(
+            since.elapsed().as_secs() < 10,
+            "the popup never opened: {} dictionaries, errors {:?}, {:?}",
+            r.dict.dicts.len(),
+            r.dict.errors,
+            r.dict.levels.first().map(|l| l
+                .result
+                .groups
+                .iter()
+                .map(|g| (g.headword.clone(), g.reading.clone()))
+                .collect::<Vec<_>>())
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let groups = r.dict.levels[0].result.groups.clone();
+    while groups
+        .iter()
+        .any(|g| matches!(r.dict.cards.status(g), None | Some(anki::Status::Checking)))
+    {
+        d.frame(&mut r, vec![]);
+        assert!(since.elapsed().as_secs() < 20, "Anki checks never answered");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    for (g, s) in groups.iter().zip([
+        anki::Status::CanAdd,
+        anki::Status::Added(1),
+        anki::Status::Duplicate,
+    ]) {
+        r.dict.cards.set_status(g, s);
+    }
+    // A child popup: the cross-reference looked up with Shift.
+    let pr = r.dict.levels[0].rect.expect("drawn");
+    'find: for y in (0..)
+        .map(|k| pr.top() + 20.0 + k as f32 * 6.0)
+        .take_while(|y| *y < pr.bottom())
+    {
+        for x in (0..)
+            .map(|k| pr.left() + 16.0 + k as f32 * 8.0)
+            .take_while(|x| *x < pr.right() - 16.0)
+        {
+            d.frame_with(&mut r, vec![egui::Event::PointerMoved(pos2(x, y))], shift);
+            if r.dict.levels.len() == 2 {
+                break 'find;
+            }
+        }
+    }
+    assert_eq!(r.dict.levels.len(), 2, "a child popup");
+    assert_eq!(r.dict.levels[1].result.text, "日月");
+    let held = d.ctx.input(|i| i.pointer.hover_pos()).unwrap();
+    let mut themes = vec![
+        popup::SAME_AS_PAGES.to_owned(),
+        "catppuccin-mocha".to_owned(),
+        "gruvbox-light".to_owned(),
+        "tokyo-night".to_owned(),
+    ];
+    themes.extend(
+        env("READER_POPUP_THEMES")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+    );
+    for id in &themes {
+        // Changed with the popups open: they take it in the next frame.
+        r.settings.popup_theme = id.clone();
+        for _ in 0..3 {
+            d.frame_with(&mut r, vec![egui::Event::PointerMoved(held)], shift);
+        }
+        assert_eq!(r.dict.levels.len(), 2, "{id}: both popups stay");
+        let t = popup::popup_theme(&d.ctx, id);
+        if id == popup::SAME_AS_PAGES {
+            assert_eq!(t.id, theme::THEMES[0].id);
+        } else {
+            assert_eq!(t.id, *id);
+        }
+        let rects: Vec<Rect> = r.dict.levels.iter().map(|l| l.rect.unwrap()).collect();
+        let shot = d.shot(&format!("popup-theme-{id}"));
+        for (level, pr) in rects.iter().enumerate() {
+            // In the frame's margin, left of the entries.
+            let c = shot.pixel(pos2(pr.left() + 5.0, pr.bottom() - 30.0));
+            let diff = |a: u8, b: u8| a.abs_diff(b);
+            assert!(
+                diff(c.r(), t.page.r()) <= 2
+                    && diff(c.g(), t.page.g()) <= 2
+                    && diff(c.b(), t.page.b()) <= 2,
+                "{id}: popup {level} is {c:?}, the theme's page {:?}",
+                t.page
+            );
+        }
+    }
+    // The parent alone, scrolled to its last entries' Anki buttons (added,
+    // already in Anki, failed).
+    assert!(d.key(&mut r, Key::Escape));
+    assert_eq!(r.dict.levels.len(), 1, "Esc closes the child");
+    r.dict.scroll_lines = 20;
+    d.idle(&mut r, 3);
+    assert!(r.dict.levels[0].scroll_y > 0.0, "scrolled");
+    for id in &themes {
+        r.settings.popup_theme = id.clone();
+        d.idle(&mut r, 3);
+        d.snap(&format!("popup-theme-{id}-end"));
+    }
+    r.close(&d.ctx);
+}
+
+/// The popup theme is saved; settings from before the choice keep the
+/// popup's old look.
+#[test]
+fn popup_theme_setting() {
+    assert_eq!(Settings::default().popup_theme, popup::SAME_AS_PAGES);
+    let old: Settings = serde_json::from_str(r#"{"theme":"paper"}"#).unwrap();
+    assert_eq!(old.popup_theme, "catppuccin-mocha");
+    assert_eq!(old.theme, "paper");
+    let s = Settings {
+        popup_theme: "nord".into(),
+        ..Settings::default()
+    };
+    let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+    assert_eq!(back.popup_theme, "nord");
 }
 
 /// Popups of words picked by hand, to look at: `READER_WORDS` (comma-

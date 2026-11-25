@@ -71,6 +71,11 @@ struct Settings {
     spread: bool,
     /// The colour theme's id.
     theme: String,
+    /// The dictionary popup's theme: [`popup::SAME_AS_PAGES`] or a theme's
+    /// id. Settings saved before there was a choice keep the popup as it
+    /// was, Catppuccin Mocha.
+    #[serde(default = "popup_theme_before")]
+    popup_theme: String,
     /// Where each book was left, by its Library id: kept from before the
     /// reading-stats database, and used again only if it can't be read.
     positions: HashMap<String, Position>,
@@ -104,6 +109,7 @@ impl Default for Settings {
             margins: 1.0,
             spread: true,
             theme: theme::THEMES[0].id.to_owned(),
+            popup_theme: popup::SAME_AS_PAGES.to_owned(),
             positions: HashMap::new(),
             lookup_key: popup::LookupKey::Shift,
             freq_sort: None,
@@ -115,6 +121,10 @@ impl Default for Settings {
             tts: tts::TtsSettings::default(),
         }
     }
+}
+
+fn popup_theme_before() -> String {
+    "catppuccin-mocha".to_owned()
 }
 
 impl Settings {
@@ -140,6 +150,12 @@ struct Probe {
     /// The theme list is open: its entries, their themes and whether each
     /// is in full view (not scrolled away).
     theme_items: Vec<(Rect, usize, bool)>,
+    /// The popup theme box, while the panel is open.
+    popup_theme_box: Option<Rect>,
+    /// The popup theme list is open: its "Same as pages" entry, and the
+    /// themes as in `theme_items`.
+    popup_same: Option<Rect>,
+    popup_theme_items: Vec<(Rect, usize, bool)>,
     /// The serif font box, while the panel is open.
     serif_box: Option<Rect>,
     /// The serif list is open: one of its entries and its family.
@@ -747,6 +763,7 @@ impl Reader {
         let mut open = true;
         self.dict.warm(&ctx);
         self.dict.size = self.settings.popup_size.map(|[w, h]| vec2(w, h));
+        self.dict.theme.clone_from(&self.settings.popup_theme);
         self.dict.poll();
         self.dict.anchor = None;
         self.dicts.poll(&ctx, &self.dict, &self.settings);
@@ -1592,6 +1609,9 @@ impl Reader {
         self.probe.aa = Some(button.rect);
         self.probe.theme_box = None;
         self.probe.theme_items.clear();
+        self.probe.popup_theme_box = None;
+        self.probe.popup_same = None;
+        self.probe.popup_theme_items.clear();
         self.probe.serif_box = None;
         self.probe.serif_item = None;
         let mut open = self.settings_open;
@@ -1607,9 +1627,6 @@ impl Reader {
                 let current = theme::index(&self.settings.theme);
                 let mut chosen = None;
                 let mut items = Vec::new();
-                // Each theme shown in its own colours, light and dark side by
-                // side: one column of 16 would scroll (egui sizes a new popup
-                // at most 400 points tall).
                 let button = ui.add(
                     egui::Button::new(theme::THEMES[current].name)
                         .right_text("⏷")
@@ -1617,31 +1634,53 @@ impl Reader {
                 );
                 egui::Popup::menu(&button)
                     .id(egui::Id::unique("reader-theme-list"))
-                    .show(|ui| {
-                        let muted = theme::get(ui.ctx()).muted;
-                        ui.horizontal_top(|ui| {
-                            for dark in [false, true] {
-                                ui.vertical(|ui| {
-                                    ui.set_width(210.0);
-                                    ui.label(RichText::new(if dark { "Dark" } else { "Light" }).size(12.0).color(muted));
-                                    for (i, t) in theme::THEMES.iter().enumerate().filter(|(_, t)| t.dark == dark) {
-                                        let r = theme::swatch(ui, t, i == current);
-                                        if r.clicked() {
-                                            chosen = Some(i);
-                                            ui.close();
-                                        }
-                                        items.push((r.rect, i, ui.clip_rect().contains_rect(r.rect)));
-                                    }
-                                });
-                            }
-                        });
-                    });
+                    .show(|ui| chosen = theme_columns(ui, Some(current), &mut items));
                 self.probe.theme_box = Some(button.rect);
                 self.probe.theme_items = items;
                 if let Some(i) = chosen {
                     self.settings.theme = theme::THEMES[i].id.to_owned();
                     let egui_theme = self.prev_style.as_ref().map_or(ui.ctx().theme(), |p| p.0);
                     apply_theme(ui.ctx(), egui_theme, i);
+                }
+                ui.end_row();
+                // The dictionary popup's: the pages' theme, or one of its own.
+                ui.label("Popup theme");
+                let pages = theme::index(&self.settings.theme);
+                let current = theme::THEMES.iter().position(|t| t.id == self.settings.popup_theme);
+                let mut chosen = None;
+                let mut same = None;
+                let mut items = Vec::new();
+                let button = ui
+                    .add(
+                        egui::Button::new(current.map_or("Same as pages", |i| theme::THEMES[i].name))
+                            .right_text("⏷")
+                            .min_size(vec2(220.0, 0.0)),
+                    )
+                    .on_hover_text("The dictionary popup's colours");
+                egui::Popup::menu(&button)
+                    .id(egui::Id::unique("reader-popup-theme-list"))
+                    .show(|ui| {
+                        // As wide as the two columns below it, in the pages' colours.
+                        let w = 2.0 * THEME_COLUMN + ui.spacing().item_spacing.x;
+                        let r = ui
+                            .allocate_ui(vec2(w, 30.0), |ui| {
+                                theme::swatch_as(ui, &theme::THEMES[pages], "Same as pages", current.is_none())
+                            })
+                            .inner;
+                        if r.clicked() {
+                            chosen = Some(popup::SAME_AS_PAGES);
+                            ui.close();
+                        }
+                        same = Some(r.rect);
+                        if let Some(i) = theme_columns(ui, current, &mut items) {
+                            chosen = Some(theme::THEMES[i].id);
+                        }
+                    });
+                self.probe.popup_theme_box = Some(button.rect);
+                self.probe.popup_same = same;
+                self.probe.popup_theme_items = items;
+                if let Some(id) = chosen {
+                    self.settings.popup_theme = id.to_owned();
                 }
                 ui.end_row();
                 for serif in [true, false] {
@@ -1953,6 +1992,48 @@ fn draw_page(ui: &egui::Ui, th: &Theme, r: Rect, side: usize, spread: bool) {
             p.rect_filled(rr, 0.0, Color32::from_rgba_unmultiplied(fr, fg, fb, a));
         }
     }
+}
+
+/// A theme list's column width.
+const THEME_COLUMN: f32 = 210.0;
+
+/// The themes to choose from, each shown in its own colours, light and dark
+/// side by side: one column of 16 would scroll (egui sizes a new popup at
+/// most 400 points tall). Returns the theme clicked (and closes the list);
+/// `items` gets each entry's rect, its theme and whether it is in full view
+/// (not scrolled away).
+fn theme_columns(
+    ui: &mut egui::Ui,
+    current: Option<usize>,
+    items: &mut Vec<(Rect, usize, bool)>,
+) -> Option<usize> {
+    let muted = theme::get(ui.ctx()).muted;
+    let mut chosen = None;
+    ui.horizontal_top(|ui| {
+        for dark in [false, true] {
+            ui.vertical(|ui| {
+                ui.set_width(THEME_COLUMN);
+                ui.label(
+                    RichText::new(if dark { "Dark" } else { "Light" })
+                        .size(12.0)
+                        .color(muted),
+                );
+                for (i, t) in theme::THEMES
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| t.dark == dark)
+                {
+                    let r = theme::swatch(ui, t, Some(i) == current);
+                    if r.clicked() {
+                        chosen = Some(i);
+                        ui.close();
+                    }
+                    items.push((r.rect, i, ui.clip_rect().contains_rect(r.rect)));
+                }
+            });
+        }
+    });
+    chosen
 }
 
 /// Use theme `i` in `ctx`: its colours for the reader's bar, menus and

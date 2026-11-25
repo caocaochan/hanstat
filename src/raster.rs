@@ -299,6 +299,20 @@ impl Scene {
             .collect()
     }
 
+    /// The colour drawn at `p` (points).
+    #[cfg(test)]
+    pub(crate) fn pixel(&self, p: egui::Pos2) -> Color32 {
+        let k = self.pixels_per_point;
+        let (x, y) = ((p.x * k) as usize, (p.y * k) as usize);
+        let tris = self.triangles();
+        let on_row: Vec<&Tri> = tris
+            .iter()
+            .filter(|t| t.bounds[1] <= y && y < t.bounds[3])
+            .collect();
+        let row = self.strip(&on_row, y, 1);
+        Color32::from_rgb(row[3 * x], row[3 * x + 1], row[3 * x + 2])
+    }
+
     /// Write the page to `path`.
     pub(crate) fn write_png(&self, path: &Path) -> Result<(), String> {
         let [w, h] = self.size;
