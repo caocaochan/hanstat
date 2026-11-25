@@ -1,5 +1,13 @@
 # Changelog
 
+## [2026.11.25.10] - 2026-11-25
+
+### Fixed
+- **Writing-style rating no longer crashes hanstat on computers with less memory.** The model's server kept a cache of every sample it had read, which grew past 9 GB within seconds and ran a 16 GB laptop out of memory; hanstat then closed, and did so again on every start. The cache is off now (it was never used again) and the server stays near 4 GB, with the same ratings. If the computer is short of free memory, rating waits for it (shown in the status bar) instead of starting, and stops if memory runs low while rating. If hanstat closes while the model is loaded, rating is **paused** at the next start until you click **Rate the books without a rating** in Settings (⚙), so a crash can't repeat on every start.
+
+### Changed
+- **The model fits your graphics card.** As many of its layers go on the card as its free memory holds, keeping 1 GB for hanstat and the desktop, and the rest run on the CPU: a card with 4 GB or more runs it all, as before; a smaller one (3 GB) now uses what it has instead of failing. Settings shows the split, e.g. “33 of 33 layers on NVIDIA GeForce RTX 5070”. The ratings are the same either way; only the speed differs.
+
 ## [2026.11.25.09] - 2026-11-25
 
 ### Fixed
