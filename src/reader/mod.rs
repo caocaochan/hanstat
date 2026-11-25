@@ -1446,6 +1446,7 @@ impl Reader {
                 .collapsible(false)
                 .show(&ctx, |ui| ui.label(e));
         }
+        self.goal_glow(&ctx);
         open
     }
 

@@ -33,7 +33,19 @@ pub(super) struct Cache {
     last_state: Option<State>,
     confirm_discard: bool,
     goal_edit: Option<(u32, u64)>,
+    /// Whether today's goal was met at the last look, and for which day,
+    /// goal and counting of listening: the glow starts only when the same
+    /// one turns met.
+    goal_seen: Option<(GoalKey, bool)>,
+    /// When the goal-met glow started ([`rs::now`]).
+    pub(super) glow_since: Option<f64>,
 }
+
+/// What a goal's "met" is about: the day, the goal, whether listening counts.
+type GoalKey = (i32, Option<Goal>, bool);
+
+/// How long the goal-met glow lasts, in seconds.
+pub(super) const GLOW_SECS: f64 = 5.0;
 
 /// The line under the pages.
 pub(super) struct Line {
@@ -46,7 +58,8 @@ pub(super) struct Line {
 }
 
 /// The goal bar's hover text: what it measures and where today stands.
-fn goal_hover(g: &Goal, d: &Day) -> String {
+/// `d` is today as the goal measures it; `listening`: listening counts.
+fn goal_hover(g: &Goal, d: &Day, listening: bool) -> String {
     let mut need = Vec::new();
     if g.minutes > 0 {
         need.push(format!(
@@ -70,8 +83,80 @@ fn goal_hover(g: &Goal, d: &Day) -> String {
     if need.len() == 2 {
         s.push_str(" The bar follows whichever is further behind.");
     }
-    s.push_str(" Reading in every book counts; read aloud doesn't. Set the goal in Stats.");
+    s.push_str(if listening {
+        " Reading and read aloud in every book count. Set the goal in Stats."
+    } else {
+        " Reading in every book counts; read aloud doesn't. Set the goal in Stats."
+    });
     s
+}
+
+/// The goal-met glow `t` seconds in: a rainbow round the edge of `rect`,
+/// its hues turning, fading in, then out by [`GLOW_SECS`].
+pub(super) fn paint_glow(painter: &egui::Painter, rect: Rect, t: f64) {
+    let up = (t / 0.4).clamp(0.0, 1.0);
+    let down = ((GLOW_SECS - t) / 1.5).clamp(0.0, 1.0);
+    let a = up.min(down) as f32;
+    let a = a * a * (3.0 - 2.0 * a);
+    if a <= 0.0 {
+        return;
+    }
+    let spin = (t * 0.3) as f32;
+    let breathe = 1.0 + 0.12 * (t as f32 * std::f32::consts::TAU * 0.7).sin();
+    // The glow, fading inward, then a bright rim.
+    glow_band(painter, rect, 30.0 * breathe, 0.6 * a, 0.0, spin);
+    glow_band(painter, rect, 4.0, 0.95 * a, 0.7 * a, spin);
+}
+
+/// A band `width` wide inside the edge of `rect`, its hue going once round
+/// the edge (turned by `spin`), `outer`/`inner` its opacity at each side.
+fn glow_band(painter: &egui::Painter, rect: Rect, width: f32, outer: f32, inner: f32, spin: f32) {
+    use egui::ecolor::HsvaGamma;
+    let width = width.min(rect.width() / 2.0).min(rect.height() / 2.0);
+    let o = [
+        rect.left_top(),
+        rect.right_top(),
+        rect.right_bottom(),
+        rect.left_bottom(),
+    ];
+    let r = rect.shrink(width);
+    let i = [
+        r.left_top(),
+        r.right_top(),
+        r.right_bottom(),
+        r.left_bottom(),
+    ];
+    let perimeter = 2.0 * (rect.width() + rect.height());
+    let colour = |h: f32, a: f32| -> egui::Color32 {
+        HsvaGamma {
+            h: (h + spin).rem_euclid(1.0),
+            s: 0.85,
+            v: 1.0,
+            a,
+        }
+        .into()
+    };
+    let mut mesh = egui::Mesh::default();
+    let mut along = 0.0;
+    for side in 0..4 {
+        let (o0, o1) = (o[side], o[(side + 1) % 4]);
+        let (i0, i1) = (i[side], i[(side + 1) % 4]);
+        let len = o0.distance(o1);
+        let n = (len / 12.0).ceil().max(1.0) as usize;
+        for k in 0..=n {
+            let f = k as f32 / n as f32;
+            let h = (along + len * f) / perimeter;
+            let base = mesh.vertices.len() as u32;
+            mesh.colored_vertex(o0.lerp(o1, f), colour(h, outer));
+            mesh.colored_vertex(i0.lerp(i1, f), colour(h, inner));
+            if k > 0 {
+                mesh.add_triangle(base - 2, base - 1, base);
+                mesh.add_triangle(base - 1, base + 1, base);
+            }
+        }
+        along += len;
+    }
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 /// Where the speed for "time left" comes from: set by hand, or the best
@@ -149,6 +234,59 @@ impl Reader {
             }
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait.max(1.0)));
         }
+    }
+
+    /// Last in a frame, once the page's characters are counted: start the
+    /// glow when today's goal turns met, wake when a minutes goal will be,
+    /// and draw the glow over the whole window while it lasts.
+    pub(super) fn goal_glow(&mut self, ctx: &egui::Context) {
+        let now = rs::now();
+        self.stats_refresh(now);
+        let day = self.stats.settings.goal_day(&self.today_now(now));
+        let goal = self.stats.goal;
+        let met = goal.is_some_and(|g| g.met(&day));
+        let key = (self.stats.today, goal, self.stats.settings.goal_listening);
+        // The first look (a book opened, a new day, the goal or what counts
+        // changed) only notes where today stands. Once met, it stays met
+        // for that look, so paging back under the goal and on again doesn't
+        // glow twice.
+        let was = self
+            .stats
+            .goal_seen
+            .filter(|(k, _)| *k == key)
+            .map(|(_, m)| m);
+        if was == Some(false) && met && self.stats.settings.goal_glow {
+            self.stats.glow_since = Some(now);
+        }
+        self.stats.goal_seen = Some((key, met || was == Some(true)));
+        // A minutes goal is met by time going by, with no input to draw a
+        // frame: wake for it once the characters (if any) are there.
+        if let Some(g) = goal
+            && !met
+            && self.stats.settings.goal_glow
+            && self.tracker.running()
+            && g.minutes > 0
+            && day.read_chars >= g.chars
+        {
+            let left = g.minutes as f64 * 60.0 - day.read_secs;
+            if left > 0.0 {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(left + 0.05));
+            }
+        }
+        let Some(since) = self.stats.glow_since else {
+            return;
+        };
+        let t = now - since;
+        if !(0.0..GLOW_SECS).contains(&t) || !self.stats.settings.goal_glow {
+            self.stats.glow_since = None;
+            return;
+        }
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Tooltip,
+            egui::Id::unique("reader-goal-glow"),
+        ));
+        paint_glow(&painter, ctx.content_rect(), t);
+        ctx.request_repaint();
     }
 
     /// Where the page settled this frame.
@@ -366,8 +504,11 @@ impl Reader {
             (full, short, hover)
         });
         let goal = self.stats.goal.map(|g| {
-            let d = self.today_now(now);
-            (g.progress(&d), goal_hover(&g, &d))
+            let d = self.stats.settings.goal_day(&self.today_now(now));
+            (
+                g.progress(&d),
+                goal_hover(&g, &d, self.stats.settings.goal_listening),
+            )
         });
         Some(Line {
             left,
@@ -529,8 +670,13 @@ impl Reader {
                     ui.label(RichText::new(h).color(muted)).on_hover_text(tip);
                 }
                 if listened {
-                    ui.label(RichText::new("Listening").color(muted))
-                        .on_hover_text("Time and characters while read aloud played: kept out of speed and goals");
+                    ui.label(RichText::new("Listening").color(muted)).on_hover_text(
+                        if self.stats.settings.goal_listening {
+                            "Time and characters while read aloud played: kept out of speed, counted toward the daily goal (Settings, ⚙)"
+                        } else {
+                            "Time and characters while read aloud played: kept out of speed and goals"
+                        },
+                    );
                 }
                 ui.end_row();
                 for (name, d) in [
@@ -590,22 +736,23 @@ impl Reader {
         // Goal and streaks.
         let goal = sum.goal;
         if let Some(g) = goal {
+            let gday = self.stats.settings.goal_day(&today);
             let mut need = Vec::new();
             if g.minutes > 0 {
                 need.push(format!(
                     "{} of {} min",
-                    (today.read_secs / 60.0).floor(),
+                    (gday.read_secs / 60.0).floor(),
                     g.minutes
                 ));
             }
             if g.chars > 0 {
                 need.push(format!(
                     "{} of {} chars",
-                    fmt_int(today.read_chars),
+                    fmt_int(gday.read_chars),
                     fmt_int(g.chars)
                 ));
             }
-            let p = g.progress(&today);
+            let p = g.progress(&gday);
             ui.label(format!(
                 "Today's goal: {}{}",
                 need.join(", "),
@@ -750,6 +897,12 @@ impl Reader {
                         })
                         .response
                         .on_hover_text("0 turns either off. A change applies from today on.");
+                        ui.end_row();
+                        ui.label("");
+                        ui.checkbox(&mut set.goal_glow, "Glow round the window when it's met")
+                            .on_hover_text(
+                                "A rainbow border for 5 seconds when today's goal is reached while reading",
+                            );
                         ui.end_row();
                     });
             });

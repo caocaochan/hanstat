@@ -242,6 +242,29 @@ impl Driver {
         }
     }
 
+    /// `n` frames with no events at all (not even the modifiers, which make
+    /// egui ask for the next frame at once), and how long the last one
+    /// asked to wait for the next (seconds).
+    fn quiet(&mut self, r: &mut Reader, n: usize) -> f64 {
+        for _ in 0..n {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, self.size)),
+                time: Some(self.time),
+                predicted_dt: 1.0 / 60.0,
+                ..Default::default()
+            };
+            self.time += 1.0 / 60.0;
+            let mut out = self.ctx.run_ui(raw, |ui| {
+                r.ui(ui);
+            });
+            self.screen.absorb(&mut out);
+            self.last = Some(out);
+        }
+        self.last.as_ref().unwrap().viewport_output[&egui::ViewportId::ROOT]
+            .repaint_delay
+            .as_secs_f64()
+    }
+
     /// Until the page is shown and every chapter is built.
     fn ready(&mut self, r: &mut Reader) {
         let t = Instant::now();
@@ -2922,6 +2945,118 @@ fn reader_hover_texts() {
             "{name}: {want:?} not in {texts:?}"
         );
     }
+    rs::set_test_clock(None);
+}
+
+/// The goal-met glow: it starts on the turn that meets a characters goal,
+/// rings the window's edge in many hues and leaves the page alone, is gone
+/// after 5 s, doesn't come back for paging under the goal and on again or
+/// for opening a book with the goal met, and a minutes goal wakes the
+/// reader for it with no input.
+#[test]
+#[ignore = "opens the reader with the system fonts and dictionary settings"]
+fn goal_glow() {
+    use crate::reading_stats as rs;
+    let temp = tempfile::tempdir().unwrap();
+    let t0 = 1_790_000_000.0;
+    rs::set_test_clock(Some(t0));
+    rs::reset_for_test(rs::ReadingStats {
+        goals: vec![rs::Goal {
+            from_day: 0,
+            minutes: 0,
+            chars: 50,
+        }],
+        // No minute ticks for the line, so the goal's wake-up shows alone.
+        settings: rs::TrackerSettings {
+            live_line: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let mut d = Driver::new();
+    let mut r = stats_book(&mut d, temp.path());
+    assert_eq!(r.stats.glow_since, None);
+    d.key(&mut r, Key::ArrowRight);
+    assert_eq!(r.tracker.totals.read_chars, 40);
+    assert_eq!(r.stats.glow_since, None, "40 of 50");
+    rs::set_test_clock(Some(t0 + 20.0));
+    d.key(&mut r, Key::ArrowRight);
+    assert_eq!(r.tracker.totals.read_chars, 60);
+    assert_eq!(r.stats.glow_since, Some(t0 + 20.0), "met on this turn");
+
+    // Two seconds in: bright, many-hued edges; the middle as without it.
+    rs::set_test_clock(Some(t0 + 22.0));
+    assert_eq!(d.quiet(&mut r, 3), 0.0, "frames while it shows");
+    let on = d.shot("goal-glow");
+    let edges = [
+        pos2(1.0, 400.0),
+        pos2(600.0, 1.0),
+        pos2(1198.0, 400.0),
+        pos2(600.0, 798.0),
+    ];
+    let lit: Vec<Color32> = edges.iter().map(|p| on.pixel(*p)).collect();
+    let chroma = |c: &Color32| {
+        let [r, g, b, _] = c.to_array();
+        r.max(g).max(b) - r.min(g).min(b)
+    };
+    for c in &lit {
+        assert!(chroma(c) > 60, "{lit:?}");
+    }
+    assert!(lit.iter().any(|c| *c != lit[0]), "one hue: {lit:?}");
+    let middle = pos2(600.0, 400.0);
+    let mid_on = on.pixel(middle);
+
+    rs::set_test_clock(Some(t0 + 25.1));
+    let wait = d.quiet(&mut r, 3);
+    assert_eq!(r.stats.glow_since, None, "over after 5 s");
+    assert!(wait > 1.0, "no more frames for it: {wait}");
+    let off = d.shot("goal-glow-after");
+    for (p, c) in edges.iter().zip(&lit) {
+        assert_ne!(off.pixel(*p), *c, "edge at {p:?} still lit");
+    }
+    assert_eq!(off.pixel(middle), mid_on, "the page untouched");
+
+    // Under the goal and over it again: once a day is enough.
+    d.key(&mut r, Key::ArrowLeft);
+    assert_eq!(r.tracker.totals.read_chars, 40);
+    d.key(&mut r, Key::ArrowRight);
+    assert_eq!(r.tracker.totals.read_chars, 60);
+    assert_eq!(r.stats.glow_since, None, "no second glow");
+
+    // Opened again with the goal met: no glow.
+    r.end_stats();
+    drop(r);
+    let mut r = stats_book(&mut d, temp.path());
+    d.idle(&mut r, 5);
+    assert_eq!(r.stats.glow_since, None, "met before the book opened");
+
+    // A minutes goal set now (not met yet) is met by time alone: the
+    // reader asks for a frame when it will be, and glows then.
+    let today = rs::local_day(rs::now(), 4);
+    rs::update_meta(|s| s.set_goal(today, 1, 0));
+    let wait = d.quiet(&mut r, 3);
+    assert_eq!(r.stats.glow_since, None);
+    assert!((1.0..60.0).contains(&wait), "woken in {wait} s");
+    rs::set_test_clock(Some(rs::now() + wait - 1.0));
+    d.quiet(&mut r, 1);
+    assert_eq!(r.stats.glow_since, None, "a second early");
+    rs::set_test_clock(Some(rs::now() + 1.0));
+    d.quiet(&mut r, 1);
+    assert!(r.stats.glow_since.is_some(), "met by time");
+
+    // Turned off: a goal met later glows no more.
+    r.end_stats();
+    drop(r);
+    rs::update_meta(|s| {
+        s.settings.goal_glow = false;
+        s.set_goal(today, 0, 70);
+    });
+    let mut r = stats_book(&mut d, temp.path());
+    d.key(&mut r, Key::Home);
+    d.key(&mut r, Key::ArrowRight);
+    let met = rs::with(|s| s.summary(today).goal_days.contains(&today));
+    assert!(met, "goal met");
+    assert_eq!(r.stats.glow_since, None, "glow turned off");
     rs::set_test_clock(None);
 }
 

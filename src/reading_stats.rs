@@ -36,6 +36,11 @@ pub struct TrackerSettings {
     pub day_start_hour: u32,
     /// Show the stats line in the reader's bottom margin.
     pub live_line: bool,
+    /// Listening (read aloud playing) counts toward the daily goal, as
+    /// reading: its time and characters. Speed and the rest keep them apart.
+    pub goal_listening: bool,
+    /// A rainbow glow around the window when the reader sees today's goal met.
+    pub goal_glow: bool,
 }
 
 impl Default for TrackerSettings {
@@ -45,8 +50,31 @@ impl Default for TrackerSettings {
             idle_mins: 5,
             day_start_hour: 4,
             live_line: true,
+            goal_listening: false,
+            goal_glow: true,
         }
     }
+}
+
+impl TrackerSettings {
+    /// `d` as the daily goal measures it: listening folded into reading
+    /// when it counts.
+    pub fn goal_day(&self, d: &Day) -> Day {
+        goal_day(d, self.goal_listening)
+    }
+}
+
+/// `d` with listening added to reading when `listening` (it counts toward
+/// the goal).
+pub fn goal_day(d: &Day, listening: bool) -> Day {
+    let mut g = *d;
+    if listening {
+        g.read_secs += d.listen_secs;
+        g.read_chars += d.listen_chars;
+        g.listen_secs = 0.0;
+        g.listen_chars = 0;
+    }
+    g
 }
 
 /// Reading and listening (read aloud playing) in one day, or one session.
@@ -290,9 +318,18 @@ pub struct Summary {
     /// Every goal change, for [`goal_in`].
     pub goals: Vec<Goal>,
     pub goal_days: std::collections::HashSet<i32>,
+    /// Listening counts toward the goal ([`TrackerSettings::goal_listening`]).
+    pub goal_listening: bool,
     pub speed: Option<f64>,
     /// Per book: id, stats without the session lists.
     pub books: Vec<(String, BookRow)>,
+}
+
+impl Summary {
+    /// `d` as the daily goal measures it.
+    pub fn goal_day(&self, d: &Day) -> Day {
+        goal_day(d, self.goal_listening)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -315,7 +352,10 @@ impl ReadingStats {
             totals.add(d);
         }
         let read = |_: i32, d: &Day| d.read_secs >= DAY_READ_SECS;
-        let goal_ok = |day: i32, d: &Day| self.goal_on(day).is_some_and(|g| g.met(d));
+        let goal_ok = |day: i32, d: &Day| {
+            self.goal_on(day)
+                .is_some_and(|g| g.met(&self.settings.goal_day(d)))
+        };
         let goal_days = days
             .iter()
             .filter(|(k, v)| goal_ok(**k, v))
@@ -354,6 +394,7 @@ impl ReadingStats {
             goal: self.goal_on(today),
             goals: self.goals.clone(),
             goal_days,
+            goal_listening: self.settings.goal_listening,
             speed: self.measured_speed(today),
             days,
             books,
@@ -1291,6 +1332,45 @@ mod tests {
         assert!(!g.met(&day(40.0, 5000)));
         assert!(g.met(&day(30.0, 6000)));
         assert_eq!(g.progress(&day(15.0, 6000)), 0.5);
+    }
+
+    #[test]
+    fn listening_counts_toward_the_goal_only_when_set() {
+        let mut s = ReadingStats::default();
+        s.set_goal(10, 30, 0);
+        let mut d = day(20.0, 1000);
+        d.listen_secs = 15.0 * 60.0;
+        d.listen_chars = 4000;
+        s.books.entry("a".into()).or_default().days.insert(12, d);
+        let g = s.goal_on(12).unwrap();
+        assert!(!g.met(&s.settings.goal_day(&d)));
+        let sum = s.summary(12);
+        assert!(!sum.goal_days.contains(&12));
+        assert_eq!(sum.goal_streak.0, 0);
+
+        s.settings.goal_listening = true;
+        let folded = s.settings.goal_day(&d);
+        assert_eq!(folded.read_secs, 35.0 * 60.0);
+        assert_eq!(folded.read_chars, 5000);
+        assert!(g.met(&folded));
+        let sum = s.summary(12);
+        assert!(sum.goal_listening);
+        assert!(sum.goal_days.contains(&12));
+        assert_eq!(sum.goal_streak.0, 1);
+        // Speed and the days read stay reading only.
+        assert_eq!(sum.days_read, 1);
+        assert_eq!(s.measured_speed(12), Some(1000.0 / 20.0));
+    }
+
+    #[test]
+    fn settings_from_before_the_goal_options_keep_the_defaults() {
+        let s: TrackerSettings = serde_json::from_str(
+            r#"{"auto_start":false,"idle_mins":5,"day_start_hour":4,"live_line":true}"#,
+        )
+        .unwrap();
+        assert!(!s.auto_start);
+        assert!(!s.goal_listening);
+        assert!(s.goal_glow);
     }
 
     #[test]

@@ -967,7 +967,8 @@ fn hero_text(
 
 /// Today's reading: the goal as a ring, and the streaks.
 fn today(ui: &mut Ui, sum: &Summary, goal_edit: &mut Option<(u32, u64)>, act: &mut Option<Act>) {
-    let day = sum.days.get(&sum.today).copied().unwrap_or_default();
+    // As the goal measures it: listening folded in when it counts.
+    let day = sum.goal_day(&sum.days.get(&sum.today).copied().unwrap_or_default());
     let goal = sum.goal.filter(|g| g.is_set());
     ui.add_space(6.0);
     ui.label(palette::bold_text("Today", 19.0).color(palette::strong()));
@@ -980,7 +981,7 @@ fn today(ui: &mut Ui, sum: &Summary, goal_edit: &mut Option<(u32, u64)>, act: &m
             goal.map_or(0.0, |g| g.progress(&day)),
             &minutes.to_string(),
             "min",
-            &ring_hover(goal.as_ref(), &day),
+            &ring_hover(goal.as_ref(), &day, sum.goal_listening),
         );
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 3.0;
@@ -1028,18 +1029,27 @@ fn today(ui: &mut Ui, sum: &Summary, goal_edit: &mut Option<(u32, u64)>, act: &m
 
 /// "45 min a day" or "45 min + 5,000 chars a day".
 /// The Today ring's hover text: the minutes in it, and what fills it.
-fn ring_hover(goal: Option<&rs::Goal>, day: &rs::Day) -> String {
+fn ring_hover(goal: Option<&rs::Goal>, day: &rs::Day, listening: bool) -> String {
+    let what = if listening {
+        "Minutes read and listened to today, in every book."
+    } else {
+        "Minutes read today, in every book."
+    };
     let Some(g) = goal else {
-        return "Minutes read today, in every book. Set a daily goal to fill the ring.".to_owned();
+        return format!("{what} Set a daily goal to fill the ring.");
     };
     let mut s = format!(
-        "Minutes read today, in every book. The ring is today's goal: {}% of it",
+        "{what} The ring is today's goal: {}% of it",
         (g.progress(day) * 100.0).floor()
     );
     if g.minutes > 0 && g.chars > 0 {
         s.push_str(", following whichever of minutes and characters is further behind");
     }
-    s.push_str(". Read aloud doesn't count.");
+    s.push_str(if listening {
+        ". Read aloud counts (Settings, ⚙)."
+    } else {
+        ". Read aloud doesn't count."
+    });
     s
 }
 
@@ -1658,19 +1668,22 @@ mod tests {
             read_chars: 3000,
             ..rs::Day::default()
         };
-        assert!(ring_hover(None, &day).ends_with("Set a daily goal to fill the ring."));
+        assert!(ring_hover(None, &day, false).ends_with("Set a daily goal to fill the ring."));
         let minutes = rs::Goal {
             minutes: 30,
             ..rs::Goal::default()
         };
-        let t = ring_hover(Some(&minutes), &day);
+        let t = ring_hover(Some(&minutes), &day, false);
         assert!(t.contains("today's goal: 33% of it."), "{t}");
         assert!(!t.contains("further behind"), "{t}");
         let both = rs::Goal {
             chars: 10_000,
             ..minutes
         };
-        let t = ring_hover(Some(&both), &day);
+        let t = ring_hover(Some(&both), &day, false);
         assert!(t.contains("30% of it, following whichever"), "{t}");
+        let t = ring_hover(Some(&minutes), &day, true);
+        assert!(t.starts_with("Minutes read and listened to today"), "{t}");
+        assert!(t.ends_with("Read aloud counts (Settings, ⚙)."), "{t}");
     }
 }

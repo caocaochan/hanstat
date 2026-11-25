@@ -2739,6 +2739,26 @@ impl App {
                 .small(),
             );
             ui.separator();
+            ui.strong("Daily reading goal");
+            let mut listening = reading_stats::with(|s| s.settings.goal_listening);
+            if ui
+                .checkbox(&mut listening, "Count listening (read aloud) as reading time")
+                .changed()
+            {
+                reading_stats::update_meta(|s| s.settings.goal_listening = listening);
+                if let Err(e) = reading_stats::save() {
+                    self.set_error("reading stats", e);
+                }
+            }
+            ui.label(
+                RichText::new(
+                    "Time and characters while read aloud plays count toward the daily goal and its streak, \
+                     in the reader, on Home and in Library Stats. Reading speed leaves them out either way.",
+                )
+                .weak()
+                .small(),
+            );
+            ui.separator();
             self.shortcuts_ui(ui);
             ui.separator();
             ui.strong("Writing style");
