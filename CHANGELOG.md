@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.25.08] - 2026-11-25
+
+### Added
+- **Your own voice and message for the daily goal.** Under **Stats › Settings** in the reader, the goal sound has a **Voice** list: the built-in cheer, your designed voices and the local voice's speakers (once downloaded under Read aloud). Pick one, type what it should say (up to 20 characters, so it stays under about 5 seconds), and press **Make**: the voice says it once and it plays from then on. **▶ Play** lets you hear it. Until it is made, or after you change the voice or the message, the built-in cheer plays.
+
 ## [2026.11.25.07] - 2026-11-25
 
 ### Added
