@@ -437,6 +437,26 @@ pub(crate) fn progress_bar(ui: &Ui, rect: Rect, done: f32) {
     }
 }
 
+/// The ring's colour at `done` (0..=1): red at the start, through orange
+/// (peach) and yellow, to green when the goal is met. Yellow sits between
+/// peach and green because blending those two directly goes through khaki.
+fn ring_colour(c: &palette::Flavour, done: f32) -> Color32 {
+    let stops = [
+        (0.0, c.red),
+        (0.45, c.peach),
+        (0.75, c.yellow),
+        (1.0, c.green),
+    ];
+    let done = done.clamp(0.0, 1.0);
+    for w in stops.windows(2) {
+        let ((a, from), (b, to)) = (w[0], w[1]);
+        if done <= b {
+            return palette::mix(to, from, (done - a) / (b - a));
+        }
+    }
+    c.green
+}
+
 /// A ring of `RING` points, `done` (0..=1) of it drawn round from the top.
 fn ring(ui: &mut Ui, done: f32, middle: &str, under: &str, hover: &str) {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(RING), Sense::hover());
@@ -456,10 +476,11 @@ fn ring(ui: &mut Ui, done: f32, middle: &str, under: &str, hover: &str) {
             centre + r * vec2(a.cos(), a.sin())
         };
         let points: Vec<Pos2> = (0..=n).map(at).collect();
+        let fill = ring_colour(c, done);
         // Round ends.
-        p.circle_filled(points[0], width / 2.0, c.peach);
-        p.circle_filled(points[n], width / 2.0, c.peach);
-        p.add(egui::Shape::line(points, Stroke::new(width, c.peach)));
+        p.circle_filled(points[0], width / 2.0, fill);
+        p.circle_filled(points[n], width / 2.0, fill);
+        p.add(egui::Shape::line(points, Stroke::new(width, fill)));
     }
     p.text(
         centre - vec2(0.0, 6.0),
@@ -1616,6 +1637,18 @@ mod tests {
         assert_eq!(greeting(9), "Good morning");
         assert_eq!(greeting(13), "Good afternoon");
         assert_eq!(greeting(21), "Good evening");
+    }
+
+    #[test]
+    fn ring_goes_red_to_green() {
+        let c = &palette::MOCHA;
+        assert_eq!(ring_colour(c, 0.0), c.red);
+        assert_eq!(ring_colour(c, 0.45), c.peach);
+        assert_eq!(ring_colour(c, 0.75), c.yellow);
+        assert_eq!(ring_colour(c, 1.0), c.green);
+        assert_eq!(ring_colour(c, 1.7), c.green);
+        let mid = ring_colour(c, 0.2);
+        assert!(mid != c.red && mid != c.peach);
     }
 
     #[test]

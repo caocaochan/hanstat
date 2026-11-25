@@ -1,5 +1,11 @@
 # Changelog
 
+## [2026.11.25.04] - 2026-11-25
+
+### Changed
+- **Pages turn only from beside them.** A click on a page no longer turns it; click to the left of the pages to go back and to the right to go forward. Clicks on the text (links, read-aloud jumps, closing popups) work as before, and the keys and mouse wheel still turn pages.
+- **The Today ring changes colour as you read.** On Home it starts red, turns orange and then yellow, and is green once the day's goal is met.
+
 ## [2026.11.25.03] - 2026-11-25
 
 ### Added

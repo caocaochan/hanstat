@@ -498,11 +498,16 @@ fn reader_text_selection() {
     assert_eq!((r.spine, r.page), (0, 0), "dragging a link selects text");
     assert!(r.selection.is_some());
     d.click(&mut r, margin);
-    assert_eq!(r.page, 2);
+    assert_eq!(r.page, 0, "a click on the page doesn't turn it");
+    assert!(r.selection.is_none());
+    let beside = pos2(page.right() + 9.0, page.center().y);
+    d.click(&mut r, beside);
+    assert_eq!(r.page, 2, "a click right of the pages turns them");
     assert!(r.selection.is_none());
     assert!(r.layouts[&0].shows_text(r.page, target));
-    d.key(&mut r, Key::ArrowLeft);
-    assert_eq!(r.page, 0);
+    let left_of = pos2(r.drawn.unwrap().pages[0].left() - 9.0, page.center().y);
+    d.click(&mut r, left_of);
+    assert_eq!(r.page, 0, "a click left of the pages turns back");
     d.frame(
         &mut r,
         vec![egui::Event::MouseWheel {
@@ -722,14 +727,16 @@ fn settings_panel_clicks() {
     d.idle(&mut r, 5);
     d.snap("panel-font-chosen");
     let page = (r.spine, r.page).max(page);
-    let on_page = pos2(d.size.x - 200.0, d.size.y / 2.0);
-    d.click(&mut r, on_page);
+    let g = r.drawn.unwrap();
+    let last = if g.spread { g.pages[1] } else { g.pages[0] };
+    let beside = pos2(last.right() + 9.0, d.size.y / 2.0);
+    d.click(&mut r, beside);
     assert!(
         r.probe.serif_box.is_none(),
-        "a click on the page closes the panel"
+        "a click beside the pages closes the panel"
     );
     assert_eq!((r.spine, r.page), page, "and doesn't turn the page");
-    d.click(&mut r, on_page);
+    d.click(&mut r, beside);
     assert_ne!((r.spine, r.page), page, "the next click turns it");
     d.click(&mut r, aa.center());
     assert!(r.probe.serif_box.is_some(), "Aa opens the panel again");

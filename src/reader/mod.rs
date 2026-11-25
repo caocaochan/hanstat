@@ -1265,15 +1265,18 @@ impl Reader {
                         self.tts.play_from(self.spine, src, &self.settings.tts);
                     }
                 } else {
+                    // Only a click beside the pages turns them: left of them
+                    // back, right of them forward. On a page, above, below or
+                    // in the gutter it does nothing.
                     let left = g.pages[0].left();
                     let right = if g.spread {
                         g.pages[1].right()
                     } else {
                         g.pages[0].right()
                     };
-                    if p.x < left + (right - left) * 0.3 {
+                    if p.x < left {
                         self.prev(&g);
-                    } else {
+                    } else if p.x > right {
                         self.next(&g);
                     }
                 }
