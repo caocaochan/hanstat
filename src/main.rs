@@ -2631,6 +2631,12 @@ impl App {
                         .show_percentage(),
                 );
             }
+            style::Phase::WaitingForMemory(why) => {
+                ui.separator();
+                ui.label("⏳ Writing style waits for free memory").on_hover_text(format!(
+                    "{why}. The model starts when other programs leave enough; closing some helps."
+                ));
+            }
             style::Phase::Starting => {
                 ui.separator();
                 ui.spinner();
@@ -2649,6 +2655,11 @@ impl App {
                 ui.separator();
                 ui.colored_label(palette::warn(), "⚠ Writing-style rating failed")
                     .on_hover_text(e);
+            }
+            style::Phase::Paused(why) => {
+                ui.separator();
+                ui.colored_label(palette::warn(), "⏸ Writing-style rating paused")
+                    .on_hover_text(why);
             }
         }
     }
@@ -2795,7 +2806,9 @@ impl App {
                 ui.label(
                     RichText::new(format!(
                         "First use downloads llama.cpp and the Qwen3.5-4B model ({:.1} GB). They run on this computer, \
-                         on the GPU if it has one (about 5 seconds a book), otherwise on the CPU (much longer); the books never leave it.",
+                         on the GPU if it has one (about 5 seconds a book with 4 GB or more of graphics memory; \
+                         less memory puts part of the model on the CPU, which is slower), otherwise on the CPU (much longer). \
+                         While rating they need about 4.5 GB of free memory; the books never leave the computer.",
                         dl as f64 / 1e9
                     ))
                     .weak()
@@ -2838,6 +2851,22 @@ impl App {
                 "{rated} of the {} books in the Library are rated.",
                 books.len()
             ));
+            if let Some(place) = self.style.rater.as_ref().and_then(|r| r.placement()) {
+                ui.label(RichText::new(format!("The model runs with {place}.")).weak())
+                    .on_hover_text(
+                        "llama.cpp puts as many of the model's layers on the graphics card as its free memory holds, \
+                         keeping 1 GB for hanstat's window and the desktop, and runs the rest on the CPU. \
+                         More on the card is faster; the ratings are the same either way.",
+                    );
+            }
+            if let Some(style::Phase::WaitingForMemory(why)) =
+                self.style.rater.as_ref().map(|r| r.phase())
+            {
+                ui.colored_label(
+                    palette::warn(),
+                    format!("Waiting for free memory: {why}. Closing other programs helps."),
+                );
+            }
             if let Some(mode) = self
                 .style
                 .rater
@@ -2866,8 +2895,11 @@ impl App {
                     .on_hover_text(skipped.join("\n"));
             }
             let phase = self.style.rater.as_ref().map(|r| r.phase());
-            let failed = matches!(phase, Some(style::Phase::Failed(_)));
-            if let Some(style::Phase::Failed(e)) = &phase {
+            let failed = matches!(
+                phase,
+                Some(style::Phase::Failed(_) | style::Phase::Paused(_))
+            );
+            if let Some(style::Phase::Failed(e) | style::Phase::Paused(e)) = &phase {
                 ui.colored_label(palette::warn(), e);
             }
             let unrated = books.len() - rated;

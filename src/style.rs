@@ -30,6 +30,16 @@
 //! examples and the typical rating are Simplified, and the model rated
 //! Traditional text lower as it was than converted.
 //!
+//! **Fitting the computer.** llama.cpp puts as many layers on the graphics
+//! card as its free memory holds, keeping 1 GiB free (`--fit`; all 33 on a
+//! 4 GB card or more, part of them on a 3 GB one, the rest on the CPU): the
+//! ratings are the same, only the speed differs. Its prompt cache is off and
+//! its checkpoints few ([`BASE_ARGS`]), so the server stays near 4.1 GB of
+//! memory instead of growing to 9 GB and more. It starts only with
+//! [`memory_needed`] free and is stopped when the computer runs low while
+//! rating; a start after hanstat ended with the model loaded (a crash)
+//! pauses instead of loading it again ([`Phase::Paused`]).
+//!
 //! What the rater did (downloads, starting llama.cpp, each book's samples
 //! and answers, and the reason for every failure) goes to `style.log` next
 //! to it, written anew each time a [`Rater`] starts ([`Log`]).
@@ -436,6 +446,11 @@ pub struct Server {
     /// llama.cpp's own output.
     server_log: PathBuf,
     log: Log,
+    /// Where the model's layers are ([`placement`]); `None` on the CPU.
+    pub placement: Option<String>,
+    /// Removed with the server, after the process is killed (fields drop
+    /// after `Drop::drop`).
+    _running: Running,
 }
 
 /// How llama.cpp is run, fastest first. Each is tried after llama.cpp
@@ -498,6 +513,216 @@ impl Mode {
         std::fs::write(Self::path(), serde_json::to_vec_pretty(&json).unwrap())
             .map_err(|e| format!("Cannot save {}: {e}", Self::path().display()))
     }
+}
+
+/// Graphics memory llama.cpp leaves free when it fits the model to the card
+/// (`--fit-target`, its default): hanstat draws its window on the same card.
+const GPU_MARGIN_MIB: &str = "1024";
+const GPU_ARGS: [&str; 6] = [
+    "--n-gpu-layers",
+    "auto",
+    "--fit",
+    "on",
+    "--fit-target",
+    GPU_MARGIN_MIB,
+];
+const GPU_NO_FA_ARGS: [&str; 8] = [
+    "--n-gpu-layers",
+    "auto",
+    "--fit",
+    "on",
+    "--fit-target",
+    GPU_MARGIN_MIB,
+    "--flash-attn",
+    "off",
+];
+
+/// What keeps llama.cpp's own memory down, and lets the log say where the
+/// model runs.
+///
+/// - `--cache-ram 0`: each sample is rated once, so the server's prompt
+///   cache in RAM (8 GiB by default in b12464, about 440 MiB a sample with
+///   this model) is never read again. With it the server reached 9.3 GB of
+///   private memory in 19 s (three books, RTX 5070, 2026-11-25) and a
+///   16 GB laptop ran out, taking hanstat down; without it, 4.1 GB over 14
+///   books, with the same ratings.
+/// - `--ctx-checkpoints 4` (default 32, 50 MiB each): enough for the four
+///   later questions about a sample to reuse it (about 520 tokens each
+///   instead of 2,900) and for the instructions to be reused across samples.
+/// - `-lv 4`: the log then says which device holds how many layers
+///   ([`placement`]), about 70 KB a book instead of 19.
+const BASE_ARGS: [&str; 6] = ["--cache-ram", "0", "--ctx-checkpoints", "4", "-lv", "4"];
+
+/// Memory the server needs before it starts, by where it runs: its private
+/// bytes level off at 4.1 GB with the whole model on the GPU (Windows
+/// charges graphics memory to the process) and at about 2.1 GB on the CPU
+/// or split between both (measured 2026-11-25, b12464). Free means
+/// commit left (Windows) or available memory plus swap (Linux).
+pub fn memory_needed(mode: Mode) -> u64 {
+    match mode {
+        Mode::Cpu => 3 << 30,
+        _ => 9 << 29, // 4.5 GiB
+    }
+}
+/// Physical memory the server's working set needs (3.2 GB measured) not to
+/// run from the page file.
+const NEED_PHYSICAL: u64 = 3 << 30;
+/// While rating: with less commit left than this, the server is stopped so
+/// that hanstat itself does not run out.
+const LOW_COMMIT: u64 = 1 << 30;
+/// How often a rater waiting for memory looks again.
+const MEMORY_RECHECK: Duration = Duration::from_secs(10);
+
+/// Free memory as the system counts it, in bytes; `None` where it is not
+/// asked (macOS, or the call failed).
+#[derive(Clone, Copy, Debug)]
+pub struct FreeMemory {
+    /// Physical memory available (free and standby).
+    pub physical: u64,
+    /// What can still be committed before allocations fail: commit limit
+    /// minus commit charge on Windows, available memory plus free swap on
+    /// Linux.
+    pub commit: u64,
+}
+
+impl FreeMemory {
+    /// Why the server can't start now, `None` if it can.
+    fn short_for(self, mode: Mode) -> Option<String> {
+        let need = memory_needed(mode);
+        let gb = |b: u64| b as f64 / 1e9;
+        if self.commit < need {
+            Some(format!(
+                "{:.1} GB of memory free, {:.1} GB needed",
+                gb(self.commit),
+                gb(need)
+            ))
+        } else if self.physical < NEED_PHYSICAL {
+            Some(format!(
+                "{:.1} GB of RAM available, {:.1} GB needed",
+                gb(self.physical),
+                gb(NEED_PHYSICAL)
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+pub fn free_memory() -> Option<FreeMemory> {
+    // `MEMORYSTATUSEX`. Declared here rather than through windows-sys,
+    // whose feature list is in Cargo.toml and so in every user's analysis
+    // fingerprint.
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+    let mut m = MemoryStatusEx {
+        length: size_of::<MemoryStatusEx>() as u32,
+        memory_load: 0,
+        total_phys: 0,
+        avail_phys: 0,
+        total_page_file: 0,
+        avail_page_file: 0,
+        total_virtual: 0,
+        avail_virtual: 0,
+        avail_extended_virtual: 0,
+    };
+    // SAFETY: `m` is a MEMORYSTATUSEX with its length set, as the call requires.
+    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(FreeMemory {
+        physical: m.avail_phys,
+        commit: m.avail_page_file,
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub fn free_memory() -> Option<FreeMemory> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb = |key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix(':'))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            .map(|k| k * 1024)
+    };
+    let available = kb("MemAvailable")?;
+    Some(FreeMemory {
+        physical: available,
+        commit: available + kb("SwapFree").unwrap_or(0),
+    })
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn free_memory() -> Option<FreeMemory> {
+    None
+}
+
+/// `style-running` next to `style.json`: there while llama.cpp runs for a
+/// [`Server`], removed when the server stops. Left over at the next start,
+/// hanstat ended with the model loaded: closed by Windows or Task Manager,
+/// or crashed, as hanstat did when the server's prompt cache ran a 16 GB
+/// laptop out of memory and the next start loaded the model and crashed
+/// again. The rater then waits to be started again instead.
+struct Running(PathBuf);
+
+impl Running {
+    fn path() -> PathBuf {
+        models::app_dir().join("style-running")
+    }
+
+    fn mark() -> Running {
+        let p = Self::path();
+        let _ = std::fs::write(&p, format!("{}\n", std::process::id()));
+        Running(p)
+    }
+
+    /// Whether the last run left its mark; the mark is removed.
+    fn left_over(path: &std::path::Path) -> bool {
+        path.is_file() && std::fs::remove_file(path).is_ok()
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Where llama.cpp put the model, from its log (`-lv 4`): "33 of 33 layers
+/// on NVIDIA GeForce RTX 5070". `None` without a GPU line (on the CPU only).
+fn placement(server_log: &str) -> Option<String> {
+    let layers = server_log.lines().rev().find_map(|l| {
+        let rest = l.split_once("offloaded ")?.1;
+        let (n, rest) = rest.split_once('/')?;
+        let total = rest.split_once(' ')?.0;
+        Some((n.trim().parse::<u32>().ok()?, total.parse::<u32>().ok()?))
+    })?;
+    // "using device Vulkan0 (NVIDIA GeForce RTX 5070) (0000:08:00.0) - 11172 MiB free"
+    let device = server_log.lines().rev().find_map(|l| {
+        let rest = l.split_once("using device ")?.1;
+        let rest = rest.rsplit_once(" - ").map_or(rest, |r| r.0);
+        let desc = rest.split_once(" (")?.1;
+        let desc = match desc.rsplit_once(") (") {
+            Some((name, _)) => name,
+            None => desc.strip_suffix(')').unwrap_or(desc),
+        };
+        Some(desc.trim().to_owned())
+    });
+    Some(match device {
+        Some(d) if layers.0 > 0 => format!("{} of {} layers on {d}", layers.0, layers.1),
+        _ => format!("{} of {} layers on the GPU", layers.0, layers.1),
+    })
 }
 
 /// llama.cpp's own list of the devices it can use, for the log.
@@ -580,9 +805,13 @@ impl Server {
             .args(["--host", "127.0.0.1", "--port", &port.to_string()])
             // A sample is about 2,600 tokens and the instructions 600.
             .args(["--ctx-size", "8192", "--parallel", "1", "--no-ui"])
+            .args(BASE_ARGS)
             .args(match mode {
-                Mode::Gpu | Mode::GpuNoCoopmat => &["--n-gpu-layers", "99"][..],
-                Mode::GpuNoFlashAttn => &["--n-gpu-layers", "99", "--flash-attn", "off"][..],
+                // As many layers as fit the card's free memory, leaving
+                // GPU_MARGIN_MIB for hanstat's own window and the desktop;
+                // the rest run on the CPU.
+                Mode::Gpu | Mode::GpuNoCoopmat => &GPU_ARGS[..],
+                Mode::GpuNoFlashAttn => &GPU_NO_FA_ARGS[..],
                 Mode::Cpu => &["--n-gpu-layers", "0", "--device", "none"][..],
             })
             .stdin(Stdio::null())
@@ -598,6 +827,7 @@ impl Server {
             cmd.env("GGML_VK_DISABLE_COOPMAT", "1");
         }
         log.line(format!("Starting llama.cpp {}: {cmd:?}", mode.describe()));
+        let running = Running::mark();
         let child = crate::child_guard::spawn(&mut cmd, |w| log.line(w))
             .map_err(|e| format!("Cannot start {}: {e}", exe.display()))?;
         let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -614,13 +844,20 @@ impl Server {
             agent,
             server_log: log_path,
             log: log.clone(),
+            placement: None,
+            _running: running,
         };
         let t = Instant::now();
         match s.wait_ready(Duration::from_secs(600)) {
             Ok(()) => {
+                let text = std::fs::read(&s.server_log)
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_default();
+                s.placement = placement(&text);
                 log.line(format!(
-                    "llama.cpp loaded the model in {:.1} s",
-                    t.elapsed().as_secs_f64()
+                    "llama.cpp loaded the model in {:.1} s ({})",
+                    t.elapsed().as_secs_f64(),
+                    s.placement.as_deref().unwrap_or("on the CPU")
                 ));
                 Ok(s)
             }
@@ -812,6 +1049,9 @@ pub enum Phase {
     Idle,
     /// Downloading llama.cpp and the model (bytes).
     Downloading { done: u64, total: u64 },
+    /// Not enough free memory to start the server ([`memory_needed`]):
+    /// why, looked at again every few seconds.
+    WaitingForMemory(String),
     /// Loading the model.
     Starting,
     /// Rating `title`; `left` books are waiting after it.
@@ -819,6 +1059,9 @@ pub enum Phase {
     /// The server could not be started, or crashed with every [`Mode`];
     /// nothing is rated until the rater is started again.
     Failed(String),
+    /// hanstat ended with the model loaded last time ([`Running`]): why.
+    /// Nothing is rated until the rater is started again.
+    Paused(String),
 }
 
 #[derive(Default)]
@@ -832,6 +1075,8 @@ struct State {
     child: Option<Arc<Mutex<Child>>>,
     /// How llama.cpp is run ([`Mode::load`] at the start).
     mode: Mode,
+    /// Where the running server put the model ([`Server::placement`]).
+    placement: Option<String>,
 }
 
 type Shared = Arc<(Mutex<State>, Condvar)>;
@@ -856,6 +1101,13 @@ impl Rater {
         shared.0.lock().unwrap().mode = Mode::load();
         let s = shared.clone();
         let log = Log::create();
+        if Running::left_over(&Running::path()) {
+            let why = "Paused: hanstat closed while the writing-style model was loaded \
+                       (a crash, or hanstat was ended). So that it can't crash again on every start, \
+                       rating waits for \"Rate the books without a rating\" in Settings (⚙).";
+            log.line(why);
+            shared.0.lock().unwrap().phase = Phase::Paused(why.into());
+        }
         let l = log.clone();
         let thread = std::thread::Builder::new()
             .name("style-rater".into())
@@ -899,6 +1151,11 @@ impl Rater {
     /// How llama.cpp is run now.
     pub fn mode(&self) -> Mode {
         self.shared.0.lock().unwrap().mode
+    }
+
+    /// Where the model's layers are while the server runs, or ran last.
+    pub fn placement(&self) -> Option<String> {
+        self.shared.0.lock().unwrap().placement.clone()
     }
 
     /// Books waiting, including the one being rated.
@@ -954,7 +1211,7 @@ fn run(shared: Shared, notify: impl Fn(), log: Log) {
                 if st.stop {
                     return;
                 }
-                if matches!(st.phase, Phase::Failed(_)) {
+                if matches!(st.phase, Phase::Failed(_) | Phase::Paused(_)) {
                     st = cv.wait(st).unwrap();
                     continue;
                 }
@@ -975,6 +1232,20 @@ fn run(shared: Shared, notify: impl Fn(), log: Log) {
                 }
             }
         };
+        // The computer running out of memory (other programs): free the
+        // server's before hanstat runs out too; it starts again when there
+        // is enough.
+        if server.is_some()
+            && let Some(f) = free_memory()
+            && f.commit < LOW_COMMIT
+        {
+            log.line(format!(
+                "Only {:.1} GB of memory left: stopping llama.cpp until more is free",
+                f.commit as f64 / 1e9
+            ));
+            m.lock().unwrap().child = None;
+            server = None;
+        }
         if server.is_none() {
             let total = download_size();
             if total > 0 {
@@ -1016,8 +1287,24 @@ fn run(shared: Shared, notify: impl Fn(), log: Log) {
                 listed = true;
                 log.line(format!("llama.cpp --list-devices:\n{}", list_devices()));
             }
-            set(Phase::Starting);
             let mode = m.lock().unwrap().mode;
+            // Enough free memory for the server, or wait for it.
+            let mut said = String::new();
+            loop {
+                let short = free_memory().and_then(|f| f.short_for(mode));
+                let Some(why) = short else { break };
+                if why != said {
+                    log.line(format!("Waiting for memory {}: {why}", mode.describe()));
+                    said = why.clone();
+                }
+                set(Phase::WaitingForMemory(why));
+                let st = m.lock().unwrap();
+                let (st, _) = cv.wait_timeout(st, MEMORY_RECHECK).unwrap();
+                if st.stop {
+                    return;
+                }
+            }
+            set(Phase::Starting);
             // Known to the rater from the moment it exists, so that dropping
             // the rater (the app closing) kills it while the model loads
             // instead of waiting for it to load and rate a book.
@@ -1043,7 +1330,10 @@ fn run(shared: Shared, notify: impl Fn(), log: Log) {
                 return;
             }
             match started {
-                Ok(s) => server = Some(s),
+                Ok(s) => {
+                    m.lock().unwrap().placement = s.placement.clone();
+                    server = Some(s);
+                }
                 Err(e) => {
                     m.lock().unwrap().child = None;
                     m.lock().unwrap().queue.push_front(job);
@@ -1261,5 +1551,80 @@ mod tests {
         let none = serde_json::json!({"choices": [{"logprobs": {"content": [{"top_logprobs": [
             {"token": "A", "logprob": 0.0}]}]}, "message": {"content": "A"}}]});
         assert!(expected_digit(&none).is_err());
+    }
+
+    #[test]
+    fn placement_from_the_server_log() {
+        let full = "0.00.624 I llama_prepare_model_devices: using device Vulkan0 (NVIDIA GeForce RTX 5070) (0000:08:00.0) - 11172 MiB free\n\
+                    0.00.994 I load_tensors: offloaded 33/33 layers to GPU\n";
+        assert_eq!(
+            placement(full).as_deref(),
+            Some("33 of 33 layers on NVIDIA GeForce RTX 5070")
+        );
+        let split = "I llama_prepare_model_devices: using device Vulkan0 (AMD Radeon(TM) Graphics) - 2900 MiB free\n\
+                     I load_tensors: offloaded 12/33 layers to GPU\n";
+        assert_eq!(
+            placement(split).as_deref(),
+            Some("12 of 33 layers on AMD Radeon(TM) Graphics")
+        );
+        assert_eq!(
+            placement("I load_tensors: offloaded 7/33 layers to GPU\n").as_deref(),
+            Some("7 of 33 layers on the GPU")
+        );
+        assert_eq!(placement("I load_tensors: loading model tensors\n"), None);
+    }
+
+    #[test]
+    fn left_over_mark_is_taken_once() {
+        let dir = std::env::temp_dir().join(format!("hanstat-style-mark-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("style-running");
+        assert!(!Running::left_over(&p));
+        drop(Running(p.clone()));
+        std::fs::write(&p, "1\n").unwrap();
+        assert!(Running::left_over(&p));
+        assert!(!Running::left_over(&p));
+        // A running server's mark goes with it.
+        let r = Running(p.clone());
+        std::fs::write(&p, "1\n").unwrap();
+        drop(r);
+        assert!(!p.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memory_gate() {
+        let gb = |x: f64| (x * 1e9) as u64;
+        let plenty = FreeMemory {
+            physical: gb(8.0),
+            commit: gb(10.0),
+        };
+        assert_eq!(plenty.short_for(Mode::Gpu), None);
+        let low_commit = FreeMemory {
+            physical: gb(8.0),
+            commit: gb(4.0),
+        };
+        assert!(
+            low_commit
+                .short_for(Mode::Gpu)
+                .unwrap()
+                .contains("4.0 GB of memory free")
+        );
+        assert_eq!(low_commit.short_for(Mode::Cpu), None);
+        let low_ram = FreeMemory {
+            physical: gb(2.0),
+            commit: gb(10.0),
+        };
+        assert!(
+            low_ram
+                .short_for(Mode::Cpu)
+                .unwrap()
+                .contains("of RAM available")
+        );
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            let f = free_memory().expect("the system's free memory");
+            assert!(f.physical > 0 && f.commit >= f.physical / 4, "{f:?}");
+        }
     }
 }
