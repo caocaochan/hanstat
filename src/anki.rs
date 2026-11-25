@@ -2,8 +2,8 @@
 //!
 //! The collection is never opened in place: Anki keeps it open with an
 //! exclusive lock while running, so `collection.anki2` (and its `-wal`, which
-//! holds changes not yet checkpointed) are copied to a private temp folder and
-//! read from there. Nothing is ever written back.
+//! holds changes not yet checkpointed) are copied to a private folder under
+//! [`copies_root`] and read from there. Nothing is ever written back.
 //!
 //! Classification follows Anki's own Card Counts definitions: a review card is
 //! *mature* when its interval is ≥ 21 days and *young* otherwise; learning and
@@ -392,12 +392,20 @@ impl SegConfig {
     }
 }
 
-/// Deletes the private copy when the collection is dropped.
-struct TempCopy(PathBuf);
+/// A private copy of a collection, in its own folder under [`copies_root`].
+/// The folder's lock file stays locked for as long as the copy is in use, so
+/// another hanstat (or a later run) can tell a live copy from one left behind
+/// by a crash. The folder is deleted when the copy is dropped.
+struct TempCopy {
+    dir: PathBuf,
+    lock: Option<std::fs::File>,
+}
 
 impl Drop for TempCopy {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        // Closed first: Windows cannot delete a folder holding an open file.
+        drop(self.lock.take());
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -411,32 +419,113 @@ pub struct Collection {
 
 static COPY_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Where private copies of collections are made: `anki-copy` in
+/// [`crate::models::cache_dir`], on disk. Not the temp folder, which on many
+/// Linux systems is a RAM-backed tmpfs capped at half the RAM: a large
+/// collection didn't fit there ("No space left on device").
+pub fn copies_root() -> PathBuf {
+    crate::models::cache_dir().join("anki-copy")
+}
+
+const LOCK_FILE: &str = "lock";
+
+/// Headroom on top of the files themselves: SQLite's `-shm` and growth while
+/// the copied WAL is replayed.
+const COPY_SLACK: u64 = 16 << 20;
+
+/// The error when `free` bytes (if known) cannot hold `need`.
+fn check_space(need: u64, free: Option<u64>, dir: &Path) -> Result<(), String> {
+    match free {
+        Some(free) if free < need => Err(format!(
+            "Not enough free space for a private copy of the Anki collection: it needs {}, but {} has only {} free.",
+            human_bytes(need),
+            dir.display(),
+            human_bytes(free)
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn human_bytes(n: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    let mb = n as f64 / MB;
+    if mb >= 1024.0 {
+        format!("{:.1} GB", mb / 1024.0)
+    } else {
+        format!("{mb:.0} MB")
+    }
+}
+
+/// Copies `path` (and its `-wal`, if not empty) into a new locked folder under
+/// `root`, after clearing copies left behind there. Returns the copy's guard and
+/// the copied database.
+fn make_copy(path: &Path, root: &Path) -> Result<(TempCopy, PathBuf), String> {
+    let src_len = std::fs::metadata(path)
+        .map_err(|e| format!("Cannot read Anki collection {}: {e}", path.display()))?
+        .len();
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    let wal = PathBuf::from(wal);
+    let wal_len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+
+    remove_stale_copies(root);
+    std::fs::create_dir_all(root).map_err(|e| format!("Cannot create {}: {e}", root.display()))?;
+    // The WAL is counted twice: once copied, once replayed into the database.
+    let need = src_len + 2 * wal_len + COPY_SLACK;
+    check_space(need, crate::dict::manage::free_space(root), root)?;
+
+    let dir = root.join(format!(
+        "{}-{}",
+        std::process::id(),
+        COPY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    // A folder left by an earlier process with the same id is stale.
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
+    let mut guard = TempCopy {
+        dir: dir.clone(),
+        lock: None,
+    };
+    let lock = std::fs::File::create(dir.join(LOCK_FILE))
+        .map_err(|e| format!("Cannot create {}: {e}", dir.join(LOCK_FILE).display()))?;
+    lock.lock()
+        .map_err(|e| format!("Cannot lock {}: {e}", dir.join(LOCK_FILE).display()))?;
+    guard.lock = Some(lock);
+
+    let copy_err = |what: &Path, e: std::io::Error| {
+        let mut msg = format!(
+            "Cannot copy {} into {}: {e}",
+            what.display(),
+            dir.display()
+        );
+        if e.kind() == std::io::ErrorKind::StorageFull {
+            msg.push_str(&format!(
+                " (needs about {}; free up space there or set XDG_CACHE_HOME to a folder on a larger disk)",
+                human_bytes(need)
+            ));
+        }
+        msg
+    };
+    let db = dir.join("collection.anki2");
+    std::fs::copy(path, &db).map_err(|e| copy_err(path, e))?;
+    if wal_len > 0 {
+        std::fs::copy(&wal, dir.join("collection.anki2-wal")).map_err(|e| copy_err(&wal, e))?;
+    }
+    Ok((guard, db))
+}
+
 fn sql_err(e: rusqlite::Error) -> String {
     format!("Reading the Anki collection failed: {e}")
 }
 
 impl Collection {
     pub fn open(path: &Path) -> Result<Collection, String> {
-        let tmp_root = std::env::temp_dir();
-        remove_stale_copies(&tmp_root);
-        let dir = tmp_root.join(format!(
-            "hanstat-anki-{}-{}",
-            std::process::id(),
-            COPY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
-        let guard = TempCopy(dir.clone());
-        let db = dir.join("collection.anki2");
-        std::fs::copy(path, &db)
-            .map_err(|e| format!("Cannot read Anki collection {}: {e}", path.display()))?;
-        let mut wal = path.as_os_str().to_owned();
-        wal.push("-wal");
-        let wal = PathBuf::from(wal);
-        if std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0) {
-            std::fs::copy(&wal, dir.join("collection.anki2-wal"))
-                .map_err(|e| format!("Cannot read {}: {e}", wal.display()))?;
-        }
+        Self::open_in(path, &copies_root())
+    }
+
+    /// [`Collection::open`], with the private copy made under `root`.
+    fn open_in(path: &Path, root: &Path) -> Result<Collection, String> {
+        let (guard, db) = make_copy(path, root)?;
         // Read-write only so SQLite can replay the copied WAL into its own index.
         let conn = Connection::open_with_flags(
             &db,
@@ -788,18 +877,47 @@ fn all_deck_ids(conn: &Connection) -> Result<Vec<(i64, String)>, String> {
 }
 
 /// Copies left behind by a crashed run, older than a day.
-fn remove_stale_copies(tmp: &Path) {
-    let Ok(rd) = std::fs::read_dir(tmp) else {
-        return;
-    };
-    let day = std::time::Duration::from_secs(86_400);
-    for e in rd.flatten() {
-        if e.file_name().to_string_lossy().starts_with("hanstat-anki-")
-            && e.metadata()
-                .and_then(|m| m.modified())
-                .is_ok_and(|t| t.elapsed().is_ok_and(|age| age > day))
-        {
-            let _ = std::fs::remove_dir_all(e.path());
+/// Deletes private copies no running hanstat is using: under `root`, every
+/// folder whose lock file can be locked (its owner has exited or crashed),
+/// however old; and every copy from before 2026.11.25, which went into the temp
+/// folder as `hanstat-anki-*` with no lock file.
+pub fn remove_stale_copies(root: &Path) {
+    if let Ok(rd) = std::fs::read_dir(root) {
+        for e in rd.flatten() {
+            let dir = e.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let lock = dir.join(LOCK_FILE);
+            let stale = match std::fs::OpenOptions::new().write(true).open(&lock) {
+                // Locked here means nobody else holds it. Kept locked until the
+                // folder is gone, then closed (Windows deletes the closed file
+                // on a second pass).
+                Ok(f) => match f.try_lock() {
+                    Ok(()) => {
+                        let _ = std::fs::remove_dir_all(&dir);
+                        drop(f);
+                        true
+                    }
+                    Err(_) => false,
+                },
+                // A folder whose lock file isn't made yet is being set up by
+                // someone right now, unless it has sat like that for a while.
+                Err(_) => e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|t| t.elapsed().is_ok_and(|age| age.as_secs() > 3600)),
+            };
+            if stale {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+    }
+    if let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) {
+        for e in rd.flatten() {
+            if e.file_name().to_string_lossy().starts_with("hanstat-anki-") {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
         }
     }
 }
@@ -1420,5 +1538,67 @@ mod tests {
         assert_eq!(k.word("响彻"), Status::Mature);
         assert_eq!(k.word("響徹"), Status::Mature);
         assert_eq!(k.char('响'), Status::Mature);
+    }
+
+    fn copy_root(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("hanstat-copytest-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn space_check() {
+        let dir = Path::new("/c");
+        assert!(check_space(900 << 20, None, dir).is_ok());
+        assert!(check_space(900 << 20, Some(1 << 30), dir).is_ok());
+        let e = check_space(900 << 20, Some(300 << 20), dir).unwrap_err();
+        assert!(e.contains("needs 900 MB") && e.contains("only 300 MB free"), "{e}");
+    }
+
+    #[test]
+    fn copies_are_locked_and_stale_ones_cleared() {
+        let base = copy_root("live");
+        let src = base.join("collection.anki2");
+        std::fs::write(&src, b"db").unwrap();
+        std::fs::write(base.join("collection.anki2-wal"), b"wal").unwrap();
+        let root = base.join("copies");
+
+        // Left behind by a crash: a lock file nobody holds.
+        let crashed = root.join("1-0");
+        std::fs::create_dir_all(&crashed).unwrap();
+        std::fs::write(crashed.join(LOCK_FILE), b"").unwrap();
+        std::fs::write(crashed.join("collection.anki2"), b"old").unwrap();
+        // Being set up by another process: no lock file yet, just made.
+        let starting = root.join("2-0");
+        std::fs::create_dir_all(&starting).unwrap();
+
+        let (live, db) = make_copy(&src, &root).unwrap();
+        assert!(!crashed.exists(), "an unlocked copy is stale whatever its age");
+        assert!(starting.exists(), "a folder being set up is left alone");
+        assert_eq!(std::fs::read(&db).unwrap(), b"db");
+        assert_eq!(std::fs::read(db.with_file_name("collection.anki2-wal")).unwrap(), b"wal");
+
+        // A second copy (as on Reload while a job still holds the first)
+        // must not clear the first.
+        let (second, _) = make_copy(&src, &root).unwrap();
+        assert!(live.dir.exists());
+        let first_dir = live.dir.clone();
+        drop(live);
+        assert!(!first_dir.exists());
+        let second_dir = second.dir.clone();
+        drop(second);
+        assert!(!second_dir.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn missing_collection_is_a_read_error() {
+        let base = copy_root("missing");
+        let e = make_copy(&base.join("collection.anki2"), &base.join("copies"))
+            .err()
+            .unwrap();
+        assert!(e.starts_with("Cannot read Anki collection"), "{e}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

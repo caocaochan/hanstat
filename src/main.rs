@@ -1744,7 +1744,10 @@ impl App {
         self.refresh_anki_coverage();
         self.anki.profiles = anki::find_profiles();
         if self.anki.settings.enabled && self.anki.settings.collection.is_some() {
+            // Clears copies left behind by earlier runs before making its own.
             self.anki_open(ctx);
+        } else {
+            std::thread::spawn(|| anki::remove_stale_copies(&anki::copies_root()));
         }
     }
 
