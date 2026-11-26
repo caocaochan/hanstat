@@ -3188,6 +3188,100 @@ fn reader_search_peek() {
     rs::set_test_clock(None);
 }
 
+/// Back from search results in a real book (`READER_EPUB`): from a page in
+/// the middle of a chapter, through results in other chapters and the same
+/// one, with page turns between, back to exactly that page.
+#[test]
+#[ignore = "needs READER_EPUB"]
+fn reader_search_back_real() {
+    let book = env("READER_EPUB").expect("set READER_EPUB");
+    let mut d = Driver::new();
+    let mut r = d.open(&book);
+    r.settings = Settings {
+        spread: false,
+        autohide_bar: env("READER_AUTOHIDE").is_some(),
+        ..Settings::default()
+    };
+    d.ready(&mut r);
+    // A page well into a chapter in the middle of the book.
+    let spine = r.epub.spine.len() / 2;
+    r.go_chapter(spine, Target::Offset(0));
+    d.ready(&mut r);
+    for _ in 0..3 {
+        d.key(&mut r, Key::ArrowRight);
+    }
+    let start = (r.spine, r.page, r.offset);
+    eprintln!("start {start:?}");
+    let ctrl_f = egui::Event::Key {
+        key: Key::F,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND,
+    };
+    d.frame_with(&mut r, vec![ctrl_f.clone()], egui::Modifiers::COMMAND);
+    d.idle(&mut r, 3);
+    d.frame(&mut r, vec![egui::Event::Text("他们".into())]);
+    let t = Instant::now();
+    while r.search.searching() || r.search.hits.is_empty() {
+        d.idle(&mut r, 1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(t.elapsed().as_secs() < 30, "no results");
+    }
+    eprintln!("{} hits", r.search.hits.len());
+    // Enter: the first result (another chapter, most likely), then two more.
+    for i in 0..3 {
+        if i > 0 {
+            d.frame_with(&mut r, vec![ctrl_f.clone()], egui::Modifiers::COMMAND);
+            d.idle(&mut r, 3);
+        }
+        d.key(&mut r, Key::Enter);
+        d.ready(&mut r);
+        eprintln!(
+            "result {i}: at {:?} peek {:?}",
+            (r.spine, r.page, r.offset),
+            r.peek
+        );
+    }
+    d.key(&mut r, Key::ArrowRight);
+    d.key(&mut r, Key::ArrowRight);
+    // Back, by its button.
+    let back = r.probe.back_bar.expect("Back bar shown");
+    d.click(&mut r, pos2(back.left() + 40.0, back.center().y));
+    d.ready(&mut r);
+    eprintln!("back at {:?}", (r.spine, r.page, r.offset));
+    assert!(r.peek.is_none(), "Back clicked");
+    assert_eq!((r.spine, r.page, r.offset), start, "back where reading was");
+    // Laid out again (the window resized): still there.
+    d.size = vec2(d.size.x - 120.0, d.size.y);
+    d.idle(&mut r, 20);
+    d.ready(&mut r);
+    assert_eq!(
+        (r.spine, r.offset),
+        (start.0, start.2),
+        "kept after a re-layout"
+    );
+    let l = r.layouts[&r.spine].clone();
+    assert_eq!(r.page, l.page_of_offset(start.2));
+    d.size = vec2(d.size.x + 120.0, d.size.y);
+    d.idle(&mut r, 20);
+    d.ready(&mut r);
+    assert_eq!((r.spine, r.page, r.offset), start);
+    // A result in the same chapter, then Esc.
+    d.frame_with(&mut r, vec![ctrl_f.clone()], egui::Modifiers::COMMAND);
+    d.idle(&mut r, 3);
+    let same = r.search.hits.iter().position(|h| h.spine == start.0);
+    if let Some(i) = same {
+        let h = r.search.hits[i].clone();
+        r.search_go(h);
+        d.ready(&mut r);
+        eprintln!("same chapter at {:?}", (r.spine, r.page, r.offset));
+        assert!(d.key(&mut r, Key::Escape));
+        d.ready(&mut r);
+        assert_eq!((r.spine, r.page, r.offset), start, "back by Esc");
+    }
+}
+
 /// Every text in the last frame's shapes, tooltips included.
 fn shown_text(d: &Driver) -> Vec<String> {
     fn walk(s: &egui::Shape, out: &mut Vec<String>) {

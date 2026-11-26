@@ -725,6 +725,10 @@ impl Reader {
         self.search_hit = None;
         self.dict.close();
         self.forward = false;
+        // An offset target keeps `offset` as it is (it is the place it
+        // names): set it, or the result's would stay and later re-layouts
+        // and saves would go there.
+        self.offset = p.offset;
         self.go_chapter(p.spine, Target::Offset(p.offset));
     }
 

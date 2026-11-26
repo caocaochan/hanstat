@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.26.04] - 2026-11-26
+
+### Fixed
+- **Back from a search result returns to your reading place.** After **Back to where you were** (or Esc), the Reader showed your page but still remembered the search result's position, so resizing the window, changing a setting in **Aa**, or closing and reopening the book took you to the wrong place. It now returns to exactly where you were reading.
+
 ## [2026.11.26.03] - 2026-11-26
 
 ### Fixed
