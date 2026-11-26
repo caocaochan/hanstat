@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.26.03] - 2026-11-26
+
+### Fixed
+- **Search works with the hidden menu bar.** With **Menu bar: Hide until the pointer is at the top** on, the **Back to where you were** bar sat at the top of the window, so reaching for it brought the menu bar out over it. It now sits over the line under the page, and the search sidebar starts below the strip at the top, so neither is covered.
+
 ## [2026.11.26.02] - 2026-11-26
 
 ### Added

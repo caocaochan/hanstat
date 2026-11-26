@@ -3136,7 +3136,7 @@ fn reader_search_peek() {
 
     // Ctrl+F again: the same results; a click on one goes there, not
     // through to the page under the sidebar.
-    d.frame_with(&mut r, vec![ctrl_f], egui::Modifiers::COMMAND);
+    d.frame_with(&mut r, vec![ctrl_f.clone()], egui::Modifiers::COMMAND);
     d.idle(&mut r, 3);
     assert!(r.search.open);
     assert_eq!(r.search.hits.len(), 3, "results kept");
@@ -3153,6 +3153,38 @@ fn reader_search_peek() {
     assert!(r.peek.is_none());
     assert_eq!(r.tracker.base().unwrap().spine, 1);
     assert_eq!(chars(&r), 60);
+
+    // With the menu bar hidden, the sidebar and the Back bar sit under the
+    // strip that brings it out: reaching for them leaves it hidden, and a
+    // click on Back goes back.
+    r.settings.autohide_bar = true;
+    let middle = pos2(d.size.x / 2.0, d.size.y / 2.0);
+    d.frame(&mut r, vec![egui::Event::PointerMoved(middle)]);
+    d.ready(&mut r);
+    d.idle(&mut r, 60);
+    assert!(r.probe.bar.is_none());
+    let reach = r.bar_h + 8.0;
+    d.frame_with(&mut r, vec![ctrl_f], egui::Modifiers::COMMAND);
+    d.idle(&mut r, 3);
+    let side = r.search.rect.expect("sidebar shown");
+    assert!(side.top() > reach, "{side:?} under {reach}");
+    d.key(&mut r, Key::Enter);
+    assert!(r.peek.is_some());
+    let back = r.probe.back_bar.expect("Back bar shown");
+    assert!(back.top() > reach, "{back:?} under {reach}");
+    let g = r.last_geom.unwrap();
+    assert!(
+        back.top() > g.pages[0].bottom() - g.inset.y,
+        "over the footer, not the text: {back:?}"
+    );
+    d.snap("search-peek-autohide");
+    let on_back = pos2(back.left() + 40.0, back.center().y);
+    d.frame(&mut r, vec![egui::Event::PointerMoved(on_back)]);
+    d.idle(&mut r, 30);
+    assert!(r.probe.bar.is_none(), "the menu bar stays hidden");
+    d.click(&mut r, on_back);
+    assert!(r.peek.is_none(), "Back clicked");
+    assert_eq!(r.spine, 1);
     rs::set_test_clock(None);
 }
 

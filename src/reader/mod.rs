@@ -166,6 +166,8 @@ impl Settings {
 struct Probe {
     /// The menu bar, when drawn this frame.
     bar: Option<Rect>,
+    /// The Back bar (a search result shown), when drawn this frame.
+    back_bar: Option<Rect>,
     aa: Option<Rect>,
     /// The theme box, while the panel is open.
     theme_box: Option<Rect>,
@@ -674,6 +676,14 @@ impl Reader {
     /// The search sidebar and, while a result is shown, the Back bar.
     fn search_frame(&mut self, ctx: &egui::Context, th: &Theme) {
         let Some(area) = self.page_area else { return };
+        // A hidden menu bar comes out when the pointer is in the strip it
+        // covers (and a little below): the sidebar and the Back bar start
+        // under it, or reaching for them would bring the bar over them.
+        let area = if self.settings.autohide_bar {
+            area.with_min_y((area.top() + self.bar_h + 12.0).min(area.bottom() - 100.0))
+        } else {
+            area
+        };
         let w = self.search.width;
         if let Some(search::Action::Go(h)) =
             self.search.ui(ctx, area, th, &self.chapter_names, self.now)
@@ -739,10 +749,24 @@ impl Reader {
             .filter(|l| !l.is_empty())
             .cloned();
         let (mut back, mut keep, mut find) = (false, false, false);
-        egui::Area::new(egui::Id::unique("reader-back-bar"))
+        // Over the running head; with the menu bar hidden the top is where
+        // the pointer brings it out, so over the footer line instead.
+        let footer = self
+            .drawn
+            .or(self.last_geom)
+            .filter(|_| self.settings.autohide_bar)
+            .map(|g| g.pages[0].bottom() - g.inset.y * 0.5);
+        let (pivot, at) = match footer {
+            Some(y) => (egui::Align2::CENTER_CENTER, pos2(area.center().x, y)),
+            None => (
+                egui::Align2::CENTER_TOP,
+                pos2(area.center().x, area.top() + 8.0),
+            ),
+        };
+        let shown = egui::Area::new(egui::Id::unique("reader-back-bar"))
             .order(egui::Order::Middle)
-            .pivot(egui::Align2::CENTER_TOP)
-            .fixed_pos(pos2(area.center().x, area.top() + 8.0))
+            .pivot(pivot)
+            .fixed_pos(at)
             .show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(th.bar)
@@ -771,6 +795,7 @@ impl Reader {
                         });
                     });
             });
+        self.probe.back_bar = Some(shown.response.rect);
         if back {
             self.peek_back();
         } else if keep {
@@ -1066,6 +1091,7 @@ impl Reader {
             .inner_margin(egui::Margin::symmetric(10, 6));
         self.probe.aa = None;
         self.probe.bar = None;
+        self.probe.back_bar = None;
         if self.settings.autohide_bar {
             // Over the pages, so they stay where they are whether it shows
             // or not. The bar's panels and windows keep it shown (the
