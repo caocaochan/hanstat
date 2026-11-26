@@ -80,6 +80,9 @@ struct Settings {
     margins: f32,
     /// Two pages side by side when the window is wide enough.
     spread: bool,
+    /// The menu bar shows only with the pointer at the top of the window,
+    /// over the pages, which are laid out as if it weren't there.
+    autohide_bar: bool,
     /// The colour theme's id.
     theme: String,
     /// The dictionary popup's theme: [`popup::SAME_AS_PAGES`] or a theme's
@@ -119,6 +122,7 @@ impl Default for Settings {
             line_spacing: 1.75,
             margins: 1.0,
             spread: true,
+            autohide_bar: false,
             theme: theme::THEMES[0].id.to_owned(),
             popup_theme: popup::SAME_AS_PAGES.to_owned(),
             positions: HashMap::new(),
@@ -155,6 +159,8 @@ impl Settings {
 /// Widgets of the settings panel as drawn in the last frame.
 #[derive(Default)]
 struct Probe {
+    /// The menu bar, when drawn this frame.
+    bar: Option<Rect>,
     aa: Option<Rect>,
     /// The theme box, while the panel is open.
     theme_box: Option<Rect>,
@@ -256,6 +262,12 @@ pub struct Reader {
     /// Where the settings' widgets were drawn this frame (for tests that click them).
     probe: Probe,
     error: Option<String>,
+    /// The hidden menu bar ([`Settings::autohide_bar`]): its height when
+    /// last drawn, the time it shows until, and the notice it last showed
+    /// for.
+    bar_h: f32,
+    bar_until: f64,
+    bar_notice: Option<String>,
     /// The time of this frame, and of the last page turn.
     now: f64,
     turned_at: f64,
@@ -460,6 +472,9 @@ impl Reader {
             settings_open: false,
             probe: Probe::default(),
             error: None,
+            bar_h: 40.0,
+            bar_until: 0.0,
+            bar_notice: None,
             now: 0.0,
             turned_at: 0.0,
             dict,
@@ -873,96 +888,53 @@ impl Reader {
         let mut geom_for_keys: Option<Geometry> = self.last_geom;
         let mut play_page = false;
 
-        egui::Panel::top("reader-bar")
-            .frame(
-                egui::Frame::new()
-                    .fill(th.bar)
-                    .inner_margin(egui::Margin::symmetric(10, 6)),
-            )
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if ui
-                        .button(RichText::new("‹ Back").size(15.0))
-                        .on_hover_text("Back to the statistics (Esc)")
-                        .clicked()
-                    {
-                        open = false;
-                    }
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new(&self.epub.title)
-                            .size(15.0)
-                            .color(th.text)
-                            .strong(),
-                    );
-                    if let Some(n) = &self.notice {
-                        ui.add_space(12.0);
-                        ui.label(RichText::new(&n.text).size(14.0).color(th.accent))
-                            .on_hover_text(&n.hover);
-                        if let Some(b) = n.button
-                            && ui
-                                .button(RichText::new(b).size(14.0))
-                                .on_hover_text(&n.hover)
-                                .clicked()
-                        {
-                            self.notice_clicked = true;
-                        }
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        self.settings_menu(ui);
-                        self.stats_menu(ui);
-                        self.contents_menu(ui);
-                        let n = self.dicts.updates();
-                        let label = if self.dicts.working() {
-                            "Dictionaries …".to_owned()
-                        } else if n > 0 {
-                            format!("Dictionaries ({n} update{})", if n == 1 { "" } else { "s" })
-                        } else {
-                            "Dictionaries".to_owned()
-                        };
-                        let b = ui
-                            .selectable_label(self.dicts.open, RichText::new(label).size(14.0))
-                            .on_hover_text(format!(
-                                "Look up a word: hold {} with the pointer on it",
-                                self.settings.lookup_key.label()
-                            ));
-                        if b.clicked() {
-                            self.dicts.open = !self.dicts.open;
-                        }
-                        let before = self.settings.tts.clone();
-                        let read = self.tts.bar(ui);
-                        if let Some(tts::Action::PlayPage) =
-                            self.tts.panel(&read, &mut self.settings.tts, self.spine)
-                        {
-                            play_page = true;
-                        }
-                        if self.settings.tts != before {
-                            self.dirty = true;
-                        }
-                        ui.separator();
-                        let before = self.settings.spread;
-                        ui.selectable_value(
-                            &mut self.settings.spread,
-                            true,
-                            RichText::new("Two pages").size(14.0),
-                        )
-                        .on_hover_text("Two pages side by side, when the window is wide enough");
-                        ui.selectable_value(
-                            &mut self.settings.spread,
-                            false,
-                            RichText::new("One page").size(14.0),
-                        );
-                        if self.settings.spread != before {
-                            self.dirty = true;
-                        }
-                        ui.separator();
-                        if let Some(p) = self.progress() {
-                            ui.label(RichText::new(format!("{:.0}%", p * 100.0)).color(th.muted))
-                                .on_hover_text("Of the book's text, before this page");
-                        }
+        let bar_frame = egui::Frame::new()
+            .fill(th.bar)
+            .inner_margin(egui::Margin::symmetric(10, 6));
+        self.probe.aa = None;
+        self.probe.bar = None;
+        if self.settings.autohide_bar {
+            // Over the pages, so they stay where they are whether it shows
+            // or not. The bar's panels and windows keep it shown (the
+            // read-aloud windows are drawn from it); the text menu doesn't.
+            let screen = ui.max_rect();
+            let bar_menus = menus_open
+                && (!text_menu_open
+                    || self.settings_open
+                    || self.stats_open
+                    || self.tts.panel_open
+                    || self.tts.local_window_open()
+                    || self.tts.design_window_open()
+                    || self.dicts.open
+                    || self.dict.cards.setup_open);
+            let shown = self.bar_wanted(&ctx, screen, bar_menus);
+            let t = ctx.animate_bool_with_time(egui::Id::unique("reader-bar-shown"), shown, 0.12);
+            if t > 0.0 {
+                let r = egui::Area::new(egui::Id::unique("reader-bar-overlay"))
+                    .order(egui::Order::Middle)
+                    .fixed_pos(screen.min)
+                    .constrain(false)
+                    .interactable(shown)
+                    .show(&ctx, |ui| {
+                        ui.multiply_opacity(t);
+                        bar_frame
+                            .show(ui, |ui| {
+                                ui.set_width(screen.width() - bar_frame.inner_margin.sum().x);
+                                self.bar(ui, th)
+                            })
+                            .inner
                     });
-                });
-            });
+                self.bar_h = r.response.rect.height();
+                self.probe.bar = Some(r.response.rect);
+                (open, play_page) = r.inner;
+            }
+        } else {
+            let r = egui::Panel::top("reader-bar")
+                .frame(bar_frame)
+                .show(ui, |ui| self.bar(ui, th));
+            self.probe.bar = Some(r.response.rect);
+            (open, play_page) = r.inner;
+        }
 
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let area = ui.max_rect();
@@ -1509,6 +1481,129 @@ impl Reader {
         open
     }
 
+    /// Show the hidden menu bar ([`Settings::autohide_bar`]) this frame:
+    /// with the pointer where it is (not while a button is held, so a
+    /// selection dragged up doesn't bring it out), while `menus` (its panels)
+    /// are open, and for a while after either, or after a new notice.
+    fn bar_wanted(&mut self, ctx: &egui::Context, screen: Rect, menus: bool) -> bool {
+        const LINGER: f64 = 0.5;
+        let now = self.now;
+        let shown = now < self.bar_until;
+        match &self.notice {
+            Some(n) if self.bar_notice.as_deref() != Some(n.text.as_str()) => {
+                self.bar_notice = Some(n.text.clone());
+                self.bar_until = self.bar_until.max(now + 4.0);
+            }
+            Some(_) => {}
+            None => self.bar_notice = None,
+        }
+        let (pointer, down) = ctx.input(|i| (i.pointer.hover_pos(), i.pointer.any_down()));
+        // Once out, a little below it too, so it doesn't flicker at its edge.
+        let reach = self.bar_h + if shown { 8.0 } else { 0.0 };
+        let at_top = pointer.is_some_and(|p| screen.contains(p) && p.y < screen.top() + reach);
+        if menus || (at_top && (shown || !down)) {
+            self.bar_until = self.bar_until.max(now + LINGER);
+        }
+        if now < self.bar_until {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+                self.bar_until - now + 0.01,
+            ));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The menu bar's contents: whether the reader stays open, and whether
+    /// to read the page aloud.
+    fn bar(&mut self, ui: &mut egui::Ui, th: &Theme) -> (bool, bool) {
+        let mut open = true;
+        let mut play_page = false;
+        ui.horizontal(|ui| {
+            if ui
+                .button(RichText::new("‹ Back").size(15.0))
+                .on_hover_text("Back to the statistics (Esc)")
+                .clicked()
+            {
+                open = false;
+            }
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(&self.epub.title)
+                    .size(15.0)
+                    .color(th.text)
+                    .strong(),
+            );
+            if let Some(n) = &self.notice {
+                ui.add_space(12.0);
+                ui.label(RichText::new(&n.text).size(14.0).color(th.accent))
+                    .on_hover_text(&n.hover);
+                if let Some(b) = n.button
+                    && ui
+                        .button(RichText::new(b).size(14.0))
+                        .on_hover_text(&n.hover)
+                        .clicked()
+                {
+                    self.notice_clicked = true;
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.settings_menu(ui);
+                self.stats_menu(ui);
+                self.contents_menu(ui);
+                let n = self.dicts.updates();
+                let label = if self.dicts.working() {
+                    "Dictionaries …".to_owned()
+                } else if n > 0 {
+                    format!("Dictionaries ({n} update{})", if n == 1 { "" } else { "s" })
+                } else {
+                    "Dictionaries".to_owned()
+                };
+                let b = ui
+                    .selectable_label(self.dicts.open, RichText::new(label).size(14.0))
+                    .on_hover_text(format!(
+                        "Look up a word: hold {} with the pointer on it",
+                        self.settings.lookup_key.label()
+                    ));
+                if b.clicked() {
+                    self.dicts.open = !self.dicts.open;
+                }
+                let before = self.settings.tts.clone();
+                let read = self.tts.bar(ui);
+                if let Some(tts::Action::PlayPage) =
+                    self.tts.panel(&read, &mut self.settings.tts, self.spine)
+                {
+                    play_page = true;
+                }
+                if self.settings.tts != before {
+                    self.dirty = true;
+                }
+                ui.separator();
+                let before = self.settings.spread;
+                ui.selectable_value(
+                    &mut self.settings.spread,
+                    true,
+                    RichText::new("Two pages").size(14.0),
+                )
+                .on_hover_text("Two pages side by side, when the window is wide enough");
+                ui.selectable_value(
+                    &mut self.settings.spread,
+                    false,
+                    RichText::new("One page").size(14.0),
+                );
+                if self.settings.spread != before {
+                    self.dirty = true;
+                }
+                ui.separator();
+                if let Some(p) = self.progress() {
+                    ui.label(RichText::new(format!("{:.0}%", p * 100.0)).color(th.muted))
+                        .on_hover_text("Of the book's text, before this page");
+                }
+            });
+        });
+        (open, play_page)
+    }
+
     /// Turn to the sentence read aloud when it leaves the pages shown, if
     /// the one before was on them (pages turned away by hand stay), and
     /// within a sentence that goes on past them, when the voice reaches the
@@ -1859,6 +1954,10 @@ impl Reader {
                 })
                 .response
                 .on_hover_text("Two pages when the window is wide enough");
+                ui.end_row();
+                ui.label("Menu bar");
+                ui.checkbox(&mut self.settings.autohide_bar, "Hide until the pointer is at the top")
+                    .on_hover_text("The bar then shows over the pages, which stay where they are");
                 ui.end_row();
             });
         });

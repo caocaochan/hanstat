@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.26.01] - 2026-11-26
+
+### Added
+- **The Reader's menu bar can hide.** In **Aa**, tick **Menu bar: Hide until the pointer is at the top**. The bar stays out of sight and appears over the pages when you move the pointer to the top of the window. It stays while one of its panels or windows (Aa, Stats, Contents, Read aloud, Dictionaries) is open, and shows for a few seconds when a new notice arrives. The pages are laid out for the whole window and don't move or re-flow when the bar shows or hides; while shown, it covers the top edge of the pages. Dragging a text selection up to the top doesn't bring it out.
+
 ## [2026.11.26.00] - 2026-11-26
 
 ### Fixed

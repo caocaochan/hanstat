@@ -3538,3 +3538,73 @@ fn reading_han_counts() {
         "chapters whose layout count differs from the tree's"
     );
 }
+
+/// With the menu bar set to hide, the pages are laid out against the whole
+/// window and stay put while it shows and hides. It shows with the pointer
+/// at the top, stays while its Aa panel is open, and doesn't come out for a
+/// selection dragged up to it.
+#[test]
+#[ignore = "opens the reader with the system fonts and dictionary settings"]
+fn reader_autohide_bar() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut d = Driver::new();
+    let (mut r, _) = selection_book(&mut d, temp.path());
+    let docked = r.last_geom.expect("pages drawn");
+    assert!(r.probe.bar.is_some(), "the bar is drawn by default");
+
+    let middle = pos2(d.size.x / 2.0, d.size.y / 2.0);
+    let top = pos2(d.size.x / 2.0, 4.0);
+    let corner = pos2(5.0, d.size.y - 5.0);
+    r.settings.autohide_bar = true;
+    d.frame(&mut r, vec![egui::Event::PointerMoved(middle)]);
+    d.ready(&mut r);
+    d.idle(&mut r, 60);
+    let hidden = r.last_geom.unwrap();
+    let sides = r.probe.sides.clone();
+    assert!(r.probe.bar.is_none(), "hidden with the pointer on the page");
+    assert!(
+        hidden == r.geometry(Rect::from_min_size(Pos2::ZERO, d.size)),
+        "pages laid out against the whole window"
+    );
+    assert!(hidden.pages[0].top() < docked.pages[0].top());
+    d.snap("autohide-hidden");
+    let unmoved = |r: &Reader, when: &str| {
+        assert!(r.last_geom == Some(hidden), "pages moved {when}");
+        assert_eq!(r.probe.sides, sides, "text moved {when}");
+    };
+
+    d.frame(&mut r, vec![egui::Event::PointerMoved(top)]);
+    d.idle(&mut r, 30);
+    let bar = r.probe.bar.expect("shown with the pointer at the top");
+    assert_eq!(bar.min, Pos2::ZERO);
+    assert_eq!(bar.width(), d.size.x);
+    assert!(bar.height() > 20.0, "bar {bar:?}");
+    unmoved(&r, "with the bar shown");
+    d.snap("autohide-shown");
+
+    let aa = r.probe.aa.expect("Aa drawn");
+    d.click(&mut r, aa.center());
+    assert!(r.settings_open, "Aa opens the panel");
+    d.frame(&mut r, vec![egui::Event::PointerMoved(corner)]);
+    d.idle(&mut r, 60);
+    assert!(r.probe.bar.is_some(), "stays while its panel is open");
+    unmoved(&r, "with the panel open");
+    assert!(
+        d.key(&mut r, Key::Escape),
+        "Esc closes the panel, not the reader"
+    );
+    assert!(!r.settings_open);
+    d.idle(&mut r, 60);
+    assert!(r.probe.bar.is_none(), "hidden once the panel is closed");
+    unmoved(&r, "after the bar hid");
+
+    let primary = egui::PointerButton::Primary;
+    d.press(&mut r, middle, primary);
+    d.frame(&mut r, vec![egui::Event::PointerMoved(top)]);
+    d.idle(&mut r, 30);
+    assert!(r.probe.bar.is_none(), "not for a drag up to the top");
+    d.release(&mut r, top, primary);
+    d.idle(&mut r, 30);
+    assert!(r.probe.bar.is_some(), "shown once the button is let go");
+    unmoved(&r, "after the drag");
+}
