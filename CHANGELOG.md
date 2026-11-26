@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.26.05] - 2026-11-26
+
+### Added
+- **TXT books open in the Reader.** **📕 Read** now shows for TXT books too: on the Overview, in the Library, on Home and as the toolbar's **📕 Reader**. Each chapter found by its heading (第1章, 楔子, 番外 …) becomes its own pages, with the heading centred above it, the paragraphs indented, and every heading listed in **Contents**. The text is read with the same encoding detection and chapter splitting as the analysis, so the Reader counts the same characters as the book's statistics. Search, the dictionary popup, Anki cards, Read aloud, audiobook export and reading stats all work as with an EPUB. A very long chapter, or a book with no headings, is split into parts behind the scenes so pages still open quickly. The Reader always detects the encoding itself, even if you chose one by hand for the analysis, and **Learn while reading** does not yet follow your place in a TXT book.
+
 ## [2026.11.26.04] - 2026-11-26
 
 ### Fixed

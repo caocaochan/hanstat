@@ -4835,10 +4835,10 @@ impl App {
                         if let Some(t) = &r.title {
                             ui.heading(t);
                         }
-                        if r.format == "EPUB" && self.path.is_some() {
+                        if reader::opens(r.format) && self.path.is_some() {
                             read_book = ui
                                 .button(RichText::new("📕 Read").size(15.0))
-                                .on_hover_text("Read the book, with its layout and pictures")
+                                .on_hover_text("Read the book in the reader")
                                 .clicked();
                             export_audiobook = ui
                                 .button(RichText::new("Export audiobook…").size(15.0))
@@ -6309,7 +6309,7 @@ impl App {
         let id = reading_stats::last_read(|id| {
             entries
                 .iter()
-                .any(|e| e.id == id && e.stats.format == "EPUB")
+                .any(|e| e.id == id && reader::opens(&e.stats.format))
         })?;
         let e = entries.iter().find(|e| e.id == id)?;
         Some(LastRead {

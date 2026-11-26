@@ -56,6 +56,12 @@ use theme::Theme;
 /// Characters of text in the EPUB file `path` as the reader counts them:
 /// what its places' offsets are counted in (the reading path turns a place
 /// into a share of the file with it).
+/// Whether the reader opens books of this Library format: EPUBs, and plain
+/// text as chapter pages ([`Epub::from_text`]).
+pub(crate) fn opens(format: &str) -> bool {
+    matches!(format, "EPUB" | "TXT")
+}
+
 pub(crate) fn chapter_text_len(epub: &Epub, path: &str) -> usize {
     tree::build(epub, path, &mut tree::SheetCache::default()).text_len
 }

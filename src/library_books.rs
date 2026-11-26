@@ -710,7 +710,7 @@ impl App {
         // Progress: chapter lengths worked out for the books read in the reader.
         if used(HistCol::Progress) {
             for e in entries.iter() {
-                if e.stats.format == "EPUB"
+                if crate::reader::opens(&e.stats.format)
                     && !data.read_at.contains_key(&e.id)
                     && rs::left_at(&e.id).is_some()
                     && chapter_lengths::get(&e.id).is_none()
@@ -937,11 +937,11 @@ impl App {
                             book_cell(ui, e, tex.as_ref(), exists.get(&e.path), du.library_tag(&e.path, data.now), &mut acts);
                         });
                         row.col(|ui| {
-                            // As on the Overview: the reader takes EPUBs.
-                            if s.format == "EPUB"
+                            // As on the Overview: the reader takes EPUBs and TXTs.
+                            if crate::reader::opens(&s.format)
                                 && ui
                                     .add_enabled(exists.get(&e.path), egui::Button::new("📕 Read"))
-                                    .on_hover_text("Read the book, with its layout and pictures")
+                                    .on_hover_text("Read the book in the reader")
                                     .on_disabled_hover_text("The file is no longer there")
                                     .clicked()
                             {
@@ -1534,7 +1534,7 @@ fn progress_cell(ui: &mut egui::Ui, w: f32, i: usize, data: &Data) {
     let e = &data.entries[i];
     let place = data.place(&e.id);
     let Some(p) = data.progress(i) else {
-        if place.is_some() && e.stats.format == "EPUB" {
+        if place.is_some() && crate::reader::opens(&e.stats.format) {
             ui.label(RichText::new("…").weak())
                 .on_hover_text("Working out the chapters' lengths");
         } else {

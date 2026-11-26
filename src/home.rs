@@ -101,7 +101,7 @@ struct Found {
 struct Ask {
     id: String,
     path: PathBuf,
-    epub: bool,
+    readable: bool,
 }
 
 /// A book shown on Home.
@@ -109,7 +109,7 @@ struct Shown {
     id: String,
     title: String,
     path: PathBuf,
-    epub: bool,
+    readable: bool,
     traditional: bool,
     han_total: u64,
     /// Where the reader left it; `None`: never opened in the reader.
@@ -220,7 +220,7 @@ impl HomeView {
 /// one).
 fn find(a: Ask) -> Found {
     let (mut chapters, mut toc) = (None, Vec::new());
-    if a.epub
+    if a.readable
         && let Ok(epub) = reader::epub::Epub::open(&a.path)
     {
         chapters = Some(crate::chapter_lengths::of_open(&a.id, &epub));
@@ -233,7 +233,7 @@ fn find(a: Ask) -> Found {
     }
     let large = history::large_cover_path(&a.id);
     // Only books with a small cover have one to find.
-    if a.epub
+    if a.readable
         && !large.is_file()
         && history::cover_path(&a.id).is_file()
         && let Ok(book) = extract::load(&a.path, EncodingChoice::Auto)
@@ -592,7 +592,7 @@ impl App {
             .map(|b| Ask {
                 id: b.id.clone(),
                 path: b.path.clone(),
-                epub: b.epub,
+                readable: b.readable,
             })
             .collect();
         self.home_view.request(ask, ctx);
@@ -710,7 +710,7 @@ impl App {
             id: e.id.clone(),
             title: e.title.clone(),
             path: e.path.clone(),
-            epub: e.stats.format == "EPUB",
+            readable: reader::opens(&e.stats.format),
             traditional: e.stats.variant == "Traditional",
             han_total: e.stats.han_total,
             at,
@@ -720,7 +720,7 @@ impl App {
             .history
             .entries
             .iter()
-            .filter(|e| e.stats.format == "EPUB")
+            .filter(|e| reader::opens(&e.stats.format))
             .filter_map(|e| rs::left_at(&e.id).map(|at| shown(e, Some(at))))
             .collect();
         read.sort_by_key(|b| std::cmp::Reverse(b.at.map_or(0, |a| a.saved)));
@@ -862,13 +862,17 @@ fn hero_cover(ui: &mut Ui, b: &Shown, tex: Option<&TextureHandle>, act: &mut Opt
         &b.id,
         lift,
     );
-    let tip = if b.epub { "Read it" } else { "Its Overview" };
+    let tip = if b.readable {
+        "Read it"
+    } else {
+        "Its Overview"
+    };
     if resp
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .on_hover_text(tip)
         .clicked()
     {
-        *act = Some(if b.epub {
+        *act = Some(if b.readable {
             Act::Read(0)
         } else {
             Act::Overview(0)
@@ -950,7 +954,7 @@ fn hero_text(
     ui.add_space(24.0);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 12.0;
-        if b.epub {
+        if b.readable {
             let label = if started {
                 "▶  Continue reading"
             } else {
