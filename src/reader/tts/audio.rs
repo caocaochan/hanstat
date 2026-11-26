@@ -8,6 +8,7 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use std::collections::VecDeque;
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -106,6 +107,24 @@ struct Clip {
     id: u64,
     samples: Vec<f32>,
     pos: usize,
+    /// The samples between the silence before and after the voice.
+    voiced: Range<usize>,
+}
+
+/// Quieter than this is silence (about -46 dBFS).
+const SILENCE: f32 = 0.005;
+
+/// The samples from the first to the last one louder than silence (all of
+/// them if none is).
+fn voiced(samples: &[f32]) -> Range<usize> {
+    let loud = |s: &f32| s.abs() > SILENCE;
+    match (
+        samples.iter().position(loud),
+        samples.iter().rposition(loud),
+    ) {
+        (Some(a), Some(z)) => a..z + 1,
+        _ => 0..samples.len(),
+    }
 }
 
 struct Queue {
@@ -288,10 +307,12 @@ impl Output {
 
     /// Play `samples` (mono, at [`Output::rate`]) after what is queued.
     pub fn push(&self, id: u64, samples: Vec<f32>) {
+        let voiced = voiced(&samples);
         self.queue.lock().unwrap().clips.push_back(Clip {
             id,
             samples,
             pos: 0,
+            voiced,
         });
     }
 
@@ -317,6 +338,17 @@ impl Output {
     /// The clip being heard.
     pub fn current(&self) -> Option<u64> {
         self.queue.lock().unwrap().current
+    }
+
+    /// The clip being heard, how many of its samples were played, and
+    /// where its voice is (samples).
+    pub fn position(&self) -> Option<(u64, usize, Range<usize>)> {
+        let q = self.queue.lock().unwrap();
+        let id = q.current?;
+        q.clips
+            .iter()
+            .find(|c| c.id == id && c.id >= q.cut_below && c.pos < c.samples.len())
+            .map(|c| (id, c.pos, c.voiced.clone()))
     }
 
     /// Seconds of sound queued and not yet heard.
@@ -367,6 +399,7 @@ mod tests {
                     id,
                     samples: vec![id as f32; n],
                     pos: 0,
+                    voiced: 0..n,
                 });
             }
         }
@@ -388,6 +421,7 @@ mod tests {
                 id,
                 samples: vec![v; n],
                 pos: 0,
+                voiced: 0..n,
             });
         }
         Mutex::new(q)
@@ -426,6 +460,17 @@ mod tests {
     }
 
     #[test]
+    fn voice_is_found_between_silences() {
+        let mut x = vec![0.0f32; 100];
+        x[20] = 0.3;
+        x[70] = -0.2;
+        x[90] = 0.001;
+        assert_eq!(voiced(&x), 20..71);
+        assert_eq!(voiced(&[0.0; 5]), 0..5);
+        assert_eq!(voiced(&[]), 0..0);
+    }
+
+    #[test]
     fn a_cut_fades_out_before_the_next_clip() {
         let queue = queue_of(&[(1, 1.0, 1000)]);
         let wake = || {};
@@ -436,6 +481,7 @@ mod tests {
             id: o,
             samples: vec![-1.0; 1000],
             pos: 0,
+            voiced: 0..1000,
         });
         let mut out = [0f32; 120];
         fill(&mut out, 1, RATE, &queue, &wake);

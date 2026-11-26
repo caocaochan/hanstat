@@ -664,6 +664,11 @@ impl Tts {
         self.now.at.clone()
     }
 
+    /// While the sentence is heard: when its voice started and how long.
+    pub fn clock(&self) -> Option<engine::Clock> {
+        self.now.clock
+    }
+
     /// Read from the sentence holding character `src` of chapter `spine`.
     pub fn play_from(&mut self, spine: usize, src: u32, s: &TtsSettings) {
         self.paused_by_popup = false;

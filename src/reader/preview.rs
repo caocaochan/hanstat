@@ -2123,6 +2123,30 @@ fn read_aloud() {
         (r.spine, r.page),
         r.tts.at().map(|(s, rg)| (s, rg.start))
     );
+    // A sentence going on past the pages turns them while it is heard,
+    // once the voice reaches the next page's first character.
+    if let Some(end) = l.page_first_src(page + step)
+        && sents[last].start < end
+        && end < sents[last].end
+    {
+        assert_eq!(
+            index(&r),
+            Some(last),
+            "turned within the sentence going on to the next page"
+        );
+        let clock = r.tts.clock().expect("the sentence is heard");
+        let s = &sents[last];
+        let frac = (end - s.start) as f32 / s.len() as f32;
+        let late = clock.at(frac).elapsed().as_secs_f32();
+        eprintln!(
+            "turned {late:.2} s after the estimated voice reached {:?} of {:?}",
+            ch.chars[end as usize],
+            text_of(last)
+        );
+        assert!(late < 0.5, "turned {late:.2} s late");
+    } else {
+        eprintln!("the page's last sentence ends on it: not turned mid-sentence");
+    }
     d.idle(&mut r, 2);
     d.snap("tts-followed");
     r.tts.stop();
@@ -2196,6 +2220,102 @@ fn read_aloud() {
 #[ignore]
 fn read_aloud_local() {
     check_local_read_aloud(false);
+}
+
+/// The page turns within a sentence that goes on to the next page, once the
+/// voice reaches that page's first character, not when the sentence ends;
+/// it then stays through the rest of the sentence and as the next starts.
+/// Read with the local voice (no key needed): `HANSTAT_MODEL_DIR` with
+/// CustomVoice downloaded, `LOCALAPPDATA` at a scratch folder,
+/// `HANSTAT_NO_UPDATE=1`, `READER_EPUB`, optionally `READER_SPINE`.
+#[test]
+#[ignore]
+fn read_aloud_turns_within_sentence() {
+    use std::sync::atomic::Ordering::Relaxed;
+    use tts::PlayState;
+    let book = env("READER_EPUB").expect("set READER_EPUB");
+    tts::audio::MUTE.store(true, Relaxed);
+    assert!(tts::local::downloaded(), "CustomVoice in HANSTAT_MODEL_DIR");
+    let mut d = Driver::new();
+    let mut r = d.open(&book);
+    r.settings.tts.source = tts::Source::Local;
+    r.spine = env("READER_SPINE")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
+    r.target = Some(Target::Offset(0));
+    d.ready(&mut r);
+    let spine = r.spine;
+    let step = if r.last_geom.is_some_and(|g| g.spread) {
+        2
+    } else {
+        1
+    };
+    let l = r.layouts[&spine].clone();
+    let ch = r.chapter(spine).unwrap();
+    let sents = tts::sentences(&ch.chars);
+    // A spread whose last sentence goes on to the next, well into it.
+    let (page, i, end) = (0..l.pages.len().saturating_sub(step))
+        .step_by(step)
+        .find_map(|p| {
+            let end = l.page_first_src(p + step)?;
+            let i = tts::sentence_at(&sents, end);
+            let s = sents.get(i)?;
+            let frac = (end - s.start) as f32 / s.len() as f32;
+            (s.start < end && s.len() >= 15 && (0.3..0.8).contains(&frac)).then_some((p, i, end))
+        })
+        .expect("a sentence going on to the next page");
+    let s = sents[i].clone();
+    let frac = (end - s.start) as f32 / s.len() as f32;
+    let text: String = ch.chars[s.start as usize..s.end as usize].iter().collect();
+    eprintln!("page {page}: next page from character {frac:.2} of {text:?}");
+    r.target = Some(Target::Src(s.start));
+    d.ready(&mut r);
+    assert_eq!(r.page, page);
+
+    r.tts.play_from(spine, s.start, &r.settings.tts);
+    let t = Instant::now();
+    let mut clock = None;
+    while r.page == page {
+        d.frame(&mut r, vec![]);
+        assert!(t.elapsed().as_secs() < 120, "state {:?}", r.tts.state());
+        assert!(r.tts.error().is_none(), "{:?}", r.tts.error());
+        if r.tts.state() == PlayState::Playing {
+            assert_eq!(
+                r.tts.at(),
+                Some((spine, s.clone())),
+                "the sentence ended before the page turned"
+            );
+            clock = r.tts.clock().or(clock);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let clock = clock.expect("the sentence was heard");
+    let into = clock.start.elapsed().as_secs_f32() / clock.secs;
+    eprintln!(
+        "turned {into:.2} of the way into {:.1} s of voice (next page at {frac:.2})",
+        clock.secs
+    );
+    assert_eq!(r.page, page + step);
+    assert_eq!(r.tts.at(), Some((spine, s.clone())), "turned mid-sentence");
+    assert!(
+        (into - frac).abs() * clock.secs < 0.2,
+        "turned at {into:.2}, expected {frac:.2}"
+    );
+    d.idle(&mut r, 2);
+    d.snap("tts-turned-within");
+    // It stays through the rest of the sentence and as the next starts.
+    let t = Instant::now();
+    while r.tts.at().is_some_and(|(_, rg)| rg.start < s.end) {
+        d.frame(&mut r, vec![]);
+        assert!(t.elapsed().as_secs() < 60);
+        assert_eq!(r.page, page + step, "the page stays");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    d.idle(&mut r, 5);
+    assert_eq!(r.page, page + step, "the page stays");
+    r.tts.stop();
+    d.idle(&mut r, 20);
+    r.close(&d.ctx);
 }
 
 /// As for CustomVoice, but make and keep a real VoiceDesign sample, then

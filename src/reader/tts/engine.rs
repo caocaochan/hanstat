@@ -543,6 +543,23 @@ pub struct Now {
     pub at: Option<(usize, Range<u32>)>,
     pub error: Option<String>,
     pub needs_setup: bool,
+    /// While the sentence is being heard: when its voice started and ends.
+    pub clock: Option<Clock>,
+}
+
+/// When the voice of the sentence heard starts and how long it lasts, so
+/// the UI can tell how far into it the voice is without a frame per tick.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Clock {
+    pub start: Instant,
+    pub secs: f32,
+}
+
+impl Clock {
+    /// When the voice is `frac` (0 to 1) of the way through the sentence.
+    pub fn at(&self, frac: f32) -> Instant {
+        self.start + Duration::from_secs_f32(self.secs * frac.clamp(0.0, 1.0))
+    }
 }
 
 pub struct Engine {
@@ -611,6 +628,28 @@ struct Player {
     paras: HashMap<usize, Arc<Vec<usize>>>,
     /// Stopped: the device closes at this time, once the sound faded out.
     closing: Option<Instant>,
+    /// The clip heard and its clock.
+    clock: Option<(u64, Clock)>,
+}
+
+/// The clock of the clip heard: `old` while it is still right to within a
+/// tenth of a second (so the UI isn't woken every tick), else measured again.
+fn clip_clock(out: &Output, old: Option<(u64, Clock)>) -> Option<(u64, Clock)> {
+    let (id, pos, voiced) = out.position()?;
+    let rate = out.rate as f32;
+    let now = Instant::now();
+    let played = Duration::from_secs_f32(pos as f32 / rate);
+    let lead = Duration::from_secs_f32(voiced.start as f32 / rate);
+    let start = now.checked_sub(played).unwrap_or(now) + lead;
+    let secs = voiced.len() as f32 / rate;
+    if let Some((old_id, c)) = old
+        && old_id == id
+        && c.secs == secs
+        && c.start.max(start) - c.start.min(start) < Duration::from_millis(100)
+    {
+        return old;
+    }
+    Some((id, Clock { start, secs }))
 }
 
 impl Player {
@@ -642,6 +681,7 @@ impl Player {
             sentences: HashMap::new(),
             paras: HashMap::new(),
             closing: None,
+            clock: None,
         }
     }
 
@@ -946,6 +986,11 @@ impl Player {
         if self.error.is_some() && !playing {
             self.state = State::Stopped;
         }
+        self.clock = if self.state == State::Playing && !self.buffering {
+            clip_clock(&out, self.clock)
+        } else {
+            None
+        };
         self.output = Some(out);
         if self.state == State::Stopped {
             self.output = None;
@@ -1187,6 +1232,10 @@ impl Player {
             },
             error: self.error.clone(),
             needs_setup: self.needs_setup && self.state == State::Stopped,
+            clock: self
+                .clock
+                .filter(|_| self.state == State::Playing)
+                .map(|(_, c)| c),
         };
         let mut n = self.now.lock().unwrap();
         if *n != now {

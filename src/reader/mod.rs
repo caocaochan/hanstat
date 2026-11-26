@@ -1060,7 +1060,7 @@ impl Reader {
                 && !primary_click
                 && !secondary_click
             {
-                self.follow_reading(&l, step)
+                self.follow_reading(&l, step, &ctx)
             } else {
                 None
             };
@@ -1510,9 +1510,16 @@ impl Reader {
     }
 
     /// Turn to the sentence read aloud when it leaves the pages shown, if
-    /// the one before was on them (pages turned away by hand stay).
+    /// the one before was on them (pages turned away by hand stay), and
+    /// within a sentence that goes on past them, when the voice reaches the
+    /// next page's first character.
     /// If it moves to another chapter, return its target to open after painting.
-    fn follow_reading(&mut self, l: &ChapterLayout, step: usize) -> Option<(usize, u32)> {
+    fn follow_reading(
+        &mut self,
+        l: &ChapterLayout,
+        step: usize,
+        ctx: &egui::Context,
+    ) -> Option<(usize, u32)> {
         let (spine, r) = self.tts.at()?;
         let first = (spine == self.spine)
             .then(|| l.page_of_src(r.start))
@@ -1524,6 +1531,9 @@ impl Reader {
         let key = (spine, r.start);
         if self.tts.last_at == Some(key) {
             self.tts.last_visible = visible;
+            if visible && spine == self.spine {
+                self.follow_within(l, step, &r, ctx);
+            }
             return None;
         }
         self.tts.last_at = Some(key);
@@ -1544,6 +1554,40 @@ impl Reader {
             self.offset = l.page_offset(self.page);
         }
         None
+    }
+
+    /// The sentence heard is on the pages shown and goes on past them: turn
+    /// when the voice reaches the next page, estimated from how far into
+    /// the sentence's sound it is (as many characters as seconds in).
+    fn follow_within(
+        &mut self,
+        l: &ChapterLayout,
+        step: usize,
+        r: &std::ops::Range<u32>,
+        ctx: &egui::Context,
+    ) {
+        let next = self.page + step;
+        let Some(end) = l.page_first_src(next) else {
+            return;
+        };
+        if end <= r.start || end >= r.end {
+            return;
+        }
+        let Some(clock) = self.tts.clock() else {
+            return;
+        };
+        let frac = (end - r.start) as f32 / (r.end - r.start) as f32;
+        let when = clock.at(frac);
+        let now = std::time::Instant::now();
+        if now < when {
+            ctx.request_repaint_after(when - now);
+            return;
+        }
+        self.turned_at = self.now;
+        self.forward = true;
+        self.tracker.turned();
+        self.page = next;
+        self.offset = l.page_offset(self.page);
     }
 
     fn contents_menu(&mut self, ui: &mut egui::Ui) {

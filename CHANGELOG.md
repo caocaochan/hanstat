@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.26.00] - 2026-11-26
+
+### Fixed
+- **Read aloud turns the page in the middle of a sentence.** When a sentence runs on to the next page, the page now turns as the voice reaches that page's first character, instead of after the whole sentence has been read. This works with both the Azure and the local voice. The timing is estimated from how far the voice is into the sentence's audio, so the turn can come slightly early or late if there is a long pause at a comma just before the page break.
+
 ## [2026.11.25.11] - 2026-11-25
 
 ### Changed
