@@ -7,6 +7,7 @@ use super::theme::Theme;
 use super::tracker::{Frame, Pause, Place, State};
 use super::{Geometry, Reader, goal_sound, tts};
 use crate::fmt_int;
+use crate::icons::{self, GEAR};
 use crate::reading_stats::{self as rs, BookStats, Day, Goal, Summary};
 use eframe::egui::{self, FontId, Rect, RichText, pos2};
 use std::sync::Arc;
@@ -374,6 +375,13 @@ impl Reader {
         self.stats_after(now);
     }
 
+    /// Every book's stats were reset ([`rs::reset_all`]): this book's
+    /// session starts again now.
+    pub fn stats_reset(&mut self) {
+        self.tracker.restart(rs::now());
+        self.stats.unsaved = false;
+    }
+
     /// The book closes (or the app): add the running stretch and save.
     pub fn end_stats(&mut self) {
         let now = rs::now();
@@ -708,7 +716,7 @@ impl Reader {
                 if listened {
                     ui.label(RichText::new("Listening").color(muted)).on_hover_text(
                         if self.stats.settings.goal_listening {
-                            "Time and characters while read aloud played: kept out of speed, counted toward the daily goal (Settings, ⚙)"
+                            "Time and characters while read aloud played: kept out of speed, counted toward the daily goal (Settings, \u{e270})"
                         } else {
                             "Time and characters while read aloud played: kept out of speed and goals"
                         },
@@ -838,18 +846,18 @@ impl Reader {
         }
         let note = if self.cpm_by_hand {
             format!(
-                "Reading times use {:.0} chars/min, set by hand in Settings (⚙).",
+                "Reading times use {:.0} chars/min, set by hand in Settings ({GEAR}).",
                 self.cpm
             )
         } else if sum.speed.is_some() {
             "Reading times in the Library and time left here use it.".to_owned()
         } else {
             format!(
-                "Until then, reading times use {:.0} chars/min from Settings (⚙).",
+                "Until then, reading times use {:.0} chars/min from Settings ({GEAR}).",
                 self.cpm
             )
         };
-        ui.label(RichText::new(note).color(muted).small());
+        ui.label(icons::rich(ui, RichText::new(note).color(muted).small()));
 
         // Discard.
         let session_any = !session.is_empty();

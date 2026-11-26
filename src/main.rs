@@ -1,5 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use crate::icons::{
+    ARROW_CLOCKWISE, ARROW_COUNTER_CLOCKWISE, ARROW_U_UP_LEFT, BOOK_BOOKMARK, BOOK_OPEN, BOOKS,
+    CARDS, CARET_DOWN, CARET_UP, CHECK, DOWNLOAD, EXPORT, FLOPPY_DISK, FOLDER_OPEN, GEAR,
+    HOURGLASS, HOUSE, IMAGE, INFO, LIGHTBULB, LIST_CHECKS, MAGNIFYING_GLASS, PAUSE_CIRCLE, WARNING,
+    X,
+};
 use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 use hanstat::analyze::{self, Prepared, Report};
@@ -29,6 +35,7 @@ mod chapter_lengths;
 mod charts;
 mod duchinese;
 mod home;
+mod icons;
 mod library_books;
 mod library_columns;
 mod library_reading;
@@ -261,7 +268,7 @@ fn install_fonts(ctx: &egui::Context) {
     fonts
         .families
         .insert(egui::FontFamily::Name(palette::BOLD.into()), bold);
-    reader::icons::install(&mut fonts);
+    icons::install(&mut fonts);
     reader::fonts::set_base(fonts.clone());
     ctx.set_fonts(fonts);
     palette::install(ctx);
@@ -720,6 +727,8 @@ struct App {
     removed: Option<Removed>,
     /// The Settings window (⚙ in the status bar).
     settings_window: bool,
+    /// The "Reset all reading stats" confirmation is open.
+    reset_stats: bool,
     /// Sort column and direction (descending) of the Characters and Words tables.
     char_sort: (CharCol, bool),
     word_sort: (WordCol, bool),
@@ -1539,6 +1548,7 @@ impl Default for App {
             exists: Exists::default(),
             removed: None,
             settings_window: false,
+            reset_stats: false,
             char_sort: (CharCol::Rank, false),
             word_sort: (WordCol::Rank, false),
             char_rows: None,
@@ -2234,7 +2244,7 @@ impl App {
                         reopen = true;
                     }
                     if ui
-                        .add_enabled(a.settings.collection.is_some(), egui::Button::new("⟳ Reload"))
+                        .add_enabled(a.settings.collection.is_some(), egui::Button::new(icons::rich(ui, format!("{ARROW_CLOCKWISE} Reload"))))
                         .on_hover_text("Re-read the collection, e.g. after reviewing in Anki")
                         .clicked()
                     {
@@ -2246,7 +2256,7 @@ impl App {
                     }
                 });
                 if let Some(e) = &a.error {
-                    ui.colored_label(palette::error(), format!("⚠ {e}"));
+                    ui.label(icons::rich(ui, RichText::new(format!("{WARNING} {e}")).color(palette::error())));
                 }
                 if a.profiles.is_empty() && a.settings.collection.is_none() {
                     let base = anki::anki_base()
@@ -2543,7 +2553,7 @@ impl App {
                     0
                 };
                 for w in &self.user_words[hidden..] {
-                    let b = egui::Button::new(format!("{w} ✖")).small();
+                    let b = egui::Button::new(icons::rich(ui, format!("{w} {X}"))).small();
                     if ui
                         .add_enabled(!busy, b)
                         .on_hover_text("Stop forcing this word")
@@ -2611,7 +2621,7 @@ impl App {
             UpdatePhase::Available(rel) => {
                 ui.separator();
                 if ui
-                    .button(format!("⬆ Update to {}", rel.tag))
+                    .button(icons::rich(ui, format!("{DOWNLOAD} Update to {}", rel.tag)))
                     .on_hover_text(notes_preview(&rel))
                     .clicked()
                 {
@@ -2620,8 +2630,11 @@ impl App {
             }
             UpdatePhase::Installed(rel) => {
                 ui.separator();
-                let label =
-                    RichText::new(format!("⟳ Restart to use {}", rel.tag)).color(palette::good());
+                let label = icons::rich(
+                    ui,
+                    RichText::new(format!("{ARROW_CLOCKWISE} Restart to use {}", rel.tag))
+                        .color(palette::good()),
+                );
                 let hover = format!(
                     "hanstat {} is installed and starts next time. Restart now to use it; the open file is reopened.\n\n{}",
                     rel.tag,
@@ -2633,8 +2646,11 @@ impl App {
             }
             UpdatePhase::Failed(e) => {
                 ui.separator();
-                ui.colored_label(palette::warn(), "⚠ Update failed")
-                    .on_hover_text(e);
+                ui.label(icons::rich(
+                    ui,
+                    RichText::new(format!("{WARNING} Update failed")).color(palette::warn()),
+                ))
+                .on_hover_text(e);
             }
             UpdatePhase::Idle | UpdatePhase::Checking | UpdatePhase::UpToDate => {}
         }
@@ -2811,7 +2827,11 @@ impl App {
             }
             style::Phase::WaitingForMemory(why) => {
                 ui.separator();
-                ui.label("⏳ Writing style waits for free memory").on_hover_text(format!(
+                ui.label(icons::rich(
+                    ui,
+                    format!("{HOURGLASS} Writing style waits for free memory"),
+                ))
+                .on_hover_text(format!(
                     "{why}. The model starts when other programs leave enough; closing some helps."
                 ));
             }
@@ -2831,13 +2851,21 @@ impl App {
             }
             style::Phase::Failed(e) => {
                 ui.separator();
-                ui.colored_label(palette::warn(), "⚠ Writing-style rating failed")
-                    .on_hover_text(e);
+                ui.label(icons::rich(
+                    ui,
+                    RichText::new(format!("{WARNING} Writing-style rating failed"))
+                        .color(palette::warn()),
+                ))
+                .on_hover_text(e);
             }
             style::Phase::Paused(why) => {
                 ui.separator();
-                ui.colored_label(palette::warn(), "⏸ Writing-style rating paused")
-                    .on_hover_text(why);
+                ui.label(icons::rich(
+                    ui,
+                    RichText::new(format!("{PAUSE_CIRCLE} Writing-style rating paused"))
+                        .color(palette::warn()),
+                ))
+                .on_hover_text(why);
             }
         }
     }
@@ -2851,6 +2879,13 @@ impl App {
             .default_width(460.0)
             .resizable(false)
             .show(ctx, |ui| {
+            // Taller than the screen once Keyboard shortcuts is open: the
+            // whole body scrolls (title bar and margins stay outside).
+            let max_h = (ctx.content_rect().height() - 80.0).max(200.0);
+            egui::ScrollArea::vertical()
+                .id_salt("settings-scroll")
+                .max_height(max_h)
+                .show(ui, |ui| {
             ui.set_max_width(460.0);
             ui.strong("Counting");
             if ui
@@ -2928,7 +2963,7 @@ impl App {
                 .small(),
             );
             ui.separator();
-            ui.strong("Daily reading goal");
+            ui.strong("Reading stats");
             let mut listening = reading_stats::with(|s| s.settings.goal_listening);
             if ui
                 .checkbox(&mut listening, "Count listening (read aloud) as reading time")
@@ -2947,6 +2982,15 @@ impl App {
                 .weak()
                 .small(),
             );
+            let any = reading_stats::with(|s| !s.books.is_empty());
+            if ui
+                .add_enabled(any, egui::Button::new("Reset all reading stats…"))
+                .on_hover_text("Every book's reading time, characters, days and sessions")
+                .on_disabled_hover_text("Nothing has been read in the reader yet")
+                .clicked()
+            {
+                self.reset_stats = true;
+            }
             ui.separator();
             self.shortcuts_ui(ui);
             ui.separator();
@@ -2997,7 +3041,7 @@ impl App {
                 return;
             }
             let hover = format!(
-                "The weight works on the model's own rating (1 plain – 9 near classical Chinese, shown with ⓘ on a book's \
+                "The weight works on the model's own rating (1 plain – 9 near classical Chinese, shown with {INFO} on a book's \
                  Difficulty tile), not on the percentage, which only compares the books of your Library. A book rated a point \
                  above typical ({:.2}) counts as this many points less of its running words known, for its difficulty and in the \
                  reading path (whose target rises by as much); one rated below typical, as more. \
@@ -3006,7 +3050,7 @@ impl App {
                 style::DEFAULT_WEIGHT
             );
             ui.horizontal(|ui| {
-                ui.label("Weight").on_hover_text(&hover);
+                ui.label("Weight").on_hover_text(icons::rich(ui, hover.as_str()));
                 if ui
                     .add(
                         egui::DragValue::new(&mut self.settings.style_weight)
@@ -3015,7 +3059,7 @@ impl App {
                             .max_decimals(1)
                             .suffix(" % known per point of the model's rating"),
                     )
-                    .on_hover_text(&hover)
+                    .on_hover_text(icons::rich(ui, hover.as_str()))
                     .changed()
                     && let Err(e) = self.settings.save()
                 {
@@ -3129,6 +3173,7 @@ impl App {
             if let Some(e) = &self.style.error {
                 ui.colored_label(palette::warn(), e);
             }
+                });
         });
         self.settings_window &= open;
     }
@@ -3403,7 +3448,7 @@ impl eframe::App for App {
             ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.report.is_some() || !self.history.entries.is_empty() {
                     let mut image = None;
-                    ui.menu_button("💾 Export", |ui| {
+                    ui.menu_button(icons::rich(ui, format!("{EXPORT} Export")), |ui| {
                         let busy = self.image_busy();
                         let library_button = |ui: &mut egui::Ui| {
                             ui.add_enabled(!busy, egui::Button::new("Library as image (PNG)…"))
@@ -3478,7 +3523,7 @@ impl eframe::App for App {
                 }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true), |ui| {
                     if ui
-                        .selectable_label(on_home, "🏠 Home")
+                        .selectable_label(on_home, icons::rich(ui, format!("{HOUSE} Home")))
                         .on_hover_text(self.shortcuts.hint(&ctx, Action::Home, "The book you're reading, today's reading and your totals"))
                         .clicked()
                     {
@@ -3487,7 +3532,7 @@ impl eframe::App for App {
                     if ui
                         .selectable_label(
                             self.show_history,
-                            format!("📖 Library ({})", self.history.entries.len()),
+                            icons::rich(ui, format!("{BOOKS} Library ({})", self.history.entries.len())),
                         )
                         .on_hover_text(self.shortcuts.hint(&ctx, Action::Library, "Every book analysed before, with its statistics, and a reading path through them"))
                         .clicked()
@@ -3495,7 +3540,7 @@ impl eframe::App for App {
                         self.show_history = !self.show_history;
                     }
                     let last = self.last_read();
-                    let reader_button = ui.add_enabled(last.is_some(), egui::Button::new("📕 Reader"));
+                    let reader_button = ui.add_enabled(last.is_some(), egui::Button::new(icons::rich(ui, format!("{BOOK_OPEN} Reader"))));
                     if let Some(b) = last {
                         if reader_button
                             .on_hover_text(format!("Go back to {} where you left it", b.title))
@@ -3510,7 +3555,7 @@ impl eframe::App for App {
                         reader_button.on_disabled_hover_text("No Library book read in the reader yet");
                     }
                     if ui
-                        .button("📂 Open…")
+                        .button(icons::rich(ui, format!("{FOLDER_OPEN} Open…")))
                         .on_hover_text(self.shortcuts.hint(&ctx, Action::Open, "Open a book, or select several: each is analysed and added to the Library, and the last one is shown"))
                         .clicked()
                     {
@@ -3534,7 +3579,7 @@ impl eframe::App for App {
 
                         let hover = "Words always segmented as single words, saved between runs. Add them here or from the Suggested words tab.";
                         if ui
-                            .selectable_label(self.forced_window, format!("📖 {} forced words", self.user_words.len()))
+                            .selectable_label(self.forced_window, icons::rich(ui, format!("{BOOK_BOOKMARK} {} forced words", self.user_words.len())))
                             .on_hover_text(self.shortcuts.hint(&ctx, Action::ForcedWords, hover))
                             .clicked()
                         {
@@ -3545,13 +3590,13 @@ impl eframe::App for App {
                     ui.separator();
                     let anki_label = match &self.anki.knowledge {
                         Some(k) if self.anki.settings.enabled => format!(
-                            "🃏 Anki: {} known words",
+                            "{CARDS} Anki: {} known words",
                             fmt_int(k.summary.words.known())
                         ),
-                        _ => "🃏 Anki…".to_owned(),
+                        _ => format!("{CARDS} Anki…"),
                     };
                     if ui
-                        .selectable_label(self.anki.window, anki_label)
+                        .selectable_label(self.anki.window, icons::rich(ui, anki_label))
                         .on_hover_text(self.shortcuts.hint(&ctx, Action::Anki, "Compare the book with your Anki cards (young and mature)"))
                         .clicked()
                     {
@@ -3576,13 +3621,13 @@ impl eframe::App for App {
 
                     ui.separator();
                     let label = if self.known.settings.is_empty() {
-                        "📚 HSK, TOCFL & word lists…".to_owned()
+                        format!("{LIST_CHECKS} HSK, TOCFL & word lists…")
                     } else {
-                        format!("📚 Known: {}", self.known.settings.label())
+                        format!("{LIST_CHECKS} Known: {}", self.known.settings.label())
                     };
                     let hover = "Mark HSK 3.0, HSK 2.0 or TOCFL levels and imported word lists as known, in addition to your Anki cards";
                     if ui
-                        .selectable_label(self.known.window, label)
+                        .selectable_label(self.known.window, icons::rich(ui, label))
                         .on_hover_text(self.shortcuts.hint(&ctx, Action::KnownWords, hover))
                         .clicked()
                     {
@@ -3602,7 +3647,7 @@ impl eframe::App for App {
             ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.version_menu(ui, &ctx);
                 if ui
-                    .selectable_label(self.settings_window, RichText::new("⚙").weak())
+                    .selectable_label(self.settings_window, icons::glyph(&ctx, GEAR, false).size(16.0))
                     .on_hover_text(self.shortcuts.hint(&ctx, Action::Settings, "Settings, keyboard shortcuts"))
                     .clicked()
                 {
@@ -3619,7 +3664,7 @@ impl eframe::App for App {
                 let mut undo = false;
                 if let Some(r) = &self.removed {
                     undo = ui
-                        .button("↩ Undo")
+                        .button(icons::rich(ui, format!("{ARROW_U_UP_LEFT} Undo")))
                         .on_hover_text("Put it back in the Library")
                         .clicked();
                     ui.label(format!("Removed “{}” from the Library.", r.entry.title));
@@ -3694,10 +3739,11 @@ impl eframe::App for App {
                         let errors = f.errors.lock().unwrap();
                         if !errors.is_empty() {
                             ui.separator();
-                            ui.colored_label(
-                                palette::warn(),
-                                "⚠ Model download failed; it will be retried when the model is needed",
-                            )
+                            ui.label(icons::rich(
+                                ui,
+                                RichText::new(format!("{WARNING} Model download failed; it will be retried when the model is needed"))
+                                    .color(palette::warn()),
+                            ))
                             .on_hover_text(errors.join("\n\n"));
                         }
                     }
@@ -3718,10 +3764,17 @@ impl eframe::App for App {
                     let mut dismiss = None;
                     for (i, (_, e)) in self.errors.iter().enumerate() {
                         ui.horizontal(|ui| {
-                            if ui.small_button("✖").on_hover_text("Dismiss").clicked() {
+                            if ui
+                                .small_button(icons::glyph(ui.ctx(), X, false))
+                                .on_hover_text("Dismiss")
+                                .clicked()
+                            {
                                 dismiss = Some(i);
                             }
-                            ui.colored_label(palette::error(), format!("⚠ {e}"));
+                            ui.label(icons::rich(
+                                ui,
+                                RichText::new(format!("{WARNING} {e}")).color(palette::error()),
+                            ));
                         });
                     }
                     if let Some(i) = dismiss {
@@ -3781,6 +3834,9 @@ impl eframe::App for App {
         }
         if self.settings_window {
             self.settings_window(&ctx);
+        }
+        if self.reset_stats {
+            self.reset_stats_window(&ctx);
         }
         self.read_window(&ctx);
         self.du_windows(&ctx);
@@ -4077,6 +4133,77 @@ impl App {
         }
     }
 
+    /// "Reset all reading stats": what goes, what stays, and the copy kept.
+    fn reset_stats_window(&mut self, ctx: &egui::Context) {
+        let (books, secs, chars) = reading_stats::with(|s| {
+            s.books
+                .values()
+                .fold((0usize, 0.0f64, 0u64), |(n, t, c), b| {
+                    let d = b.totals();
+                    (
+                        n + 1,
+                        t + d.read_secs + d.listen_secs,
+                        c + d.read_chars + d.listen_chars,
+                    )
+                })
+        });
+        let mut open = true;
+        let mut close = false;
+        egui::Window::new("Reset all reading stats")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.label(format!(
+                    "Remove the reading stats of all {} {}: {} and {} characters, read or listened to, \
+                     with every day, session and streak, and the speed measured in the reader.",
+                    fmt_int(books as u64),
+                    if books == 1 { "book" } else { "books" },
+                    library_stats::fmt_time(secs / 60.0),
+                    fmt_int(chars),
+                ));
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Kept: where you left each book, your daily goals and these settings, and the books marked read. \
+                         A copy of the stats as they are now is saved in the app's folder first.",
+                    )
+                    .weak()
+                    .small(),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Reset").clicked() {
+                        match reading_stats::reset_all() {
+                            Ok(copy) => {
+                                if let Some(r) = &mut self.reader {
+                                    r.stats_reset();
+                                }
+                                let m = match copy {
+                                    Some(p) => format!(
+                                        "Reading stats reset; the old ones are in {}",
+                                        p.file_name().unwrap_or_default().to_string_lossy()
+                                    ),
+                                    None => "Reading stats reset".to_owned(),
+                                };
+                                self.toast = Some((m, ui.input(|i| i.time) + 6.0));
+                            }
+                            Err(e) => self.set_error("reading stats", e),
+                        }
+                        close = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if close || !open {
+            self.reset_stats = false;
+        }
+    }
+
     /// The Keyboard shortcuts section of the Settings window.
     fn shortcuts_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
@@ -4091,8 +4218,6 @@ impl App {
                     .weak()
                     .small(),
                 );
-                // Taller than the rest of the window: it scrolls.
-                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
                 egui::Grid::new("shortcut-grid")
                     .num_columns(3)
                     .spacing([12.0, 4.0])
@@ -4132,7 +4257,7 @@ impl App {
                                 if ui
                                     .add_enabled(
                                         self.shortcuts.get(a).is_some(),
-                                        egui::Button::new("✖").small(),
+                                        egui::Button::new(icons::glyph(ui.ctx(), X, false)).small(),
                                     )
                                     .on_hover_text("No keys")
                                     .clicked()
@@ -4145,7 +4270,7 @@ impl App {
                                 if ui
                                     .add_enabled(
                                         !self.shortcuts.is_default(a),
-                                        egui::Button::new("⟲").small(),
+                                        egui::Button::new(icons::glyph(ui.ctx(), ARROW_COUNTER_CLOCKWISE, false)).small(),
                                     )
                                     .on_hover_text("Back to the default")
                                     .clicked()
@@ -4164,7 +4289,6 @@ impl App {
                             ui.end_row();
                         }
                     });
-                });
                 if let Some(n) = &self.shortcut_note {
                     ui.colored_label(palette::warn(), n);
                 }
@@ -4347,7 +4471,7 @@ impl App {
 
                 ui.horizontal(|ui| {
                     ui.strong("Word lists");
-                    if ui.button("📂 Import TXT…").clicked()
+                    if ui.button(icons::rich(ui, format!("{FOLDER_OPEN} Import TXT…"))).clicked()
                         && let Some(paths) = rfd::FileDialog::new()
                             .add_filter("Word lists", &["txt", "csv", "tsv"])
                             .add_filter("All files", &["*"])
@@ -4378,7 +4502,7 @@ impl App {
                                 for (i, l) in k.settings.lists.iter().enumerate() {
                                     ui.label(&l.name).on_hover_text(l.path.display().to_string());
                                     ui.label(format!("{} words", fmt_int(l.words.len() as u64)));
-                                    if ui.small_button("✖").on_hover_text("Remove this list").clicked() {
+                                    if ui.small_button(icons::glyph(ui.ctx(), X, false)).on_hover_text("Remove this list").clicked() {
                                         remove = Some(i);
                                     }
                                     ui.end_row();
@@ -4424,7 +4548,7 @@ impl App {
                                 // Newest first.
                                 for w in k.settings.marked.iter().rev() {
                                     if ui
-                                        .small_button(format!("{w} ✖"))
+                                        .small_button(icons::rich(ui, format!("{w} {X}")))
                                         .on_hover_text("Unmark")
                                         .clicked()
                                     {
@@ -4441,10 +4565,11 @@ impl App {
                 ui.separator();
                 ui.strong(format!("Books read ({})", fmt_int(k.settings.read.len() as u64)));
                 if k.settings.read.is_empty() {
-                    ui.label(
-                        RichText::new("Mark a book read with ✔ in the Library to count its most frequent words as known.")
+                    ui.label(icons::rich(
+                        ui,
+                        RichText::new(format!("Mark a book read with {CHECK} in the Library to count its most frequent words as known."))
                             .weak(),
-                    );
+                    ));
                 } else {
                     let mut unread = None;
                     egui::ScrollArea::vertical()
@@ -4454,7 +4579,7 @@ impl App {
                             ui.horizontal_wrapped(|ui| {
                                 for b in k.settings.read.iter().rev() {
                                     if ui
-                                        .small_button(format!("{} ✖", b.title))
+                                        .small_button(icons::rich(ui, format!("{} {X}", b.title)))
                                         .on_hover_text(format!(
                                             "{} words ({}% of those read {}+ times), marked read {}. Click to unmark it and take them back.",
                                             fmt_int(b.words.len() as u64),
@@ -4474,7 +4599,7 @@ impl App {
                     }
                 }
                 if let Some(e) = &k.error {
-                    ui.colored_label(palette::error(), format!("⚠ {e}"));
+                    ui.label(icons::rich(ui, RichText::new(format!("{WARNING} {e}")).color(palette::error())));
                 }
 
                 ui.separator();
@@ -4684,7 +4809,7 @@ fn stat_tile_info(
                         .strong(),
                 );
                 ui.add_space(2.0);
-                ui.label(RichText::new(sub).color(palette::weak()));
+                ui.label(icons::rich(ui, RichText::new(sub).color(palette::weak())));
             });
         })
         .response
@@ -4729,7 +4854,7 @@ fn share_bar(ui: &mut egui::Ui, label: &str, f: f32) {
 }
 
 /// The Overview's explanation of the writing-style rating.
-const STYLE_HOVER: &str = "How hard the prose is to read when you know its words: sentence structure, written and classical register, rhetoric and description, what you must infer. Rated by a local AI model (Qwen3.5-4B) from four samples of 3,000 characters. The percentage compares it with the rated books in your Library: 50% is their median, and 9 in 10 of them fall between 5% and 95%. The word after it (plain, typical, literary, very literary) is the model's own judgment, the same for everyone. It counts toward the difficulty with the weight set in Settings (⚙), where it can be turned off.";
+const STYLE_HOVER: &str = "How hard the prose is to read when you know its words: sentence structure, written and classical register, rhetoric and description, what you must infer. Rated by a local AI model (Qwen3.5-4B) from four samples of 3,000 characters. The percentage compares it with the rated books in your Library: 50% is their median, and 9 in 10 of them fall between 5% and 95%. The word after it (plain, typical, literary, very literary) is the model's own judgment, the same for everyone. It counts toward the difficulty with the weight set in Settings (\u{e270}), where it can be turned off.";
 
 impl App {
     /// The writing-style scale fitted to the rated books of the Library
@@ -4778,9 +4903,12 @@ impl App {
             .unwrap_or(0);
         if rec > 0 {
             let msg = format!(
-                "💡 {rec} likely names/terms are being split by the segmenter, which inflates unique words. Review them in Suggested words."
+                "{LIGHTBULB} {rec} likely names/terms are being split by the segmenter, which inflates unique words. Review them in Suggested words."
             );
-            if ui.link(RichText::new(msg).color(palette::warn())).clicked() {
+            if ui
+                .link(icons::rich(ui, RichText::new(msg).color(palette::warn())))
+                .clicked()
+            {
                 self.tab = Tab::Suggestions;
             }
             ui.add_space(4.0);
@@ -4837,7 +4965,7 @@ impl App {
                         }
                         if reader::opens(r.format) && self.path.is_some() {
                             read_book = ui
-                                .button(RichText::new("📕 Read").size(15.0))
+                                .button(icons::rich(ui, RichText::new(format!("{BOOK_OPEN} Read")).size(15.0)))
                                 .on_hover_text("Read the book in the reader")
                                 .clicked();
                             export_audiobook = ui
@@ -4848,7 +4976,7 @@ impl App {
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                     save_image = ui
-                        .add_enabled(!image_busy, egui::Button::new("🖼 Save as image…"))
+                        .add_enabled(!image_busy, egui::Button::new(icons::rich(ui, format!("{IMAGE} Save as image…"))))
                         .on_hover_text("Save this Overview as a picture (PNG): the cover, figures, difficulty and the most frequent unknown words")
                         .on_disabled_hover_text("An image is being saved")
                         .clicked();
@@ -4876,7 +5004,7 @@ impl App {
                     &format!(
                         "{} occur only once{}",
                         fmt_int(r.words_hapax as u64),
-                        if skip_hapax { " · left out (⚙)" } else { "" }
+                        if skip_hapax { " · left out (\u{e270})" } else { "" }
                     ),
                 );
                 if let Some((value, hover)) = &style_info
@@ -4887,7 +5015,7 @@ impl App {
                     let explain = |ui: &mut egui::Ui| {
                         ui.label(hover);
                         ui.add_space(4.0);
-                        ui.label(RichText::new(STYLE_HOVER).weak());
+                        ui.label(icons::rich(ui, RichText::new(STYLE_HOVER).weak()));
                     };
                     stat_tile_info(
                         ui,
@@ -4929,7 +5057,7 @@ impl App {
                     let unknown = rw.not_known();
                     let hapax_note = if c.hapax_left_out > 0 {
                         format!(
-                            "{} words that occur only once are left out of these numbers, known or not (Settings, ⚙).\n\n",
+                            "{} words that occur only once are left out of these numbers, known or not (Settings, {GEAR}).\n\n",
                             fmt_int(c.hapax_left_out)
                         )
                     } else {
@@ -4972,14 +5100,14 @@ impl App {
                         if let Some((_, hover)) = &style_info {
                             ui.label(hover);
                             if styled {
-                                ui.label(format!(
-                                    "{:.1}% of running words known, {} {:.1} points for the writing style (weight in Settings, ⚙): counts as {counted:.1}%.",
+                                ui.label(icons::rich(ui, format!(
+                                    "{:.1}% of running words known, {} {:.1} points for the writing style (weight in Settings, {GEAR}): counts as {counted:.1}%.",
                                     rw.percent(),
                                     if style_off > 0.0 { "less" } else { "plus" },
                                     style_off.abs()
-                                ));
+                                )));
                             }
-                            ui.label(RichText::new(STYLE_HOVER).weak().small());
+                            ui.label(icons::rich(ui, RichText::new(STYLE_HOVER).weak().small()));
                             ui.separator();
                         }
                         ui.label("From the share of running words you know:");
@@ -5038,12 +5166,13 @@ impl App {
                     (true, false) => format!("{anki_part}, or {list_part}"),
                     (false, _) => list_part,
                 };
-                ui.label(
+                ui.label(icons::rich(
+                    ui,
                     RichText::new(format!(
-                        "Known = {known_def}. A character is known if it appears in a known word. Click ⓘ on the last two tiles for details."
+                        "Known = {known_def}. A character is known if it appears in a known word. Click {INFO} on the last two tiles for details."
                     ))
                     .weak(),
-                );
+                ));
                 ui.add_space(10.0);
             }
 
@@ -5781,7 +5910,7 @@ impl App {
             if ui
                 .add_enabled(
                     n_sel > 0 && self.job.is_none(),
-                    egui::Button::new(format!("✔ Apply {n_sel} selected")),
+                    egui::Button::new(icons::rich(ui, format!("{CHECK} Apply {n_sel} selected"))),
                 )
                 .clicked()
             {
@@ -6084,7 +6213,7 @@ const METHOD: &[&str] = &[
 const LIBRARY_SEARCH_HOVER: &str = "Filters by title and file name. Letters need only appear in order (hp finds Harry Potter); \
      several words must all match. With * (any characters) or ? (one character) a word must match the whole title or \
      file name: 三体* starts with 三体, *.txt ends with .txt. Case is ignored and 三體 finds 三体. On Books, your own \
-     Text columns (☷ Columns…) are searched too, each word in any of them. Esc clears it.";
+     Text columns (\u{e546} Columns…) are searched too, each word in any of them. Esc clears it.";
 
 impl App {
     /// Every book analysed before, as recorded when its analysis (or what
@@ -6113,19 +6242,19 @@ impl App {
             if self.history_tab != HistTab::Stats {
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut self.library_filter)
-                        .hint_text("🔍 Search")
+                        .hint_text(icons::rich(ui, format!("{MAGNIFYING_GLASS} Search")))
                         .desired_width(180.0),
                 )
-                .on_hover_text(self.shortcuts.hint(ctx, Action::Filter, "Search the Library (ⓘ: how)"));
+                .on_hover_text(icons::rich(ui, self.shortcuts.hint(ctx, Action::Filter, &format!("Search the Library ({INFO}: how)"))));
                 Self::focus_filter_box(&mut self.focus_filter, ui, &r, &self.library_filter);
                 if (r.has_focus() || r.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     self.library_filter.clear();
                 }
                 info_button(ui, |ui| {
-                    ui.label(LIBRARY_SEARCH_HOVER);
+                    ui.label(icons::rich(ui, LIBRARY_SEARCH_HOVER));
                 });
                 if !self.library_filter.is_empty()
-                    && ui.small_button("✖").on_hover_text("Clear the search").clicked()
+                    && ui.small_button(icons::glyph(ui.ctx(), X, false)).on_hover_text("Clear the search").clicked()
                 {
                     self.library_filter.clear();
                 }
@@ -6155,7 +6284,7 @@ impl App {
                 }
                 let busy = self.batch.as_ref().is_some_and(|b| b.mode != BatchMode::Auto);
                 let r = ui
-                    .add_enabled(!busy && can > 0, egui::Button::new("⟳ Recalculate library"))
+                    .add_enabled(!busy && can > 0, egui::Button::new(icons::rich(ui, format!("{ARROW_CLOCKWISE} Recalculate library"))))
                     .on_hover_text(hover)
                     .on_disabled_hover_text(if busy {
                         "Books are being analysed: wait for them, or stop them in the status bar"
@@ -6184,8 +6313,14 @@ impl App {
         if let Some(e) = &self.history_error {
             let mut dismiss = false;
             ui.horizontal(|ui| {
-                dismiss = ui.small_button("✖").on_hover_text("Dismiss").clicked();
-                ui.colored_label(palette::warn(), format!("⚠ {e}"));
+                dismiss = ui
+                    .small_button(icons::glyph(ui.ctx(), X, false))
+                    .on_hover_text("Dismiss")
+                    .clicked();
+                ui.label(icons::rich(
+                    ui,
+                    RichText::new(format!("{WARNING} {e}")).color(palette::warn()),
+                ));
             });
             if dismiss {
                 self.history_error = None;
@@ -6375,14 +6510,17 @@ fn sort_header<C: Copy + PartialEq>(
     first_desc: bool,
 ) -> Option<(C, bool)> {
     let arrow = match (col == c, desc) {
-        (false, _) => "",
-        (true, true) => " ⏷",
-        (true, false) => " ⏶",
+        (false, _) => String::new(),
+        (true, true) => format!(" {CARET_DOWN}"),
+        (true, false) => format!(" {CARET_UP}"),
     };
     let r = ui
         .add(
-            egui::Label::new(RichText::new(format!("{title}{arrow}")).strong())
-                .sense(egui::Sense::click()),
+            egui::Label::new(icons::rich(
+                ui,
+                RichText::new(format!("{title}{arrow}")).strong(),
+            ))
+            .sense(egui::Sense::click()),
         )
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     if r.hovered() {
@@ -6406,7 +6544,7 @@ fn sort_header<C: Copy + PartialEq>(
 fn info_button(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) -> egui::Response {
     let r = ui
         .add(
-            egui::Button::new(RichText::new("ⓘ").weak())
+            egui::Button::new(icons::glyph(ui.ctx(), INFO, false).weak())
                 .frame(false)
                 .small(),
         )
@@ -7271,9 +7409,9 @@ impl App {
         });
         if read_mode {
             ui.horizontal_wrapped(|ui| {
-                let hover = "The rule ✔ Mark read uses (one setting: changing it here changes the Mark read default too). \
+                let hover = "The rule \u{e182} Mark read uses (one setting: changing it here changes the Mark read default too). \
                              A word none of the books teaches on its own is learned once met this many times in two or more books.";
-                ui.label("A book teaches the").on_hover_text(hover);
+                ui.label("A book teaches the").on_hover_text(icons::rich(ui, hover));
                 changed |= ui
                     .add(egui::DragValue::new(&mut st.read_percent).range(1..=100).suffix("%"))
                     .on_hover_text(hover)
@@ -7287,8 +7425,8 @@ impl App {
                     )
                     .on_hover_text(hover)
                     .changed();
-                ui.label("times; words met that often across books are learned too (as ✔ Mark read).")
-                    .on_hover_text(hover);
+                ui.label(icons::rich(ui, format!("times; words met that often across books are learned too (as {CHECK} Mark read).")))
+                    .on_hover_text(icons::rich(ui, hover));
             });
         }
         if !read_mode {
@@ -7350,7 +7488,10 @@ impl App {
             self.plan.error = Some(e);
         }
         if let Some(e) = &self.plan.error {
-            ui.colored_label(palette::warn(), format!("⚠ {e}"));
+            ui.label(icons::rich(
+                ui,
+                RichText::new(format!("{WARNING} {e}")).color(palette::warn()),
+            ));
         }
 
         let have = self.plan_have();
@@ -7678,7 +7819,7 @@ impl App {
             .column(Column::remainder())
             .header(24.0, |mut h| {
                 let mut heads: Vec<(&str, &str)> = if reading_mode { vec![
-                    ("#", "Reading order. ⏶⏷ set your own order; the planner's is shown alongside. A book you have started comes first (📖)"),
+                    ("#", "Reading order. \u{e13c}\u{e136} set your own order; the planner's is shown alongside. A book you have started comes first (\u{e0e6})"),
                     ("Book", "Click a title to open the book"),
                     ("Known now", "Running words you know now (names left out)"),
                     ("When reached", "Running words known when the path reaches the book, before reading it"),
@@ -7688,7 +7829,7 @@ impl App {
                     ("From earlier", "Words of this book you don't know now that the path teaches before it"),
                     ("", ""),
                 ] } else { vec![
-                    ("#", "Reading order. ⏶⏷ set your own order; the planner's is shown alongside"),
+                    ("#", "Reading order. \u{e13c}\u{e136} set your own order; the planner's is shown alongside"),
                     ("Book", "Click a title to open the book"),
                     ("Known now", "Running words you know now (names left out)"),
                     ("When reached", "Running words known when the path reaches the book, before studying for it"),
@@ -7709,13 +7850,13 @@ impl App {
                         2,
                         (
                             "Writing style",
-                            "How hard the prose is when you know its words (⚙); a book above typical gets a higher target, one below a lower",
+                            "How hard the prose is when you know its words (\u{e270}); a book above typical gets a higher target, one below a lower",
                         ),
                     );
                 }
                 for (t, hover) in heads {
                     h.col(|ui| {
-                        ui.strong(t).on_hover_text(hover);
+                        ui.strong(t).on_hover_text(icons::rich(ui, hover));
                     });
                 }
             })
@@ -7731,7 +7872,7 @@ impl App {
                         let after_volume = i > 0 && lib.precedes(path.steps[i - 1].book, s.book);
                         let before_volume = i + 1 < n && lib.precedes(s.book, path.steps[i + 1].book);
                         if ui
-                            .add_enabled(i > 0 && !after_volume, egui::Button::new("⏶").small())
+                            .add_enabled(i > 0 && !after_volume, egui::Button::new(icons::glyph(ui.ctx(), CARET_UP, false)).small())
                             .on_hover_text("Read earlier")
                             .on_disabled_hover_text(if after_volume { "The book above is an earlier volume of its series" } else { "" })
                             .clicked()
@@ -7739,7 +7880,7 @@ impl App {
                             act = Some(PlanAction::Move(i, -1));
                         }
                         if ui
-                            .add_enabled(i + 1 < n && !before_volume, egui::Button::new("⏷").small())
+                            .add_enabled(i + 1 < n && !before_volume, egui::Button::new(icons::glyph(ui.ctx(), CARET_DOWN, false)).small())
                             .on_hover_text("Read later")
                             .on_disabled_hover_text(if before_volume { "The book below is a later volume of its series" } else { "" })
                             .clicked()
@@ -7780,7 +7921,7 @@ impl App {
                         );
                         // A book started: where the reader is.
                         if let Some(f) = s.from {
-                            ui.label(RichText::new(format!("📖 {:.0}%", f * 100.0)).strong())
+                            ui.label(icons::rich(ui, RichText::new(format!("{BOOK_OPEN} {:.0}%", f * 100.0)).strong()))
                                 .on_hover_text("You are reading it: it comes first, and its figures are for the rest of it");
                         }
                         match e.filter(|e| exists.get(&e.path)) {
@@ -7914,21 +8055,21 @@ impl App {
                             )
                         };
                         if ui
-                            .add_enabled(any, egui::Button::new("💾").small())
+                            .add_enabled(any, egui::Button::new(icons::glyph(ui.ctx(), FLOPPY_DISK, false)).small())
                             .on_hover_text(hover)
                             .clicked()
                         {
                             act = Some(PlanAction::SaveList(i));
                         }
                         if ui
-                            .small_button("✔")
+                            .small_button(icons::glyph(ui.ctx(), CHECK, false))
                             .on_hover_text("Mark it read: its most frequent words count as known, and it leaves the path")
                             .clicked()
                         {
                             act = Some(PlanAction::MarkRead(b.id.clone()));
                         }
                         if ui
-                            .small_button("✖")
+                            .small_button(icons::glyph(ui.ctx(), X, false))
                             .on_hover_text("Leave it out of the path without marking it read")
                             .clicked()
                         {
@@ -7949,7 +8090,10 @@ impl App {
                         ))
                         .weak(),
                     )
-                    .on_hover_text("Unmark one with its ✔ in the Library's Books tab");
+                    .on_hover_text(icons::rich(
+                        ui,
+                        format!("Unmark one with its {CHECK} in the Library's Books tab"),
+                    ));
                 }
                 if left_out.is_empty() {
                     return;
@@ -7957,7 +8101,7 @@ impl App {
                 ui.label(RichText::new(format!("Left out ({}):", left_out.len())).weak());
                 for (id, title) in &left_out {
                     if ui
-                        .small_button(format!("↩ {title}"))
+                        .small_button(icons::rich(ui, format!("{ARROW_U_UP_LEFT} {title}")))
                         .on_hover_text("Put it back on the path")
                         .clicked()
                     {
@@ -8101,14 +8245,14 @@ fn speed_input(
                 .speed(step)
                 .suffix(suffix),
         )
-        .on_hover_text("This book only, to try another speed. The default is your speed measured in the reader, or the one set in Settings (⚙)")
+        .on_hover_text(icons::rich(ui, format!("This book only, to try another speed. The default is your speed measured in the reader, or the one set in Settings ({GEAR})")))
         .changed()
     {
         *speed = Some(v);
     }
     if speed.is_some_and(|s| s != default)
         && ui
-            .small_button("↺")
+            .small_button(icons::glyph(ui.ctx(), ARROW_COUNTER_CLOCKWISE, false))
             .on_hover_text(format!("Back to the default, {default:.0}{suffix}"))
             .clicked()
     {

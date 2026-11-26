@@ -3346,7 +3346,7 @@ fn goal_sound_settings() {
         "Play a sound when it's met",
         "Voice",
         "Built in (Citrus)",
-        "▶ Play",
+        &format!("{} Play", crate::icons::PLAY),
     ] {
         assert!(texts.iter().any(|t| t == want), "{want:?} not in {texts:?}");
     }

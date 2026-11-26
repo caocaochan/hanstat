@@ -4,6 +4,7 @@
 //! cards and charts.
 
 use crate::charts::{self, Bar, CalDay};
+use crate::icons::{self, BOOK_OPEN, CARET_LEFT, CARET_RIGHT};
 use crate::library_stats::{Tile, card, tile_grid};
 use crate::reader::stats_mins as mins;
 use crate::reading_stats::{self as rs, Day, Summary};
@@ -293,7 +294,10 @@ impl App {
             ui.separator();
             let name = view.unit.name();
             if ui
-                .add_enabled(p.start > first_day, egui::Button::new("‹"))
+                .add_enabled(
+                    p.start > first_day,
+                    egui::Button::new(icons::glyph(ui.ctx(), CARET_LEFT, false)),
+                )
                 .on_hover_text(format!("The {name} before"))
                 .clicked()
             {
@@ -301,7 +305,10 @@ impl App {
             }
             ui.label(RichText::new(p.label()).strong());
             if ui
-                .add_enabled(p.end <= sum.today, egui::Button::new("›"))
+                .add_enabled(
+                    p.end <= sum.today,
+                    egui::Button::new(icons::glyph(ui.ctx(), CARET_RIGHT, false)),
+                )
                 .on_hover_text(format!("The {name} after"))
                 .clicked()
             {
@@ -322,13 +329,14 @@ impl App {
             if problem.is_some() {
                 return;
             }
-            ui.label(
-                RichText::new(
-                    "Nothing timed yet. Open a book with 📕 Read: the reader times your reading and counts \
+            ui.label(icons::rich(
+                ui,
+                RichText::new(format!(
+                    "Nothing timed yet. Open a book with {BOOK_OPEN} Read: the reader times your reading and counts \
                      the Chinese characters you page past (P pauses it). Your time, speed and streaks show here.",
-                )
+                ))
                 .color(palette::weak()),
-            );
+            ));
             return;
         }
         let before = period;
@@ -396,7 +404,10 @@ impl App {
             {
                 ui.horizontal(|ui| {
                     if ui
-                        .add_enabled(year > first_year, egui::Button::new("‹"))
+                        .add_enabled(
+                            year > first_year,
+                            egui::Button::new(icons::glyph(ui.ctx(), CARET_LEFT, false)),
+                        )
                         .on_hover_text("The year before")
                         .clicked()
                     {
@@ -404,7 +415,10 @@ impl App {
                     }
                     ui.label(RichText::new(year.to_string()).strong());
                     if ui
-                        .add_enabled(year < this_year, egui::Button::new("›"))
+                        .add_enabled(
+                            year < this_year,
+                            egui::Button::new(icons::glyph(ui.ctx(), CARET_RIGHT, false)),
+                        )
                         .on_hover_text("The year after")
                         .clicked()
                     {

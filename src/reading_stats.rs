@@ -439,20 +439,34 @@ struct Store {
     speed: Option<(u64, i32, Option<f64>)>,
 }
 
-static STORE: LazyLock<Mutex<Store>> = LazyLock::new(|| {
-    Mutex::new(Store {
-        stats: ReadingStats::default(),
-        loaded: false,
-        revision: 1,
-        dirty: BTreeSet::new(),
-        removed: BTreeSet::new(),
-        meta_dirty: false,
-        places_dirty: BTreeSet::new(),
-        places_removed: BTreeSet::new(),
-        broken: None,
-        speed: None,
-    })
-});
+impl Store {
+    fn new() -> Store {
+        Store {
+            stats: ReadingStats::default(),
+            loaded: false,
+            revision: 1,
+            dirty: BTreeSet::new(),
+            removed: BTreeSet::new(),
+            meta_dirty: false,
+            places_dirty: BTreeSet::new(),
+            places_removed: BTreeSet::new(),
+            broken: None,
+            speed: None,
+        }
+    }
+
+    /// Every book's stats gone (to be deleted at the next save); places,
+    /// goals and settings kept.
+    fn clear_books(&mut self) {
+        let ids: Vec<String> = self.stats.books.keys().cloned().collect();
+        self.stats.books.clear();
+        self.dirty.clear();
+        self.removed.extend(ids);
+        self.revision += 1;
+    }
+}
+
+static STORE: LazyLock<Mutex<Store>> = LazyLock::new(|| Mutex::new(Store::new()));
 
 fn path() -> std::path::PathBuf {
     hanstat::models::app_dir().join(DB_FILE)
@@ -525,6 +539,48 @@ pub fn remove_book(id: &str) {
     s.revision += 1;
     s.dirty.remove(id);
     s.removed.insert(id.to_owned());
+}
+
+/// Remove every book's reading stats: time, characters, days, sessions and
+/// the first-read and finished dates. Where each book was left, the goals
+/// and the settings stay. The saved database is copied first, and nothing
+/// is removed if that fails; the copy's path is returned (`None`: nothing
+/// was saved yet). A book open in the reader must restart its session
+/// (`Tracker::restart`).
+pub fn reset_all() -> Result<Option<std::path::PathBuf>, String> {
+    if let Some(msg) = problem() {
+        return Err(msg);
+    }
+    save()?;
+    flush();
+    let p = path();
+    let backup = if cfg!(test) || !p.exists() {
+        None
+    } else {
+        Some(backup(&p)?)
+    };
+    store().clear_books();
+    save()?;
+    Ok(backup)
+}
+
+/// A copy of the database at `p`, beside it: `reading-stats-before-reset-
+/// <date>.sqlite` (then `-2`, `-3`… on the same day).
+fn backup(p: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let day = local_day(now(), with(|s| s.settings.day_start_hour));
+    let dir = p.parent().unwrap_or(std::path::Path::new("."));
+    let stem = format!("reading-stats-before-reset-{}", date(day));
+    let mut out = dir.join(format!("{stem}.sqlite"));
+    let mut n = 2;
+    while out.exists() {
+        out = dir.join(format!("{stem}-{n}.sqlite"));
+        n += 1;
+    }
+    let c = rusqlite::Connection::open_with_flags(p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("Cannot copy the reading stats: {e}"))?;
+    c.execute("VACUUM INTO ?1", [out.to_string_lossy()])
+        .map_err(|e| format!("Cannot copy the reading stats to {}: {e}", out.display()))?;
+    Ok(out)
 }
 
 /// Book `old` is now book `new` (its file was rebuilt, so its Library id
@@ -1533,6 +1589,54 @@ mod tests {
         };
         db::write(&mut c, &moved).unwrap();
         assert_eq!(db::read(&c).unwrap(), s);
+    }
+
+    #[test]
+    fn resetting_clears_every_book_and_keeps_places_and_goals() {
+        let mut st = Store::new();
+        st.stats = sample();
+        st.dirty.insert("lib-1".into());
+        let rev = st.revision;
+        st.clear_books();
+        assert!(st.stats.books.is_empty());
+        assert!(st.dirty.is_empty());
+        assert_eq!(
+            st.removed.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["C:\\书\\b.epub", "lib-1"]
+        );
+        assert!(st.revision > rev);
+        let kept = sample();
+        assert_eq!(st.stats.places, kept.places);
+        assert_eq!(st.stats.goals, kept.goals);
+        assert_eq!(st.stats.settings, kept.settings);
+        // Written: the books are gone from the database, the place stays.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("reading-stats.sqlite");
+        let mut c = db::open(&p).unwrap();
+        db::write(&mut c, &batch_all(&kept)).unwrap();
+        // The copy taken first has everything, under a new name each time.
+        let a = backup(&p).unwrap();
+        let b = backup(&p).unwrap();
+        assert_ne!(a, b);
+        assert!(
+            b.to_string_lossy().ends_with("-2.sqlite"),
+            "{}",
+            b.display()
+        );
+        assert_eq!(db::read(&db::open(&a).unwrap()).unwrap(), kept);
+        let removed = db::Batch {
+            books: vec![],
+            removed: st.removed.iter().cloned().collect(),
+            meta: None,
+            places: vec![],
+            places_removed: vec![],
+        };
+        db::write(&mut c, &removed).unwrap();
+        let after = db::read(&c).unwrap();
+        assert!(after.books.is_empty());
+        assert_eq!(after.places, kept.places);
+        assert_eq!(after.goals, kept.goals);
+        assert_eq!(db::read(&db::open(&a).unwrap()).unwrap(), kept);
     }
 
     #[test]

@@ -11,7 +11,7 @@ mod dicts_ui;
 pub(crate) mod epub;
 pub(crate) mod fonts;
 mod goal_sound;
-pub(crate) mod icons;
+pub(crate) use crate::icons;
 mod images;
 mod layout;
 mod markup;
@@ -1775,7 +1775,10 @@ impl Reader {
         let mut play_page = false;
         ui.horizontal(|ui| {
             if ui
-                .button(RichText::new("‹ Back").size(15.0))
+                .button(icons::rich(
+                    ui,
+                    RichText::new(format!("{} Back", icons::CARET_LEFT)).size(15.0),
+                ))
                 .on_hover_text("Back to the statistics (Esc)")
                 .clicked()
             {
@@ -1993,46 +1996,52 @@ impl Reader {
         let numbers_col = number_w.iter().copied().fold(0.0, f32::max);
         let text = ui.visuals().text_color();
         let muted = theme::get(ui.ctx()).muted;
-        let menu = ui.menu_button(RichText::new("☰ Contents").size(15.0), |ui| {
-            egui::ScrollArea::vertical()
-                .max_height(ui.ctx().content_rect().height() * 0.7)
-                .show(ui, |ui| {
-                    for (i, e) in self.epub.toc.iter().enumerate() {
-                        let mut job = egui::text::LayoutJob::default();
-                        job.append(
-                            &self.toc_labels[i],
-                            indent(e),
-                            egui::TextFormat::simple(font.clone(), text),
-                        );
-                        // Gap to the numbers' column, numbers right-aligned in it.
-                        let gap = (names_col - indent(e) - name_w[i]).max(0.0)
-                            + 28.0
-                            + (numbers_col - number_w[i]);
-                        job.append(
-                            &numbers[i],
-                            gap,
-                            egui::TextFormat {
-                                valign: egui::Align::Center,
-                                ..egui::TextFormat::simple(small.clone(), muted)
-                            },
-                        );
-                        let r = ui
-                            .selectable_label(current == Some(i), job)
-                            .on_hover_text("Its length: Chinese characters, letters and digits");
-                        // Opened at the reader's place.
-                        if scroll && current == Some(i) {
-                            r.scroll_to_me(Some(egui::Align::Center));
+        let menu = ui.menu_button(
+            icons::rich(
+                ui,
+                RichText::new(format!("{} Contents", icons::LIST)).size(15.0),
+            ),
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(ui.ctx().content_rect().height() * 0.7)
+                    .show(ui, |ui| {
+                        for (i, e) in self.epub.toc.iter().enumerate() {
+                            let mut job = egui::text::LayoutJob::default();
+                            job.append(
+                                &self.toc_labels[i],
+                                indent(e),
+                                egui::TextFormat::simple(font.clone(), text),
+                            );
+                            // Gap to the numbers' column, numbers right-aligned in it.
+                            let gap = (names_col - indent(e) - name_w[i]).max(0.0)
+                                + 28.0
+                                + (numbers_col - number_w[i]);
+                            job.append(
+                                &numbers[i],
+                                gap,
+                                egui::TextFormat {
+                                    valign: egui::Align::Center,
+                                    ..egui::TextFormat::simple(small.clone(), muted)
+                                },
+                            );
+                            let r = ui.selectable_label(current == Some(i), job).on_hover_text(
+                                "Its length: Chinese characters, letters and digits",
+                            );
+                            // Opened at the reader's place.
+                            if scroll && current == Some(i) {
+                                r.scroll_to_me(Some(egui::Align::Center));
+                            }
+                            if i == 5 {
+                                toc_item = Some(r.rect);
+                            }
+                            if r.clicked() {
+                                go = Some(i);
+                                ui.close();
+                            }
                         }
-                        if i == 5 {
-                            toc_item = Some(r.rect);
-                        }
-                        if r.clicked() {
-                            go = Some(i);
-                            ui.close();
-                        }
-                    }
-                });
-        });
+                    });
+            },
+        );
         self.probe.contents = Some(menu.response.rect);
         self.probe.toc_item = toc_item;
         self.contents_shown = menu.inner.is_some();
@@ -2082,7 +2091,7 @@ impl Reader {
                 let mut items = Vec::new();
                 let button = ui.add(
                     egui::Button::new(theme::THEMES[current].name)
-                        .right_text("⏷")
+                        .right_text(icons::glyph(ui.ctx(), icons::CARET_DOWN, false))
                         .min_size(vec2(220.0, 0.0)),
                 );
                 egui::Popup::menu(&button)
@@ -2106,7 +2115,7 @@ impl Reader {
                 let button = ui
                     .add(
                         egui::Button::new(current.map_or("Same as pages", |i| theme::THEMES[i].name))
-                            .right_text("⏷")
+                            .right_text(icons::glyph(ui.ctx(), icons::CARET_DOWN, false))
                             .min_size(vec2(220.0, 0.0)),
                     )
                     .on_hover_text("The dictionary popup's colours");

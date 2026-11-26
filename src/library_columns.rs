@@ -181,7 +181,7 @@ impl FieldType {
             FieldType::Text => "Text",
             FieldType::Number => "Number",
             FieldType::YesNo => "Yes/No",
-            FieldType::Rating => "Rating ★",
+            FieldType::Rating => "Rating \u{e46a}",
             FieldType::Date => "Date",
         }
     }
@@ -772,7 +772,7 @@ pub(crate) fn hover(c: HistCol) -> &'static str {
             "From the share of running words known (and the writing style, while rated), as on the Overview"
         }
         Style => {
-            "How hard the prose is when you know its words, rated by a local AI model (⚙). The percentage compares it with the Library's rated books (50% is their median); the word is the model's own judgment. Chinese books only"
+            "How hard the prose is when you know its words, rated by a local AI model (in Settings). The percentage compares it with the Library's rated books (50% is their median); the word is the model's own judgment. Chinese books only"
         }
         Time => "Reading time at the speeds set on the Overview",
         Analysed => "When the book was last analysed",

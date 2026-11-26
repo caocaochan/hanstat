@@ -1104,7 +1104,7 @@ impl Rater {
         if Running::left_over(&Running::path()) {
             let why = "Paused: hanstat closed while the writing-style model was loaded \
                        (a crash, or hanstat was ended). So that it can't crash again on every start, \
-                       rating waits for \"Rate the books without a rating\" in Settings (⚙).";
+                       rating waits for \"Rate the books without a rating\" in Settings.";
             log.line(why);
             shared.0.lock().unwrap().phase = Phase::Paused(why.into());
         }
@@ -1197,7 +1197,7 @@ fn run(shared: Shared, notify: impl Fn(), log: Log) {
     };
     let fail = |e: String| {
         log.line(format!(
-            "Rating stopped: {e}\nNothing more is rated until it is started again in Settings (⚙)."
+            "Rating stopped: {e}\nNothing more is rated until it is started again in Settings."
         ));
         set(Phase::Failed(e));
     };

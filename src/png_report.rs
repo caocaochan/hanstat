@@ -89,6 +89,7 @@ pub(crate) static WENKAI: &[u8] = include_bytes!("../assets/fonts/LXGWWenKai-Med
 /// (Windows), ahead of the regular fonts for what they lack; elsewhere the
 /// regular ones. Book titles: the bundled LXGW WenKai, then the bold family.
 fn add_fonts(defs: &mut egui::FontDefinitions) {
+    crate::icons::install(defs);
     let mut bold_family = Vec::new();
     #[cfg(windows)]
     {
@@ -214,7 +215,7 @@ fn pill(
     fg: Color32,
     bg: Color32,
 ) -> f32 {
-    let g = p.layout_no_wrap(s.to_owned(), bold(size), fg);
+    let g = p.layout_job(crate::icons::job(s, bold(size), fg, true));
     let pad = vec2(size * 0.75, size * 0.35);
     let r = Rect::from_min_size(
         pos2(left_center.x, left_center.y - g.size().y / 2.0 - pad.y),
@@ -1138,7 +1139,14 @@ impl App {
         }
         if read.is_some() {
             let c = palette::good();
-            x += pill(p, pos2(x, y), "✔ Read", 11.5, c, mix(c, look.card, 0.16)) + 6.0;
+            x += pill(
+                p,
+                pos2(x, y),
+                &format!("{} Read", crate::icons::CHECK),
+                11.5,
+                c,
+                mix(c, look.card, 0.16),
+            ) + 6.0;
         }
         if let Some(st) = style
             && x + 80.0 < r.right()

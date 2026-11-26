@@ -68,6 +68,7 @@ const NOT_ANALYSIS: &[&str] = &[
     "src/search.rs",
     "src/whats_new.rs",
     "src/reader",
+    "src/icons.rs",
     "src/reading_stats.rs",
     "src/dict",
     "src/duchinese",

@@ -69,7 +69,7 @@ impl StyleScale {
     pub(crate) fn hover(&self, score: f32) -> String {
         format!(
             "The model's rating: {score:.2} on its scale of 1 (plain) to 9 (near classical Chinese); typical {:.2}. \
-             It counts toward the difficulty with the weight set in ⚙.\n\
+             It counts toward the difficulty with the weight set in Settings.\n\
              {} against the {} rated books of your Library: 50% is their median ({:.2}).",
             hanstat::style::TYPICAL,
             self.pct(score),

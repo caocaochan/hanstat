@@ -15,6 +15,10 @@
 //! Before both, every idiom (`data/chengyu.txt`, either script) becomes one
 //! token, like a user-dictionary word: models cut idioms apart (若/有所思) and
 //! glue names to them (白柳若/有所思 → 白柳/若有所思).
+//! First of all, a token that mixes Han with other letters or digits is cut
+//! where the script changes (LTP glues a Latin name to the next character:
+//! Myself嗯 → Myself/嗯), unless the whole token is a dictionary word (AA制,
+//! B超, 4S店); a user or known word spanning the cut joins it again.
 
 use crate::ckip::Ckip;
 use crate::models;
@@ -353,12 +357,16 @@ impl Segmenter {
                     } else {
                         c.split_inclusive(|_| true).collect()
                     };
+                    let toks = split_scripts(toks);
                     self.force(c, self.merge_known(c, self.idioms(c, toks)))
                 })
                 .collect(),
             _ => chunks
                 .iter()
-                .map(|c| self.force(c, self.merge_known(c, self.idioms(c, self.cut_one(c)))))
+                .map(|c| {
+                    let toks = split_scripts(self.cut_one(c));
+                    self.force(c, self.merge_known(c, self.idioms(c, toks)))
+                })
                 .collect(),
         }
     }
@@ -404,6 +412,50 @@ impl Segmenter {
             s.split_inclusive(|_| true).collect()
         }
     }
+}
+
+/// `toks` with each token that mixes Han and other characters cut where the
+/// script changes (Myself嗯 → Myself/嗯, 3天 → 3/天), unless it is a
+/// dictionary word (AA制, B超). A combining mark stays with the character
+/// before it. Still slices of the same text, in order.
+fn split_scripts(toks: Vec<&str>) -> Vec<&str> {
+    let mixed = |t: &str| {
+        let mut han = t.chars().map(crate::chars::is_han);
+        let first = han.next().unwrap_or(false);
+        han.any(|h| h != first)
+    };
+    if !toks.iter().any(|t| mixed(t)) {
+        return toks;
+    }
+    let mut out = Vec::with_capacity(toks.len() + 1);
+    for t in toks {
+        if !mixed(t) || crate::lexicon::is_dictionary_word(t) {
+            out.push(t);
+            continue;
+        }
+        let mut start = 0;
+        let mut prev: Option<bool> = None;
+        for (i, c) in t.char_indices() {
+            let mark = matches!(
+                unicode_general_category::get_general_category(c),
+                unicode_general_category::GeneralCategory::NonspacingMark
+                    | unicode_general_category::GeneralCategory::SpacingMark
+                    | unicode_general_category::GeneralCategory::EnclosingMark
+            );
+            let han = if mark {
+                prev.unwrap_or(false)
+            } else {
+                crate::chars::is_han(c)
+            };
+            if prev.is_some_and(|p| p != han) {
+                out.push(&t[start..i]);
+                start = i;
+            }
+            prev = Some(han);
+        }
+        out.push(&t[start..]);
+    }
+    out
 }
 
 /// The idioms of `data/chengyu.txt` (Simplified), built once.
@@ -575,6 +627,44 @@ mod tests {
         .unwrap();
         let out = seg.cut_many(&[s]).pop().unwrap();
         assert!(out.contains(&"柳若"), "{out:?}");
+    }
+
+    #[test]
+    fn mixed_script_tokens_split_unless_words() {
+        // LTP glues a Latin name to the next character.
+        let s = "Myself嗯好吧";
+        assert_eq!(
+            split_scripts(tokens(s, &[7, 1, 1])),
+            ["Myself", "嗯", "好", "吧"]
+        );
+        // Digits likewise; kana too.
+        let s = "3天后の家";
+        assert_eq!(
+            split_scripts(tokens(s, &[2, 1, 2])),
+            ["3", "天", "后", "の", "家"]
+        );
+        // Dictionary words that mix scripts stay whole.
+        let s = "AA制B超4S店";
+        assert_eq!(
+            split_scripts(tokens(s, &[3, 2, 3])),
+            ["AA制", "B超", "4S店"]
+        );
+        // A mark stays with the character before it.
+        let s = "e\u{301}好";
+        assert_eq!(split_scripts(tokens(s, &[3])), ["e\u{301}", "好"]);
+        // Through the whole pipeline: a user word across the cut joins it again.
+        let s = "我上B站看";
+        let seg = Segmenter::new(
+            SegmenterKind::Jieba,
+            &["B站".to_owned()],
+            Variant::Simplified,
+        )
+        .unwrap();
+        let out = seg.cut_many(&[s]).pop().unwrap();
+        assert!(out.contains(&"B站"), "{out:?}");
+        let plain = Segmenter::new(SegmenterKind::Jieba, &[], Variant::Simplified).unwrap();
+        let out = plain.cut_many(&["Myself嗯"]).pop().unwrap();
+        assert!(out.iter().all(|t| *t != "Myself嗯"), "{out:?}");
     }
 
     #[test]

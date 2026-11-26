@@ -5,6 +5,7 @@
 //! The marks live in the known-words file, with the words they added, so
 //! unmarking a book takes back exactly those.
 
+use crate::icons::{self, CHECK, GEAR, WARNING};
 use crate::library_stats::{Tile, fmt_time, reading_minutes, tile_grid};
 use crate::{AnkiState, App, fmt_int};
 use eframe::egui::{self, RichText};
@@ -307,7 +308,7 @@ impl App {
                     });
                 }
                 if let Some(n) = &d.note {
-                    ui.colored_label(crate::palette::warn(), format!("⚠ {n}"));
+                    ui.label(icons::rich(ui, RichText::new(format!("{WARNING} {n}")).color(crate::palette::warn())));
                 }
                 if !new.is_empty() {
                     ui.add_space(4.0);
@@ -369,8 +370,8 @@ impl App {
                 }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    let label = if d.marked.is_some() { "Save" } else { "✔ Mark read" };
-                    if ui.add_enabled(dates.is_ok(), egui::Button::new(label)).clicked()
+                    let label = if d.marked.is_some() { "Save".to_owned() } else { format!("{CHECK} Mark read") };
+                    if ui.add_enabled(dates.is_ok(), egui::Button::new(icons::rich(ui, label))).clicked()
                     {
                         let words: Vec<String> = sel.iter().map(|(w, _)| w.clone()).collect();
                         act = Some(ReadAct::Mark(ReadBook {
@@ -540,10 +541,11 @@ impl App {
         ui.add_space(10.0);
         ui.label(RichText::new("Books read").size(16.0).strong());
         if marks.is_empty() {
-            ui.label(
-                RichText::new("None yet. Mark a book read with ✔ in the Read column of the Library's Books tab.")
+            ui.label(icons::rich(
+                ui,
+                RichText::new(format!("None yet. Mark a book read with {CHECK} in the Read column of the Library's Books tab."))
                     .weak(),
-            );
+            ));
             return;
         }
         let by_id: HashMap<&str, &history::Entry> =
@@ -590,7 +592,7 @@ impl App {
                 Tile::new(
                     "Time read",
                     RichText::new(fmt_time(read_mins)),
-                    "at the speeds set in ⚙".to_owned(),
+                    format!("at the speeds set in {GEAR}"),
                 ),
                 Tile::new(
                     "Words from them",

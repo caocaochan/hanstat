@@ -309,6 +309,19 @@ impl Tracker {
         }
     }
 
+    /// Every book's stats were reset: start a new session from `now`, with
+    /// nothing before it to add or take back. The page stays the base, so
+    /// turns from it count.
+    pub fn restart(&mut self, now: f64) {
+        self.session = None;
+        self.added.clear();
+        self.debt_before = 0;
+        self.totals = Day::default();
+        self.start = now;
+        self.since = now;
+        self.changed = false;
+    }
+
     /// Take this session out of the stats, and start a new one.
     pub fn discard(&mut self, s: &mut ReadingStats, now: f64) {
         let added = std::mem::take(&mut self.added);
@@ -750,6 +763,29 @@ mod tests {
         assert_eq!(b.debt, 50);
         assert!(b.sessions.is_empty());
         assert_eq!(f.t.totals, Day::default());
+    }
+
+    #[test]
+    fn after_a_reset_only_new_reading_counts() {
+        let mut f = Fx::new();
+        f.t.place(&mut f.s, at(0, 0, 0), &none, T0);
+        f.turn(40.0, at(0, 1, 500));
+        assert_eq!(f.s.books["b"].sessions.len(), 1);
+        // Every book's stats reset while the book is open.
+        f.s.books.clear();
+        f.t.restart(T0 + 45.0);
+        f.turn(70.0, at(0, 2, 800));
+        f.t.end(&mut f.s, T0 + 70.0);
+        let b = &f.s.books["b"];
+        assert_eq!(b.sessions.len(), 1);
+        assert_eq!(b.sessions[0].start, (T0 + 45.0) as u64);
+        assert_eq!(b.first_read, Some((T0 + 45.0) as u64));
+        assert_eq!(b.totals().read_chars, 300);
+        assert_eq!(b.totals().read_secs, 25.0);
+        assert_eq!(f.t.totals.read_chars, 300);
+        // Discarding the session takes back only what came after the reset.
+        f.t.discard(&mut f.s, T0 + 80.0);
+        assert_eq!(f.s.books["b"].totals(), Day::default());
     }
 
     #[test]

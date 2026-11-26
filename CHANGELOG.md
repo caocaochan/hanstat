@@ -1,5 +1,17 @@
 # Changelog
 
+## [2026.11.26.06] - 2026-11-26
+
+### Added
+- **Reset all reading stats.** **Settings › Reading stats** has **Reset all reading stats…**. It first shows how many books, hours and characters will go, then removes every book's reading time, characters, days and sessions, and with them the streaks and the speed measured in the Reader. Where you left each book, your daily goals, these settings and the books marked read are kept. A copy of the stats as they were is saved first in hanstat's folder as `reading-stats-before-reset-<date>.sqlite`. If a book is open in the Reader, its timing starts again from the reset.
+
+### Changed
+- **New icons.** The emoji and symbols used as icons are now Phosphor icons everywhere: the toolbar and status bar, Home, the Library, the Overview, Settings, DuChinese, the Reader and its dictionary popup, and the saved Overview image. They look the same on Windows, macOS and Linux, and the Settings gear in the status bar is larger.
+
+### Fixed
+- **Writing style can be reached in Settings.** With **Keyboard shortcuts** open, the Settings window grew taller than the screen, and only the shortcuts list scrolled. The whole window now scrolls, and the shortcuts list no longer has a scroll box of its own.
+- **Letters glued to Chinese characters no longer count as words.** When the segmenter joined Latin letters or digits to Chinese characters (Myself嗯, 地雷x1, 0点), the whole thing was counted as one Chinese word. Such tokens are now cut where the script changes, so only the Chinese part counts. Dictionary words that mix scripts, such as T恤, AA制, B超 and 4S店, stay whole, and so does a word in your user dictionary (for example B站). Every book is analysed again once after updating. On four test novels this removed between 4 and 1,175 such non-words per book, and changed nothing else.
+
 ## [2026.11.26.05] - 2026-11-26
 
 ### Added

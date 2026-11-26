@@ -1066,7 +1066,11 @@ impl Popup {
                                     let open = !dict.collapsed != lvl.bars.contains(&(gi, pi));
                                     let label = format!(
                                         "{} {}{}",
-                                        if open { "▾" } else { "▸" },
+                                        if open {
+                                            super::icons::CARET_DOWN
+                                        } else {
+                                            super::icons::CARET_RIGHT
+                                        },
                                         dict.title,
                                         if p.glossaries.len() > 1 {
                                             format!("  ×{}", p.glossaries.len())
@@ -1075,11 +1079,12 @@ impl Popup {
                                         }
                                     );
                                     let bar = ui.add(
-                                        egui::Label::new(
+                                        egui::Label::new(super::icons::rich(
+                                            ui,
                                             RichText::new(label)
                                                 .size(size * 0.72)
                                                 .color(look.faint),
-                                        )
+                                        ))
                                         .sense(Sense::click()),
                                     );
                                     if bar.clicked() {
@@ -1449,14 +1454,14 @@ fn card_button(
                 ("…", look.subtle, false, "Adding…".into(), None)
             }
             CardButton::Status(Some(Status::Added(id))) => (
-                "✔",
+                "\u{e182}",
                 look.green,
                 true,
                 "Added. Click to see it in Anki's browser".into(),
                 Some(CardClick::Browse(*id)),
             ),
             CardButton::Status(Some(Status::AddedWithout(id, why))) => (
-                "✔",
+                "\u{e182}",
                 look.yellow,
                 true,
                 format!("Added, without audio: {why}\nClick to see it in Anki's browser"),
@@ -1485,13 +1490,16 @@ fn card_button(
     };
     let p = ui.painter();
     p.rect_filled(rect, 5.0, bg);
-    p.text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        label,
-        egui::FontId::proportional(rect.height() * 0.72),
-        fg,
-    );
+    let font = egui::FontId::proportional(rect.height() * 0.72);
+    match super::icons::font(ui.ctx(), font.size, true) {
+        // The check of a card added: Phosphor's, filled.
+        Some(icon) if label == "\u{e182}" => {
+            p.text(rect.center(), egui::Align2::CENTER_CENTER, label, icon, fg);
+        }
+        _ => {
+            p.text(rect.center(), egui::Align2::CENTER_CENTER, label, font, fg);
+        }
+    }
     if enabled && resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }

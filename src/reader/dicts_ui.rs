@@ -393,10 +393,10 @@ impl Manager {
                                     action = Some(Action::Enable(e.id.clone(), on));
                                 }
                                 ui.horizontal(|ui| {
-                                    if ui.add_enabled(i > 0, egui::Button::new("▲").small()).on_hover_text("Earlier in the popup").clicked() {
+                                    if ui.add_enabled(i > 0, egui::Button::new(super::icons::glyph(ui.ctx(), super::icons::CARET_UP, false)).small()).on_hover_text("Earlier in the popup").clicked() {
                                         action = Some(Action::Move(i, i - 1));
                                     }
-                                    if ui.add_enabled(i + 1 < n, egui::Button::new("▼").small()).on_hover_text("Later in the popup").clicked() {
+                                    if ui.add_enabled(i + 1 < n, egui::Button::new(super::icons::glyph(ui.ctx(), super::icons::CARET_DOWN, false)).small()).on_hover_text("Later in the popup").clicked() {
                                         action = Some(Action::Move(i, i + 1));
                                     }
                                 });
@@ -486,7 +486,7 @@ impl Manager {
                                             action = Some(Action::KeepIt);
                                         }
                                     });
-                                } else if ui.button("🗑").on_hover_text("Delete this dictionary").clicked() {
+                                } else if ui.button(super::icons::glyph(ui.ctx(), super::icons::TRASH, false)).on_hover_text("Delete this dictionary").clicked() {
                                     action = Some(Action::AskDelete(e.id.clone()));
                                 }
                                 ui.end_row();

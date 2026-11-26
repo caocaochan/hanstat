@@ -8,6 +8,9 @@
 //! [`crate::chapter_lengths`]), and the large covers, are worked out on a
 //! background thread the first time Home shows a book.
 
+use crate::icons::{
+    self, BOOKS, CARDS, CARET_RIGHT, CONFETTI, FIRE, FOLDER_OPEN, LIST_CHECKS, PLAY,
+};
 use crate::library_reading::{calendar_shades, day_hover, day_level};
 use crate::reader::{self, stats_mins as mins};
 use crate::reading_stats::{self as rs, LeftAt, Summary};
@@ -460,7 +463,7 @@ fn ring_colour(c: &palette::Flavour, done: f32) -> Color32 {
 /// A ring of `RING` points, `done` (0..=1) of it drawn round from the top.
 fn ring(ui: &mut Ui, done: f32, middle: &str, under: &str, hover: &str) {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(RING), Sense::hover());
-    resp.on_hover_text(hover);
+    resp.on_hover_text(icons::rich(ui, hover));
     let p = ui.painter();
     let c = palette::cat();
     let width = 9.0;
@@ -513,7 +516,10 @@ fn section_head(ui: &mut Ui, title: &str, count: Option<usize>, link: Option<&st
         if let Some(l) = link {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 clicked = ui
-                    .add(egui::Button::new(RichText::new(l).color(palette::weak())).frame(false))
+                    .add(
+                        egui::Button::new(icons::rich(ui, RichText::new(l).color(palette::weak())))
+                            .frame(false),
+                    )
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked();
             });
@@ -545,10 +551,13 @@ fn primary(ui: &mut Ui, text: &str) -> egui::Response {
     ui.scope(|ui| {
         ui.spacing_mut().button_padding = vec2(18.0, 9.0);
         ui.add(
-            egui::Button::new(RichText::new(text).size(15.0).color(c.crust))
-                .fill(c.mauve)
-                .stroke(Stroke::NONE)
-                .corner_radius(10),
+            egui::Button::new(icons::rich(
+                ui,
+                RichText::new(text).size(15.0).color(c.crust),
+            ))
+            .fill(c.mauve)
+            .stroke(Stroke::NONE)
+            .corner_radius(10),
         )
     })
     .inner
@@ -679,7 +688,12 @@ impl App {
                     if !shelf.is_empty() {
                         ui.add_space(SECTION);
                         let read = books.iter().skip(1).filter(|b| b.at.is_some()).count();
-                        if section_head(ui, "Recently read", Some(read), Some("See all ›")) {
+                        if section_head(
+                            ui,
+                            "Recently read",
+                            Some(read),
+                            Some(&format!("See all {CARET_RIGHT}")),
+                        ) {
                             act = Some(Act::Library(HistTab::Stats));
                         }
                         ui.add_space(14.0);
@@ -829,13 +843,14 @@ fn header(ui: &mut Ui, library_size: usize, act: &mut Option<Act>) {
             let books = if library_size == 1 { "book" } else { "books" };
             if ui
                 .add(
-                    egui::Button::new(
+                    egui::Button::new(icons::rich(
+                        ui,
                         RichText::new(format!(
-                            "📖 {} {books} in your Library ›",
+                            "{BOOKS} {} {books} in your Library {CARET_RIGHT}",
                             fmt_int(library_size as u64)
                         ))
                         .color(palette::weak()),
-                    )
+                    ))
                     .frame(false),
                 )
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -956,11 +971,11 @@ fn hero_text(
         ui.spacing_mut().item_spacing.x = 12.0;
         if b.readable {
             let label = if started {
-                "▶  Continue reading"
+                format!("{PLAY}  Continue reading")
             } else {
-                "▶  Start reading"
+                format!("{PLAY}  Start reading")
             };
-            if primary(ui, label).clicked() {
+            if primary(ui, &label).clicked() {
                 *act = Some(Act::Read(0));
             }
             if secondary(ui, "Overview")
@@ -1002,11 +1017,14 @@ fn today(ui: &mut Ui, sum: &Summary, goal_edit: &mut Option<(u32, u64)>, act: &m
                     .color(palette::strong()),
             );
             let goal_text = match goal {
-                Some(g) if g.met(&day) => "Goal met 🎉".to_owned(),
+                Some(g) if g.met(&day) => format!("Goal met {CONFETTI}"),
                 Some(g) => goal_words(&g),
                 None => "No daily goal".to_owned(),
             };
-            ui.label(RichText::new(goal_text).color(palette::weak()));
+            ui.label(icons::rich(
+                ui,
+                RichText::new(goal_text).color(palette::weak()),
+            ));
             goal_menu(ui, goal.map(|g| (g.minutes, g.chars)), goal_edit, act);
         });
     });
@@ -1015,10 +1033,11 @@ fn today(ui: &mut Ui, sum: &Summary, goal_edit: &mut Option<(u32, u64)>, act: &m
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         if current > 0 {
-            ui.label(
-                palette::bold_text(format!("🔥 {current}-day streak"), 14.5)
+            ui.label(icons::rich(
+                ui,
+                palette::bold_text(format!("{FIRE} {current}-day streak"), 14.5)
                     .color(palette::pick(palette::cat().peach, palette::ink::PEACH)),
-            );
+            ));
         } else {
             ui.label(
                 RichText::new("No streak yet")
@@ -1056,7 +1075,7 @@ fn ring_hover(goal: Option<&rs::Goal>, day: &rs::Day, listening: bool) -> String
         s.push_str(", following whichever of minutes and characters is further behind");
     }
     s.push_str(if listening {
-        ". Read aloud counts (Settings, ⚙)."
+        ". Read aloud counts (Settings, \u{e270})."
     } else {
         ". Read aloud doesn't count."
     });
@@ -1483,7 +1502,7 @@ fn welcome(ui: &mut Ui, act: &mut Option<Act>) {
                     .layout(Layout::top_down(Align::Center)),
             );
             {
-                ui.label(RichText::new("📚").size(34.0));
+                ui.label(icons::glyph(ui.ctx(), BOOKS, false).size(34.0));
                 ui.add_space(6.0);
                 let text = if drop_works() {
                     "Drop .epub or .txt files here"
@@ -1492,7 +1511,7 @@ fn welcome(ui: &mut Ui, act: &mut Option<Act>) {
                 };
                 ui.label(palette::bold_text(text, 18.0).color(palette::strong()));
                 ui.add_space(12.0);
-                if primary(ui, "📂  Open books…").clicked() {
+                if primary(ui, &format!("{FOLDER_OPEN}  Open books…")).clicked() {
                     *act = Some(Act::Open);
                 }
             }
@@ -1546,10 +1565,19 @@ fn welcome(ui: &mut Ui, act: &mut Option<Act>) {
                 if k == 1 {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        if ui.button("🃏 Anki…").clicked() {
+                        if ui
+                            .button(icons::rich(ui, format!("{CARDS} Anki…")))
+                            .clicked()
+                        {
                             *act = Some(Act::Anki);
                         }
-                        if ui.button("📚 HSK, TOCFL & lists…").clicked() {
+                        if ui
+                            .button(icons::rich(
+                                ui,
+                                format!("{LIST_CHECKS} HSK, TOCFL & lists…"),
+                            ))
+                            .clicked()
+                        {
                             *act = Some(Act::Known);
                         }
                     });
@@ -1694,6 +1722,12 @@ mod tests {
         assert!(t.contains("30% of it, following whichever"), "{t}");
         let t = ring_hover(Some(&minutes), &day, true);
         assert!(t.starts_with("Minutes read and listened to today"), "{t}");
-        assert!(t.ends_with("Read aloud counts (Settings, ⚙)."), "{t}");
+        assert!(
+            t.ends_with(&format!(
+                "Read aloud counts (Settings, {}).",
+                crate::icons::GEAR
+            )),
+            "{t}"
+        );
     }
 }

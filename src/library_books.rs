@@ -3,6 +3,10 @@
 //! them, the columns that don't fit on further pages, the Columns window,
 //! and the user's own columns edited in place.
 
+use crate::icons::{
+    self, ARROW_CLOCKWISE, ARROW_U_UP_LEFT, BOOK_OPEN, CALENDAR, CARET_DOWN, CARET_LEFT,
+    CARET_RIGHT, CARET_UP, CHECK, COLUMNS, DOTS_SIX_VERTICAL, GEAR, PENCIL, STAR, TRASH, X,
+};
 use crate::library_columns::{
     self as lc, Columns, Deleted, FieldType, Filter, FilterKind, HistCol, Key, STATS, Val, Value,
 };
@@ -117,7 +121,7 @@ impl ColumnsState {
     pub(crate) fn undo_ui(&mut self, ui: &mut egui::Ui) {
         let Some((d, _)) = &self.deleted else { return };
         let undo = ui
-            .button("↩ Undo")
+            .button(icons::rich(ui, format!("{ARROW_U_UP_LEFT} Undo")))
             .on_hover_text("Put the column back, with its values")
             .clicked();
         let n = d.values.len();
@@ -439,13 +443,21 @@ pub(crate) fn day_picker_from(
                 *day = Some(nd);
                 changed = true;
             }
-            if ui.small_button("✖").on_hover_text("No date").clicked() {
+            if ui
+                .small_button(icons::glyph(ui.ctx(), X, false))
+                .on_hover_text("No date")
+                .clicked()
+            {
                 *day = None;
                 changed = true;
             }
         }
         None => {
-            if ui.button("📆 Set").on_hover_text(tip).clicked() {
+            if ui
+                .button(icons::rich(ui, format!("{CALENDAR} Set")))
+                .on_hover_text(tip)
+                .clicked()
+            {
                 *day = Some(start);
                 changed = true;
             }
@@ -620,7 +632,10 @@ impl App {
     /// The Library header's "Columns…" button.
     pub(crate) fn columns_button(&mut self, ui: &mut egui::Ui) {
         if ui
-            .selectable_label(self.columns.window_open, "☷ Columns…")
+            .selectable_label(
+                self.columns.window_open,
+                icons::rich(ui, format!("{COLUMNS} Columns…")),
+            )
             .on_hover_text("Choose, order and add the Library's columns, including your own")
             .clicked()
         {
@@ -810,7 +825,7 @@ impl App {
                         acts.push(Act::Filter(*c, nf));
                     }
                     if ui
-                        .small_button("✖")
+                        .small_button(icons::glyph(ui.ctx(), X, false))
                         .on_hover_text("Remove this filter")
                         .clicked()
                     {
@@ -824,7 +839,10 @@ impl App {
                 if pages.len() > 1 {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .add_enabled(page + 1 < pages.len(), egui::Button::new("▶"))
+                            .add_enabled(
+                                page + 1 < pages.len(),
+                                egui::Button::new(icons::glyph(ui.ctx(), CARET_RIGHT, false)),
+                            )
                             .on_hover_text("The next columns")
                             .clicked()
                         {
@@ -832,7 +850,10 @@ impl App {
                         }
                         ui.label(format!("{} / {}", page + 1, pages.len()));
                         if ui
-                            .add_enabled(page > 0, egui::Button::new("◀"))
+                            .add_enabled(
+                                page > 0,
+                                egui::Button::new(icons::glyph(ui.ctx(), CARET_LEFT, false)),
+                            )
                             .on_hover_text("The columns before")
                             .clicked()
                         {
@@ -840,14 +861,15 @@ impl App {
                         }
                         let on_page = page_cols[range.clone()].contains(&col);
                         if !on_page && !matches!(col, HistCol::Title | HistCol::Read) {
-                            ui.label(
+                            ui.label(icons::rich(
+                                ui,
                                 RichText::new(format!(
                                     "Sorted by {} {}",
                                     cols.name(col),
-                                    if desc { "⏷" } else { "⏶" }
+                                    if desc { CARET_DOWN } else { CARET_UP }
                                 ))
                                 .weak(),
-                            );
+                            ));
                         }
                     });
                 }
@@ -897,7 +919,7 @@ impl App {
                                     });
                                     format!(
                                         "Your own column ({}). Click a cell to change it.",
-                                        ty.map_or("?", |f| f.ty.label())
+                                        ty.map_or("?", |f| f.ty.label().trim_end_matches(['\u{e46a}', ' ']))
                                     )
                                 }
                                 c => lc::hover(c).to_owned(),
@@ -940,7 +962,7 @@ impl App {
                             // As on the Overview: the reader takes EPUBs and TXTs.
                             if crate::reader::opens(&s.format)
                                 && ui
-                                    .add_enabled(exists.get(&e.path), egui::Button::new("📕 Read"))
+                                    .add_enabled(exists.get(&e.path), egui::Button::new(icons::rich(ui, format!("{BOOK_OPEN} Read"))))
                                     .on_hover_text("Read the book in the reader")
                                     .on_disabled_hover_text("The file is no longer there")
                                     .clicked()
@@ -954,7 +976,7 @@ impl App {
                         row.col(|ui| match data.read_at.get(&e.id) {
                             Some(&t) => {
                                 if ui
-                                    .button(RichText::new("✔").strong().color(palette::good()))
+                                    .button(icons::glyph(ui.ctx(), CHECK, true).color(palette::good()))
                                     .on_hover_text(format!(
                                         "Marked read {} ({}). Click to change how many of its words count as known, or to unmark it.",
                                         history::age(t, data.now),
@@ -968,9 +990,9 @@ impl App {
                             None => {
                                 let has_words = exists.get(&hist.profile(&e.id));
                                 if ui
-                                    .add_enabled(has_words, egui::Button::new(RichText::new("✔").weak()))
+                                    .add_enabled(has_words, egui::Button::new(icons::glyph(ui.ctx(), CHECK, false).weak()))
                                     .on_hover_text("Mark read: count its most frequent words as known and take it off the reading path")
-                                    .on_disabled_hover_text("No word data yet: open the book, or ⟳ Recalculate library")
+                                    .on_disabled_hover_text(icons::rich(ui, format!("No word data yet: open the book, or {ARROW_CLOCKWISE} Recalculate library")))
                                     .clicked()
                                 {
                                     acts.push(Act::MarkRead(e.id.clone()));
@@ -981,7 +1003,7 @@ impl App {
                             // Apart from ✔, so as not to be hit instead of it.
                             ui.add_space(6.0);
                             if ui
-                                .small_button("✖")
+                                .small_button(icons::glyph(ui.ctx(), X, false))
                                 .on_hover_text(
                                     "Remove from the Library, with hanstat's copy of the book (the file you added it from is not touched); it can be put back for a few seconds",
                                 )
@@ -1048,7 +1070,7 @@ impl App {
             .collapsible(false)
             .default_width(380.0)
             .show(ctx, |ui| {
-                ui.label(RichText::new("Book and 📕 Read are always first; ✔ Read and ✖ always last.").weak());
+                ui.label(icons::rich(ui, RichText::new(format!("Book and {BOOK_OPEN} Read are always first; {CHECK} Read and {X} always last.")).weak()));
                 ui.add_space(4.0);
                 let cols = &mut st.cols;
                 let n = cols.order.len();
@@ -1061,15 +1083,15 @@ impl App {
                         let (c, mut shown) = cols.order[i];
                         let row = ui.horizontal(|ui| {
                             ui.dnd_drag_source(egui::Id::unique(("lib-col", i)), i, |ui| {
-                                ui.label(RichText::new("☰").weak());
+                                ui.label(icons::glyph(ui.ctx(), DOTS_SIX_VERTICAL, false).weak());
                             })
                             .response
                             .on_hover_text("Drag to move");
-                            if ui.add_enabled(i > 0, egui::Button::new("▲").small()).on_hover_text("Move up").clicked() {
+                            if ui.add_enabled(i > 0, egui::Button::new(icons::glyph(ui.ctx(), CARET_UP, false)).small()).on_hover_text("Move up").clicked() {
                                 moved = Some((i, i - 1));
                             }
                             if ui
-                                .add_enabled(i + 1 < n, egui::Button::new("▼").small())
+                                .add_enabled(i + 1 < n, egui::Button::new(icons::glyph(ui.ctx(), CARET_DOWN, false)).small())
                                 .on_hover_text("Move down")
                                 .clicked()
                             {
@@ -1081,7 +1103,7 @@ impl App {
                                     let r = ui.add(egui::TextEdit::singleline(text).desired_width(150.0));
                                     let ok = cols.name_free(text, Some(*id));
                                     let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                                    if (ui.add_enabled(ok, egui::Button::new("✔")).clicked() || (enter && ok))
+                                    if (ui.add_enabled(ok, egui::Button::new(icons::glyph(ui.ctx(), CHECK, false))).clicked() || (enter && ok))
                                         && let Some(f) = cols.fields.iter_mut().find(|f| f.id == *id)
                                     {
                                         f.name = text.trim().to_owned();
@@ -1104,24 +1126,24 @@ impl App {
                                     ),
                                     c if c.is_stat() => ("stat".to_owned(), lc::hover(c).to_owned()),
                                     HistCol::Style if !style_on => (
-                                        "default · off in ⚙".to_owned(),
-                                        "Shown while writing-style rating is on (⚙ Settings)".to_owned(),
+                                        format!("default · off in {GEAR}"),
+                                        format!("Shown while writing-style rating is on ({GEAR} Settings)"),
                                     ),
                                     c => ("default".to_owned(), lc::hover(c).to_owned()),
                                 };
-                                ui.label(RichText::new(tag).small().weak()).on_hover_text(hover);
+                                ui.label(icons::rich(ui, RichText::new(tag).small().weak())).on_hover_text(icons::rich(ui, hover));
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| match c {
                                     HistCol::Field(id) => {
-                                        if ui.small_button("🗑").on_hover_text("Delete this column and its values (Undo for a few seconds)").clicked() {
+                                        if ui.small_button(icons::glyph(ui.ctx(), TRASH, false)).on_hover_text("Delete this column and its values (Undo for a few seconds)").clicked() {
                                             delete = Some(id);
                                         }
-                                        if ui.small_button("✎").on_hover_text("Rename").clicked() {
+                                        if ui.small_button(icons::glyph(ui.ctx(), PENCIL, false)).on_hover_text("Rename").clicked() {
                                             st.rename = Some((id, cols.name(c)));
                                         }
                                     }
                                     c if c.is_stat()
                                         && ui
-                                            .small_button("✖")
+                                            .small_button(icons::glyph(ui.ctx(), X, false))
                                             .on_hover_text("Remove (it can be added again)")
                                             .clicked() =>
                                     {
@@ -1213,10 +1235,10 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.label("Type");
                         egui::ComboBox::from_id_salt("new-col-type")
-                            .selected_text(ty.label())
+                            .selected_text(icons::rich(ui, ty.label()))
                             .show_ui(ui, |ui| {
                                 for t in FieldType::ALL {
-                                    ui.selectable_value(ty, t, t.label());
+                                    ui.selectable_value(ty, t, icons::rich(ui, t.label()));
                                 }
                             });
                     });
@@ -1676,7 +1698,7 @@ fn field_cell(
                 let on = k <= n;
                 let r = ui
                     .add(
-                        egui::Label::new(RichText::new(if on { "★" } else { "☆" }).color(if on {
+                        egui::Label::new(icons::glyph(ui.ctx(), STAR, on).color(if on {
                             palette::highlight()
                         } else {
                             palette::weak()

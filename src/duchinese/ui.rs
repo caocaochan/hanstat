@@ -8,6 +8,7 @@ use super::api::Session;
 use super::data::{Course, Lesson, Level};
 use super::store::{self, Estimate, Record, Records};
 use super::worker::{Account, EstimateInputs, Event, Make, Task, Worker};
+use crate::icons::{self, ARROW_CLOCKWISE, FOLDER_OPEN, MAGNIFYING_GLASS, WARNING, X};
 use crate::reader::Notice;
 use crate::{App, BatchMode, palette};
 use eframe::egui::{self, RichText};
@@ -893,14 +894,14 @@ impl App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let mine: Vec<Record> = self.du.records.books.clone();
                         let r = ui
-                            .add_enabled(!self.du.checking && !mine.is_empty(), egui::Button::new("⟳ Check for new chapters"))
+                            .add_enabled(!self.du.checking && !mine.is_empty(), egui::Button::new(icons::rich(ui, format!("{ARROW_CLOCKWISE} Check for new chapters"))))
                             .on_hover_text("Ask DuChinese about every imported story now: new chapters, chapters opened up by a subscription, and edited ones")
                             .on_disabled_hover_text(if self.du.checking { "Checking…" } else { "No story imported yet" });
                         if r.clicked() {
                             check = Some(mine);
                         }
                         if ui
-                            .small_button("⟳")
+                            .small_button(icons::glyph(ui.ctx(), ARROW_CLOCKWISE, false))
                             .on_hover_text("Fetch the list of stories and courses again")
                             .clicked()
                         {
@@ -910,10 +911,10 @@ impl App {
                 });
                 if let Some(e) = self.du.error.clone() {
                     ui.horizontal(|ui| {
-                        if ui.small_button("✖").on_hover_text("Dismiss").clicked() {
+                        if ui.small_button(icons::glyph(ui.ctx(), X, false)).on_hover_text("Dismiss").clicked() {
                             self.du.error = None;
                         }
-                        ui.colored_label(palette::warn(), format!("⚠ {e}"));
+                        ui.label(icons::rich(ui, RichText::new(format!("{WARNING} {e}")).color(palette::warn())));
                     });
                 }
                 ui.separator();
@@ -931,7 +932,7 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.du.search)
-                            .hint_text("🔍 Search")
+                            .hint_text(icons::rich(ui, format!("{MAGNIFYING_GLASS} Search")))
                             .desired_width(180.0),
                     );
                     ui.checkbox(&mut self.du.hide_imported, "Hide imported");
@@ -1097,7 +1098,7 @@ impl App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let folder = s.folder();
                         if ui
-                            .small_button("📂")
+                            .small_button(icons::glyph(ui.ctx(), FOLDER_OPEN, false))
                             .on_hover_text(format!("Saved to {}. Click to choose another folder for new imports", folder.display()))
                             .clicked()
                             && let Some(p) = rfd::FileDialog::new().set_directory(&folder).pick_folder()

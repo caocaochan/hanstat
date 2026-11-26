@@ -311,7 +311,10 @@ impl State {
                 }
             }
             if ui
-                .button("▶ Play")
+                .button(crate::icons::rich(
+                    ui,
+                    format!("{} Play", crate::icons::PLAY),
+                ))
                 .on_hover_text("Hear the sound that plays when the goal is met")
                 .clicked()
             {

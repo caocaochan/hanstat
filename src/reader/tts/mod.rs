@@ -1388,7 +1388,11 @@ impl Tts {
                 };
             }
             if ui
-                .small_button("↻")
+                .small_button(crate::icons::glyph(
+                    ui.ctx(),
+                    crate::icons::ARROW_CLOCKWISE,
+                    false,
+                ))
                 .on_hover_text("Get the voice list again")
                 .clicked()
             {

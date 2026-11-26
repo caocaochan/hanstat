@@ -2,6 +2,7 @@
 //! vocabulary of the books measured against what is known now, with charts.
 
 use crate::charts::{self, Band, Bar, Point};
+use crate::icons::{self, WARNING};
 use crate::{App, LibKey, difficulty_color, difficulty_fill, fmt_int};
 use eframe::egui::{self, Color32, RichText};
 use hanstat::anki::{Difficulty, Knowledge};
@@ -105,12 +106,15 @@ pub(crate) fn tile_grid(ui: &mut egui::Ui, tiles: Vec<Tile>) {
                                     .truncate(),
                             );
                             ui.add_space(2.0);
-                            ui.add(egui::Label::new(RichText::new(t.sub).color(weak)).truncate());
+                            ui.add(
+                                egui::Label::new(icons::rich(ui, RichText::new(t.sub).color(weak)))
+                                    .truncate(),
+                            );
                         });
                     })
                     .response;
                 if let Some(h) = t.hover {
-                    r.on_hover_text(h);
+                    r.on_hover_text(icons::rich(ui, h));
                 }
             }
         });
@@ -448,7 +452,7 @@ impl App {
                 RichText::new(fmt_time(minutes)),
                 format!("{:.0} days of reading 1 h a day", minutes / 60.0),
             )
-            .hover("At your speed measured in the reader (unless set by hand in Settings, ⚙)"),
+            .hover("At your speed measured in the reader (unless set by hand in Settings, \u{e270})"),
         ];
         if known_of > 0.0 {
             let p = known * 100.0 / known_of;
@@ -488,7 +492,10 @@ impl App {
             }
         });
         if let Some(e) = &self.stats.error {
-            ui.colored_label(crate::palette::warn(), format!("⚠ {e}"));
+            ui.label(icons::rich(
+                ui,
+                RichText::new(format!("{WARNING} {e}")).color(crate::palette::warn()),
+            ));
         }
         // The last count, until a newer one is ready.
         let res = self.stats.shown.as_ref();
