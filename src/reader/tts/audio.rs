@@ -98,6 +98,82 @@ pub fn resample(input: &[f32], from: u32, to: u32) -> Vec<f32> {
 #[cfg(test)]
 pub static MUTE: AtomicBool = AtomicBool::new(false);
 
+/// `input` (mono, `rate` Hz) played `speed` times as fast, at the same
+/// pitch: WSOLA (overlap-add of 25 ms Hann windows at half-window steps,
+/// each taken within ±8 ms of where it would be where it best continues the
+/// last one). 1.0 gives the samples unchanged.
+pub fn stretch(input: &[f32], rate: u32, speed: f32) -> Vec<f32> {
+    if (speed - 1.0).abs() < 0.005 || !speed.is_finite() || speed <= 0.0 {
+        return input.to_vec();
+    }
+    let n = (((rate as f32 * 0.025) as usize).max(16)) & !1;
+    let hs = n / 2;
+    let out_len = (input.len() as f64 / speed as f64).round() as usize;
+    if input.len() < 2 * n {
+        // Too short to stretch: a click or a breath.
+        return input.to_vec();
+    }
+    let ha = hs as f64 * speed as f64;
+    let delta = (rate as f32 * 0.008) as isize;
+    let win: Vec<f32> = (0..n)
+        .map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / n as f32).cos())
+        .collect();
+    let get = |i: isize| -> f32 {
+        if i >= 0 && (i as usize) < input.len() {
+            input[i as usize]
+        } else {
+            0.0
+        }
+    };
+    let mut out = vec![0f32; out_len + n];
+    let mut norm = vec![0f32; out_len + n];
+    let mut prev: isize = 0;
+    for k in 0..=out_len / hs {
+        let nominal = (k as f64 * ha).round() as isize;
+        let pos = if k == 0 {
+            0
+        } else {
+            // What the last window's second half went on to: the new
+            // window's first half should look like it.
+            let target = prev + hs as isize;
+            let mut best = nominal;
+            let mut best_c = f32::MIN;
+            let mut off = -delta;
+            while off <= delta {
+                let cand = nominal + off;
+                let (mut c, mut e) = (0.0f32, 1e-9f32);
+                let mut j = 0;
+                while j < hs {
+                    let a = get(cand + j as isize);
+                    c += a * get(target + j as isize);
+                    e += a * a;
+                    j += 2;
+                }
+                let c = c / e.sqrt();
+                if c > best_c {
+                    best_c = c;
+                    best = cand;
+                }
+                off += 2;
+            }
+            best
+        };
+        let o = k * hs;
+        for (j, w) in win.iter().enumerate() {
+            out[o + j] += get(pos + j as isize) * w;
+            norm[o + j] += w;
+        }
+        prev = pos;
+    }
+    out.truncate(out_len);
+    for (s, w) in out.iter_mut().zip(&norm) {
+        if *w > 1e-3 {
+            *s /= w;
+        }
+    }
+    out
+}
+
 /// Seconds over which sound fades out (pause, stop, a jump to another
 /// sentence) and back in (resume): no click where the wave is cut.
 const FADE_OUT: f32 = 0.06;
@@ -307,13 +383,29 @@ impl Output {
 
     /// Play `samples` (mono, at [`Output::rate`]) after what is queued.
     pub fn push(&self, id: u64, samples: Vec<f32>) {
+        self.push_at(id, samples, 0);
+    }
+
+    /// Play `samples` from sample `pos` on (the rest of a clip heard partly).
+    pub fn push_at(&self, id: u64, samples: Vec<f32>, pos: usize) {
         let voiced = voiced(&samples);
+        let pos = pos.min(samples.len());
         self.queue.lock().unwrap().clips.push_back(Clip {
             id,
             samples,
-            pos: 0,
+            pos,
             voiced,
         });
+    }
+
+    /// The clip being heard and how far into it it is (0 to 1).
+    pub fn progress(&self) -> Option<(u64, f32)> {
+        let q = self.queue.lock().unwrap();
+        let id = q.current?;
+        q.clips
+            .iter()
+            .find(|c| c.id == id && c.id >= q.cut_below && !c.samples.is_empty())
+            .map(|c| (id, c.pos as f32 / c.samples.len() as f32))
     }
 
     /// Stop and forget everything queued: what is heard fades out first.
@@ -377,6 +469,98 @@ impl Output {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sine(hz: f32, rate: u32, secs: f32) -> Vec<f32> {
+        (0..(rate as f32 * secs) as usize)
+            .map(|i| (std::f32::consts::TAU * hz * i as f32 / rate as f32).sin() * 0.5)
+            .collect()
+    }
+
+    fn crossings(x: &[f32]) -> usize {
+        x.windows(2)
+            .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+            .count()
+    }
+
+    #[test]
+    fn stretching_changes_length_not_pitch() {
+        let rate = 24_000;
+        let x = sine(440.0, rate, 2.0);
+        assert_eq!(stretch(&x, rate, 1.0), x, "normal speed: unchanged");
+        for speed in [0.5f32, 0.75, 1.25, 1.5, 2.0] {
+            let y = stretch(&x, rate, speed);
+            let want = (x.len() as f32 / speed).round() as usize;
+            assert_eq!(y.len(), want, "{speed}");
+            // The same pitch: crossings per second as before (within 2%),
+            // away from the ends.
+            let mid = &y[y.len() / 10..y.len() * 9 / 10];
+            let hz = crossings(mid) as f32 / 2.0 / (mid.len() as f32 / rate as f32);
+            assert!((hz - 440.0).abs() < 9.0, "{speed}: {hz} Hz");
+            // No louder than the input, and not much quieter.
+            let peak = mid.iter().fold(0f32, |m, s| m.max(s.abs()));
+            assert!((0.4..=0.55).contains(&peak), "{speed}: peak {peak}");
+        }
+        // A blip too short to stretch stays as it is.
+        let blip = sine(440.0, rate, 0.02);
+        assert_eq!(stretch(&blip, rate, 1.5), blip);
+    }
+
+    /// A saved clip (`HANSTAT_STRETCH_IN`, .mp3 or .opus) stretched to each
+    /// playback speed, as WAVs in `HANSTAT_STRETCH_OUT`: to listen to.
+    #[test]
+    #[ignore = "needs a clip, writes WAVs to listen to"]
+    fn stretch_samples() {
+        let input = std::path::PathBuf::from(std::env::var_os("HANSTAT_STRETCH_IN").unwrap());
+        let out = std::path::PathBuf::from(std::env::var_os("HANSTAT_STRETCH_OUT").unwrap());
+        std::fs::create_dir_all(&out).unwrap();
+        let bytes = std::fs::read(&input).unwrap();
+        let (x, rate) = if input.extension().is_some_and(|e| e == "opus") {
+            super::super::opus::decode(bytes).unwrap()
+        } else {
+            decode_mp3(bytes).unwrap()
+        };
+        for speed in [0.5f32, 0.75, 1.0, 1.25, 1.5, 2.0] {
+            let t = std::time::Instant::now();
+            let y = stretch(&x, rate, speed);
+            eprintln!(
+                "{speed}×: {:.1} s of sound in {:?}",
+                y.len() as f32 / rate as f32,
+                t.elapsed()
+            );
+            let mut w = Vec::new();
+            let data = (y.len() * 2) as u32;
+            w.extend_from_slice(b"RIFF");
+            w.extend_from_slice(&(36 + data).to_le_bytes());
+            w.extend_from_slice(b"WAVEfmt ");
+            w.extend_from_slice(&16u32.to_le_bytes());
+            w.extend_from_slice(&1u16.to_le_bytes());
+            w.extend_from_slice(&1u16.to_le_bytes());
+            w.extend_from_slice(&rate.to_le_bytes());
+            w.extend_from_slice(&(rate * 2).to_le_bytes());
+            w.extend_from_slice(&2u16.to_le_bytes());
+            w.extend_from_slice(&16u16.to_le_bytes());
+            w.extend_from_slice(b"data");
+            w.extend_from_slice(&data.to_le_bytes());
+            for s in y {
+                w.extend_from_slice(&((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
+            }
+            std::fs::write(out.join(format!("speed-{speed:.2}.wav")), w).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_clip_can_start_part_way() {
+        let out = Mutex::new(Queue::default());
+        out.lock().unwrap().clips.push_back(Clip {
+            id: 1,
+            samples: vec![0.5; 100],
+            pos: 40,
+            voiced: 0..100,
+        });
+        let mut buf = vec![0f32; 70];
+        fill(&mut buf, 1, 48_000, &out, &|| {});
+        assert_eq!(out.lock().unwrap().finished, vec![1], "60 left, then done");
+    }
 
     #[test]
     fn resampling_keeps_length_and_ends() {

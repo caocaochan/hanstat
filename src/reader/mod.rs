@@ -11,6 +11,7 @@ mod dicts_ui;
 pub(crate) mod epub;
 pub(crate) mod fonts;
 mod goal_sound;
+pub(crate) mod icons;
 mod images;
 mod layout;
 mod markup;
@@ -18,6 +19,7 @@ mod popup;
 #[cfg(test)]
 mod preview;
 mod render;
+mod search;
 mod stats_ui;
 mod style;
 mod theme;
@@ -110,6 +112,8 @@ struct Settings {
     anki: anki::CardSettings,
     /// Reading aloud.
     tts: tts::TtsSettings,
+    /// The search sidebar's width.
+    search_width: f32,
 }
 
 impl Default for Settings {
@@ -134,6 +138,7 @@ impl Default for Settings {
             popup_size: None,
             anki: anki::CardSettings::default(),
             tts: tts::TtsSettings::default(),
+            search_width: 340.0,
         }
     }
 }
@@ -296,6 +301,17 @@ pub struct Reader {
     /// set by the app each frame, and its button clicked.
     pub notice: Option<Notice>,
     notice_clicked: bool,
+    /// Ctrl+F: the search sidebar and its results.
+    search: search::Search,
+    /// A search result is shown: where reading was. Until Back (or "Keep
+    /// reading here") the place, reading time and stats stay there.
+    peek: Option<Position>,
+    /// The match shown, highlighted on its page.
+    search_hit: Option<(usize, Range<u32>)>,
+    /// Each chapter's name in the table of contents (empty: none).
+    chapter_names: Vec<String>,
+    /// Where the pages are drawn this frame (the sidebar goes over its left).
+    page_area: Option<Rect>,
 }
 
 impl Drop for Reader {
@@ -420,6 +436,7 @@ impl Reader {
         );
         let mut dict = popup::Popup::new(ctx, settings.freq_sort.clone(), dictionary);
         dict.cards.book = Arc::from(epub.title.as_str());
+        let migrated = settings.anki.add_sentence_audio();
         dict.sync_cards(&settings.anki);
         let mut dicts = dicts_ui::Manager::new(ctx, &dict);
         dicts.install_default();
@@ -432,7 +449,14 @@ impl Reader {
         let tracker = crate::reading_stats::with(|s| {
             tracker::Tracker::new(&book_id, &epub.title, s, crate::reading_stats::now())
         });
+        let search = search::Search::new(chapters.clone(), ctx, settings.search_width);
+        let chapter_names = chapter_labels(&epub, &toc_labels);
         Ok(Reader {
+            search,
+            peek: None,
+            search_hit: None,
+            chapter_names,
+            page_area: None,
             tracker,
             stats_open: false,
             stats: stats_ui::Cache::default(),
@@ -465,7 +489,7 @@ impl Reader {
             resized_at: 0.0,
             last_geom: None,
             drawn: None,
-            dirty: false,
+            dirty: migrated,
             persist: true,
             toc_labels,
             contents_shown: false,
@@ -489,6 +513,11 @@ impl Reader {
     /// Restore the app's look and remember the place.
     pub fn close(mut self, ctx: &egui::Context) {
         egui::Popup::close_id(ctx, egui::Id::unique("reader-text-menu"));
+        // Closed while a search result was shown: reading was elsewhere.
+        if let Some(p) = self.peek.take() {
+            self.spine = p.spine;
+            self.offset = p.offset;
+        }
         self.end_stats();
         self.save();
         if let Some((theme, style)) = self.prev_style.take() {
@@ -502,8 +531,10 @@ impl Reader {
             return;
         }
         // The place goes to the reading-stats database; to reader.json only
-        // while that can't be read (it is never written to then).
-        if crate::reading_stats::problem().is_none() {
+        // while that can't be read (it is never written to then). Not while
+        // a search result is shown: reading is still where it was.
+        if self.peek.is_some() {
+        } else if crate::reading_stats::problem().is_none() {
             crate::reading_stats::set_left_at(&self.book_id, self.spine, self.offset);
             if let Err(e) = crate::reading_stats::save() {
                 self.error = Some(e);
@@ -640,6 +671,130 @@ impl Reader {
         self.spine + 1 >= self.epub.spine.len()
     }
 
+    /// The search sidebar and, while a result is shown, the Back bar.
+    fn search_frame(&mut self, ctx: &egui::Context, th: &Theme) {
+        let Some(area) = self.page_area else { return };
+        let w = self.search.width;
+        if let Some(search::Action::Go(h)) =
+            self.search.ui(ctx, area, th, &self.chapter_names, self.now)
+        {
+            self.search_go(h);
+        }
+        if self.search.width != w {
+            self.settings.search_width = self.search.width;
+            self.dirty = true;
+        }
+        if self.peek.is_some() {
+            self.back_bar(ctx, area, th);
+        }
+    }
+
+    /// Show a search result's page: reading stays where it was (the first
+    /// result's peek keeps the place for all that follow).
+    fn search_go(&mut self, h: search::Hit) {
+        if self.peek.is_none() {
+            self.peek = Some(Position {
+                spine: self.spine,
+                offset: self.offset,
+            });
+        }
+        self.dict.close();
+        self.selection = None;
+        self.selection_anchor = None;
+        self.forward = true;
+        self.go_chapter(h.spine, Target::Src(h.range.start));
+        self.search_hit = Some((h.spine, h.range));
+        // Out of the way of the page; Ctrl+F or 🔍 brings it back.
+        self.search.close();
+    }
+
+    /// Back to where reading was.
+    fn peek_back(&mut self) {
+        let Some(p) = self.peek.take() else { return };
+        self.tracker.jumped();
+        self.search_hit = None;
+        self.dict.close();
+        self.forward = false;
+        self.go_chapter(p.spine, Target::Offset(p.offset));
+    }
+
+    /// Read on from the result shown: it becomes the place (a jump: no
+    /// characters count for it).
+    fn peek_keep(&mut self) {
+        if self.peek.take().is_some() {
+            // A jump: the next place seen only moves the tracker's base
+            // (pages turned while the result was shown don't count).
+            self.tracker.jumped();
+            self.search_hit = None;
+            self.save();
+        }
+    }
+
+    /// "← Back to where you were", over the top of the pages.
+    fn back_bar(&mut self, ctx: &egui::Context, area: Rect, th: &Theme) {
+        let Some(p) = self.peek else { return };
+        let label = self
+            .chapter_names
+            .get(p.spine)
+            .filter(|l| !l.is_empty())
+            .cloned();
+        let (mut back, mut keep, mut find) = (false, false, false);
+        egui::Area::new(egui::Id::unique("reader-back-bar"))
+            .order(egui::Order::Middle)
+            .pivot(egui::Align2::CENTER_TOP)
+            .fixed_pos(pos2(area.center().x, area.top() + 8.0))
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(th.bar)
+                    .stroke(egui::Stroke::new(1.0, th.muted.gamma_multiply(0.5)))
+                    .corner_radius(8)
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let text = match &label {
+                                Some(l) => format!("Back to where you were ({l})"),
+                                None => "Back to where you were".to_owned(),
+                            };
+                            ui.visuals_mut().override_text_color = Some(th.text);
+                            back = ui
+                                .button(icons::text(ctx, icons::ARROW_LEFT, &text, 14.0))
+                                .on_hover_text("Your reading place, time and stats didn't move (Esc)")
+                                .clicked();
+                            keep = ui
+                                .button(RichText::new("Keep reading here").color(th.text))
+                                .on_hover_text("Make this your reading place (counts as a jump: no characters)")
+                                .clicked();
+                            find = ui
+                                .button(icons::text(ctx, icons::MAGNIFYING_GLASS, "", 14.0))
+                                .on_hover_text("The search results (Ctrl+F)")
+                                .clicked();
+                        });
+                    });
+            });
+        if back {
+            self.peek_back();
+        } else if keep {
+            self.peek_keep();
+        }
+        if find {
+            self.search.show();
+        }
+    }
+
+    /// The app's known words (the popup's ✓ buttons), each frame.
+    pub fn set_known(
+        &mut self,
+        known: Option<Arc<hanstat::anki::Knowledge>>,
+        marked: Arc<std::collections::HashSet<String>>,
+    ) {
+        self.dict.set_known(known, marked);
+    }
+
+    /// Words marked known (true) or unmarked in the popup since last asked.
+    pub fn take_known_toggles(&mut self) -> Vec<(String, bool)> {
+        self.dict.take_known_toggles()
+    }
+
     /// The notice's button was clicked (since last asked).
     pub fn take_notice_click(&mut self) -> bool {
         std::mem::take(&mut self.notice_clicked)
@@ -661,7 +816,7 @@ impl Reader {
         if self.spine + 1 < self.epub.spine.len() {
             self.go_chapter(self.spine + 1, Target::Offset(0));
             self.save();
-        } else {
+        } else if self.peek.is_none() {
             self.stats_finish();
         }
     }
@@ -809,6 +964,7 @@ impl Reader {
             })
             .is_some_and(|menu| menu.inner);
         if play && let Some(spot) = menu.target {
+            self.peek_keep();
             self.tts.play_from(spot.spine, spot.src, &self.settings.tts);
         }
     }
@@ -831,6 +987,17 @@ impl Reader {
         self.dict.anchor = None;
         self.dicts.poll(&ctx);
         self.tts.poll(&self.settings.tts);
+        // Anki cards' audio is said by read aloud's voice: the key is looked
+        // for once cards with audio are set up, the voice handed over while
+        // the popup is open (its + sends it with the note to make).
+        if self.dict.cards.shown() && self.dict.cards.cfg.ready() && self.dict.cards.wants_audio() {
+            if self.settings.tts.source == tts::Source::Azure {
+                self.tts.prepare_key();
+            }
+            if self.dict.is_open() {
+                self.dict.cards.voice = self.tts.card_voice(&self.settings.tts);
+            }
+        }
         // Dictionaries dropped on the reader are imported.
         let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
             i.raw
@@ -853,7 +1020,13 @@ impl Reader {
             || self.tts.design_window_open()
             || self.dicts.open
             || self.dict.cards.setup_open;
+        // A search result shown isn't reading: its time doesn't count.
         self.stats_frame(&ctx, menus_open);
+        // Ctrl+F, wherever the keys are (the search box too).
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::F)) {
+            self.search.show();
+        }
+        self.search.poll(now, &ctx);
         let dict_open = self.dict.is_open();
         let popup_was_open = menus_open || dict_open;
         let text_menu_id = egui::Id::unique("reader-text-menu");
@@ -938,6 +1111,7 @@ impl Reader {
 
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let area = ui.max_rect();
+            self.page_area = Some(area);
             ui.painter().rect_filled(area, 0.0, th.desk);
             let g = self.geometry(area);
             geom_for_keys = Some(g);
@@ -1017,6 +1191,7 @@ impl Reader {
             self.tts.page_src = l.page_first_src(self.page).unwrap_or(0);
             self.tts.page_end = l.page_first_src(self.page + step).unwrap_or(u32::MAX);
             if play_page {
+                self.peek_keep();
                 let src = l.page_first_src(self.page).unwrap_or(0);
                 self.tts.play_from(self.spine, src, &self.settings.tts);
             }
@@ -1027,7 +1202,8 @@ impl Reader {
             );
             let primary_click = resp.clicked_by(egui::PointerButton::Primary);
             let secondary_click = resp.clicked_by(egui::PointerButton::Secondary);
-            let spoken_chapter = if !text_input_busy
+            let spoken_chapter = if self.peek.is_none()
+                && !text_input_busy
                 && !resp.is_pointer_button_down_on()
                 && !primary_click
                 && !secondary_click
@@ -1228,6 +1404,13 @@ impl Reader {
                 for i in items {
                     paint_item(&mut self.images, th, &painter, &l.items[i], off, ppp);
                 }
+                if let Some((sp, range)) = &self.search_hit
+                    && *sp == self.spine
+                {
+                    for r in l.char_rects(idx, range.clone()) {
+                        painter.rect_filled(r.translate(off).expand2(vec2(1.0, 0.0)), 3.0, th.search_hit());
+                    }
+                }
                 if let Some(range) = &self.selection {
                     for r in l.char_rects(idx, range.clone()) {
                         painter.rect_filled(r.translate(off), 2.0, ui.visuals().selection.bg_fill);
@@ -1300,6 +1483,7 @@ impl Reader {
                     }
                 } else if let Some((src, _, _)) = hit_text(p) {
                     if self.tts.active() {
+                        self.peek_keep();
                         self.tts.play_from(self.spine, src, &self.settings.tts);
                     }
                 } else {
@@ -1352,9 +1536,33 @@ impl Reader {
                     )
                 });
                 self.dict.scroll_lines += down as i32 - up as i32;
+                // A: the first entry's word known (or not).
+                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::A)) {
+                    self.dict.toggle_first_known();
+                }
             }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::P)) {
                 self.stats_toggle();
+            }
+            // Read aloud: Ctrl+← → by sentences, K pauses (as video players do;
+            // Ctrl+Space switches Chinese input methods).
+            if self.tts.active() {
+                let (back, fwd, pause) = ctx.input_mut(|i| {
+                    (
+                        i.consume_key(egui::Modifiers::COMMAND, Key::ArrowLeft),
+                        i.consume_key(egui::Modifiers::COMMAND, Key::ArrowRight),
+                        i.consume_key(egui::Modifiers::NONE, Key::K),
+                    )
+                });
+                if back {
+                    self.tts.step(-1);
+                }
+                if fwd {
+                    self.tts.step(1);
+                }
+                if pause {
+                    self.tts.toggle_pause();
+                }
             }
             let (fwd, back, home, end, esc, wheel) = ctx.input_mut(|i| {
                 let fwd = [Key::ArrowRight, Key::ArrowDown, Key::PageDown, Key::Space]
@@ -1384,7 +1592,10 @@ impl Reader {
                         .sum::<f32>(),
                 )
             });
-            let wheel = if over_dict { 0.0 } else { wheel };
+            let over_search = ctx
+                .pointer_hover_pos()
+                .is_some_and(|p| self.search.rect.is_some_and(|r| r.contains(p)));
+            let wheel = if over_dict || over_search { 0.0 } else { wheel };
             if fwd || back || home || end || wheel != 0.0 {
                 self.dict.close();
             }
@@ -1402,7 +1613,13 @@ impl Reader {
                 self.page = l.pages.len().saturating_sub(1);
                 self.offset = l.page_offset(self.page);
             }
-            if esc {
+            if esc && self.search.open {
+                // Esc with the sidebar shown closes it, not the book.
+                self.search.close();
+            } else if esc && self.peek.is_some() {
+                // Esc on a search result: back to reading, not out of the book.
+                self.peek_back();
+            } else if esc {
                 open = false;
             }
             self.scroll += wheel;
@@ -1417,6 +1634,7 @@ impl Reader {
                 self.scroll *= 0.8;
             }
         }
+        self.search_frame(&ctx, th);
         // The popup, beside its word; gone with the word (a page turned).
         if self.dict.is_open() {
             if let (Some(_), Some(params)) = (self.dict.anchor, self.params.clone()) {
@@ -1569,7 +1787,7 @@ impl Reader {
                     self.dicts.open = !self.dicts.open;
                 }
                 let before = self.settings.tts.clone();
-                let read = self.tts.bar(ui);
+                let read = self.tts.bar(ui, &mut self.settings.tts);
                 if let Some(tts::Action::PlayPage) =
                     self.tts.panel(&read, &mut self.settings.tts, self.spine)
                 {

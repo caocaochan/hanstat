@@ -1,5 +1,13 @@
 # Changelog
 
+## [2026.11.26.02] - 2026-11-26
+
+### Added
+- **Anki cards get audio.** The **+** in the dictionary popup now adds the word and its sentence spoken by the voice chosen in **Read aloud** (Azure or the voice on your computer). In the card setup, `{audio}` is the word and the new `{sentence-audio}` is the sentence; Lapis's **SentenceAudio** field gets `{sentence-audio}` by itself. A sentence already read aloud uses the audio made then. The audio is made in the background, so the popup and the pages don't wait for it. With no voice set up the card is still added, without audio, and its ✔ turns yellow with the reason in its tooltip.
+- **Mark words known from the dictionary popup.** Each entry has a ✓ beside the **+**: click it (or press **A** for the first entry) to mark the word known, and again to unmark it. Words that Anki or your word lists already count as known show a blue ✓ that names where they are known from.
+- **Search the book with Ctrl+F.** A sidebar opens over the left of the pages with a search box and every match, each with its sentence and chapter. Traditional and Simplified characters find each other, and a match can run across a line break. Click a result (or press Enter for the next one) to open its page with the match highlighted. Your reading place, reading time and stats stay where they were: **Back to where you were** (or Esc) returns you there, and **Keep reading here** makes the result your reading place instead. The sidebar hides when you open a result; Ctrl+F or 🔍 brings it back with the same results.
+- **Read aloud controls.** While reading aloud, the bar has buttons to go back a sentence, pause or resume, stop, and go forward a sentence (Ctrl+←, K and Ctrl+→), and a **playback speed** slider from 0.5× to 2× (double-click for normal speed). The speed works for every voice, changes at once on the sentence you're hearing, and needs no new audio. Azure's own speed setting is now called **Voice speed**: it makes the audio again.
+
 ## [2026.11.26.01] - 2026-11-26
 
 ### Added

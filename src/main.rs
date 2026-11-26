@@ -261,6 +261,7 @@ fn install_fonts(ctx: &egui::Context) {
     fonts
         .families
         .insert(egui::FontFamily::Name(palette::BOLD.into()), bold);
+    reader::icons::install(&mut fonts);
     reader::fonts::set_base(fonts.clone());
     ctx.set_fonts(fonts);
     palette::install(ctx);
@@ -1354,6 +1355,9 @@ struct KnownState {
     /// changes: everything keyed by it (the Library's rows, the reading path,
     /// the statistics) is then left alone.
     merged_from: Option<MergedFrom>,
+    /// `settings.marked` as a set, for the reader's popup (made again when
+    /// `merged` is).
+    marked_set: Arc<HashSet<String>>,
 }
 
 /// What [`KnownState::merged`] is made from (see [`read_books::merged_knowledge`]).
@@ -2016,6 +2020,7 @@ impl App {
         }
         self.known.merged = read_books::merged_knowledge(&self.anki, &self.known.settings);
         self.known.merged_from = Some(from);
+        self.known.marked_set = Arc::new(self.known.settings.marked.iter().cloned().collect());
     }
 
     fn refresh_anki_coverage(&mut self, ctx: &egui::Context) {
@@ -3338,11 +3343,28 @@ impl eframe::App for App {
             .reader
             .as_ref()
             .and_then(|r| self.du_reader_notice(r.book_id(), r.on_last_chapter()));
+        if self.reader.is_some() && self.known.marked_set.len() != self.known.settings.marked.len()
+        {
+            self.known.marked_set = Arc::new(self.known.settings.marked.iter().cloned().collect());
+        }
         if let Some(r) = &mut self.reader {
             r.cpm = cpm;
             r.cpm_by_hand = by_hand;
             r.notice = notice;
+            r.set_known(self.known.merged.clone(), self.known.marked_set.clone());
             let open = r.ui(ui);
+            let toggles = r.take_known_toggles();
+            if !toggles.is_empty() {
+                // Marked in the popup: saved, and coverage brought up to date.
+                self.edit_known(&ctx, |k| {
+                    let mut changed = false;
+                    for (w, on) in &toggles {
+                        changed |= k.set_marked(w, *on);
+                    }
+                    changed
+                });
+            }
+            let Some(r) = &mut self.reader else { return };
             if r.take_notice_click() {
                 self.du_reload(&ctx);
                 ctx.request_repaint();

@@ -43,8 +43,12 @@ pub struct TtsSettings {
     /// The voice for Simplified and for Traditional books; empty: the default.
     pub voice: String,
     pub voice_trad: String,
-    /// Speed change in percent.
+    /// Azure's speed change in percent (part of the audio: changing it
+    /// makes the sentences again).
     pub rate: i32,
+    /// Playback speed (1.0: as made), for every voice: the sound is
+    /// stretched as it is played, so no audio is made again.
+    pub playback: f32,
     /// The dictionary popup pauses reading while it is open.
     pub pause_for_popup: bool,
     /// Who reads: Azure or the local voice.
@@ -68,6 +72,7 @@ impl Default for TtsSettings {
             voice: String::new(),
             voice_trad: String::new(),
             rate: 0,
+            playback: 1.0,
             pause_for_popup: true,
             source: Source::Azure,
             local: local::LocalSettings::default(),
@@ -168,6 +173,61 @@ impl Speech {
         } else {
             audio::decode_mp3(bytes)
         }
+    }
+}
+
+/// An Azure region and key.
+type AzureClient = (String, String);
+
+/// Audio for Anki cards, made the way read aloud reads: saved with the
+/// book's read-aloud clips (a sentence already heard costs nothing).
+pub struct CardVoice {
+    speech: Speech,
+    azure: Option<Arc<azure::Azure>>,
+    dir: PathBuf,
+}
+
+impl CardVoice {
+    /// The saved clip of `text` (made now if there is none; slow: a
+    /// request to Azure, or the local voice, which may have to load).
+    pub fn clip(&self, text: &str) -> Result<PathBuf, String> {
+        if text.trim().is_empty() {
+            return Err("Nothing to say".into());
+        }
+        let (key, ext) = (self.speech.key(text), self.speech.ext());
+        if let Some(p) = saved_clip(&self.dir, key, ext) {
+            return Ok(p);
+        }
+        let bytes = match &self.speech.local {
+            Some(l) => opus::encode(&local::preview(text, l)?)?,
+            None => self
+                .azure
+                .as_ref()
+                .ok_or("Add your Azure Speech key and region for audio")?
+                .synth(text, &self.speech.voice, self.speech.rate)
+                .map_err(|e| e.to_string())?,
+        };
+        let path = clip_path(&self.dir, key, ext);
+        let save = || -> std::io::Result<()> {
+            use std::io::Write;
+            std::fs::create_dir_all(&self.dir)?;
+            let mut file = tempfile::NamedTempFile::new_in(&self.dir)?;
+            file.write_all(&bytes)?;
+            persist_clip(file, &path)
+        };
+        save().map_err(|e| format!("The audio can't be saved: {e}"))?;
+        let _ = self.speech.record(&self.dir);
+        Ok(path)
+    }
+
+    /// The file name a clip of `text` gets in Anki's media folder: the
+    /// same text in the same voice, the same file.
+    pub fn media_name(&self, text: &str) -> String {
+        format!(
+            "hanstat_{:016x}.{}",
+            self.speech.key(text),
+            self.speech.ext()
+        )
     }
 }
 
@@ -457,6 +517,13 @@ pub struct Tts {
     /// (the pages follow it only then).
     pub last_at: Option<(usize, u32)>,
     pub last_visible: bool,
+    /// The playback speed the engine was last told, and whether its slider
+    /// is being dragged (it is told once let go).
+    sent_playback: Option<f32>,
+    playback_dragging: bool,
+    /// Anki cards' audio, made as read aloud reads now (kept while that
+    /// stays the same).
+    card_voice: Option<(Speech, Option<AzureClient>, Arc<CardVoice>)>,
     /// The dictionary popup was open last frame, and paused the reading.
     popup_open: bool,
     paused_by_popup: bool,
@@ -505,6 +572,9 @@ impl Tts {
             book_estimate: None,
             last_at: None,
             last_visible: false,
+            sent_playback: None,
+            playback_dragging: false,
+            card_voice: None,
             popup_open: false,
             paused_by_popup: false,
             paused_until: None,
@@ -520,6 +590,40 @@ impl Tts {
             KeyState::Loaded(Some(k)) => Some(k),
             _ => None,
         }
+    }
+
+    /// Look for the Azure key now (Anki cards may need it before the
+    /// panel is ever opened).
+    pub fn prepare_key(&mut self) {
+        self.load_key();
+    }
+
+    /// Anki cards' word and sentence audio, in the voice read aloud uses;
+    /// `None` while there is none ready (no key, or no local model).
+    pub fn card_voice(&mut self, s: &TtsSettings) -> Option<Arc<CardVoice>> {
+        if !self.client_ready(s) {
+            return None;
+        }
+        let speech = self.speech(s);
+        let client = match s.source {
+            Source::Azure => Some((s.region.trim().to_owned(), self.the_key()?.to_owned())),
+            Source::Local => None,
+        };
+        if let Some((sp, c, v)) = &self.card_voice
+            && *sp == speech
+            && *c == client
+        {
+            return Some(v.clone());
+        }
+        let v = Arc::new(CardVoice {
+            speech: speech.clone(),
+            azure: client
+                .as_ref()
+                .map(|(r, k)| Arc::new(azure::Azure::new(r, k))),
+            dir: self.dir.clone(),
+        });
+        self.card_voice = Some((speech, client, v.clone()));
+        Some(v)
     }
 
     fn load_key(&mut self) {
@@ -547,6 +651,9 @@ impl Tts {
             self.sent_speech = Some(self.speech(s));
             self.sent_client = None;
             self.sent_availability = Availability::Waiting;
+            let e = self.engine.as_ref().unwrap();
+            e.send(Cmd::Playback(playback_speed(s.playback)));
+            self.sent_playback = Some(s.playback);
         }
         self.engine.as_ref().unwrap()
     }
@@ -602,6 +709,10 @@ impl Tts {
         if self.sent_speech.as_ref() != Some(&speech) {
             engine.send(Cmd::Speech(speech.clone()));
             self.sent_speech = Some(speech);
+        }
+        if !self.playback_dragging && self.sent_playback != Some(s.playback) {
+            engine.send(Cmd::Playback(playback_speed(s.playback)));
+            self.sent_playback = Some(s.playback);
         }
         let client = self
             .the_key()
@@ -760,6 +871,16 @@ impl Tts {
                 State::Loading | State::Playing => e.send(Cmd::Pause),
                 State::Stopped => {}
             }
+        }
+    }
+
+    /// Back (negative) or forward by `by` sentences while reading.
+    pub fn step(&mut self, by: i32) {
+        if !self.active() {
+            return;
+        }
+        if let Some(e) = &self.engine {
+            e.send(Cmd::Step(by));
         }
     }
 
@@ -934,9 +1055,9 @@ impl Tts {
         self.cache_size = None;
     }
 
-    /// The controls in the reader's bar: the panel's button, and pause and
-    /// stop while reading.
-    pub fn bar(&mut self, ui: &mut egui::Ui) -> egui::Response {
+    /// The controls in the reader's bar: the panel's button and, while
+    /// reading, the transport icons and the playback speed.
+    pub fn bar(&mut self, ui: &mut egui::Ui, s: &mut TtsSettings) -> egui::Response {
         let b = ui
             .selectable_label(self.panel_open, RichText::new("Read aloud").size(14.0))
             .on_hover_text("Have the book read to you by an Azure voice or one on this computer");
@@ -947,22 +1068,68 @@ impl Tts {
             }
         }
         if self.active() {
-            if ui
-                .button(RichText::new("Stop").size(14.0))
-                .on_hover_text("Stop reading aloud")
-                .clicked()
-            {
-                self.stop();
-            }
-            let paused = self.state() == State::Paused;
-            if ui
-                .button(RichText::new(if paused { "Resume" } else { "Pause" }).size(14.0))
-                .clicked()
-            {
-                self.toggle_pause();
-            }
+            self.transport(ui, 14.0);
+            self.playback_slider(ui, s, 90.0);
         }
         b
+    }
+
+    /// ⏮ ⏸/▶ ⏹ ⏭: previous sentence, pause or resume, stop, next sentence.
+    fn transport(&mut self, ui: &mut egui::Ui, size: f32) {
+        let paused = self.state() == State::Paused;
+        ui.spacing_mut().item_spacing.x = 2.0;
+        if icon_button(
+            ui,
+            Icon::Prev,
+            size,
+            "Previous sentence (Ctrl+←)",
+            "Previous sentence",
+        )
+        .clicked()
+        {
+            self.step(-1);
+        }
+        let (icon, tip, name) = if paused {
+            (Icon::Play, "Resume (K)", "Resume")
+        } else {
+            (Icon::Pause, "Pause (K)", "Pause")
+        };
+        if icon_button(ui, icon, size, tip, name).clicked() {
+            self.toggle_pause();
+        }
+        if icon_button(ui, Icon::Stop, size, "Stop reading aloud", "Stop").clicked() {
+            self.stop();
+        }
+        if icon_button(
+            ui,
+            Icon::Next,
+            size,
+            "Next sentence (Ctrl+→)",
+            "Next sentence",
+        )
+        .clicked()
+        {
+            self.step(1);
+        }
+        ui.spacing_mut().item_spacing.x = 8.0;
+    }
+
+    /// The playback speed, 0.5× to 2×: told to the engine once let go.
+    fn playback_slider(&mut self, ui: &mut egui::Ui, s: &mut TtsSettings, width: f32) {
+        ui.spacing_mut().slider_width = width;
+        let r = ui
+            .add(
+                egui::Slider::new(&mut s.playback, PLAYBACK_MIN..=PLAYBACK_MAX)
+                    .step_by(0.05)
+                    .show_value(true)
+                    .custom_formatter(|v, _| format!("{v:.2}×"))
+                    .custom_parser(|t| t.trim().trim_end_matches(['×', 'x']).trim().parse().ok()),
+            )
+            .on_hover_text("Playback speed, for every voice: no audio is made again. Double-click for normal speed");
+        if r.double_clicked() {
+            s.playback = 1.0;
+        }
+        self.playback_dragging = r.dragged();
     }
 
     /// The panel under the bar's button: playback, voice, speed, the Azure
@@ -1009,13 +1176,7 @@ impl Tts {
                             }
                         }
                         st => {
-                            let label = if st == State::Paused { "Resume" } else { "Pause" };
-                            if ui.button(label).clicked() {
-                                self.toggle_pause();
-                            }
-                            if ui.button("Stop").clicked() {
-                                self.stop();
-                            }
+                            self.transport(ui, 16.0);
                             ui.label(
                                 RichText::new(match st {
                                     State::Loading if s.source == Source::Local => {
@@ -1060,7 +1221,7 @@ impl Tts {
                         ui.label("Voice");
                         self.voice_choice(ui, s);
                         ui.end_row();
-                        ui.label("Speed");
+                        ui.label("Voice speed");
                         ui.add(
                             egui::Slider::new(&mut s.rate, -50..=100)
                                 .step_by(5.0)
@@ -1068,7 +1229,7 @@ impl Tts {
                                     if v == 0.0 { "normal".to_owned() } else { format!("{v:+.0} %") }
                                 }),
                         )
-                        .on_hover_text("Each speed is its own audio: changing it makes sentences again");
+                        .on_hover_text("Azure reads faster or slower: makes the audio again. For a speed that needs no new audio, use Playback speed");
                         ui.end_row();
                         ui.label("Dictionary");
                         ui.checkbox(&mut s.pause_for_popup, "Pause while the popup is open")
@@ -1470,6 +1631,71 @@ impl Drop for Tts {
     }
 }
 
+/// The slowest and fastest playback speeds.
+pub const PLAYBACK_MIN: f32 = 0.5;
+pub const PLAYBACK_MAX: f32 = 2.0;
+
+/// A saved playback speed made safe (an edited settings file).
+pub fn playback_speed(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(PLAYBACK_MIN, PLAYBACK_MAX)
+    } else {
+        1.0
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Icon {
+    Prev,
+    Play,
+    Pause,
+    Stop,
+    Next,
+}
+
+/// A transport icon (Phosphor's filled glyph) in the text colour, on the
+/// button's background when hovered. `name` is what screen
+/// readers (and UI Automation) call it.
+fn icon_button(ui: &mut egui::Ui, icon: Icon, size: f32, tip: &str, name: &str) -> egui::Response {
+    let pad = ui.spacing().button_padding.y;
+    let side = size + 2.0 * pad + 4.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
+    let name = name.to_owned();
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &name));
+    if ui.is_rect_visible(rect) {
+        let v = ui.style().interact(&resp);
+        let p = ui.painter();
+        if resp.hovered() || resp.has_focus() {
+            p.rect_filled(rect, v.corner_radius, v.weak_bg_fill);
+        }
+        crate::reader::icons::paint(
+            p,
+            rect.center(),
+            icon.glyph(),
+            size * 1.15,
+            true,
+            v.fg_stroke.color,
+        );
+    }
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp.on_hover_text(tip)
+}
+
+impl Icon {
+    fn glyph(self) -> char {
+        use crate::reader::icons;
+        match self {
+            Icon::Prev => icons::SKIP_BACK,
+            Icon::Play => icons::PLAY,
+            Icon::Pause => icons::PAUSE,
+            Icon::Stop => icons::STOP,
+            Icon::Next => icons::SKIP_FORWARD,
+        }
+    }
+}
+
 fn group(n: usize) -> String {
     super::group_digits(n)
 }
@@ -1477,6 +1703,78 @@ fn group(n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_icons_and_speed_are_drawn() {
+        // The bar while reading: Phosphor's glyphs, not missing-glyph boxes,
+        // and the speed slider. Pictures in TTS_LAYOUT_OUT, if set.
+        let ctx = egui::Context::default();
+        crate::install_fonts(&ctx);
+        let mut tts = Tts::new(
+            Arc::new(Mutex::new(Vec::new())),
+            Vec::new(),
+            false,
+            "",
+            "layout-test",
+            &ctx,
+        );
+        let mut settings = TtsSettings {
+            playback: 1.25,
+            ..Default::default()
+        };
+        let mut screen = crate::raster::Screen::new();
+        let size = egui::vec2(420.0, 60.0);
+        let mut glyphs = Vec::new();
+        for i in 0..3 {
+            let mut frame = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::Panel::top("bar").show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            tts.transport(ui, 14.0);
+                            tts.playback_slider(ui, &mut settings, 90.0);
+                        });
+                    });
+                },
+            );
+            screen.absorb(&mut frame);
+            if i == 2 {
+                fn walk(s: &egui::Shape, out: &mut Vec<char>) {
+                    match s {
+                        egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                        egui::Shape::Text(t) => out.extend(t.galley.text().chars()),
+                        _ => {}
+                    }
+                }
+                frame
+                    .shapes
+                    .iter()
+                    .for_each(|s| walk(&s.shape, &mut glyphs));
+                if let Some(dir) = std::env::var_os("TTS_LAYOUT_OUT") {
+                    let dir = PathBuf::from(dir);
+                    std::fs::create_dir_all(&dir).unwrap();
+                    screen
+                        .picture(&ctx, &mut frame, size)
+                        .write_png(&dir.join("transport.png"))
+                        .unwrap();
+                }
+            }
+        }
+        use crate::reader::icons;
+        for g in [
+            icons::SKIP_BACK,
+            icons::PAUSE,
+            icons::STOP,
+            icons::SKIP_FORWARD,
+        ] {
+            assert!(glyphs.contains(&g), "{:x} drawn", g as u32);
+        }
+        let shown: String = glyphs.iter().collect();
+        assert!(shown.contains("1.25×"), "{shown}");
+    }
 
     #[test]
     fn local_action_buttons_are_stacked_without_extra_space() {

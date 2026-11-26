@@ -9,6 +9,7 @@
 //! entries are checked there (duplicates) while the popup shows at once; the
 //! buttons follow a frame or so later.
 
+use super::tts::CardVoice;
 use hanstat::anki_connect::{self, CanAdd, Client, Note};
 use hanstat::dict::lookup::{DictInfo, Group, Lookup};
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,9 @@ pub struct CardSettings {
     /// A duplicate is a note of any type with the same first field, not only
     /// of this type.
     pub check_all_models: bool,
+    /// Empty sentence-audio fields (Lapis' SentenceAudio) were given
+    /// `{sentence-audio}` once, when hanstat learnt to make audio.
+    pub sentence_audio_set: bool,
 }
 
 impl Default for CardSettings {
@@ -48,11 +52,27 @@ impl Default for CardSettings {
             fields: Vec::new(),
             tags: "hanstat".to_owned(),
             check_all_models: false,
+            sentence_audio_set: false,
         }
     }
 }
 
 impl CardSettings {
+    /// Settings saved before cards had audio: their empty sentence-audio
+    /// fields get `{sentence-audio}` (once). True if anything changed.
+    pub fn add_sentence_audio(&mut self) -> bool {
+        if self.sentence_audio_set {
+            return false;
+        }
+        self.sentence_audio_set = true;
+        for (i, (name, t)) in self.fields.iter_mut().enumerate() {
+            if t.trim().is_empty() && default_template(name, i == 0) == "{sentence-audio}" {
+                *t = "{sentence-audio}".to_owned();
+            }
+        }
+        true
+    }
+
     /// A deck and note type are chosen, and the first field has a template.
     pub fn ready(&self) -> bool {
         !self.deck.is_empty()
@@ -86,7 +106,11 @@ pub const MARKERS: &[(&str, &str)] = &[
     ),
     (
         "{audio}",
-        "Empty: hanstat has no audio (HyperTTS can add it in Anki)",
+        "The word, said by the read-aloud voice (empty with none set up)",
+    ),
+    (
+        "{sentence-audio}",
+        "The sentence, said by the read-aloud voice (empty with none set up)",
     ),
     ("{screenshot}", "Empty: hanstat takes no screenshots"),
     (
@@ -133,6 +157,8 @@ pub fn default_template(field: &str, first: bool) -> String {
         "example" | "examplesentence" | "context" => {
             "{cloze-prefix}<b>{cloze-body}</b>{cloze-suffix}"
         }
+        "sentenceaudio" | "exampleaudio" => "{sentence-audio}",
+        "audio" | "wordaudio" | "expressionaudio" | "vocabaudio" => "{audio}",
         "frequencysort" => "{frequency-harmonic-rank}",
         "frequencies" => "{frequencies}",
         "source" | "book" => "{document-title}",
@@ -281,6 +307,21 @@ struct Fill<'a> {
     sentence: Option<&'a Sentence>,
     titles: &'a [String],
     book: &'a str,
+    audio: &'a Audio,
+}
+
+/// The word's and the sentence's audio as fields hold them
+/// (`[sound:name]`), empty when there is none.
+#[derive(Clone, Debug, Default)]
+pub struct Audio {
+    pub word: String,
+    pub sentence: String,
+}
+
+/// Templates (in field order) use the word's audio, the sentence's.
+fn wants_audio(cfg: &CardSettings) -> (bool, bool) {
+    let has = |m: &str| cfg.fields.iter().any(|(_, t)| t.contains(m));
+    (has("{audio}"), has("{sentence-audio}"))
 }
 
 fn esc(s: &str) -> String {
@@ -392,7 +433,9 @@ impl Fill<'_> {
             "cloze-suffix" => esc(&self.cloze().2),
             "document-title" => esc(self.book),
             // Nothing in a book to fill them with: empty, not the marker.
-            "audio" | "screenshot" | "popup-selection-text" => String::new(),
+            "audio" => self.audio.word.clone(),
+            "sentence-audio" => self.audio.sentence.clone(),
+            "screenshot" | "popup-selection-text" => String::new(),
             "frequencies" => {
                 let items: Vec<String> = self
                     .g
@@ -468,6 +511,7 @@ fn note(
     titles: &[String],
     book: &str,
     first_only: bool,
+    audio: &Audio,
 ) -> Option<Note> {
     let g = src.lookup.groups.get(src.group)?;
     let f = Fill {
@@ -475,6 +519,7 @@ fn note(
         sentence: src.sentence.as_deref(),
         titles,
         book,
+        audio,
     };
     let n = if first_only { 1 } else { cfg.fields.len() };
     Some(Note {
@@ -502,6 +547,8 @@ pub enum Status {
     Adding,
     /// Added in this session: the note's id.
     Added(i64),
+    /// Added, but without (some of) its audio: why.
+    AddedWithout(i64, String),
     /// Anki couldn't be asked, or said no (the reason).
     Failed(String),
 }
@@ -530,6 +577,8 @@ enum Job {
         src: Source,
         titles: Arc<Vec<String>>,
         book: Arc<str>,
+        /// Who says the word and the sentence (`None`: no voice set up).
+        voice: Option<Arc<CardVoice>>,
     },
     Browse {
         cfg: Arc<CardSettings>,
@@ -600,7 +649,7 @@ fn worker(rx: Receiver<Job>, tx: Sender<Answer>, repaint: Arc<dyn Fn() + Send + 
                             group,
                             sentence: sentence.clone(),
                         };
-                        if let Some(n) = note(&cfg, &s, &titles, &book, true) {
+                        if let Some(n) = note(&cfg, &s, &titles, &book, true, &Audio::default()) {
                             keys.push(key_of(&lookup.groups[group]));
                             notes.push(n);
                         }
@@ -633,17 +682,23 @@ fn worker(rx: Receiver<Job>, tx: Sender<Answer>, repaint: Arc<dyn Fn() + Send + 
                     src,
                     titles,
                     book,
+                    voice,
                 } => {
-                    let Some(n) = note(&cfg, &src, &titles, &book, false) else {
-                        continue;
-                    };
-                    let k = key_of(&src.lookup.groups[src.group]);
-                    let st = match client_for(&mut client, &cfg).add_note(&n) {
-                        Ok(id) => Status::Added(id),
-                        Err(e) if e.contains("duplicate") => Status::Duplicate,
-                        Err(e) => Status::Failed(e),
-                    };
-                    Answer::AddResult(generation, k, st)
+                    // On a thread of its own: making audio can take seconds
+                    // (the local voice may have to load), and the popup's
+                    // checks must not wait for it.
+                    let (tx, repaint) = (tx.clone(), repaint.clone());
+                    let _ = std::thread::Builder::new()
+                        .name("anki-add".into())
+                        .spawn(move || {
+                            let client = Client::new(&cfg.url, Some(&cfg.key));
+                            let a = add_note(&client, &cfg, &src, &titles, &book, voice.as_deref());
+                            if let Some((k, st)) = a {
+                                let _ = tx.send(Answer::AddResult(generation, k, st));
+                                repaint();
+                            }
+                        });
+                    continue;
                 }
                 Job::Browse { cfg, id } => {
                     Answer::Browsed(client_for(&mut client, &cfg).gui_browse(&format!("nid:{id}")))
@@ -671,6 +726,60 @@ fn worker(rx: Receiver<Job>, tx: Sender<Answer>, repaint: Arc<dyn Fn() + Send + 
     }
 }
 
+/// Make the note for `src` (its audio first, stored in Anki's media) and
+/// add it: the word's key and how it went.
+fn add_note(
+    client: &Client,
+    cfg: &CardSettings,
+    src: &Source,
+    titles: &[String],
+    book: &str,
+    voice: Option<&CardVoice>,
+) -> Option<(Key, Status)> {
+    let g = src.lookup.groups.get(src.group)?;
+    let k = key_of(g);
+    let (want_word, want_sentence) = wants_audio(cfg);
+    let mut audio = Audio::default();
+    let mut missing: Vec<String> = Vec::new();
+    let sentence: String = src
+        .sentence
+        .as_ref()
+        .map(|s| s.text.iter().collect())
+        .unwrap_or_default();
+    let mut sound = |text: &str, what: &str| -> String {
+        let Some(v) = voice else {
+            return String::new();
+        };
+        let made = v
+            .clip(text)
+            .and_then(|path| client.store_media(&v.media_name(text), &path));
+        match made {
+            Ok(name) => format!("[sound:{name}]"),
+            Err(e) => {
+                missing.push(format!("{what}: {e}"));
+                String::new()
+            }
+        }
+    };
+    if want_word {
+        audio.word = sound(&g.headword, "The word's audio");
+    }
+    if want_sentence && !sentence.trim().is_empty() {
+        audio.sentence = sound(&sentence, "The sentence's audio");
+    }
+    if voice.is_none() && (want_word || want_sentence) {
+        missing.push("No read-aloud voice is set up (Read aloud), so the note has no audio".into());
+    }
+    let n = note(cfg, src, titles, book, false, &audio)?;
+    let st = match client.add_note(&n) {
+        Ok(id) if missing.is_empty() => Status::Added(id),
+        Ok(id) => Status::AddedWithout(id, missing.join("\n")),
+        Err(e) if e.contains("duplicate") => Status::Duplicate,
+        Err(e) => Status::Failed(e),
+    };
+    Some((k, st))
+}
+
 /// The popup's side: statuses by word, and the worker.
 pub struct Cards {
     jobs: Sender<Job>,
@@ -688,6 +797,8 @@ pub struct Cards {
     pub fields_of: Option<(String, Result<Vec<String>, String>)>,
     /// The last error from opening a note in Anki's browser.
     pub browse_error: Option<String>,
+    /// Who says cards' audio: read aloud's voice, set by the reader.
+    pub voice: Option<Arc<CardVoice>>,
 }
 
 impl Cards {
@@ -709,6 +820,7 @@ impl Cards {
             lists: None,
             fields_of: None,
             browse_error: None,
+            voice: None,
         }
     }
 
@@ -773,7 +885,14 @@ impl Cards {
             src,
             titles: self.titles.clone(),
             book: self.book.clone(),
+            voice: self.voice.clone(),
         });
+    }
+
+    /// The fields' templates ask for audio.
+    pub fn wants_audio(&self) -> bool {
+        let (w, s) = wants_audio(&self.cfg);
+        w || s
     }
 
     pub fn browse(&mut self, id: i64) {
@@ -811,7 +930,7 @@ impl Cards {
                         // (it may have been asked before the click).
                         if !matches!(
                             self.statuses.get(&k),
-                            Some(Status::Adding | Status::Added(_))
+                            Some(Status::Adding | Status::Added(_) | Status::AddedWithout(..))
                         ) {
                             self.statuses.insert(k, s);
                         }
@@ -1143,6 +1262,7 @@ mod tests {
             sentence: Some(&sentence),
             titles: &titles,
             book: "通往夏天的隧道",
+            audio: &Audio::default(),
         };
         assert_eq!(f.apply("{expression}"), "养精蓄锐");
         assert_eq!(f.apply("{sentence}"), "为了明天而<b>养精蓄锐</b>。");
@@ -1180,6 +1300,15 @@ mod tests {
             ..f
         };
         assert_eq!(f.apply("[{sentence}]"), "[]");
+        let audio = Audio {
+            word: "[sound:hanstat_1.mp3]".into(),
+            sentence: "[sound:hanstat_2.mp3]".into(),
+        };
+        let f = Fill { audio: &audio, ..f };
+        assert_eq!(
+            f.apply("{audio}|{sentence-audio}"),
+            "[sound:hanstat_1.mp3]|[sound:hanstat_2.mp3]"
+        );
     }
 
     #[test]
@@ -1221,6 +1350,7 @@ mod tests {
                 "Sentence",
                 "{cloze-prefix}<b>{cloze-body}</b>{cloze-suffix}",
             ),
+            ("SentenceAudio", "{sentence-audio}"),
             ("Picture", "{screenshot}"),
             ("Glossary", "{glossary}"),
             ("Frequency", "{frequencies}"),

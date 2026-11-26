@@ -511,6 +511,10 @@ pub enum Cmd {
     Pause,
     Resume,
     Stop,
+    /// Go back (negative) or forward by sentences from the one heard.
+    Step(i32),
+    /// The playback speed (1.0: as made).
+    Playback(f32),
     Speech(Speech),
     Client(Option<Arc<Azure>>),
     Availability(Availability),
@@ -593,6 +597,43 @@ impl Engine {
     }
 }
 
+/// The sentence `by` sentences from `at` in a book of `spines` chapters,
+/// across chapters (`len(spine)`: its sentences, `None` while not built).
+/// `None` past the book's end; back before its start: the first sentence. A
+/// chapter not built yet: its first sentence, with `true`.
+fn step_across(
+    at: (usize, usize),
+    by: i32,
+    spines: usize,
+    len: &mut dyn FnMut(usize) -> Option<usize>,
+) -> Option<(usize, usize, bool)> {
+    let (mut spine, mut i) = (at.0, at.1 as i64 + by as i64);
+    loop {
+        let Some(n) = len(spine) else {
+            return Some((spine, 0, true));
+        };
+        if i < 0 {
+            if spine == 0 {
+                return Some((0, 0, false));
+            }
+            spine -= 1;
+            let Some(prev) = len(spine) else {
+                return Some((spine, 0, true));
+            };
+            i += prev as i64;
+            continue;
+        }
+        if (i as usize) < n {
+            return Some((spine, i as usize, false));
+        }
+        if spine + 1 >= spines {
+            return None;
+        }
+        i -= n as i64;
+        spine += 1;
+    }
+}
+
 /// A clip on the device: its sentence.
 struct Queued {
     spine: usize,
@@ -619,6 +660,9 @@ struct Player {
     next_id: u64,
     /// The last sentence heard (kept while paused or loading).
     heard: Option<(usize, usize)>,
+    /// The sentence the last Play started from (what a step counts from
+    /// before anything of it is heard).
+    from: Option<(usize, usize)>,
     /// The cursor the urgent requests were made for.
     asked: Option<(usize, usize, Speech)>,
     error: Option<String>,
@@ -630,6 +674,11 @@ struct Player {
     closing: Option<Instant>,
     /// The clip heard and its clock.
     clock: Option<(u64, Clock)>,
+    /// The playback speed: clips are stretched to it as they are queued.
+    playback: f32,
+    /// After a speed change: the sentence heard is queued again from this
+    /// share of it.
+    resume_at: Option<((usize, usize), f32)>,
 }
 
 /// The clock of the clip heard: `old` while it is still right to within a
@@ -674,6 +723,7 @@ impl Player {
             queued: HashMap::new(),
             next_id: 1,
             heard: None,
+            from: None,
             asked: None,
             error: None,
             availability: Availability::Waiting,
@@ -682,6 +732,8 @@ impl Player {
             paras: HashMap::new(),
             closing: None,
             clock: None,
+            playback: 1.0,
+            resume_at: None,
         }
     }
 
@@ -800,6 +852,7 @@ impl Player {
     fn command(&mut self, c: Cmd) {
         match c {
             Cmd::Play { spine, src } => {
+                self.resume_at = None;
                 self.error = None;
                 self.needs_setup = false;
                 self.closing = None;
@@ -827,9 +880,12 @@ impl Player {
                 };
                 let idx = sentence_at(&s, src);
                 self.cursor = Some((spine, idx));
+                self.from = Some((spine, idx));
                 self.heard = None;
                 self.state = State::Loading;
             }
+            Cmd::Step(by) => self.step_by(by),
+            Cmd::Playback(speed) => self.set_playback(speed),
             Cmd::Pause => {
                 if matches!(self.state, State::Loading | State::Playing) {
                     if let Some(o) = &self.output {
@@ -855,6 +911,8 @@ impl Player {
                 self.queued.clear();
                 self.cursor = None;
                 self.heard = None;
+                self.from = None;
+                self.resume_at = None;
                 self.asked = None;
                 self.needs_setup = false;
                 self.state = State::Stopped;
@@ -888,6 +946,69 @@ impl Player {
                 self.asked = None;
             }
             Cmd::Pregenerate(spines, batch) => self.pregenerate(spines, batch),
+        }
+    }
+
+    fn stepped(&mut self, at: (usize, usize), by: i32) -> Option<(usize, usize, bool)> {
+        let n = self.spines();
+        step_across(at, by, n, &mut |spine| {
+            self.sentences(spine).map(|s| s.len())
+        })
+    }
+
+    /// A new playback speed: what is queued is queued again at it, the
+    /// sentence heard from where it was (no word heard twice or missed).
+    fn set_playback(&mut self, speed: f32) {
+        if (speed - self.playback).abs() < 0.001 {
+            return;
+        }
+        self.playback = speed;
+        if !matches!(self.state, State::Loading | State::Playing | State::Paused) {
+            return;
+        }
+        let Some(o) = &self.output else { return };
+        let progress = o.progress();
+        let heard = progress
+            .and_then(|(id, _)| self.queued.get(&id))
+            .map(|q| (q.spine, q.idx));
+        let Some(at) = heard else {
+            // Nothing heard yet: the next clips are stretched anyway.
+            return;
+        };
+        let frac = progress.map_or(0.0, |p| p.1);
+        o.clear();
+        self.queued.clear();
+        self.cursor = Some(at);
+        self.heard = Some(at);
+        self.resume_at = Some((at, frac));
+        if self.state == State::Playing {
+            self.state = State::Loading;
+        }
+    }
+
+    /// Back or forward by `by` sentences: read from there (paused if it was).
+    fn step_by(&mut self, by: i32) {
+        if self.state == State::Stopped {
+            return;
+        }
+        let Some(at) = self.heard.or(self.from).or(self.cursor) else {
+            return;
+        };
+        let Some((spine, idx, unbuilt)) = self.stepped(at, by) else {
+            return;
+        };
+        let src = if unbuilt {
+            0
+        } else {
+            match self.sentences(spine).and_then(|s| s.get(idx).cloned()) {
+                Some(r) => r.start,
+                None => return,
+            }
+        };
+        let paused = self.state == State::Paused;
+        self.command(Cmd::Play { spine, src });
+        if paused {
+            self.command(Cmd::Pause);
         }
     }
 
@@ -1033,7 +1154,14 @@ impl Player {
                     Ok((samples, rate)) => {
                         let id = self.next_id;
                         self.next_id += 1;
-                        out.push(id, audio::resample(&samples, rate, out.rate));
+                        let samples = audio::stretch(&samples, rate, self.playback);
+                        let samples = audio::resample(&samples, rate, out.rate);
+                        // Queued again after a speed change: from where it was.
+                        let start = match self.resume_at.take() {
+                            Some((a, frac)) if a == at => (samples.len() as f32 * frac) as usize,
+                            _ => 0,
+                        };
+                        out.push_at(id, samples, start);
                         self.queued.insert(
                             id,
                             Queued {
@@ -1243,5 +1371,25 @@ impl Player {
             drop(n);
             (self.repaint)();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn steps_cross_chapters_and_skip_empty_ones() {
+        // Chapter 1 has no sentences (a cover); chapter 3 isn't built yet.
+        let lens = [Some(3), Some(0), Some(2), None];
+        let mut len = |i: usize| lens[i];
+        assert_eq!(step_across((0, 1), 1, 4, &mut len), Some((0, 2, false)));
+        assert_eq!(step_across((0, 2), 1, 4, &mut len), Some((2, 0, false)));
+        assert_eq!(step_across((2, 0), -1, 4, &mut len), Some((0, 2, false)));
+        assert_eq!(step_across((0, 0), -1, 4, &mut len), Some((0, 0, false)));
+        assert_eq!(step_across((2, 1), 1, 4, &mut len), Some((3, 0, true)));
+        let lens = [Some(3), Some(2)];
+        let mut len = |i: usize| lens[i];
+        assert_eq!(step_across((1, 1), 1, 2, &mut len), None, "the book's end");
     }
 }

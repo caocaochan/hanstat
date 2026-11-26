@@ -219,6 +219,7 @@ impl Reader {
             focused,
             menus,
             listening,
+            search: self.peek.is_some(),
         };
         rs::edit(|s| self.tracker.frame(s, f));
         self.stats_after(now);
@@ -317,6 +318,10 @@ impl Reader {
 
     /// Where the page settled this frame.
     pub(super) fn stats_place(&mut self, l: &Arc<ChapterLayout>) {
+        // A search result shown: reading is still where it was.
+        if self.peek.is_some() {
+            return;
+        }
         let now = rs::now();
         let p = Place {
             spine: self.spine,
@@ -487,6 +492,10 @@ impl Reader {
                 "The window isn't active. Timing goes on when you come back.".to_owned()
             }
             State::Paused(Pause::Menu) => "Timing waits while a menu or panel is open.".to_owned(),
+            State::Paused(Pause::Search) => {
+                "A search result is shown: nothing counts until you go back or keep reading there."
+                    .to_owned()
+            }
             State::Running if listening => {
                 "Read aloud is playing: this counts as listening, apart from reading.".to_owned()
             }

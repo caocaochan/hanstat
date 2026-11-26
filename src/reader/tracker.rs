@@ -26,6 +26,8 @@ pub enum Pause {
     Idle,
     Unfocused,
     Menu,
+    /// A search result is shown (not where reading is).
+    Search,
 }
 
 impl Pause {
@@ -35,6 +37,7 @@ impl Pause {
             Pause::Idle => "Paused: idle",
             Pause::Unfocused => "Paused: window inactive",
             Pause::Menu => "Paused: menu open",
+            Pause::Search => "Paused: search result shown",
         }
     }
 }
@@ -57,6 +60,8 @@ pub struct Frame {
     pub menus: bool,
     /// Read aloud is playing.
     pub listening: bool,
+    /// A search result is shown, away from the place.
+    pub search: bool,
 }
 
 /// Where the reader is: a page of a laid-out chapter.
@@ -181,6 +186,8 @@ impl Tracker {
             State::Running
         } else if !f.focused {
             State::Paused(Pause::Unfocused)
+        } else if f.search {
+            State::Paused(Pause::Search)
         } else if f.menus {
             State::Paused(Pause::Menu)
         } else if f.now - self.last_input > self.idle_secs {
@@ -223,6 +230,12 @@ impl Tracker {
     /// reported counts.
     pub fn turned(&mut self) {
         self.turn_pending = true;
+    }
+
+    /// A jump (from a search result shown): a turn made before it doesn't
+    /// count, and the next place only moves the base.
+    pub fn jumped(&mut self) {
+        self.turn_pending = false;
     }
 
     /// Where the reader settled this frame. `between(a..b)`: Chinese
@@ -452,6 +465,7 @@ mod tests {
             focused: true,
             menus: false,
             listening: false,
+            search: false,
         }
     }
 
@@ -632,6 +646,7 @@ mod tests {
         f.frame(input(0.0));
         f.frame(Frame {
             listening: true,
+            search: false,
             ..frame(60.0)
         });
         f.t.place(&mut f.s, at(0, 0, 0), &none, T0 + 60.0);
@@ -640,6 +655,7 @@ mod tests {
         // Twenty minutes of listening without input, window in the background.
         f.frame(Frame {
             listening: true,
+            search: false,
             focused: false,
             ..frame(1260.0)
         });
@@ -672,6 +688,7 @@ mod tests {
                     focused: true,
                     menus: false,
                     listening: false,
+                    search: false,
                 },
             );
         }

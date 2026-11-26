@@ -3052,6 +3052,110 @@ fn reading_stats_tracker() {
     rs::set_test_clock(None);
 }
 
+/// Ctrl+F in the real reader: results arrive, Enter or a click shows one
+/// (the sidebar hides, the page doesn't take the click), and while it is
+/// shown pages turned and time spent count for nothing; Esc goes back to
+/// the place, which counts on from there; "Keep reading here" moves it.
+#[test]
+#[ignore = "opens the reader with the system fonts and dictionary settings"]
+fn reader_search_peek() {
+    use crate::reading_stats as rs;
+    use tracker::{Pause, State};
+    let temp = tempfile::tempdir().unwrap();
+    let t0 = 1_790_000_000.0;
+    rs::set_test_clock(Some(t0));
+    rs::reset_for_test(rs::ReadingStats::default());
+    let mut d = Driver::new();
+    let mut r = stats_book(&mut d, temp.path());
+    let chars = |r: &Reader| r.tracker.totals.read_chars;
+    rs::set_test_clock(Some(t0 + 30.0));
+    d.key(&mut r, Key::ArrowRight);
+    assert_eq!((r.spine, r.page, chars(&r)), (0, 1, 40));
+
+    // Ctrl+F, a query, its results.
+    let ctrl_f = egui::Event::Key {
+        key: Key::F,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND,
+    };
+    d.frame_with(&mut r, vec![ctrl_f.clone()], egui::Modifiers::COMMAND);
+    d.idle(&mut r, 3);
+    assert!(r.search.open);
+    d.frame(&mut r, vec![egui::Event::Text("终章".into())]);
+    let t = Instant::now();
+    while r.search.hits.is_empty() || r.search.searching() {
+        d.idle(&mut r, 1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(t.elapsed().as_secs() < 10, "no results");
+    }
+    assert_eq!(r.search.hits.len(), 3, "终章文字 three times");
+    assert_eq!(r.search.hits[0].spine, 1);
+    assert_eq!(r.search.hits[0].text, "终章");
+    d.snap("search-sidebar");
+    // Esc in the box: the sidebar goes, the book stays; Ctrl+F brings it
+    // back as it was.
+    assert!(d.key(&mut r, Key::Escape), "the reader stays open");
+    assert!(!r.search.open);
+    d.frame_with(&mut r, vec![ctrl_f.clone()], egui::Modifiers::COMMAND);
+    d.idle(&mut r, 3);
+    assert!(r.search.open);
+    assert_eq!(r.search.hits.len(), 3);
+
+    // Enter in the box: the first result, the sidebar out of the way.
+    d.key(&mut r, Key::Enter);
+    assert_eq!(r.spine, 1);
+    assert!(!r.search.open);
+    assert_eq!(r.peek.map(|p| p.spine), Some(0));
+    assert!(r.search_hit.is_some());
+    d.snap("search-peek");
+    // Time and turns while it is shown count for nothing.
+    rs::set_test_clock(Some(t0 + 90.0));
+    d.idle(&mut r, 3);
+    assert_eq!(r.tracker.state(), State::Paused(Pause::Search));
+    let secs = r.tracker.totals.read_secs;
+    let base = r.tracker.base().unwrap();
+    assert_eq!((base.spine, base.page), (0, 1), "the place stays");
+    d.key(&mut r, Key::ArrowLeft);
+    assert_eq!(chars(&r), 40);
+
+    // Esc: back to the place (not out of the book), and on from there.
+    assert!(d.key(&mut r, Key::Escape), "the reader stays open");
+    assert_eq!((r.spine, r.page), (0, 1));
+    assert!(r.peek.is_none() && r.search_hit.is_none());
+    rs::set_test_clock(Some(t0 + 100.0));
+    d.idle(&mut r, 3);
+    assert_eq!(r.tracker.state(), State::Running);
+    assert_eq!(
+        r.tracker.totals.read_secs, secs,
+        "nothing counted for the peek"
+    );
+    d.key(&mut r, Key::ArrowRight);
+    assert_eq!(chars(&r), 60, "counts on from the place");
+
+    // Ctrl+F again: the same results; a click on one goes there, not
+    // through to the page under the sidebar.
+    d.frame_with(&mut r, vec![ctrl_f], egui::Modifiers::COMMAND);
+    d.idle(&mut r, 3);
+    assert!(r.search.open);
+    assert_eq!(r.search.hits.len(), 3, "results kept");
+    let side = r.search.rect.expect("sidebar shown");
+    d.click(&mut r, pos2(side.left() + 60.0, side.top() + 120.0));
+    assert_eq!(r.spine, 1, "the click chose the result");
+    assert!(!r.dict.is_open() && r.selection.is_none());
+    // Keep reading here, after a turn while it was shown: the place moves
+    // (a jump: no characters).
+    d.key(&mut r, Key::ArrowLeft);
+    d.key(&mut r, Key::ArrowRight);
+    r.peek_keep();
+    d.idle(&mut r, 3);
+    assert!(r.peek.is_none());
+    assert_eq!(r.tracker.base().unwrap().spine, 1);
+    assert_eq!(chars(&r), 60);
+    rs::set_test_clock(None);
+}
+
 /// Every text in the last frame's shapes, tooltips included.
 fn shown_text(d: &Driver) -> Vec<String> {
     fn walk(s: &egui::Shape, out: &mut Vec<String>) {

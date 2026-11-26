@@ -174,6 +174,20 @@ impl Client {
     }
 
     /// Show notes matching `query` in Anki's browser.
+    /// Copy the file at `path` into Anki's media folder as `filename`
+    /// (replacing one of that name): the name Anki gave it.
+    pub fn store_media(&self, filename: &str, path: &std::path::Path) -> Result<String, String> {
+        let v = self.call(
+            "storeMediaFile",
+            json!({ "filename": filename, "path": path.to_string_lossy() }),
+        )?;
+        match v {
+            Value::String(s) => Ok(s),
+            Value::Null => Ok(filename.to_owned()),
+            other => Err(format!("Anki stored the audio but said {other}")),
+        }
+    }
+
     pub fn gui_browse(&self, query: &str) -> Result<(), String> {
         self.call("guiBrowse", json!({ "query": query }))
             .map(|_| ())
@@ -267,6 +281,58 @@ mod tests {
             j["options"]["duplicateScopeOptions"]["checkAllModels"],
             true
         );
+    }
+
+    #[test]
+    fn media_is_stored_from_a_path() {
+        // A stand-in for AnkiConnect on a free port (never the user's Anki).
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 4096];
+            // Headers, then the body (Content-Length long).
+            loop {
+                let n = sock.read(&mut buf).unwrap();
+                req.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&req);
+                if let Some(h) = text.find("\r\n\r\n") {
+                    let len: usize = text
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if req.len() >= h + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let body = r#"{"result": "hanstat_ab_1.mp3", "error": null}"#;
+            write!(
+                sock,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            String::from_utf8(req).unwrap()
+        });
+        let c = Client::new(&format!("http://127.0.0.1:{port}"), None);
+        let path = std::path::Path::new("C:/clips/ab.mp3");
+        assert_eq!(
+            c.store_media("hanstat_ab.mp3", path).unwrap(),
+            "hanstat_ab_1.mp3",
+            "Anki's name is used"
+        );
+        let req = server.join().unwrap();
+        let body: Value = serde_json::from_str(&req[req.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+        assert_eq!(body["action"], "storeMediaFile");
+        assert_eq!(body["params"]["filename"], "hanstat_ab.mp3");
+        assert_eq!(body["params"]["path"], "C:/clips/ab.mp3");
     }
 
     #[test]

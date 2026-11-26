@@ -235,6 +235,15 @@ pub struct Popup {
     pub cards: Cards,
     /// The popup's theme as saved: [`SAME_AS_PAGES`] or a theme's id.
     pub theme: String,
+    /// Known words: Anki and the word lists merged (the app's), and the
+    /// words marked known one by one, as the book wrote them.
+    pub known: Option<Arc<hanstat::anki::Knowledge>>,
+    pub marked: Arc<HashSet<String>>,
+    /// Marked or unmarked here since `marked` was last set (shown at once,
+    /// before the app has saved them).
+    marked_here: HashMap<String, bool>,
+    /// Words marked (true) or unmarked here, for the app to save.
+    pub known_toggles: Vec<(String, bool)>,
 }
 
 /// The text a lookup reads from `src`: up to `max` characters, stopping at a
@@ -389,6 +398,48 @@ enum CardButton<'a> {
     Status(Option<&'a Status>),
 }
 
+/// An entry's ✓ (known) button, as drawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum KnownButton {
+    Unknown,
+    /// Marked known by the user (a click unmarks it).
+    Marked,
+    /// Known from Anki or a word list: shown, not changed here.
+    From(KnownStatus),
+}
+
+type KnownStatus = hanstat::anki::Status;
+
+/// Where `word` stands: marked or unmarked here (not saved yet) first, then
+/// the user's own marks, then Anki and the word lists.
+fn known_of(
+    here: &HashMap<String, bool>,
+    marked: &HashSet<String>,
+    known: Option<&hanstat::anki::Knowledge>,
+    word: &str,
+) -> KnownButton {
+    if let Some(&on) = here.get(word) {
+        return if on {
+            KnownButton::Marked
+        } else {
+            KnownButton::Unknown
+        };
+    }
+    if marked.contains(word) {
+        return KnownButton::Marked;
+    }
+    match known.map(|k| k.word(word)) {
+        Some(s) if s.is_known() => KnownButton::From(s),
+        _ => KnownButton::Unknown,
+    }
+}
+
+/// The text of the book (or popup) an entry matched: what is marked known,
+/// as the book wrote it (not the dictionary's headword).
+fn book_word(l: &Lookup, g: &hanstat::dict::lookup::Group) -> String {
+    l.text.chars().take(g.matched).collect()
+}
+
 /// A click on an entry's Anki button.
 enum CardClick {
     Add(usize),
@@ -452,7 +503,57 @@ impl Popup {
             size_changed: false,
             warmed: false,
             theme: SAME_AS_PAGES.to_owned(),
+            known: None,
+            marked: Arc::new(HashSet::new()),
+            marked_here: HashMap::new(),
+            known_toggles: Vec::new(),
         }
+    }
+
+    /// The app's known words, each frame: what the ✓ buttons show.
+    pub fn set_known(
+        &mut self,
+        known: Option<Arc<hanstat::anki::Knowledge>>,
+        marked: Arc<HashSet<String>>,
+    ) {
+        if !Arc::ptr_eq(&marked, &self.marked) {
+            self.marked_here.clear();
+        }
+        self.known = known;
+        self.marked = marked;
+    }
+
+    /// Where `word` (as the book wrote it) stands, for its ✓ button.
+    fn known_state(&self, word: &str) -> KnownButton {
+        known_of(&self.marked_here, &self.marked, self.known.as_deref(), word)
+    }
+
+    /// Mark `word` known (or unmark it): shown at once, saved by the app.
+    fn toggle_known(&mut self, word: String) {
+        let on = match self.known_state(&word) {
+            KnownButton::Unknown => true,
+            KnownButton::Marked => false,
+            KnownButton::From(_) => return,
+        };
+        self.marked_here.insert(word.clone(), on);
+        self.known_toggles.push((word, on));
+    }
+
+    /// A: the top popup's first entry's ✓ button.
+    pub fn toggle_first_known(&mut self) {
+        let Some(l) = self.levels.last() else { return };
+        let Some(g) = l.result.groups.first() else {
+            return;
+        };
+        let w = book_word(&l.result, g);
+        if !w.is_empty() {
+            self.toggle_known(w);
+        }
+    }
+
+    /// The words marked or unmarked since last asked.
+    pub fn take_known_toggles(&mut self) -> Vec<(String, bool)> {
+        std::mem::take(&mut self.known_toggles)
     }
 
     pub fn has_terms(&self) -> bool {
@@ -859,6 +960,12 @@ impl Popup {
         };
         let mut want = None;
         let mut card_click = None;
+        let mut known_click: Option<String> = None;
+        let known_states: Vec<KnownButton> = result
+            .groups
+            .iter()
+            .map(|g| self.known_state(&book_word(&result, g)))
+            .collect();
         let cards = &self.cards;
         let card_ready = cards.cfg.ready();
         let mut toggle_bar = None;
@@ -931,10 +1038,22 @@ impl Popup {
                                         CardButton::Setup
                                     }
                                 });
-                                let (click, _button) =
-                                    header(ui, gi, g, &dicts, size, show_freq, card, look);
+                                let (click, known_clicked, _button) = header(
+                                    ui,
+                                    gi,
+                                    g,
+                                    &dicts,
+                                    size,
+                                    show_freq,
+                                    card,
+                                    known_states[gi],
+                                    look,
+                                );
                                 if click.is_some() {
                                     card_click = click;
+                                }
+                                if known_clicked {
+                                    known_click = Some(book_word(&result, g));
                                 }
                                 #[cfg(test)]
                                 drawn.0.extend(_button);
@@ -1135,6 +1254,9 @@ impl Popup {
             Some(CardClick::Setup) => self.cards.open_setup(),
             None => {}
         }
+        if let Some(w) = known_click.filter(|w| !w.is_empty()) {
+            self.toggle_known(w);
+        }
         let l = &mut self.levels[level];
         l.fresh = false;
         l.scroll_y = scroll_y;
@@ -1187,27 +1309,105 @@ fn header(
     size: f32,
     show_freq: bool,
     card: Option<CardButton>,
+    known: KnownButton,
     look: &Look,
-) -> (Option<CardClick>, Option<Rect>) {
+) -> (Option<CardClick>, bool, Option<Rect>) {
     let top = ui.cursor().min;
     let full = ui.available_width();
     let side = (size * 1.45).round();
-    let reserve = if card.is_some() { side + 8.0 } else { 0.0 };
+    let gap = 6.0;
+    let buttons = 1.0 + card.is_some() as u8 as f32;
+    let reserve = buttons * side + (buttons - 1.0) * gap + 8.0;
     let row = ui.allocate_ui_with_layout(
         vec2(full - reserve, ui.spacing().interact_size.y),
         egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
         |ui| header_text(ui, g, dicts, size, show_freq, look),
     );
-    let Some(card) = card else {
-        return (None, None);
-    };
-    // Beside the headword, on the first line.
+    // Beside the headword, on the first line: ✓, then +.
     let line = row.response.rect.height().min(size * 1.55 * 1.4);
-    let rect = Rect::from_min_size(
-        pos2(top.x + full - side, top.y + ((line - side) / 2.0).max(0.0)),
-        vec2(side, side),
+    let y = top.y + ((line - side) / 2.0).max(0.0);
+    let card_rect = Rect::from_min_size(pos2(top.x + full - side, y), vec2(side, side));
+    let known_x = if card.is_some() {
+        card_rect.left() - gap - side
+    } else {
+        card_rect.left()
+    };
+    let known_rect = Rect::from_min_size(pos2(known_x, y), vec2(side, side));
+    let known_clicked = known_button(ui, known_rect, gi, known, look);
+    let Some(card) = card else {
+        return (None, known_clicked, None);
+    };
+    (
+        card_button(ui, card_rect, gi, card, look),
+        known_clicked,
+        Some(card_rect),
+    )
+}
+
+/// An entry's ✓ button: outlined while the word isn't known (a click marks
+/// it), filled green once marked (a click unmarks it), filled in the link
+/// colour when Anki or a word list knows it (not clickable).
+fn known_button(ui: &mut egui::Ui, rect: Rect, gi: usize, state: KnownButton, look: &Look) -> bool {
+    let (fg, filled, enabled, tip, name) = match state {
+        KnownButton::Unknown => (
+            look.subtle,
+            false,
+            true,
+            "Mark as known (A)".to_owned(),
+            "Mark known",
+        ),
+        KnownButton::Marked => (
+            look.green,
+            true,
+            true,
+            "Marked known by you. Click to unmark it (A)".to_owned(),
+            "Known",
+        ),
+        KnownButton::From(s) => (
+            look.link,
+            true,
+            false,
+            format!("Known: {}", from_label(s)),
+            "Known",
+        ),
+    };
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let resp = ui.interact(rect, ui.scope_id().with(("known-word", gi)), sense);
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, name));
+    let bg = if resp.hovered() && enabled {
+        look.surface1
+    } else {
+        look.surface0
+    };
+    let p = ui.painter();
+    p.rect_filled(rect, 5.0, bg);
+    // Phosphor's check circle: outlined, or filled once known.
+    super::icons::paint(
+        p,
+        rect.center(),
+        super::icons::CHECK_CIRCLE,
+        rect.height() * 0.78,
+        filled,
+        fg,
     );
-    (card_button(ui, rect, gi, card, look), Some(rect))
+    if enabled && resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let clicked = resp.clicked();
+    resp.on_hover_text(tip);
+    clicked
+}
+
+fn from_label(s: KnownStatus) -> &'static str {
+    match s {
+        KnownStatus::Mature => "mature in Anki",
+        KnownStatus::Young => "young in Anki",
+        _ => "in a word list (HSK, TOCFL, a list or a book marked read)",
+    }
 }
 
 /// An entry's Anki button: + to add (greyed out when the word is already in
@@ -1253,6 +1453,13 @@ fn card_button(
                 look.green,
                 true,
                 "Added. Click to see it in Anki's browser".into(),
+                Some(CardClick::Browse(*id)),
+            ),
+            CardButton::Status(Some(Status::AddedWithout(id, why))) => (
+                "✔",
+                look.yellow,
+                true,
+                format!("Added, without audio: {why}\nClick to see it in Anki's browser"),
                 Some(CardClick::Browse(*id)),
             ),
             CardButton::Status(Some(Status::Failed(e))) => (
@@ -1358,6 +1565,91 @@ fn freq_badge(ui: &mut egui::Ui, text: String, size: f32, look: &Look) -> egui::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_buttons_are_drawn() {
+        // The three ✓ states on the popup's colours; pictures in
+        // TTS_LAYOUT_OUT, if set.
+        let ctx = egui::Context::default();
+        crate::install_fonts(&ctx);
+        let look = Look::of(&theme::THEMES[0]);
+        let mut screen = crate::raster::Screen::new();
+        let size = vec2(200.0, 60.0);
+        let states = [
+            KnownButton::Unknown,
+            KnownButton::Marked,
+            KnownButton::From(hanstat::anki::Status::Mature),
+        ];
+        let mut glyphs = Vec::new();
+        for i in 0..3 {
+            let mut frame = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, look.base);
+                    for (gi, st) in states.iter().enumerate() {
+                        let r = Rect::from_min_size(
+                            pos2(20.0 + gi as f32 * 40.0, 16.0),
+                            vec2(26.0, 26.0),
+                        );
+                        known_button(ui, r, gi, *st, &look);
+                    }
+                },
+            );
+            screen.absorb(&mut frame);
+            if i == 2 {
+                fn walk(s: &egui::Shape, out: &mut Vec<char>) {
+                    match s {
+                        egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                        egui::Shape::Text(t) => out.extend(t.galley.text().chars()),
+                        _ => {}
+                    }
+                }
+                frame
+                    .shapes
+                    .iter()
+                    .for_each(|s| walk(&s.shape, &mut glyphs));
+                if let Some(dir) = std::env::var_os("TTS_LAYOUT_OUT") {
+                    let dir = std::path::PathBuf::from(dir);
+                    std::fs::create_dir_all(&dir).unwrap();
+                    screen
+                        .picture(&ctx, &mut frame, size)
+                        .write_png(&dir.join("known-buttons.png"))
+                        .unwrap();
+                }
+            }
+        }
+        assert_eq!(
+            glyphs
+                .iter()
+                .filter(|c| **c == super::super::icons::CHECK_CIRCLE)
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn known_buttons_put_your_marks_before_anki_and_lists() {
+        let mut k = hanstat::anki::Knowledge::empty(false);
+        k.add_listed(["学校"], "HSK".into());
+        let marked: HashSet<String> = ["老师".to_owned()].into();
+        let mut here = HashMap::new();
+        let st = |here: &HashMap<String, bool>, w| known_of(here, &marked, Some(&k), w);
+        assert_eq!(st(&here, "书包"), KnownButton::Unknown);
+        assert_eq!(st(&here, "老师"), KnownButton::Marked);
+        assert_eq!(
+            st(&here, "学校"),
+            KnownButton::From(hanstat::anki::Status::Listed)
+        );
+        // Changed here, before the app has saved it: shown at once.
+        here.insert("书包".to_owned(), true);
+        here.insert("老师".to_owned(), false);
+        assert_eq!(st(&here, "书包"), KnownButton::Marked);
+        assert_eq!(st(&here, "老师"), KnownButton::Unknown);
+        assert_eq!(known_of(&here, &marked, None, "学校"), KnownButton::Unknown);
+    }
 
     #[test]
     fn scans_stop_at_punctuation_and_blocks() {

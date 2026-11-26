@@ -266,6 +266,12 @@ pub fn book_fill(c: Color32, dark: bool) -> Color32 {
 
 impl Theme {
     /// The word looked up.
+    /// A search match on the page (see-through).
+    pub fn search_hit(&self) -> Color32 {
+        self.orange
+            .gamma_multiply(if self.dark { 0.32 } else { 0.38 })
+    }
+
     pub fn highlight(&self) -> Color32 {
         let [r, g, b, _] = self.yellow.to_array();
         Color32::from_rgba_unmultiplied(r, g, b, if self.dark { 80 } else { 96 })
