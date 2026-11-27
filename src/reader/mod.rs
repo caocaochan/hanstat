@@ -66,6 +66,19 @@ pub(crate) fn chapter_text_len(epub: &Epub, path: &str) -> usize {
     tree::build(epub, path, &mut tree::SheetCache::default()).text_len
 }
 
+/// Text lengths of every chapter in `epub`, sharing one [`tree::SheetCache`].
+pub(crate) fn chapter_text_lens(epub: &Epub) -> Vec<usize> {
+    let mut sheets = tree::SheetCache::default();
+    epub.spine
+        .iter()
+        .map(|href| tree::build(epub, href, &mut sheets).text_len)
+        .collect()
+}
+
+fn group_digits(n: usize) -> String {
+    crate::fmt_int(n as u64)
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct Position {
     spine: usize,
@@ -171,6 +184,7 @@ impl Settings {
 }
 
 /// Widgets of the settings panel as drawn in the last frame.
+#[cfg(test)]
 #[derive(Default)]
 struct Probe {
     /// The menu bar, when drawn this frame.
@@ -200,8 +214,18 @@ struct Probe {
     toc_item: Option<Rect>,
     /// The pages shown: (page, flow → screen offset).
     sides: Vec<(usize, Vec2)>,
-    #[cfg(test)]
     text_menu: [Option<Rect>; 2],
+}
+
+/// Cached widths and formatted lengths for the Contents menu.
+struct TocCache {
+    has_lengths: bool,
+    name_w: Vec<f32>,
+    numbers: Vec<String>,
+    number_w: Vec<f32>,
+    ellipsis_w: f32,
+    names_col: f32,
+    numbers_col: f32,
 }
 
 /// A line the app puts in the reader's bar, with an optional button.
@@ -247,6 +271,12 @@ pub struct Reader {
     session_tts_default: Option<tts::TtsSettings>,
     /// Chapters built by the worker, by spine index.
     chapters: Arc<Mutex<Vec<Option<Arc<Chapter>>>>>,
+    /// How many chapters the background worker has built so far.
+    chapters_built: Arc<AtomicUsize>,
+    /// Prefix sums and total text characters once every chapter is built.
+    text_totals: Option<(Vec<usize>, Vec<usize>, usize)>,
+    /// Prefix sums and total Chinese characters once every chapter is built.
+    han_totals: Option<(Vec<u64>, u64)>,
     want: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     layouts: HashMap<usize, Arc<ChapterLayout>>,
@@ -254,7 +284,6 @@ pub struct Reader {
     params: Option<Params>,
     images: images::Images,
     fonts: Option<fonts::Installed>,
-    generation: u64,
     spine: usize,
     page: usize,
     target: Option<Target>,
@@ -268,16 +297,20 @@ pub struct Reader {
     /// The geometry the laid-out pages were made for (kept while the
     /// window is resized or a slider dragged).
     drawn: Option<Geometry>,
-    /// Settings changed and not yet saved; `persist`: save at all.
+    /// Settings changed and not yet saved; `persist`: save at all (tests).
     dirty: bool,
+    #[cfg(test)]
     persist: bool,
     /// Table of contents entries as shown: numbered when the book repeats names.
     toc_labels: Vec<String>,
+    /// Cached widths and formatted lengths for the Contents menu.
+    toc_cache: Option<TocCache>,
     /// The contents menu was open last frame.
     contents_shown: bool,
     /// The Aa panel is open.
     settings_open: bool,
     /// Where the settings' widgets were drawn this frame (for tests that click them).
+    #[cfg(test)]
     probe: Probe,
     error: Option<String>,
     /// The hidden menu bar ([`Settings::autohide_bar`]): its height when
@@ -396,12 +429,14 @@ impl Reader {
         let spine = pos.spine.min(epub.spine.len() - 1);
         let n = epub.spine.len();
         let chapters = Arc::new(Mutex::new(vec![None; n]));
+        let chapters_built = Arc::new(AtomicUsize::new(0));
         let want = Arc::new(AtomicUsize::new(spine));
         let stop = Arc::new(AtomicBool::new(false));
         {
-            let (epub, chapters, want, stop, ctx) = (
+            let (epub, chapters, chapters_built, want, stop, ctx) = (
                 epub.clone(),
                 chapters.clone(),
+                chapters_built.clone(),
                 want.clone(),
                 stop.clone(),
                 ctx.clone(),
@@ -431,6 +466,7 @@ impl Reader {
                         let Some(i) = next else { return };
                         let ch = tree::build(&epub, &epub.spine[i], &mut sheets);
                         chapters.lock().unwrap()[i] = Some(Arc::new(ch));
+                        chapters_built.fetch_add(1, Ordering::Release);
                         if (i as isize - want.load(Ordering::Relaxed) as isize).abs() <= 1 {
                             ctx.request_repaint();
                         }
@@ -485,13 +521,15 @@ impl Reader {
             settings,
             session_tts_default,
             chapters,
+            chapters_built,
+            text_totals: None,
+            han_totals: None,
             want,
             stop,
             layouts: HashMap::new(),
             layout_work: None,
             params: None,
             fonts: None,
-            generation: 0,
             spine,
             page: 0,
             target: Some(Target::Offset(pos.offset)),
@@ -503,10 +541,13 @@ impl Reader {
             last_geom: None,
             drawn: None,
             dirty: migrated,
+            #[cfg(test)]
             persist: true,
             toc_labels,
+            toc_cache: None,
             contents_shown: false,
             settings_open: false,
+            #[cfg(test)]
             probe: Probe::default(),
             error: None,
             bar_h: 40.0,
@@ -521,6 +562,47 @@ impl Reader {
             selection: None,
             text_menu: None,
         })
+    }
+
+    #[inline]
+    pub(super) fn should_persist(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.persist
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
+    }
+
+    /// Populate cached prefix sums once every chapter has finished building.
+    fn sync_chapter_totals(&mut self) {
+        if self.text_totals.is_some() {
+            return;
+        }
+        let n = self.epub.spine.len();
+        if self.chapters_built.load(Ordering::Acquire) < n {
+            return;
+        }
+        let c = self.chapters.lock().unwrap();
+        let mut text_before = Vec::with_capacity(n);
+        let mut text_lens = Vec::with_capacity(n);
+        let mut text_total = 0usize;
+        let mut han_before = Vec::with_capacity(n);
+        let mut han_total = 0u64;
+        for ch in c.iter() {
+            let Some(ch) = ch.as_ref() else {
+                return;
+            };
+            text_before.push(text_total);
+            text_lens.push(ch.text_len);
+            text_total += ch.text_len;
+            han_before.push(han_total);
+            han_total += ch.han_len as u64;
+        }
+        self.text_totals = Some((text_before, text_lens, text_total));
+        self.han_totals = Some((han_before, han_total));
     }
 
     /// Restore the app's look and remember the place.
@@ -540,7 +622,7 @@ impl Reader {
 
     pub fn save(&mut self) {
         self.dirty = false;
-        if !self.persist {
+        if !self.should_persist() {
             return;
         }
         // The place goes to the reading-stats database; to reader.json only
@@ -601,8 +683,7 @@ impl Reader {
             .as_ref()
             .is_none_or(|f| f.key != (serif.clone(), sans.clone()))
         {
-            self.generation += 1;
-            self.fonts = Some(fonts::install(ctx, &fams, &serif, &sans, self.generation));
+            self.fonts = Some(fonts::install(ctx, &fams, &serif, &sans));
             self.layouts.clear();
             self.layout_work = None;
         }
@@ -810,7 +891,12 @@ impl Reader {
                         });
                     });
             });
-        self.probe.back_bar = Some(shown.response.rect);
+        #[cfg(test)]
+        {
+            self.probe.back_bar = Some(shown.response.rect);
+        }
+        #[cfg(not(test))]
+        let _ = shown;
         if back {
             self.peek_back();
         } else if keep {
@@ -915,6 +1001,9 @@ impl Reader {
     /// Chinese characters): from where it starts to where the next one does.
     /// `None` until every chapter is built.
     fn toc_lengths(&self) -> Option<Vec<usize>> {
+        if self.chapters_built.load(Ordering::Acquire) < self.epub.spine.len() {
+            return None;
+        }
         let c = self.chapters.lock().unwrap();
         let mut before = Vec::with_capacity(c.len() + 1);
         let mut total = 0usize;
@@ -947,6 +1036,13 @@ impl Reader {
 
     /// The share of the book before the current page, once every chapter is read.
     fn progress(&self) -> Option<f32> {
+        if let Some((before, lens, total)) = &self.text_totals {
+            let here = lens.get(self.spine).map_or(0, |&n| self.offset.min(n));
+            return (*total > 0).then(|| (before[self.spine] + here) as f32 / *total as f32);
+        }
+        if self.chapters_built.load(Ordering::Acquire) < self.epub.spine.len() {
+            return None;
+        }
         let c = self.chapters.lock().unwrap();
         let mut total = 0usize;
         let mut before = 0usize;
@@ -1017,6 +1113,7 @@ impl Reader {
         let now = ctx.input(|i| i.time);
         self.now = now;
         let th = theme::get(&ctx);
+        self.sync_chapter_totals();
         self.images.next_frame();
         self.images.poll(&ctx);
         let mut open = true;
@@ -1025,7 +1122,7 @@ impl Reader {
         self.dict.theme.clone_from(&self.settings.popup_theme);
         self.dict.poll();
         self.dict.anchor = None;
-        self.dicts.poll(&ctx);
+        self.dicts.poll(&ctx, &self.dict);
         self.tts.poll(&self.settings.tts);
         // Anki cards' audio is said by read aloud's voice: the key is looked
         // for once cards with audio are set up, the voice handed over while
@@ -1104,9 +1201,12 @@ impl Reader {
         let bar_frame = egui::Frame::new()
             .fill(th.bar)
             .inner_margin(egui::Margin::symmetric(10, 6));
-        self.probe.aa = None;
-        self.probe.bar = None;
-        self.probe.back_bar = None;
+        #[cfg(test)]
+        {
+            self.probe.aa = None;
+            self.probe.bar = None;
+            self.probe.back_bar = None;
+        }
         if self.settings.autohide_bar {
             // Over the pages, so they stay where they are whether it shows
             // or not. The bar's panels and windows keep it shown (the
@@ -1139,14 +1239,20 @@ impl Reader {
                             .inner
                     });
                 self.bar_h = r.response.rect.height();
-                self.probe.bar = Some(r.response.rect);
+                #[cfg(test)]
+                {
+                    self.probe.bar = Some(r.response.rect);
+                }
                 (open, play_page) = r.inner;
             }
         } else {
             let r = egui::Panel::top("reader-bar")
                 .frame(bar_frame)
                 .show(ui, |ui| self.bar(ui, th));
-            self.probe.bar = Some(r.response.rect);
+            #[cfg(test)]
+            {
+                self.probe.bar = Some(r.response.rect);
+            }
             (open, play_page) = r.inner;
         }
 
@@ -1282,7 +1388,7 @@ impl Reader {
                             off.y += ((g.content.y - l.page_height(idx)) / 2.0).max(0.0);
                         }
                     }
-                    let off = off + l.page_items(idx).1;
+                    let off = off + l.page_shift(idx);
                     Some((idx, off, Rect::from_min_size(origin, g.content).expand(4.0)))
                 })
                 .collect();
@@ -1424,7 +1530,10 @@ impl Reader {
                 };
                 self.dict.point(spot, &ch.chars, lookup_key, now, &ctx);
             }
-            self.probe.sides = sides.iter().map(|(i, o, _)| (*i, *o)).collect();
+            #[cfg(test)]
+            {
+                self.probe.sides = sides.iter().map(|(i, o, _)| (*i, *o)).collect();
+            }
             let highlight = self.dict.highlight(self.spine);
             let stats_line = self.stats_line(crate::reading_stats::now());
             for side in 0..step {
@@ -1995,103 +2104,149 @@ impl Reader {
             return;
         }
         let mut go = None;
-        let current = self.toc_current();
-        let lengths = self.toc_lengths();
         let scroll = !self.contents_shown;
-        self.probe.toc_item = None;
+        #[cfg(test)]
+        {
+            self.probe.toc_item = None;
+        }
+        #[cfg(test)]
         let mut toc_item = None;
-        // Each entry is one line of text: its name, then its length in a
-        // column just past the longest name, so the menu is as wide as its
-        // contents (a right-aligned column would stretch it across the window).
-        let font = egui::FontId::proportional(15.0);
-        let small = egui::FontId::proportional(13.0);
-        let indent = |e: &epub::TocEntry| e.depth as f32 * 16.0;
-        let name_w: Vec<f32> = ui.fonts_mut(|f| {
-            self.toc_labels
-                .iter()
-                .map(|l| {
-                    f.layout_no_wrap(l.clone(), font.clone(), Color32::WHITE)
-                        .size()
-                        .x
-                })
-                .collect()
-        });
-        let numbers: Vec<String> = (0..self.toc_labels.len())
-            .map(|i| {
-                lengths
-                    .as_ref()
-                    .map_or("…".to_owned(), |l| group_digits(l[i]))
-            })
-            .collect();
-        let number_w: Vec<f32> = ui.fonts_mut(|f| {
-            numbers
-                .iter()
-                .map(|n| {
-                    f.layout_no_wrap(n.clone(), small.clone(), Color32::WHITE)
-                        .size()
-                        .x
-                })
-                .collect()
-        });
-        let names_col = self
-            .epub
-            .toc
-            .iter()
-            .zip(&name_w)
-            .map(|(e, w)| indent(e) + w)
-            .fold(0.0, f32::max)
-            .min(480.0);
-        let numbers_col = number_w.iter().copied().fold(0.0, f32::max);
-        let text = ui.visuals().text_color();
-        let muted = theme::get(ui.ctx()).muted;
         let menu = ui.menu_button(
             icons::rich(
                 ui,
                 RichText::new(format!("{} Contents", icons::LIST)).size(15.0),
             ),
             |ui| {
-                egui::ScrollArea::vertical()
-                    .max_height(ui.ctx().content_rect().height() * 0.7)
-                    .show(ui, |ui| {
-                        for (i, e) in self.epub.toc.iter().enumerate() {
-                            let mut job = egui::text::LayoutJob::default();
-                            job.append(
-                                &self.toc_labels[i],
-                                indent(e),
-                                egui::TextFormat::simple(font.clone(), text),
-                            );
-                            // Gap to the numbers' column, numbers right-aligned in it.
-                            let gap = (names_col - indent(e) - name_w[i]).max(0.0)
-                                + 28.0
-                                + (numbers_col - number_w[i]);
-                            job.append(
-                                &numbers[i],
-                                gap,
-                                egui::TextFormat {
-                                    valign: egui::Align::Center,
-                                    ..egui::TextFormat::simple(small.clone(), muted)
-                                },
-                            );
-                            let r = ui.selectable_label(current == Some(i), job).on_hover_text(
-                                "Its length: Chinese characters, letters and digits",
-                            );
-                            // Opened at the reader's place.
-                            if scroll && current == Some(i) {
-                                r.scroll_to_me(Some(egui::Align::Center));
-                            }
-                            if i == 5 {
-                                toc_item = Some(r.rect);
-                            }
-                            if r.clicked() {
-                                go = Some(i);
-                                ui.close();
-                            }
-                        }
+                // Each entry is one line of text: its name, then its length in a
+                // column just past the longest name, so the menu is as wide as its
+                // contents (a right-aligned column would stretch it across the window).
+                let font = egui::FontId::proportional(15.0);
+                let small = egui::FontId::proportional(13.0);
+                let indent = |e: &epub::TocEntry| e.depth as f32 * 16.0;
+                let current = self.toc_current();
+                let need_lengths = self.toc_cache.as_ref().is_none_or(|c| !c.has_lengths);
+                let lengths = if need_lengths {
+                    self.toc_lengths()
+                } else {
+                    None
+                };
+                let toc = &self.epub.toc;
+                let labels = &self.toc_labels;
+                let cache = self.toc_cache.get_or_insert_with(|| {
+                    let (name_w, ellipsis_w) = ui.fonts_mut(|f| {
+                        let nw: Vec<f32> = labels
+                            .iter()
+                            .map(|l| {
+                                f.layout_no_wrap(l.clone(), font.clone(), Color32::WHITE)
+                                    .size()
+                                    .x
+                            })
+                            .collect();
+                        let ew = f
+                            .layout_no_wrap("…".to_owned(), small.clone(), Color32::WHITE)
+                            .size()
+                            .x;
+                        (nw, ew)
                     });
+                    let names_col = toc
+                        .iter()
+                        .zip(&name_w)
+                        .map(|(e, w)| indent(e) + w)
+                        .fold(0.0, f32::max)
+                        .min(480.0);
+                    TocCache {
+                        has_lengths: false,
+                        name_w,
+                        numbers: Vec::new(),
+                        number_w: Vec::new(),
+                        ellipsis_w,
+                        names_col,
+                        numbers_col: ellipsis_w,
+                    }
+                });
+                if !cache.has_lengths
+                    && let Some(lengths) = lengths
+                {
+                    let numbers: Vec<String> =
+                        lengths.iter().map(|&l| crate::fmt_int(l as u64)).collect();
+                    let number_w: Vec<f32> = ui.fonts_mut(|f| {
+                        numbers
+                            .iter()
+                            .map(|n| {
+                                f.layout_no_wrap(n.clone(), small.clone(), Color32::WHITE)
+                                    .size()
+                                    .x
+                            })
+                            .collect()
+                    });
+                    cache.numbers_col = number_w.iter().copied().fold(0.0, f32::max);
+                    cache.numbers = numbers;
+                    cache.number_w = number_w;
+                    cache.has_lengths = true;
+                }
+                let text = ui.visuals().text_color();
+                let muted = theme::get(ui.ctx()).muted;
+                let max_h = ui.ctx().content_rect().height() * 0.7;
+                let row_h = (ui.fonts_mut(|f| f.row_height(&font))
+                    + 2.0 * ui.spacing().button_padding.y)
+                    .max(ui.spacing().interact_size.y);
+                let mut scroll_area = egui::ScrollArea::vertical().max_height(max_h);
+                if scroll && let Some(cur) = current {
+                    let spacing = ui.spacing().item_spacing.y;
+                    let stride = row_h + spacing;
+                    let content_h = (toc.len() as f32 * stride - spacing).max(0.0);
+                    let visible_h = max_h.min(content_h);
+                    let target_y = (cur as f32 * stride + row_h * 0.5 - visible_h * 0.5)
+                        .clamp(0.0, (content_h - visible_h).max(0.0));
+                    scroll_area = scroll_area.vertical_scroll_offset(target_y);
+                }
+                scroll_area.show_rows(ui, row_h, toc.len(), |ui, rows| {
+                    for i in rows {
+                        let e = &toc[i];
+                        let ind = indent(e);
+                        let (num_str, num_w) = if cache.has_lengths {
+                            (cache.numbers[i].as_str(), cache.number_w[i])
+                        } else {
+                            ("…", cache.ellipsis_w)
+                        };
+                        let mut job = egui::text::LayoutJob::default();
+                        job.append(
+                            &labels[i],
+                            ind,
+                            egui::TextFormat::simple(font.clone(), text),
+                        );
+                        // Gap to the numbers' column, numbers right-aligned in it.
+                        let gap = (cache.names_col - ind - cache.name_w[i]).max(0.0)
+                            + 28.0
+                            + (cache.numbers_col - num_w);
+                        job.append(
+                            num_str,
+                            gap,
+                            egui::TextFormat {
+                                valign: egui::Align::Center,
+                                ..egui::TextFormat::simple(small.clone(), muted)
+                            },
+                        );
+                        let r = ui
+                            .selectable_label(current == Some(i), job)
+                            .on_hover_text("Its length: Chinese characters, letters and digits");
+                        #[cfg(test)]
+                        if i == 5 {
+                            toc_item = Some(r.rect);
+                        }
+                        if r.clicked() {
+                            go = Some(i);
+                            ui.close();
+                        }
+                    }
+                });
             },
         );
-        self.probe.contents = Some(menu.response.rect);
-        self.probe.toc_item = toc_item;
+        #[cfg(test)]
+        {
+            self.probe.contents = Some(menu.response.rect);
+            self.probe.toc_item = toc_item;
+        }
         self.contents_shown = menu.inner.is_some();
         if let Some(i) = go {
             let e = self.epub.toc[i].clone();
@@ -2105,7 +2260,6 @@ impl Reader {
     }
 
     fn settings_menu(&mut self, ui: &mut egui::Ui) {
-        let before = self.settings.clone();
         // The panel's open state is kept here, not in egui's memory: egui
         // keeps one open popup per window, so opening a font list (a popup)
         // would close a popup panel. It ignores clicks and closes with its
@@ -2116,27 +2270,45 @@ impl Reader {
         if button.clicked() {
             self.settings_open = !self.settings_open;
         }
-        self.probe.aa = Some(button.rect);
-        self.probe.theme_box = None;
-        self.probe.theme_items.clear();
-        self.probe.popup_theme_box = None;
-        self.probe.popup_same = None;
-        self.probe.popup_theme_items.clear();
-        self.probe.serif_box = None;
-        self.probe.serif_item = None;
-        self.probe.vertical = None;
+        #[cfg(test)]
+        {
+            self.probe.aa = Some(button.rect);
+            self.probe.theme_box = None;
+            self.probe.theme_items.clear();
+            self.probe.popup_theme_box = None;
+            self.probe.popup_same = None;
+            self.probe.popup_theme_items.clear();
+            self.probe.serif_box = None;
+            self.probe.serif_item = None;
+            self.probe.vertical = None;
+        }
+        let mut changed = false;
         let mut open = self.settings_open;
         egui::Popup::menu(&button)
             .id(egui::Id::unique("reader-settings"))
             .open_bool(&mut open)
             .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
             .show(|ui| {
+            let before = (
+                self.settings.theme.clone(),
+                self.settings.popup_theme.clone(),
+                self.settings.serif.clone(),
+                self.settings.sans.clone(),
+                self.settings.sans_default,
+                self.settings.size,
+                self.settings.line_spacing,
+                self.settings.margins,
+                self.settings.vertical,
+                self.settings.spread,
+                self.settings.autohide_bar,
+            );
             ui.set_min_width(300.0);
             let fams = fonts::families();
             egui::Grid::new("reader-settings").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                 ui.label("Theme");
                 let current = theme::index(&self.settings.theme);
                 let mut chosen = None;
+                #[cfg(test)]
                 let mut items = Vec::new();
                 let button = ui.add(
                     egui::Button::new(theme::THEMES[current].name)
@@ -2145,9 +2317,21 @@ impl Reader {
                 );
                 egui::Popup::menu(&button)
                     .id(egui::Id::unique("reader-theme-list"))
-                    .show(|ui| chosen = theme_columns(ui, Some(current), &mut items));
-                self.probe.theme_box = Some(button.rect);
-                self.probe.theme_items = items;
+                    .show(|ui| {
+                        #[cfg(test)]
+                        {
+                            chosen = theme_columns(ui, Some(current), &mut items);
+                        }
+                        #[cfg(not(test))]
+                        {
+                            chosen = theme_columns(ui, Some(current));
+                        }
+                    });
+                #[cfg(test)]
+                {
+                    self.probe.theme_box = Some(button.rect);
+                    self.probe.theme_items = items;
+                }
                 if let Some(i) = chosen {
                     self.settings.theme = theme::THEMES[i].id.to_owned();
                     let egui_theme = self.prev_style.as_ref().map_or(ui.ctx().theme(), |p| p.0);
@@ -2159,7 +2343,9 @@ impl Reader {
                 let pages = theme::index(&self.settings.theme);
                 let current = theme::THEMES.iter().position(|t| t.id == self.settings.popup_theme);
                 let mut chosen = None;
+                #[cfg(test)]
                 let mut same = None;
+                #[cfg(test)]
                 let mut items = Vec::new();
                 let button = ui
                     .add(
@@ -2182,14 +2368,24 @@ impl Reader {
                             chosen = Some(popup::SAME_AS_PAGES);
                             ui.close();
                         }
-                        same = Some(r.rect);
-                        if let Some(i) = theme_columns(ui, current, &mut items) {
+                        #[cfg(test)]
+                        {
+                            same = Some(r.rect);
+                            if let Some(i) = theme_columns(ui, current, &mut items) {
+                                chosen = Some(theme::THEMES[i].id);
+                            }
+                        }
+                        #[cfg(not(test))]
+                        if let Some(i) = theme_columns(ui, current) {
                             chosen = Some(theme::THEMES[i].id);
                         }
                     });
-                self.probe.popup_theme_box = Some(button.rect);
-                self.probe.popup_same = same;
-                self.probe.popup_theme_items = items;
+                #[cfg(test)]
+                {
+                    self.probe.popup_theme_box = Some(button.rect);
+                    self.probe.popup_same = same;
+                    self.probe.popup_theme_items = items;
+                }
                 if let Some(id) = chosen {
                     self.settings.popup_theme = id.to_owned();
                 }
@@ -2204,6 +2400,7 @@ impl Reader {
                             .unwrap_or_else(|| "App font".into())
                     });
                     let mut chosen = current.clone();
+                    #[cfg(test)]
                     let mut item = None;
                     let combo = egui::ComboBox::from_id_salt(("reader-font", serif))
                         .selected_text(&shown)
@@ -2221,17 +2418,23 @@ impl Reader {
                                         if r.clicked() {
                                             chosen = Some(fam.name.clone());
                                         }
+                                        #[cfg(test)]
                                         if i == 2 {
                                             item = Some((r.rect, fam.name.clone()));
                                         }
+                                        #[cfg(not(test))]
+                                        let _ = i;
                                     }
                                 }
                             }
                         });
+                    #[cfg(test)]
                     if serif {
                         self.probe.serif_box = Some(combo.response.rect);
                         self.probe.serif_item = item;
                     }
+                    #[cfg(not(test))]
+                    let _ = combo;
                     if chosen != current {
                         if serif {
                             self.settings.serif = chosen;
@@ -2260,15 +2463,24 @@ impl Reader {
                 ui.add(egui::Slider::new(&mut self.settings.margins, 0.4..=2.0).step_by(0.1).fixed_decimals(1));
                 ui.end_row();
                 ui.label("Text direction");
+                #[cfg(test)]
                 let mut vert_rect = None;
                 ui.horizontal(|ui| {
                     ui.radio_value(&mut self.settings.vertical, false, "Horizontal");
                     let v = ui.radio_value(&mut self.settings.vertical, true, "Vertical");
-                    vert_rect = Some(v.rect);
+                    #[cfg(test)]
+                    {
+                        vert_rect = Some(v.rect);
+                    }
+                    #[cfg(not(test))]
+                    let _ = v;
                 })
                 .response
                 .on_hover_text("Vertical: top to bottom, right to left, on a landscape page");
-                self.probe.vertical = vert_rect;
+                #[cfg(test)]
+                {
+                    self.probe.vertical = vert_rect;
+                }
                 ui.end_row();
                 ui.label("Pages");
                 ui.add_enabled_ui(!self.settings.vertical, |ui| {
@@ -2286,25 +2498,39 @@ impl Reader {
                     .on_hover_text("The bar then shows over the pages, which stay where they are");
                 ui.end_row();
             });
+            if (
+                before.0.as_str(),
+                before.1.as_str(),
+                before.2.as_deref(),
+                before.3.as_deref(),
+                before.4,
+                before.5,
+                before.6,
+                before.7,
+                before.8,
+                before.9,
+                before.10,
+            ) != (
+                self.settings.theme.as_str(),
+                self.settings.popup_theme.as_str(),
+                self.settings.serif.as_deref(),
+                self.settings.sans.as_deref(),
+                self.settings.sans_default,
+                self.settings.size,
+                self.settings.line_spacing,
+                self.settings.margins,
+                self.settings.vertical,
+                self.settings.spread,
+                self.settings.autohide_bar,
+            ) {
+                changed = true;
+            }
         });
         self.settings_open = open;
-        if self.settings != before {
+        if changed {
             self.dirty = true;
         }
     }
-}
-
-/// `12345` as `12,345`.
-fn group_digits(n: usize) -> String {
-    let s = n.to_string();
-    let mut out = String::new();
-    for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
 }
 
 /// The table of contents' labels, numbered in front by position at their level when
@@ -2446,8 +2672,8 @@ fn paint_item(
                 (r.width() * ppp).ceil() as u32,
                 (r.height() * ppp).ceil() as u32,
             ];
-            match images.texture(path, px) {
-                Some(id) => {
+            match images.texture(painter.ctx(), path, px) {
+                images::TexState::Ready(id) => {
                     painter.image(
                         id,
                         r,
@@ -2455,11 +2681,8 @@ fn paint_item(
                         Color32::WHITE,
                     );
                 }
-                None => {
+                images::TexState::Pending | images::TexState::Failed => {
                     painter.rect_filled(r, 2.0, th.bar);
-                    painter
-                        .ctx()
-                        .request_repaint_after(std::time::Duration::from_millis(50));
                 }
             }
         }
@@ -2583,7 +2806,7 @@ const THEME_COLUMN: f32 = 210.0;
 fn theme_columns(
     ui: &mut egui::Ui,
     current: Option<usize>,
-    items: &mut Vec<(Rect, usize, bool)>,
+    #[cfg(test)] items: &mut Vec<(Rect, usize, bool)>,
 ) -> Option<usize> {
     let muted = theme::get(ui.ctx()).muted;
     let mut chosen = None;
@@ -2606,6 +2829,7 @@ fn theme_columns(
                         chosen = Some(i);
                         ui.close();
                     }
+                    #[cfg(test)]
                     items.push((r.rect, i, ui.clip_rect().contains_rect(r.rect)));
                 }
             });

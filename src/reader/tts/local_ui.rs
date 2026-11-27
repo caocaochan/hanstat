@@ -6,21 +6,98 @@ use super::audio::{self, Output};
 use super::local::{self, LocalSettings, SPEAKERS};
 use super::{Source, Tts, TtsSettings, group, sentence_at, sentences};
 use eframe::egui::{self, Color32, RichText};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::{Arc, Condvar, Mutex};
 
 mod designer;
 
 const RED: Color32 = Color32::from_rgb(0xdc, 0x32, 0x2f);
+
+/// Plays a short clip on its own thread so reading, decoding, resampling
+/// and opening/closing the sound device never block the UI thread.
+struct Playback {
+    wake: Arc<(Mutex<bool>, Condvar)>,
+    started: Arc<AtomicBool>,
+    done: Receiver<Result<(), String>>,
+}
+
+impl Playback {
+    fn start(
+        name: &str,
+        repaint: super::engine::Repaint,
+        load: impl FnOnce() -> Result<Vec<i16>, String> + Send + 'static,
+    ) -> Self {
+        let wake = Arc::new((Mutex::new(false), Condvar::new()));
+        let wake_bg = wake.clone();
+        let started = Arc::new(AtomicBool::new(false));
+        let started_bg = started.clone();
+        let done = local::spawn(name, repaint.clone(), move || {
+            let pcm = load()?;
+            if *wake_bg.0.lock().unwrap() {
+                return Ok(());
+            }
+            let wake_cb = wake_bg.clone();
+            let out = Output::open(Arc::new(move || {
+                wake_cb.1.notify_all();
+            }))?;
+            let f: Vec<f32> = pcm.iter().map(|&x| x as f32 / 32768.0).collect();
+            out.push(1, audio::resample_owned(f, super::opus::RATE, out.rate));
+            out.set_paused(false);
+            started_bg.store(true, Ordering::Release);
+            repaint();
+            let stopped = {
+                let mut stop = wake_bg.0.lock().unwrap();
+                while !*stop && !out.queued().is_empty() && !out.failed() {
+                    let (g, _) = wake_bg
+                        .1
+                        .wait_timeout(stop, std::time::Duration::from_millis(250))
+                        .unwrap();
+                    stop = g;
+                }
+                *stop
+            };
+            if stopped && !out.queued().is_empty() && !out.failed() {
+                out.clear();
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+            drop(out);
+            Ok(())
+        });
+        Self {
+            wake,
+            started,
+            done,
+        }
+    }
+
+    fn is_playing(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
+
+    fn poll(&self) -> Option<Result<(), String>> {
+        match self.done.try_recv() {
+            Ok(r) => Some(r),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Ok(())),
+        }
+    }
+}
+
+impl Drop for Playback {
+    fn drop(&mut self) {
+        *self.wake.0.lock().unwrap() = true;
+        self.wake.1.notify_all();
+    }
+}
 
 /// The preview clip: being made, playing, or what went wrong.
 #[derive(Default)]
 enum Preview {
     #[default]
     None,
-    Making(Receiver<Result<Vec<i16>, String>>),
-    Playing(Output),
+    Making(Playback),
+    Playing(Playback),
     Failed(String),
 }
 
@@ -107,6 +184,8 @@ impl Download {
 pub struct State {
     custom: Download,
     design: Download,
+    /// Cached `local::design_download_size()` (invalidated on download completion / window open).
+    design_size: Option<u64>,
     designer: designer::State,
     preview: Preview,
     /// The "Generate locally" window.
@@ -115,6 +194,8 @@ pub struct State {
     chosen: Vec<bool>,
     /// Each chapter's sentences and characters, once built.
     sizes: Vec<Option<(usize, usize)>>,
+    /// Every chapter's size is known: no need to lock `chapters` again.
+    counted_all: bool,
     /// Generating switched reading aloud to the local voice.
     switched: bool,
 }
@@ -128,6 +209,10 @@ impl State {
         };
         download.present.unwrap_or(false)
     }
+
+    pub(super) fn apply_pending_designed(&mut self, s: &mut LocalSettings) {
+        self.designer.apply_pending_designed(s);
+    }
 }
 
 impl Tts {
@@ -138,34 +223,36 @@ impl Tts {
         if custom || design {
             self.local.custom.present = Some(local::downloaded());
             self.local.design.present = Some(local::design_downloaded());
-            if [local::NOT_DOWNLOADED, local::DESIGN_NOT_DOWNLOADED]
-                .iter()
-                .any(|note| self.key_note.as_ref().is_some_and(|(_, text)| text == note))
-            {
-                self.key_note = None;
-            }
+            self.local.design_size = None;
         }
-        self.local.designer.poll();
-        match &self.local.preview {
-            Preview::Making(rx) => {
-                if let Ok(r) = rx.try_recv() {
-                    self.local.preview = match r.and_then(|pcm| play(&pcm, &self.repaint)) {
-                        Ok(o) => Preview::Playing(o),
-                        Err(e) => Preview::Failed(e),
-                    };
+        self.local.designer.poll(&self.repaint);
+        let preview_transition = match &self.local.preview {
+            Preview::Making(p) => match p.poll() {
+                Some(Ok(())) => Some(Ok(false)),
+                Some(Err(e)) => Some(Err(e)),
+                None if p.is_playing() => Some(Ok(true)),
+                None => None,
+            },
+            Preview::Playing(p) => match p.poll() {
+                Some(Ok(())) => Some(Ok(false)),
+                Some(Err(e)) => Some(Err(e)),
+                None => None,
+            },
+            _ => None,
+        };
+        match preview_transition {
+            Some(Ok(true)) => {
+                if let Preview::Making(p) = std::mem::take(&mut self.local.preview) {
+                    self.local.preview = Preview::Playing(p);
                 }
             }
-            Preview::Playing(o) if o.queued().is_empty() || o.failed() => {
-                self.local.preview = Preview::None;
-            }
-            _ => {}
+            Some(Ok(false)) => self.local.preview = Preview::None,
+            Some(Err(e)) => self.local.preview = Preview::Failed(e),
+            None => {}
         }
     }
 
     pub(super) fn stop_preview(&mut self) {
-        if let Preview::Playing(o) = &self.local.preview {
-            o.clear();
-        }
         self.local.preview = Preview::None;
         self.local.designer.stop_sample();
     }
@@ -212,7 +299,7 @@ impl Tts {
             text = "这是一段试听，用来听一听现在的设置读起来是什么样子。".into();
         }
         let s = s.clone();
-        self.local.preview = Preview::Making(local::spawn(
+        self.local.preview = Preview::Making(Playback::start(
             "tts-preview",
             self.repaint.clone(),
             move || local::preview(&text, &s),
@@ -286,7 +373,10 @@ impl Tts {
         if hanstat::models::QWEN_TTS_SERVER.is_none() {
             return;
         }
-        let size = local::design_download_size();
+        let size = *self
+            .local
+            .design_size
+            .get_or_insert_with(local::design_download_size);
         ui.horizontal(|ui| {
             ui.label("Voice models");
             let design = &mut self.local.design;
@@ -306,7 +396,7 @@ impl Tts {
     /// Voice, instructions, preview and the advanced settings: in the
     /// panel and in the window.
     fn local_controls(&mut self, ui: &mut egui::Ui, s: &mut TtsSettings, spine: usize, wide: bool) {
-        self.local.designer.load_voices();
+        self.local.designer.load_voices(&self.repaint);
         let busy = self.local_voice_busy();
         let mut design = false;
         let l = &mut s.local;
@@ -443,7 +533,7 @@ impl Tts {
             match &self.local.preview {
                 Preview::Making(_) => {
                     ui.add_enabled(false, egui::Button::new("Preview"));
-                    ui.spinner();
+                    crate::palette::spinner(ui);
                     ui.label(
                         RichText::new(if local::loaded(s.local.mode(), s.local.parallel) {
                             "Making the preview…"
@@ -489,16 +579,6 @@ impl Tts {
             .present
             .get_or_insert_with(local::design_downloaded);
         self.download_row(ui, &s.local);
-        if let Some((ok, note)) = &self.key_note
-            && (note == local::NOT_DOWNLOADED || note == local::DESIGN_NOT_DOWNLOADED)
-        {
-            let c = if *ok {
-                ui.visuals().weak_text_color()
-            } else {
-                RED
-            };
-            ui.colored_label(c, note);
-        }
         let spine = self.spine_shown();
         self.local_controls(ui, s, spine, false);
         ui.label(
@@ -521,26 +601,50 @@ impl Tts {
         if self.local.chosen.len() != n {
             self.local.chosen = vec![false; n];
             self.local.sizes = vec![None; n];
+            self.local.counted_all = false;
         }
         if !self.local.chosen.iter().any(|&c| c) && spine < n {
             self.local.chosen[spine] = true;
         }
         self.local.custom.present = Some(local::downloaded());
         self.local.design.present = Some(local::design_downloaded());
+        self.local.design_size = None;
         self.local.window_open = true;
     }
 
     /// Sentences and characters of each built chapter (counted once).
     fn count_chapters(&mut self) {
-        let chapters = self.chapters.lock().unwrap().clone();
-        for (i, c) in chapters.iter().enumerate() {
-            if self.local.sizes[i].is_none()
-                && let Some(c) = c
-            {
-                let s = sentences(&c.chars);
-                let chars = s.iter().map(|r| r.len()).sum();
-                self.local.sizes[i] = Some((s.len(), chars));
-            }
+        if self.local.counted_all {
+            return;
+        }
+        let mut all_present = true;
+        let pending: Vec<(usize, Arc<crate::reader::tree::Chapter>)> = {
+            let chapters = self.chapters.lock().unwrap();
+            self.local
+                .sizes
+                .iter()
+                .enumerate()
+                .filter_map(|(i, sz)| {
+                    if sz.is_some() {
+                        return None;
+                    }
+                    match chapters.get(i).and_then(Option::as_ref) {
+                        Some(c) => Some((i, c.clone())),
+                        None => {
+                            all_present = false;
+                            None
+                        }
+                    }
+                })
+                .collect()
+        };
+        for (i, c) in pending {
+            let s = sentences(&c.chars);
+            let chars = s.iter().map(|r| r.len()).sum();
+            self.local.sizes[i] = Some((s.len(), chars));
+        }
+        if all_present {
+            self.local.counted_all = true;
         }
     }
 
@@ -607,22 +711,19 @@ impl Tts {
                 set(&mut self.local, &|i| i >= spine);
             }
         });
+        let row_h = ui.spacing().interact_size.y;
         egui::ScrollArea::vertical()
             .id_salt("reader-tts-local-chapters")
             .max_height(260.0)
             .auto_shrink([false, true])
-            .show(ui, |ui| {
-                for &i in &readable {
+            .show_rows(ui, row_h, readable.len(), |ui, range| {
+                for &i in &readable[range] {
                     let label = match self.labels.get(i).filter(|l| !l.is_empty()) {
-                        Some(l) => l.clone(),
-                        None => format!("Part {}", i + 1),
+                        Some(l) => RichText::new(l.as_str()),
+                        None => RichText::new(format!("Part {}", i + 1)),
                     };
+                    let text = if i == spine { label.strong() } else { label };
                     ui.horizontal(|ui| {
-                        let text = if i == spine {
-                            RichText::new(label).strong()
-                        } else {
-                            RichText::new(label)
-                        };
                         ui.checkbox(&mut self.local.chosen[i], text);
                         let size = match self.local.sizes[i] {
                             Some((k, chars)) => format!(
@@ -907,16 +1008,6 @@ hanstat uses fewer when the graphics card has less memory, and one fewer each ti
 runs out (until hanstat closes). Lower it yourself if other programs need the \
 graphics card.\n\n\
 It never changes how the audio sounds.";
-
-/// `pcm` (the clip rate) played on the default device.
-fn play(pcm: &[i16], repaint: &super::engine::Repaint) -> Result<Output, String> {
-    let r = repaint.clone();
-    let out = Output::open(Arc::new(move || r()))?;
-    let f: Vec<f32> = pcm.iter().map(|&x| x as f32 / 32768.0).collect();
-    out.push(1, audio::resample(&f, super::opus::RATE, out.rate));
-    out.set_paused(false);
-    Ok(out)
-}
 
 /// "2 h 05 min", "12 min", "40 s".
 fn duration(secs: f64) -> String {

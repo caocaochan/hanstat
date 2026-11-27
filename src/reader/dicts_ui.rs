@@ -15,29 +15,28 @@ use std::sync::mpsc::Receiver;
 /// Automatic update checks at most this often (seconds).
 const CHECK_EVERY: u64 = 24 * 3600;
 
+type Rows = Vec<(Entry, Option<Meta>)>;
+type DeleteResult = (Result<(), String>, Rows, Option<String>);
+
 pub struct Manager {
     pub open: bool,
     root: PathBuf,
-    rows: Vec<(Entry, Option<Meta>)>,
+    rows: Rows,
     jobs: Jobs,
+    repaint: Arc<dyn Fn() + Send + Sync>,
+    /// Initial `manage::list` running off the UI thread: `(rows, last_auto_check)`.
+    loading: Option<Receiver<(Rows, u64)>>,
     checking: Option<Receiver<usize>>,
+    /// Dictionary currently being deleted off the UI thread: `(id, rx)`.
+    deleting: Option<(String, Receiver<DeleteResult>)>,
+    /// Deferred until initial `loading` finishes.
+    want_default: bool,
+    pending_auto_check: Option<bool>,
     confirm_delete: Option<String>,
     /// What the last finished jobs or checks said.
     notes: Vec<(bool, String)>,
     /// Install the updates the running check finds.
     install_found: bool,
-}
-
-fn fmt_count(n: u64) -> String {
-    let s = n.to_string();
-    let mut out = String::new();
-    for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
 }
 
 fn fmt_size(b: u64) -> String {
@@ -57,18 +56,30 @@ impl Manager {
     pub fn new(ctx: &egui::Context, popup: &Popup) -> Manager {
         let root = hanstat::dict::root();
         let c = ctx.clone();
-        let jobs = Jobs::start(
-            root.clone(),
-            popup.unloader(),
-            true,
-            Arc::new(move || c.request_repaint()),
-        );
+        let repaint: Arc<dyn Fn() + Send + Sync> = Arc::new(move || c.request_repaint());
+        let jobs = Jobs::start(root.clone(), popup.unloader(), true, repaint.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let r = root.clone();
+        let rep = repaint.clone();
+        let _ = std::thread::Builder::new()
+            .name("dict-list".into())
+            .spawn(move || {
+                let last = hanstat::dict::format::Manifest::load(&r).last_auto_check;
+                let rows = manage::list(&r);
+                let _ = tx.send((rows, last));
+                rep();
+            });
         Manager {
             open: false,
-            rows: manage::list(&root),
+            rows: Vec::new(),
             root,
             jobs,
+            repaint,
+            loading: Some(rx),
             checking: None,
+            deleting: None,
+            want_default: false,
+            pending_auto_check: None,
             confirm_delete: None,
             notes: Vec::new(),
             install_found: false,
@@ -112,13 +123,16 @@ impl Manager {
             .count()
     }
 
-    /// An import or download running (or waiting).
+    /// An import, download or deletion running (or waiting).
     pub fn working(&self) -> bool {
-        self.jobs.busy()
+        self.jobs.busy() || self.deleting.is_some()
     }
 
     pub fn busy(&self) -> bool {
-        self.jobs.busy() || self.checking.is_some()
+        self.jobs.busy()
+            || self.checking.is_some()
+            || self.deleting.is_some()
+            || self.loading.is_some()
     }
 
     /// Check for updates now (in the background); `install`: install what
@@ -141,6 +155,17 @@ impl Manager {
     /// With no dictionary at all, CC-CEDICT is downloaded (once ever: a
     /// deleted one stays deleted).
     pub fn install_default(&mut self) {
+        if updates_off() {
+            return;
+        }
+        if self.loading.is_some() {
+            self.want_default = true;
+            return;
+        }
+        self.run_install_default();
+    }
+
+    fn run_install_default(&mut self) {
         if updates_off() || !self.rows.is_empty() {
             return;
         }
@@ -165,14 +190,22 @@ impl Manager {
         if !settings.check_updates || updates_off() {
             return;
         }
+        if self.loading.is_some() {
+            self.pending_auto_check = Some(settings.auto_install);
+            return;
+        }
         let last = hanstat::dict::format::Manifest::load(&self.root).last_auto_check;
+        self.run_auto_check(ctx, last, settings.auto_install);
+    }
+
+    fn run_auto_check(&mut self, ctx: &egui::Context, last: u64, auto_install: bool) {
         if hanstat::dict::format::now().saturating_sub(last) >= CHECK_EVERY
             && self
                 .rows
                 .iter()
                 .any(|(_, m)| m.as_ref().is_some_and(|m| m.update.is_some()))
         {
-            self.check(ctx, settings.auto_install);
+            self.check(ctx, auto_install);
         }
     }
 
@@ -243,8 +276,30 @@ impl Manager {
         }
     }
 
-    /// Take in finished jobs and checks. Call every frame.
-    pub fn poll(&mut self, ctx: &egui::Context) {
+    /// Take in finished jobs, checks, initial load and deletions. Call every frame.
+    pub fn poll(&mut self, ctx: &egui::Context, popup: &Popup) {
+        if let Some(rx) = &self.loading
+            && let Ok((rows, last)) = rx.try_recv()
+        {
+            self.loading = None;
+            self.rows = rows;
+            if std::mem::take(&mut self.want_default) {
+                self.run_install_default();
+            }
+            if let Some(auto_install) = self.pending_auto_check.take() {
+                self.run_auto_check(ctx, last, auto_install);
+            }
+        }
+        if let Some((_, rx)) = &self.deleting
+            && let Ok((r, rows, freq_sort)) = rx.try_recv()
+        {
+            self.deleting = None;
+            if let Err(e) = r {
+                self.notes.push((false, e));
+            }
+            self.rows = rows;
+            popup.reload(freq_sort);
+        }
         let done = self.jobs.take_finished();
         if !done.is_empty() {
             for (label, r) in done {
@@ -298,24 +353,51 @@ impl Manager {
         settings: &Settings,
         f: impl FnOnce(&mut hanstat::dict::format::Manifest),
     ) {
-        if let Err(e) = manage::edit_manifest(&self.root, f) {
+        let mut new_entries = None;
+        if let Err(e) = manage::edit_manifest(&self.root, |m| {
+            f(m);
+            new_entries = Some(m.dicts.clone());
+        }) {
             self.notes.push((false, e));
         }
-        self.refresh();
+        if let Some(entries) = new_entries {
+            let mut metas: std::collections::HashMap<String, Option<Meta>> =
+                self.rows.drain(..).map(|(e, m)| (e.id, m)).collect();
+            self.rows = entries
+                .into_iter()
+                .map(|e| {
+                    let m = metas
+                        .remove(&e.id)
+                        .unwrap_or_else(|| manage::read_meta(&self.root.join(&e.id)));
+                    (e, m)
+                })
+                .collect();
+        }
         popup.reload(settings.freq_sort.clone());
     }
 
     pub(super) fn delete(&mut self, id: &str, popup: &mut Popup, settings: &Settings) {
-        popup.close();
-        let r = popup
-            .unloader()
-            .unload(vec![id.to_owned()])
-            .and_then(|_| manage::delete(&self.root, id));
-        if let Err(e) = r {
-            self.notes.push((false, e));
+        if self.deleting.is_some() {
+            return;
         }
-        self.refresh();
-        popup.reload(settings.freq_sort.clone());
+        popup.close();
+        let id_owned = id.to_owned();
+        let root = self.root.clone();
+        let unloader = popup.unloader();
+        let freq_sort = settings.freq_sort.clone();
+        let repaint = self.repaint.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _ = std::thread::Builder::new()
+            .name("dict-delete".into())
+            .spawn(move || {
+                let r = unloader
+                    .unload(vec![id_owned.clone()])
+                    .and_then(|_| manage::delete(&root, &id_owned));
+                let rows = manage::list(&root);
+                let _ = tx.send((r, rows, freq_sort));
+                repaint();
+            });
+        self.deleting = Some((id.to_owned(), rx));
     }
 
     /// The window. Returns whether the popup's settings changed.
@@ -415,7 +497,7 @@ impl Manager {
                                             (false, true) => "Frequency",
                                             _ => "Terms",
                                         });
-                                        ui.label(fmt_count(m.terms.max(m.freqs)));
+                                        ui.label(crate::fmt_int(m.terms.max(m.freqs)));
                                         ui.label(fmt_size(m.bytes)).on_hover_text("On disk");
                                         // Update status.
                                         let busy_here = self.jobs.list.iter().find(|j| j.label == m.title && !matches!(j.state(), State::Done(_)));
@@ -477,16 +559,41 @@ impl Manager {
                                 } else {
                                     ui.label("");
                                 }
-                                if self.confirm_delete.as_deref() == Some(&e.id) {
+                                if self.deleting.as_ref().is_some_and(|(id, _)| id == &e.id) {
+                                    ui.label(
+                                        RichText::new("Deleting…")
+                                            .color(crate::reader::theme::get(ui.ctx()).subtle),
+                                    );
+                                } else if self.confirm_delete.as_deref() == Some(&e.id) {
                                     ui.horizontal(|ui| {
-                                        if ui.button(RichText::new("Delete").color(crate::reader::theme::get(ui.ctx()).red)).clicked() {
+                                        if ui
+                                            .add_enabled(
+                                                self.deleting.is_none(),
+                                                egui::Button::new(
+                                                    RichText::new("Delete")
+                                                        .color(crate::reader::theme::get(ui.ctx()).red),
+                                                ),
+                                            )
+                                            .clicked()
+                                        {
                                             action = Some(Action::Delete(e.id.clone()));
                                         }
                                         if ui.button("Keep").clicked() {
                                             action = Some(Action::KeepIt);
                                         }
                                     });
-                                } else if ui.button(super::icons::glyph(ui.ctx(), super::icons::TRASH, false)).on_hover_text("Delete this dictionary").clicked() {
+                                } else if ui
+                                    .add_enabled(
+                                        self.deleting.is_none(),
+                                        egui::Button::new(super::icons::glyph(
+                                            ui.ctx(),
+                                            super::icons::TRASH,
+                                            false,
+                                        )),
+                                    )
+                                    .on_hover_text("Delete this dictionary")
+                                    .clicked()
+                                {
                                     action = Some(Action::AskDelete(e.id.clone()));
                                 }
                                 ui.end_row();

@@ -1,14 +1,16 @@
 //! Make a reference to keep, and manage the references available to both
 //! local voice pickers.
 
+use super::super::engine::Repaint;
 use super::super::{Tts, TtsSettings};
-use super::{Output, RED, local, play};
+use super::{Playback, RED, local};
 use eframe::egui::{self, RichText};
-use local::{SavedVoice, VoiceStore};
+use local::{LocalSettings, SavedVoice, VoiceStore};
 use std::fs;
 use std::hash::{BuildHasher, RandomState};
 use std::io::ErrorKind;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 const EXAMPLE: &str = "三十岁左右的男声，低沉温和，像深夜电台主持人";
@@ -25,7 +27,7 @@ struct Take {
     description: String,
     text: String,
     seed: u64,
-    sample: local::Sample,
+    sample: Arc<local::Sample>,
 }
 
 enum Edit {
@@ -37,6 +39,17 @@ enum Edit {
 enum Transfer {
     Imported(Option<String>),
     Exported(PathBuf),
+}
+
+enum VoiceOp {
+    Saved { id: String, voices: Vec<SavedVoice> },
+    Renamed(Vec<SavedVoice>),
+    Deleted { id: String, voices: Vec<SavedVoice> },
+}
+
+enum PendingDesigned {
+    Select(String),
+    ClearIf(String),
 }
 
 fn voice_dialog(title: &str) -> rfd::FileDialog {
@@ -74,8 +87,11 @@ pub(super) struct State {
     take: Option<Take>,
     keep_name: Option<String>,
     /// A playing take has no id, since it hasn't been kept yet.
-    playing: Option<(Option<String>, Output)>,
+    playing: Option<(Option<String>, Playback)>,
     listed: bool,
+    listing: Option<Receiver<Result<Vec<SavedVoice>, String>>>,
+    op: Option<Receiver<Result<VoiceOp, String>>>,
+    pending_designed: Option<PendingDesigned>,
     pub voices: Vec<SavedVoice>,
     edit: Option<Edit>,
     error: Option<String>,
@@ -94,6 +110,9 @@ impl Default for State {
             keep_name: None,
             playing: None,
             listed: false,
+            listing: None,
+            op: None,
+            pending_designed: None,
             voices: Vec::new(),
             edit: None,
             error: None,
@@ -108,7 +127,17 @@ impl State {
         self.pending.is_some()
     }
 
-    pub fn poll(&mut self) {
+    pub fn apply_pending_designed(&mut self, s: &mut LocalSettings) {
+        match self.pending_designed.take() {
+            Some(PendingDesigned::Select(id)) => s.designed = Some(id),
+            Some(PendingDesigned::ClearIf(id)) if s.designed.as_ref() == Some(&id) => {
+                s.designed = None;
+            }
+            Some(PendingDesigned::ClearIf(_)) | None => {}
+        }
+    }
+
+    pub fn poll(&mut self, repaint: &Repaint) {
         if let Some(rx) = &self.pending {
             let answer = match rx.try_recv() {
                 Ok(answer) => Some(answer),
@@ -123,6 +152,48 @@ impl State {
                 }
             }
         }
+        if let Some(rx) = &self.listing {
+            let answer = match rx.try_recv() {
+                Ok(answer) => Some(answer),
+                Err(TryRecvError::Disconnected) => Some(Err("The voice list stopped.".into())),
+                Err(TryRecvError::Empty) => None,
+            };
+            if let Some(answer) = answer {
+                self.listing = None;
+                match answer {
+                    Ok(voices) => self.voices = voices,
+                    Err(e) => self.error = Some(e),
+                }
+            }
+        }
+        if let Some(rx) = &self.op {
+            let answer = match rx.try_recv() {
+                Ok(answer) => Some(answer),
+                Err(TryRecvError::Disconnected) => Some(Err("The voice update stopped.".into())),
+                Err(TryRecvError::Empty) => None,
+            };
+            if let Some(answer) = answer {
+                self.op = None;
+                match answer {
+                    Ok(VoiceOp::Saved { id, voices }) => {
+                        self.voices = voices;
+                        self.keep_name = None;
+                        self.error = None;
+                        self.pending_designed = Some(PendingDesigned::Select(id));
+                    }
+                    Ok(VoiceOp::Renamed(voices)) => {
+                        self.voices = voices;
+                        self.error = None;
+                    }
+                    Ok(VoiceOp::Deleted { id, voices }) => {
+                        self.voices = voices;
+                        self.error = None;
+                        self.pending_designed = Some(PendingDesigned::ClearIf(id));
+                    }
+                    Err(e) => self.error = Some(e),
+                }
+            }
+        }
         if let Some(rx) = &self.transfer {
             let answer = match rx.try_recv() {
                 Ok(answer) => Some(answer),
@@ -133,7 +204,7 @@ impl State {
                 self.transfer = None;
                 self.transfer_note = Some(answer.map(|result| match result {
                     Transfer::Imported(name) => {
-                        self.refresh();
+                        self.refresh(repaint);
                         match name {
                             Some(name) => format!("Imported “{name}”."),
                             None => "Already imported.".into(),
@@ -145,19 +216,18 @@ impl State {
                 }));
             }
         }
-        if self
-            .playing
-            .as_ref()
-            .is_some_and(|(_, o)| o.queued().is_empty() || o.failed())
+        if let Some((_, p)) = &self.playing
+            && let Some(result) = p.poll()
         {
-            self.stop_sample();
+            self.playing = None;
+            if let Err(e) = result {
+                self.error = Some(e);
+            }
         }
     }
 
     pub fn stop_sample(&mut self) {
-        if let Some((_, output)) = self.playing.take() {
-            output.clear();
-        }
+        self.playing = None;
     }
 
     fn playing(&self, id: Option<&str>) -> bool {
@@ -166,25 +236,25 @@ impl State {
             .is_some_and(|(from, _)| from.as_deref() == id)
     }
 
-    pub fn load_voices(&mut self) {
+    pub fn load_voices(&mut self, repaint: &Repaint) {
         if !self.listed {
-            self.refresh();
+            self.refresh(repaint);
         }
     }
 
-    fn refresh(&mut self) {
+    fn refresh(&mut self, repaint: &Repaint) {
         self.listed = true;
-        match VoiceStore::default().list_voices() {
-            Ok(voices) => self.voices = voices,
-            Err(e) => self.error = Some(e),
-        }
+        self.listing = Some(local::spawn("tts-voices-list", repaint.clone(), || {
+            VoiceStore::default().list_voices()
+        }));
     }
 }
 
 impl Tts {
     pub fn open_design_window(&mut self) {
         self.local.design.present = Some(local::design_downloaded());
-        self.local.designer.refresh();
+        self.local.design_size = None;
+        self.local.designer.refresh(&self.repaint);
         self.local.designer.open = true;
     }
 
@@ -219,7 +289,7 @@ impl Tts {
             "tts-design",
             self.repaint.clone(),
             move || {
-                let sample = local::design_sample(&description, &text, seed)?;
+                let sample = Arc::new(local::design_sample(&description, &text, seed)?);
                 Ok(Take {
                     description,
                     text,
@@ -239,20 +309,23 @@ impl Tts {
             self.stop();
         }
         self.stop_preview();
+        let repaint = self.repaint.clone();
         let d = &mut self.local.designer;
-        let played = match id {
-            Some(id) => VoiceStore::default()
-                .samples(id)
-                .and_then(|pcm| play(&pcm, &self.repaint)),
+        let playback = match id {
+            Some(id) => {
+                let id = id.to_owned();
+                Playback::start("tts-sample", repaint, move || {
+                    VoiceStore::default().samples(&id)
+                })
+            }
             None => {
                 let Some(take) = &d.take else { return };
-                play(&take.sample.pcm, &self.repaint)
+                let sample = Arc::clone(&take.sample);
+                Playback::start("tts-sample", repaint, move || Ok(sample.pcm.clone()))
             }
         };
-        match played {
-            Ok(output) => d.playing = Some((id.map(str::to_owned), output)),
-            Err(e) => d.error = Some(e),
-        }
+        d.error = None;
+        d.playing = Some((id.map(str::to_owned), playback));
     }
 
     pub(in crate::reader::tts) fn design_window(
@@ -261,6 +334,7 @@ impl Tts {
         s: &mut TtsSettings,
         spine: usize,
     ) {
+        self.local.designer.apply_pending_designed(&mut s.local);
         if !self.design_window_open() {
             return;
         }
@@ -274,9 +348,9 @@ impl Tts {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     self.design_download_row(ui);
                     ui.separator();
-                    self.make_sample_form(ui, s, spine);
+                    self.make_sample_form(ui, spine);
                     ui.separator();
-                    self.kept_voices(ui, s);
+                    self.kept_voices(ui);
                     if let Some(e) = &self.local.designer.error {
                         ui.colored_label(RED, e);
                     }
@@ -287,10 +361,10 @@ impl Tts {
         }
     }
 
-    fn make_sample_form(&mut self, ui: &mut egui::Ui, s: &mut TtsSettings, spine: usize) {
+    fn make_sample_form(&mut self, ui: &mut egui::Ui, spine: usize) {
         let busy = self.local_voice_busy();
         let d = &mut self.local.designer;
-        let can_keep = !busy && d.transfer.is_none();
+        let can_keep = !busy && d.transfer.is_none() && d.op.is_none();
         let mut from_page = false;
         ui.add_enabled_ui(!d.making(), |ui| {
             ui.label("Description").on_hover_text(DESCRIPTION_TIP);
@@ -328,7 +402,7 @@ impl Tts {
             }
             let d = &self.local.designer;
             if d.making() {
-                ui.spinner();
+                crate::palette::spinner(ui);
                 ui.label(RichText::new(if local::loaded(local::Mode::Design, 1) {
                     "Making the sample…"
                 } else {
@@ -343,6 +417,7 @@ impl Tts {
                 }
             }
         });
+        let repaint = self.repaint.clone();
         let d = &mut self.local.designer;
         if let (Some(name), Some(take)) = (&mut d.keep_name, &d.take) {
             let mut keep = false;
@@ -360,38 +435,36 @@ impl Tts {
             if cancel {
                 d.keep_name = None;
             } else if keep {
-                match VoiceStore::default().save_voice(
-                    name,
-                    &take.description,
-                    &take.text,
-                    take.seed,
-                    &take.sample.wav,
-                ) {
-                    Ok(id) => {
-                        s.local.designed = Some(id);
-                        d.keep_name = None;
-                        d.error = None;
-                        d.refresh();
-                    }
-                    Err(e) => d.error = Some(e),
-                }
+                let name = name.clone();
+                let description = take.description.clone();
+                let text = take.text.clone();
+                let seed = take.seed;
+                let sample = Arc::clone(&take.sample);
+                d.error = None;
+                d.op = Some(local::spawn("tts-voice-save", repaint, move || {
+                    let store = VoiceStore::default();
+                    let id = store.save_voice(&name, &description, &text, seed, &sample.wav)?;
+                    let voices = store.list_voices()?;
+                    Ok(VoiceOp::Saved { id, voices })
+                }));
             }
         }
     }
 
-    fn kept_voices(&mut self, ui: &mut egui::Ui, s: &mut TtsSettings) {
+    fn kept_voices(&mut self, ui: &mut egui::Ui) {
         let busy = self.local_voice_busy();
         let d = &mut self.local.designer;
         let transferring = d.transfer.is_some();
+        let working = transferring || d.op.is_some();
         let mut import = false;
         ui.horizontal(|ui| {
             ui.label(RichText::new("Kept voices").strong())
                 .on_hover_text(SAMPLE_STYLE);
             import = ui
-                .add_enabled(!transferring, egui::Button::new("Import voice…").small())
+                .add_enabled(!working, egui::Button::new("Import voice…").small())
                 .clicked();
-            if transferring {
-                ui.spinner();
+            if working {
+                crate::palette::spinner(ui);
             }
         });
         if d.voices.is_empty() {
@@ -415,7 +488,7 @@ impl Tts {
                     {
                         play_id = Some(voice.id.clone());
                     }
-                    ui.add_enabled_ui(!busy && !transferring, |ui| {
+                    ui.add_enabled_ui(!busy && !working, |ui| {
                         if ui.small_button("Rename…").clicked() {
                             d.edit = Some(Edit::Rename {
                                 id: voice.id.clone(),
@@ -430,7 +503,7 @@ impl Tts {
                         }
                     });
                     if ui
-                        .add_enabled(!transferring, egui::Button::new("Export…").small())
+                        .add_enabled(!working, egui::Button::new("Export…").small())
                         .clicked()
                     {
                         export = Some((voice.id.clone(), voice.info.name.clone()));
@@ -446,7 +519,7 @@ impl Tts {
         } else if let Some((id, name)) = export {
             self.choose_voice_export(id, &name);
         }
-        self.edit_voice(ui, s, busy);
+        self.edit_voice(ui, busy);
         match &self.local.designer.transfer_note {
             Some(Ok(note)) => {
                 ui.label(note);
@@ -519,12 +592,15 @@ impl Tts {
         ));
     }
 
-    fn edit_voice(&mut self, ui: &mut egui::Ui, s: &mut TtsSettings, busy: bool) {
+    fn edit_voice(&mut self, ui: &mut egui::Ui, busy: bool) {
+        let repaint = self.repaint.clone();
         let d = &mut self.local.designer;
         let Some(edit) = &mut d.edit else { return };
         let mut confirm = false;
         let mut cancel = false;
-        let ready = d.transfer.is_none() && (!busy || matches!(edit, Edit::ReplaceExport { .. }));
+        let ready = d.transfer.is_none()
+            && d.op.is_none()
+            && (!busy || matches!(edit, Edit::ReplaceExport { .. }));
         ui.add_enabled_ui(ready, |ui| match edit {
             Edit::Rename { name, .. } => {
                 ui.horizontal(|ui| {
@@ -556,23 +632,29 @@ impl Tts {
         if cancel {
             d.edit = None;
         } else if confirm {
-            let store = VoiceStore::default();
-            let result = match d.edit.take().unwrap() {
-                Edit::Rename { id, name } => store.rename_voice(&id, &name),
+            match d.edit.take().unwrap() {
+                Edit::Rename { id, name } => {
+                    d.error = None;
+                    d.op = Some(local::spawn("tts-voice-rename", repaint, move || {
+                        let store = VoiceStore::default();
+                        store.rename_voice(&id, &name)?;
+                        let voices = store.list_voices()?;
+                        Ok(VoiceOp::Renamed(voices))
+                    }));
+                }
                 Edit::Delete { id, .. } => {
-                    let result = store.delete_voice(&id);
-                    if result.is_ok() && s.local.designed.as_ref() == Some(&id) {
-                        s.local.designed = None;
-                    }
-                    result
+                    d.error = None;
+                    d.op = Some(local::spawn("tts-voice-delete", repaint, move || {
+                        let store = VoiceStore::default();
+                        store.delete_voice(&id)?;
+                        let voices = store.list_voices()?;
+                        Ok(VoiceOp::Deleted { id, voices })
+                    }));
                 }
                 Edit::ReplaceExport { id, path } => {
                     self.start_voice_export(id, path, true);
-                    return;
                 }
-            };
-            d.error = result.err();
-            d.refresh();
+            }
         }
     }
 }

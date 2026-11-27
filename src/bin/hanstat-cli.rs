@@ -448,8 +448,8 @@ fn run_plan(a: &PlanArgs, k: Option<&Knowledge>, fold: bool, json: bool) {
     let width = a
         .width
         .unwrap_or_else(|| plan::width_for(&lib, &all, plan::SEARCH_BUDGET));
-    let path = lib
-        .optimise(
+    let (path, naive) = lib
+        .optimise_with_baseline(
             &k0,
             &params,
             &all,
@@ -457,11 +457,6 @@ fn run_plan(a: &PlanArgs, k: Option<&Knowledge>, fold: bool, json: bool) {
             &std::sync::atomic::AtomicBool::new(false),
         )
         .unwrap();
-    let naive = lib.evaluate(
-        &k0,
-        &params,
-        &lib.started_first(&params, &lib.easiest_now(&k0, &all)),
-    );
     eprintln!(
         "plan of {} books, beam width {width}: {:?}",
         all.len(),
@@ -1194,7 +1189,7 @@ fn main() {
             })
     };
     let t_analysis = std::time::Instant::now();
-    let prep = analyse(&words);
+    let mut prep = analyse(&words);
     let mut analysis = (t_analysis.elapsed(), prep.cached);
     let included: Vec<bool> = book
         .sections
@@ -1209,9 +1204,6 @@ fn main() {
         None => anki::Settings::load().0.match_across_scripts,
     };
     let mut r = analyze::build_report(&book, &prep, &included, fold);
-    // Where its words occur, saved with them by --library.
-    let mut positions =
-        hanstat::profile::Positions::from_analysis(&book, &prep, &included, &r.word_freq);
     if auto_dict {
         let known: std::collections::HashSet<String> = words.iter().cloned().collect();
         let found = hanstat::discover::discover(
@@ -1233,11 +1225,9 @@ fn main() {
         );
         words.extend(rec);
         let t_analysis = std::time::Instant::now();
-        let prep = analyse(&words);
+        prep = analyse(&words);
         analysis = (analysis.0 + t_analysis.elapsed(), analysis.1 && prep.cached);
         r = analyze::build_report(&book, &prep, &included, fold);
-        positions =
-            hanstat::profile::Positions::from_analysis(&book, &prep, &included, &r.word_freq);
     }
     let anki_k = anki_col.as_ref().map(|loaded| {
         anki_knowledge(
@@ -1249,24 +1239,32 @@ fn main() {
         Some(l) => l.apply(anki_k.as_ref(), fold),
         None => anki_k,
     };
+    let discovered: Option<(Vec<hanstat::discover::Candidate>, std::time::Duration)> =
+        (known_k.is_some() || add_history || suggest.is_some()).then(|| {
+            let t = std::time::Instant::now();
+            let known: std::collections::HashSet<String> = words.iter().cloned().collect();
+            let found = hanstat::discover::discover(
+                &book,
+                &included,
+                &r.word_freq,
+                &known,
+                &hanstat::discover::Options::for_size(r.han_total),
+            );
+            (found, t.elapsed())
+        });
     // Names are left out of the difficulty: the user dictionary plus the
     // recommended discovered words, as the GUI does.
     let names: Option<std::collections::HashSet<String>> =
         (known_k.is_some() || add_history).then(|| {
-            let known: std::collections::HashSet<String> = words.iter().cloned().collect();
-            let mut names = known.clone();
-            names.extend(
-                hanstat::discover::discover(
-                    &book,
-                    &included,
-                    &r.word_freq,
-                    &known,
-                    &hanstat::discover::Options::for_size(r.han_total),
-                )
-                .into_iter()
-                .filter(|c| c.recommended)
-                .map(|c| c.word),
-            );
+            let mut names: std::collections::HashSet<String> = words.iter().cloned().collect();
+            if let Some((found, _)) = &discovered {
+                names.extend(
+                    found
+                        .iter()
+                        .filter(|c| c.recommended)
+                        .map(|c| c.word.clone()),
+                );
+            }
             names
         });
     if let (Some(k), Some(names)) = (known_k, &names) {
@@ -1279,6 +1277,8 @@ fn main() {
         ));
     }
     if add_history {
+        let positions =
+            hanstat::profile::Positions::from_analysis(&book, &prep, &included, &r.word_freq);
         record_history(&file, &book, &r, names.as_ref().unwrap(), &positions);
     }
     eprintln!(
@@ -1296,16 +1296,8 @@ fn main() {
         std::fs::write(p, analyze::freq_csv(&r.word_freq, "word")).expect("write csv");
     }
     if let Some(n) = suggest {
-        let t = std::time::Instant::now();
-        let known: std::collections::HashSet<String> = words.iter().cloned().collect();
-        let c = hanstat::discover::discover(
-            &book,
-            &included,
-            &r.word_freq,
-            &known,
-            &hanstat::discover::Options::for_size(r.han_total),
-        );
-        eprintln!("discovery {:?}, {} candidates", t.elapsed(), c.len());
+        let (c, elapsed) = discovered.unwrap();
+        eprintln!("discovery {elapsed:?}, {} candidates", c.len());
         println!(
             "{:3} {:10} {:>7} {:>6} {:>8} {:>5} {:>5} {:>5} dict",
             "rec", "word", "occur", "whole%", "cohesion", "dep", "H_l", "H_r"

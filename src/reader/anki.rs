@@ -896,6 +896,7 @@ impl Cards {
     }
 
     pub fn browse(&mut self, id: i64) {
+        self.browse_error = None;
         let _ = self.jobs.send(Job::Browse {
             cfg: self.cfg.clone(),
             id,
@@ -999,7 +1000,7 @@ impl Cards {
                 ui.horizontal(|ui| {
                     match &self.lists {
                         None => {
-                            ui.spinner();
+                            crate::palette::spinner(ui);
                             ui.label("Asking Anki…");
                         }
                         Some(Ok(l)) => {
@@ -1013,6 +1014,9 @@ impl Cards {
                         refresh = true;
                     }
                 });
+                if let Some(e) = &self.browse_error {
+                    ui.label(RichText::new(format!("Anki browser: {e}")).color(red));
+                }
                 ui.checkbox(&mut s.enabled, "Show the + button in the popup");
                 ui.add_space(4.0);
                 let lists = self.lists.as_ref().and_then(|l| l.as_ref().ok());
@@ -1046,7 +1050,7 @@ impl Cards {
                         ui.label(RichText::new(e).color(red));
                     }
                     None if !s.model.is_empty() && s.fields.is_empty() => {
-                        ui.spinner();
+                        crate::palette::spinner(ui);
                     }
                     _ => {}
                 }
@@ -1239,7 +1243,6 @@ mod tests {
                     json: Ok(r#"["to conserve energy", {"type":"structured-content","content":{"tag":"a","href":"?query=x","content":"x"}}]"#.into()),
                     def_tags: String::new(),
                     term_tags: String::new(),
-                    score: 0,
                 }],
             }],
         }

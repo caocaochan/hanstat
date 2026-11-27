@@ -93,12 +93,6 @@ impl std::fmt::Display for Error {
     }
 }
 
-impl From<Error> for String {
-    fn from(e: Error) -> String {
-        e.to_string()
-    }
-}
-
 pub struct Client {
     agent: ureq::Agent,
     session: Mutex<Session>,

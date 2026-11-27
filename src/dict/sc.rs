@@ -132,8 +132,26 @@ fn img(o: &serde_json::Map<String, Value>, out: &mut String) {
     out.push('>');
 }
 
+fn container(t: &str, o: &serde_json::Map<String, Value>, out: &mut String) {
+    let _ = write!(out, "<{t} class=\"gloss-sc-{t}\"");
+    attrs(o, out);
+    if t == "details" && o.get("open").and_then(|v| v.as_bool()) == Some(true) {
+        out.push_str(" open");
+    }
+    for k in ["colSpan", "rowSpan"] {
+        if let Some(n) = o.get(k).and_then(|v| v.as_u64()) {
+            let _ = write!(out, " {}=\"{n}\"", k.to_ascii_lowercase());
+        }
+    }
+    out.push('>');
+    if let Some(c) = o.get("content") {
+        content(c, out);
+    }
+    let _ = write!(out, "</{t}>");
+}
+
 /// Structured content (a string, an array, or an element object).
-pub fn content(v: &Value, out: &mut String) {
+fn content(v: &Value, out: &mut String) {
     match v {
         Value::String(s) => escape(s, out),
         Value::Array(a) => a.iter().for_each(|x| content(x, out)),
@@ -161,42 +179,30 @@ pub fn content(v: &Value, out: &mut String) {
                         content(c, out);
                     }
                 }
-                "ul" | "ol" if compact_items(o).is_some() => {
-                    // Short plain items (CC-CEDICT senses) on one line, as
-                    // Yomitan's compact glossaries: "to speak; to say; talk".
-                    out.push_str("<span class=\"gloss-sc-list\"");
-                    attrs(o, out);
-                    out.push('>');
-                    for (i, li) in compact_items(o).unwrap().into_iter().enumerate() {
-                        // A classifier (CL: 個) starts a line of its own.
-                        if i > 0 && classifier(li) {
-                            out.push_str("<br>");
-                        } else if i > 0 {
-                            out.push_str("<span class=\"sep\">; </span>");
+                "ul" | "ol" => {
+                    if let Some(items) = compact_items(o) {
+                        // Short plain items (CC-CEDICT senses) on one line, as
+                        // Yomitan's compact glossaries: "to speak; to say; talk".
+                        out.push_str("<span class=\"gloss-sc-list\"");
+                        attrs(o, out);
+                        out.push('>');
+                        for (i, li) in items.into_iter().enumerate() {
+                            // A classifier (CL: 個) starts a line of its own.
+                            if i > 0 && classifier(li) {
+                                out.push_str("<br>");
+                            } else if i > 0 {
+                                out.push_str("<span class=\"sep\">; </span>");
+                            }
+                            if let Some(c) = li.get("content") {
+                                content(c, out);
+                            }
                         }
-                        if let Some(c) = li.get("content") {
-                            content(c, out);
-                        }
+                        out.push_str("</span>");
+                    } else {
+                        container(tag, o, out);
                     }
-                    out.push_str("</span>");
                 }
-                t if CONTAINER.contains(&t) => {
-                    let _ = write!(out, "<{t} class=\"gloss-sc-{t}\"");
-                    attrs(o, out);
-                    if t == "details" && o.get("open").and_then(|v| v.as_bool()) == Some(true) {
-                        out.push_str(" open");
-                    }
-                    for k in ["colSpan", "rowSpan"] {
-                        if let Some(n) = o.get(k).and_then(|v| v.as_u64()) {
-                            let _ = write!(out, " {}=\"{n}\"", k.to_ascii_lowercase());
-                        }
-                    }
-                    out.push('>');
-                    if let Some(c) = o.get("content") {
-                        content(c, out);
-                    }
-                    let _ = write!(out, "</{t}>");
-                }
+                t if CONTAINER.contains(&t) => container(t, o, out),
                 _ => {
                     if let Some(c) = o.get("content") {
                         content(c, out);

@@ -30,9 +30,7 @@ pub(crate) fn pick(dark: Color32, light: Color32) -> Color32 {
 }
 
 /// One Catppuccin flavour (palette v1.8.0).
-#[allow(dead_code)]
 pub(crate) struct Flavour {
-    pub rosewater: Color32,
     pub flamingo: Color32,
     pub pink: Color32,
     pub mauve: Color32,
@@ -42,15 +40,11 @@ pub(crate) struct Flavour {
     pub yellow: Color32,
     pub green: Color32,
     pub teal: Color32,
-    pub sky: Color32,
     pub sapphire: Color32,
     pub blue: Color32,
     pub lavender: Color32,
     pub text: Color32,
     pub subtext1: Color32,
-    pub subtext0: Color32,
-    pub overlay2: Color32,
-    pub overlay1: Color32,
     pub overlay0: Color32,
     pub surface2: Color32,
     pub surface1: Color32,
@@ -65,7 +59,6 @@ const fn hex(x: u32) -> Color32 {
 }
 
 pub(crate) const MOCHA: Flavour = Flavour {
-    rosewater: hex(0xf5e0dc),
     flamingo: hex(0xf2cdcd),
     pink: hex(0xf5c2e7),
     mauve: hex(0xcba6f7),
@@ -75,15 +68,11 @@ pub(crate) const MOCHA: Flavour = Flavour {
     yellow: hex(0xf9e2af),
     green: hex(0xa6e3a1),
     teal: hex(0x94e2d5),
-    sky: hex(0x89dceb),
     sapphire: hex(0x74c7ec),
     blue: hex(0x89b4fa),
     lavender: hex(0xb4befe),
     text: hex(0xcdd6f4),
     subtext1: hex(0xbac2de),
-    subtext0: hex(0xa6adc8),
-    overlay2: hex(0x9399b2),
-    overlay1: hex(0x7f849c),
     overlay0: hex(0x6c7086),
     surface2: hex(0x585b70),
     surface1: hex(0x45475a),
@@ -94,7 +83,6 @@ pub(crate) const MOCHA: Flavour = Flavour {
 };
 
 pub(crate) const LATTE: Flavour = Flavour {
-    rosewater: hex(0xdc8a78),
     flamingo: hex(0xdd7878),
     pink: hex(0xea76cb),
     mauve: hex(0x8839ef),
@@ -104,15 +92,11 @@ pub(crate) const LATTE: Flavour = Flavour {
     yellow: hex(0xdf8e1d),
     green: hex(0x40a02b),
     teal: hex(0x179299),
-    sky: hex(0x04a5e5),
     sapphire: hex(0x209fb5),
     blue: hex(0x1e66f5),
     lavender: hex(0x7287fd),
     text: hex(0x4c4f69),
     subtext1: hex(0x5c5f77),
-    subtext0: hex(0x6c6f85),
-    overlay2: hex(0x7c7f93),
-    overlay1: hex(0x8c8fa1),
     overlay0: hex(0x9ca0b0),
     surface2: hex(0xacb0be),
     surface1: hex(0xbcc0cc),
@@ -335,6 +319,38 @@ pub(crate) fn compact(ui: &mut Ui) {
     }
 }
 
+/// A spinner like `ui.spinner()`, capped at ~30 FPS so `PresentMode::AutoNoVsync`
+/// does not spin the GPU at hundreds/thousands of FPS while background work runs.
+pub(crate) fn spinner(ui: &mut Ui) -> Response {
+    let size = ui
+        .style()
+        .spacing
+        .interact_size
+        .y
+        .min(ui.available_size_before_wrap().x.max(12.0));
+    let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(33));
+        let color = ui.visuals().strong_text_color();
+        let radius = (rect.height() / 2.0) - 2.0;
+        let n_points = 20;
+        let time = ui.input(|i| i.time);
+        let start_angle = time * std::f64::consts::TAU;
+        let end_angle = start_angle + 240f64.to_radians() * time.sin();
+        let points: Vec<egui::Pos2> = (0..n_points)
+            .map(|i| {
+                let angle = egui::lerp(start_angle..=end_angle, i as f64 / n_points as f64);
+                let (sin, cos) = angle.sin_cos();
+                rect.center() + radius * vec2(cos as f32, sin as f32)
+            })
+            .collect();
+        ui.painter()
+            .add(egui::Shape::line(points, Stroke::new(3.0, color)));
+    }
+    response
+}
+
 /// A tab: its name, underlined in the accent while it is the current one.
 pub(crate) fn tab(ui: &mut Ui, selected: bool, name: &str, size: f32) -> Response {
     let font = if selected {
@@ -347,11 +363,14 @@ pub(crate) fn tab(ui: &mut Ui, selected: bool, name: &str, size: f32) -> Respons
         .layout_no_wrap(name.to_owned(), font, Color32::PLACEHOLDER);
     let pad = vec2(10.0, 6.0);
     // Room for the semibold face either way, so tabs don't move.
-    let wide = ui
-        .painter()
-        .layout_no_wrap(name.to_owned(), bold(size), Color32::PLACEHOLDER)
-        .size()
-        .x;
+    let wide = if selected {
+        galley.size().x
+    } else {
+        ui.painter()
+            .layout_no_wrap(name.to_owned(), bold(size), Color32::PLACEHOLDER)
+            .size()
+            .x
+    };
     let size_v = vec2(wide.max(galley.size().x), galley.size().y) + 2.0 * pad + vec2(0.0, 3.0);
     let (rect, resp) = ui.allocate_exact_size(size_v, Sense::click());
     if ui.is_rect_visible(rect) {

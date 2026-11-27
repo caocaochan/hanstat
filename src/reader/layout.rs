@@ -21,28 +21,28 @@ use std::ops::Range;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct Params {
+pub(super) struct Params {
     /// The reader's text size, in points.
-    pub base: f32,
-    pub content_w: f32,
-    pub page_h: f32,
+    pub(super) base: f32,
+    pub(super) content_w: f32,
+    pub(super) page_h: f32,
     /// Lines are at least this many times their font size apart.
-    pub line_spacing: f32,
-    pub fonts: Installed,
-    pub serif_default: bool,
-    pub text: Color32,
-    pub link: Color32,
-    pub rule: Color32,
+    pub(super) line_spacing: f32,
+    pub(super) fonts: Installed,
+    pub(super) serif_default: bool,
+    pub(super) text: Color32,
+    pub(super) link: Color32,
+    pub(super) rule: Color32,
     /// The page the text is drawn on; on a `dark` one the book's colours
     /// that would be hard to read there are turned light.
-    pub page: Color32,
-    pub dark: bool,
+    pub(super) page: Color32,
+    pub(super) dark: bool,
     /// Traditional East Asian vertical layout (`vertical-rl`): columns run
     /// top to bottom and progress right to left.
-    pub vertical: bool,
+    pub(super) vertical: bool,
 }
 
-pub enum Item {
+pub(super) enum Item {
     Text {
         pos: Pos2,
         galley: Arc<Galley>,
@@ -90,29 +90,29 @@ struct Unit {
     han: u32,
 }
 
-pub struct Page {
-    pub y0: f32,
+pub(super) struct Page {
+    pub(super) y0: f32,
     units: Range<usize>,
     /// A lone image: centred on the page.
-    pub center: bool,
+    pub(super) center: bool,
 }
 
-pub struct Link {
-    pub rect: Rect,
-    pub target: u32,
+pub(super) struct Link {
+    pub(super) rect: Rect,
+    pub(super) target: u32,
     unit: usize,
 }
 
 /// Where a line's characters are, for finding the one under the pointer.
 /// Its characters are `start..start + len` of [`Hits`]' arrays.
 #[derive(Clone, Copy, Debug)]
-pub struct HitLine {
+pub(super) struct HitLine {
     /// The line box.
-    pub top: f32,
-    pub bottom: f32,
+    pub(super) top: f32,
+    pub(super) bottom: f32,
     /// The text's own height in it (a highlight's top and bottom).
-    pub glyph_top: f32,
-    pub glyph_bottom: f32,
+    pub(super) glyph_top: f32,
+    pub(super) glyph_bottom: f32,
     unit: usize,
     start: u32,
     len: u32,
@@ -122,26 +122,26 @@ pub struct HitLine {
 /// character its left edge, advance and index in [`Chapter::chars`]
 /// (increasing through the chapter).
 #[derive(Default)]
-pub struct Hits {
-    pub lines: Vec<HitLine>,
+pub(super) struct Hits {
+    pub(super) lines: Vec<HitLine>,
     x: Vec<f32>,
     w: Vec<f32>,
     src: Vec<u32>,
 }
 
-pub struct ChapterLayout {
-    pub items: Vec<Item>,
+pub(super) struct ChapterLayout {
+    pub(super) items: Vec<Item>,
     units: Vec<Unit>,
     /// Backgrounds and borders, which may cross pages: (block_start, block_end, item).
     decos: Vec<(f32, f32, usize)>,
-    pub pages: Vec<Page>,
-    pub anchors: HashMap<String, usize>,
-    pub links: Vec<Link>,
-    pub hits: Hits,
+    pub(super) pages: Vec<Page>,
+    pub(super) anchors: HashMap<String, usize>,
+    pub(super) links: Vec<Link>,
+    pub(super) hits: Hits,
     /// Chinese characters laid out in the chapter.
-    pub han_total: u32,
+    pub(super) han_total: u32,
     /// Laid out in `vertical-rl` mode.
-    pub vertical: bool,
+    pub(super) vertical: bool,
     /// Content width used when laying out (for right-edge alignment in vertical mode).
     content_w: f32,
 }
@@ -149,7 +149,7 @@ pub struct ChapterLayout {
 impl ChapterLayout {
     /// Chinese characters of the chapter before `page` (the whole chapter
     /// past its last page).
-    pub fn page_han(&self, page: usize) -> u32 {
+    pub(super) fn page_han(&self, page: usize) -> u32 {
         self.pages
             .get(page)
             .and_then(|p| self.units.get(p.units.start))
@@ -157,7 +157,7 @@ impl ChapterLayout {
     }
 
     /// The page holding the text at `offset` characters.
-    pub fn page_of_offset(&self, offset: usize) -> usize {
+    pub(super) fn page_of_offset(&self, offset: usize) -> usize {
         self.pages
             .iter()
             .rposition(|p| {
@@ -168,7 +168,7 @@ impl ChapterLayout {
             .unwrap_or(0)
     }
 
-    pub fn page_offset(&self, page: usize) -> usize {
+    pub(super) fn page_offset(&self, page: usize) -> usize {
         self.pages
             .get(page)
             .and_then(|p| self.units.get(p.units.start))
@@ -182,12 +182,24 @@ impl ChapterLayout {
             .unwrap_or(self.pages.len().saturating_sub(1))
     }
 
-    pub fn page_of_anchor(&self, id: &str) -> Option<usize> {
+    pub(super) fn page_of_anchor(&self, id: &str) -> Option<usize> {
         self.anchors.get(id).map(|u| self.page_of_unit(*u))
     }
 
+    /// The flow → page offset for `page`, without collecting its items.
+    pub(super) fn page_shift(&self, page: usize) -> Vec2 {
+        let Some(p) = self.pages.get(page) else {
+            return Vec2::ZERO;
+        };
+        if self.vertical {
+            vec2(self.content_w + p.y0, 0.0)
+        } else {
+            vec2(0.0, -p.y0)
+        }
+    }
+
     /// Items of a page and the offset that places them (flow → page).
-    pub fn page_items(&self, page: usize) -> (Vec<usize>, Vec2) {
+    pub(super) fn page_items(&self, page: usize) -> (Vec<usize>, Vec2) {
         let Some(p) = self.pages.get(page) else {
             return (Vec::new(), Vec2::ZERO);
         };
@@ -202,33 +214,28 @@ impl ChapterLayout {
         for u in &self.units[p.units.clone()] {
             out.extend(u.items.clone());
         }
-        let off = if self.vertical {
-            vec2(self.content_w + p.y0, 0.0)
-        } else {
-            vec2(0.0, -p.y0)
-        };
-        (out, off)
+        (out, self.page_shift(page))
     }
 
     /// The page's used height (for centring a lone image).
     /// The height of the whole flow (a popup entry: one long page).
-    pub fn flow_height(&self) -> f32 {
+    pub(super) fn flow_height(&self) -> f32 {
         self.units.last().map_or(0.0, |u| u.bottom)
     }
 
-    pub fn page_height(&self, page: usize) -> f32 {
+    pub(super) fn page_height(&self, page: usize) -> f32 {
         self.pages.get(page).map_or(0.0, |p| {
             self.units[p.units.end - 1].bottom - self.units[p.units.start].top
         })
     }
 
-    pub fn page_links(&self, page: usize) -> impl Iterator<Item = &Link> {
-        let range = self
-            .pages
-            .get(page)
-            .map(|p| p.units.clone())
-            .unwrap_or(0..0);
-        self.links.iter().filter(move |l| range.contains(&l.unit))
+    pub(super) fn page_links(&self, page: usize) -> std::slice::Iter<'_, Link> {
+        let Some(p) = self.pages.get(page) else {
+            return [].iter();
+        };
+        let a = self.links.partition_point(|l| l.unit < p.units.start);
+        let z = self.links.partition_point(|l| l.unit < p.units.end);
+        self.links[a..z].iter()
     }
 
     /// The lines of `page`, as a range of [`Hits::lines`].
@@ -244,7 +251,7 @@ impl ChapterLayout {
 
     /// The character at `p` (flow coordinates) on `page`: its index in
     /// [`Chapter::chars`]. Only a point on a character's own box counts.
-    pub fn char_at(&self, page: usize, p: Pos2) -> Option<u32> {
+    pub(super) fn char_at(&self, page: usize, p: Pos2) -> Option<u32> {
         let (b, inline) = if self.vertical {
             (-p.x, p.y)
         } else {
@@ -261,7 +268,7 @@ impl ChapterLayout {
     }
 
     /// The chapter-text boundary nearest the pointer, including in the margins.
-    pub fn caret_near(&self, page: usize, p: Pos2) -> Option<u32> {
+    pub(super) fn caret_near(&self, page: usize, p: Pos2) -> Option<u32> {
         let (b, inline) = if self.vertical {
             (-p.x, p.y)
         } else {
@@ -300,7 +307,7 @@ impl ChapterLayout {
     }
 
     /// Whether the range includes any laid-out characters on this page.
-    pub fn shows_text(&self, page: usize, src: &Range<u32>) -> bool {
+    pub(super) fn shows_text(&self, page: usize, src: &Range<u32>) -> bool {
         let h = &self.hits;
         let lines = &h.lines[self.page_lines(page)];
         let (Some(first), Some(last)) = (lines.first(), lines.last()) else {
@@ -314,7 +321,7 @@ impl ChapterLayout {
 
     /// The page holding character `src` of [`Chapter::chars`], or the first
     /// character laid out after it; `None` past the last one.
-    pub fn page_of_src(&self, src: u32) -> Option<usize> {
+    pub(super) fn page_of_src(&self, src: u32) -> Option<usize> {
         let h = &self.hits;
         let k = h.src.partition_point(|x| *x < src);
         if k >= h.src.len() {
@@ -325,7 +332,7 @@ impl ChapterLayout {
     }
 
     /// The first character on `page` (its index in [`Chapter::chars`]).
-    pub fn page_first_src(&self, page: usize) -> Option<u32> {
+    pub(super) fn page_first_src(&self, page: usize) -> Option<u32> {
         let h = &self.hits;
         h.lines[self.page_lines(page)]
             .iter()
@@ -335,7 +342,7 @@ impl ChapterLayout {
 
     /// The boxes (flow coordinates) of the characters `src` of
     /// [`Chapter::chars`] that are on `page`, one per line.
-    pub fn char_rects(&self, page: usize, src: Range<u32>) -> Vec<Rect> {
+    pub(super) fn char_rects(&self, page: usize, src: Range<u32>) -> Vec<Rect> {
         let h = &self.hits;
         let mut out = Vec::new();
         for l in &h.lines[self.page_lines(page)] {
@@ -452,6 +459,8 @@ struct FlowState {
     pending_anchors: Vec<String>,
     anchors: HashMap<String, usize>,
     struts: HashMap<StyleId, (f32, f32)>,
+    /// Glyph advances cached across paragraphs of a chapter.
+    widths: HashMap<(char, StyleId), f32>,
     /// Single upright character galleys cached per chapter in vertical mode.
     vert_cache: HashMap<(char, StyleId), VertCacheEntry>,
     hits: Hits,
@@ -475,13 +484,13 @@ struct BlockFrame {
 
 /// A chapter laid out across frames using the same fonts and geometry.
 #[derive(Default)]
-pub struct LayoutWork {
+pub(super) struct LayoutWork {
     state: FlowState,
     stack: Vec<BlockFrame>,
 }
 
 impl LayoutWork {
-    pub fn advance(
+    pub(super) fn advance(
         &mut self,
         ch: &Chapter,
         p: &Params,
@@ -540,7 +549,7 @@ impl LayoutWork {
     }
 }
 
-pub fn layout(
+pub(super) fn layout(
     ch: &Chapter,
     p: &Params,
     fonts: &mut FontsView<'_>,
@@ -818,7 +827,7 @@ impl Flow<'_, '_> {
             strikethrough: Stroke::NONE,
             valign: match s.valign {
                 VAlign::Super => eframe::egui::Align::TOP,
-                _ => eframe::egui::Align::BOTTOM,
+                VAlign::Baseline | VAlign::Sub => eframe::egui::Align::BOTTOM,
             },
             ..Default::default()
         }
@@ -907,7 +916,7 @@ impl Flow<'_, '_> {
             strikethrough: if s.strike { deco } else { Stroke::NONE },
             valign: match s.valign {
                 VAlign::Super => eframe::egui::Align::TOP,
-                _ => eframe::egui::Align::BOTTOM,
+                VAlign::Baseline | VAlign::Sub => eframe::egui::Align::BOTTOM,
             },
             ..Default::default()
         }
@@ -1180,10 +1189,7 @@ impl Flow<'_, '_> {
                 }
             }
             Align::End => x0 + w - inline_span,
-            Align::Start if !img.fit_page && inline_span < w * 0.9 && s.margin[3] != Len::Auto => {
-                // Block images are centred unless they say otherwise.
-                x0 + (w - inline_span) / 2.0
-            }
+            // Block images are centred unless they say otherwise.
             _ => x0 + (w - inline_span) / 2.0,
         };
         let top = self.state.y;
@@ -1453,11 +1459,10 @@ impl Flow<'_, '_> {
         let vertical = self.p.vertical;
         // Atoms.
         let mut atoms: Vec<Atom> = Vec::new();
-        let mut imgs: Vec<(Img, StyleId, Vec2)> = Vec::new();
+        let mut imgs: Vec<(Img, Vec2)> = Vec::new();
         let mut rubies: Vec<Ruby> = Vec::new();
         let mut anchors: Vec<(usize, String)> = Vec::new();
         let mut ruby_open: Option<usize> = None;
-        let mut widths: HashMap<(char, StyleId), f32> = HashMap::new();
         self.state.boxes.clear();
         for it in items {
             match it {
@@ -1471,21 +1476,28 @@ impl Flow<'_, '_> {
                     let fp = self.font_px(s);
                     let fid = FontId::new(fp, self.family(s).0);
                     let ls = s.letter_spacing * self.p.base;
+                    let vert_forms = if self.is_serif(s) {
+                        self.p.fonts.serif_vert
+                    } else {
+                        self.p.fonts.sans_vert
+                    };
+                    let widths = &mut self.state.widths;
+                    let fonts = &mut *self.fonts;
                     for (k, c) in text.chars().enumerate() {
                         let (w, vert) = if vertical {
-                            let vg = vert_glyph(c, |vc| self.has_vert(s, vc));
+                            let vg = vert_glyph(c, |vc| vert_forms.has(vc));
                             let adv = match vg {
                                 VertGlyph::Upright { ch: ' ', .. } => fp * 0.5 + ls,
                                 VertGlyph::Upright { .. } => fp + ls,
                                 VertGlyph::Sideways(gc) => *widths
                                     .entry((gc, *style))
-                                    .or_insert_with(|| self.fonts.glyph_width(&fid, gc) + ls),
+                                    .or_insert_with(|| fonts.glyph_width(&fid, gc) + ls),
                             };
                             (adv, vg)
                         } else {
                             let adv = *widths
                                 .entry((c, *style))
-                                .or_insert_with(|| self.fonts.glyph_width(&fid, c) + ls);
+                                .or_insert_with(|| fonts.glyph_width(&fid, c) + ls);
                             (
                                 adv,
                                 VertGlyph::Upright {
@@ -1511,7 +1523,7 @@ impl Flow<'_, '_> {
                 Inline::Image { img, style, link } => {
                     let s = self.ch.styles[*style as usize].clone();
                     let size = self.image_size(img, &s, w);
-                    imgs.push((img.clone(), *style, size));
+                    imgs.push((img.clone(), size));
                     atoms.push(Atom {
                         ch: '\u{FFFC}',
                         kind: AKind::Image(imgs.len() - 1),
@@ -1747,7 +1759,7 @@ impl Flow<'_, '_> {
     fn line(
         &mut self,
         atoms: &[Atom],
-        imgs: &[(Img, StyleId, Vec2)],
+        imgs: &[(Img, Vec2)],
         rubies: &[Ruby],
         offset: usize,
         bs: &Style,
@@ -1797,8 +1809,9 @@ impl Flow<'_, '_> {
                 }
             }
         }
-        // Segments: runs of text between images, ruby bases and (when the
-        // spaces take the justification) spaces.
+        // Segments: runs of text between images, ruby bases, subscripts and
+        // (when the spaces take the justification) spaces.
+        let is_sub = |st: StyleId| self.ch.styles[st as usize].valign == VAlign::Sub;
         let mut segs: Vec<(usize, usize)> = Vec::new();
         let mut i = 0;
         while i < atoms.len() {
@@ -1808,11 +1821,13 @@ impl Flow<'_, '_> {
                 i += 1;
                 continue;
             }
+            let a_sub = is_sub(a.style);
             let mut j = i + 1;
             while j < atoms.len()
                 && atoms[j].kind == AKind::Char
                 && atoms[j].ruby == a.ruby
                 && atoms[j].lead == 0.0
+                && is_sub(atoms[j].style) == a_sub
                 && !(extra_space > 0.0 && atoms[j - 1].ch == ' ')
             {
                 j += 1;
@@ -1829,6 +1844,7 @@ impl Flow<'_, '_> {
             galley: Option<Arc<Galley>>,
             faux: Option<(Arc<Galley>, Vec2)>,
             base: f32,
+            sub_shift: f32,
             img: Option<(usize, Vec2)>,
             bx: Option<usize>,
             ruby: Option<usize>,
@@ -1838,13 +1854,14 @@ impl Flow<'_, '_> {
         for &(a, z) in &segs {
             let first = &atoms[a];
             if let AKind::Image(k) = first.kind {
-                let size = imgs[k].2;
+                let size = imgs[k].1;
                 above = above.max(size.y);
                 out.push(Seg {
                     x: xs[a],
                     galley: None,
                     faux: None,
                     base: 0.0,
+                    sub_shift: 0.0,
                     img: Some((k, size)),
                     bx: None,
                     ruby: None,
@@ -1861,6 +1878,7 @@ impl Flow<'_, '_> {
                     galley: None,
                     faux: None,
                     base: 0.0,
+                    sub_shift: 0.0,
                     img: None,
                     bx: Some(k),
                     ruby: None,
@@ -1912,18 +1930,20 @@ impl Flow<'_, '_> {
                 (self.fonts.layout_job(fj), vec2((fp * 0.035).max(0.5), 0.0))
             });
             let base = baseline(&g);
+            let sub_shift = if is_sub(first.style) { fp * 0.25 } else { 0.0 };
             let ascent = g
                 .rows
                 .first()
                 .and_then(|r| r.glyphs.first())
                 .map_or(base, |gl| gl.font_ascent);
             above = above.max(base);
-            below = below.max(g.size().y - base);
+            below = below.max(g.size().y - base + sub_shift);
             out.push(Seg {
                 x: xs[a],
                 galley: Some(g),
                 faux,
                 base,
+                sub_shift,
                 img: None,
                 bx: None,
                 ruby: first.ruby,
@@ -1958,7 +1978,7 @@ impl Flow<'_, '_> {
                 continue;
             }
             let Some(g) = s.galley else { continue };
-            let pos = pos2(s.x, baseline_y - s.base);
+            let pos = pos2(s.x, baseline_y - s.base + s.sub_shift);
             if let Some(r) = s.ruby
                 && ruby_drawn.insert(r)
                 && let Some(rg) = &rubies[r].galley
@@ -2049,7 +2069,7 @@ impl Flow<'_, '_> {
     fn vertical_line(
         &mut self,
         atoms: &[Atom],
-        imgs: &[(Img, StyleId, Vec2)],
+        imgs: &[(Img, Vec2)],
         rubies: &[Ruby],
         offset: usize,
         bs: &Style,
@@ -2116,7 +2136,7 @@ impl Flow<'_, '_> {
                     left_half = left_half.max(pitch * 0.5);
                 }
                 AKind::Image(k) => {
-                    let size = imgs[k].2;
+                    let size = imgs[k].1;
                     right_half = right_half.max(size.x * 0.5);
                     left_half = left_half.max(size.x * 0.5);
                 }
@@ -2146,7 +2166,7 @@ impl Flow<'_, '_> {
         while i < atoms.len() {
             let a = &atoms[i];
             if let AKind::Image(k) = a.kind {
-                let size = imgs[k].2;
+                let size = imgs[k].1;
                 self.state.items.push(Item::Image {
                     rect: Rect::from_min_size(pos2(cx - size.x * 0.5, ys[i]), size),
                     path: imgs[k].0.path.clone(),

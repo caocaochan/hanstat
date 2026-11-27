@@ -11,7 +11,7 @@
 //! The UI sends [`Cmd`]s and reads [`Now`].
 
 use super::audio::{self, Output};
-use super::azure::{self, Azure, Fail};
+use super::azure::{Azure, Fail};
 use super::{Speech, clip_path, local, opus, saved_clip, sentence_at, sentences};
 use crate::reader::tree::Chapter;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -101,6 +101,7 @@ pub struct Batch {
     pub done: AtomicUsize,
     pub failed: AtomicUsize,
     /// Characters Azure bills for the sentences not saved before.
+    #[cfg(test)]
     pub billed: AtomicUsize,
     pub cancel: AtomicBool,
     pub error: Mutex<Option<String>>,
@@ -281,8 +282,9 @@ impl PoolInner {
                 let save = saved_clip(dir, key, speech.ext()).is_none();
                 batch.total.fetch_add(1, Ordering::Relaxed);
                 if save {
+                    #[cfg(test)]
                     batch.billed.fetch_add(
-                        azure::billed(&sentence.text, speech.rate),
+                        super::azure::billed(&sentence.text, speech.rate),
                         Ordering::Relaxed,
                     );
                 } else {
@@ -802,25 +804,46 @@ impl Player {
         }
     }
 
+    fn shutdown_output(&mut self) {
+        // The reader closed: fade out before the device goes.
+        if let Some(o) = &self.output {
+            o.clear();
+            o.set_paused(true);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     fn run(&mut self, rx: Receiver<Cmd>) {
         loop {
-            let tick = if matches!(self.state, State::Loading | State::Playing) {
-                Duration::from_millis(30)
-            } else {
-                Duration::from_millis(250)
-            };
-            match rx.recv_timeout(tick) {
-                Ok(c) => self.command(c),
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    // The reader closed: fade out before the device goes.
-                    if let Some(o) = &self.output {
-                        o.clear();
-                        o.set_paused(true);
-                        std::thread::sleep(Duration::from_millis(100));
+            let cmd = if self.state == State::Stopped && self.closing.is_none() {
+                match rx.recv() {
+                    Ok(c) => Some(c),
+                    Err(_) => {
+                        self.shutdown_output();
+                        return;
                     }
-                    return;
                 }
+            } else {
+                let tick = if matches!(self.state, State::Loading | State::Playing) {
+                    Duration::from_millis(30)
+                } else if let Some(close_at) = self.closing {
+                    close_at
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(250))
+                } else {
+                    Duration::from_millis(250)
+                };
+                match rx.recv_timeout(tick) {
+                    Ok(c) => Some(c),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        self.shutdown_output();
+                        return;
+                    }
+                }
+            };
+            if let Some(c) = cmd {
+                self.command(c);
             }
             while let Ok(c) = rx.try_recv() {
                 self.command(c);
@@ -1154,8 +1177,8 @@ impl Player {
                     Ok((samples, rate)) => {
                         let id = self.next_id;
                         self.next_id += 1;
-                        let samples = audio::stretch(&samples, rate, self.playback);
-                        let samples = audio::resample(&samples, rate, out.rate);
+                        let samples = audio::stretch_owned(samples, rate, self.playback);
+                        let samples = audio::resample_owned(samples, rate, out.rate);
                         // Queued again after a speed change: from where it was.
                         let start = match self.resume_at.take() {
                             Some((a, frac)) if a == at => (samples.len() as f32 * frac) as usize,

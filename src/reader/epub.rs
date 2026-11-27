@@ -21,10 +21,24 @@ pub struct TocEntry {
     pub fragment: Option<String>,
 }
 
+struct TextBook {
+    title: String,
+    /// Paragraphs per chapter, and whether the first paragraph is a heading.
+    chapters: Vec<(Vec<String>, bool)>,
+}
+
 enum Files {
     Zip(Mutex<zip::ZipArchive<Cursor<Vec<u8>>>>),
-    /// A plain-text book's chapter documents, by name.
-    Memory(HashMap<String, Vec<u8>>),
+    /// A plain-text book's chapters, turned into XHTML on demand.
+    Text(TextBook),
+}
+
+fn text_chapter_index(name: &str) -> Option<usize> {
+    name.strip_prefix("text/")?
+        .strip_suffix(".xhtml")?
+        .parse::<usize>()
+        .ok()?
+        .checked_sub(1)
 }
 
 pub struct Epub {
@@ -82,7 +96,10 @@ impl Epub {
                 f.read_to_end(&mut v).ok()?;
                 Some(v)
             }
-            Files::Memory(files) => files.get(real).cloned(),
+            Files::Text(tb) => {
+                let (paras, heading) = tb.chapters.get(text_chapter_index(real)?)?;
+                Some(chapter_xhtml(&tb.title, paras, *heading).into_bytes())
+            }
         }
     }
 
@@ -95,54 +112,61 @@ impl Epub {
         const PART_CHARS: usize = 20_000;
         let book = hanstat::extract::txt::load(bytes, hanstat::extract::EncodingChoice::Auto);
         let title = stem.trim().to_owned();
-        let mut files = HashMap::new();
+        let mut chapters: Vec<(Vec<String>, bool)> = Vec::new();
         let mut spine: Vec<String> = Vec::new();
         let mut toc = Vec::new();
-        let mut doc = |spine: &mut Vec<String>, paragraphs: &[String], heading: bool| {
+        let mut doc = |spine: &mut Vec<String>, paragraphs: Vec<String>, heading: bool| {
             let name = format!("text/{:05}.xhtml", spine.len() + 1);
-            files.insert(
-                name.clone(),
-                chapter_xhtml(&title, paragraphs, heading).into_bytes(),
-            );
+            chapters.push((paragraphs, heading));
             spine.push(name);
         };
-        for section in &book.sections {
-            let paragraphs = &section.paragraphs;
+        for section in book.sections {
             // The TXT loader keeps a chapter's heading line as its first paragraph.
             let heading = section.kind == hanstat::extract::SectionKind::Body
-                && paragraphs.first() == Some(&section.label);
+                && section.paragraphs.first() == Some(&section.label);
             toc.push(TocEntry {
-                label: section.label.clone(),
+                label: section.label,
                 depth: 0,
                 spine: spine.len(),
                 fragment: None,
             });
-            let mut start = 0;
-            let mut chars = 0;
-            for (i, p) in paragraphs.iter().enumerate() {
+            let total_paras = section.paragraphs.len();
+            let mut chunk = Vec::new();
+            let mut chars = 0usize;
+            let mut first_chunk = true;
+            for (i, p) in section.paragraphs.into_iter().enumerate() {
                 chars += p.chars().count();
-                if chars >= PART_CHARS && i + 1 < paragraphs.len() {
-                    doc(&mut spine, &paragraphs[start..=i], heading && start == 0);
-                    (start, chars) = (i + 1, 0);
+                chunk.push(p);
+                if chars >= PART_CHARS && i + 1 < total_paras {
+                    doc(
+                        &mut spine,
+                        std::mem::take(&mut chunk),
+                        heading && first_chunk,
+                    );
+                    first_chunk = false;
+                    chars = 0;
                 }
             }
-            if start < paragraphs.len() {
-                doc(&mut spine, &paragraphs[start..], heading && start == 0);
+            if !chunk.is_empty() {
+                doc(&mut spine, chunk, heading && first_chunk);
             }
         }
         if spine.is_empty() {
-            doc(&mut spine, &[], false);
+            doc(&mut spine, Vec::new(), false);
         }
         // The only entry of a book without headings says nothing.
         if toc.len() == 1 {
             toc.clear();
         }
-        let names = files
-            .keys()
+        let names = spine
+            .iter()
             .map(|n| (n.to_lowercase(), n.clone()))
             .collect();
         Epub {
-            files: Files::Memory(files),
+            files: Files::Text(TextBook {
+                title: title.clone(),
+                chapters,
+            }),
             names,
             title,
             spine,
@@ -151,6 +175,11 @@ impl Epub {
     }
 
     pub fn read_text(&self, name: &str) -> Option<String> {
+        if let Files::Text(tb) = &self.files {
+            let real = self.names.get(&name.to_lowercase())?;
+            let (paras, heading) = tb.chapters.get(text_chapter_index(real)?)?;
+            return Some(chapter_xhtml(&tb.title, paras, *heading));
+        }
         self.read(name)
             .map(|b| hanstat::extract::epub::decode_markup(&b).0)
     }

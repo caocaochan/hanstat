@@ -21,7 +21,7 @@ use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-pub const REPO: &str = "caocaochan/hanstat";
+const REPO: &str = "caocaochan/hanstat";
 pub const RELEASES_PAGE: &str = "https://github.com/caocaochan/hanstat/releases/latest";
 const OLD_SUFFIX: &str = "hanstat-old";
 const NEW_SUFFIX: &str = "hanstat-new";
@@ -121,7 +121,7 @@ struct ApiAsset {
 const ZIP_NAME: &str = "hanstat-x86_64-pc-windows-msvc.zip";
 
 /// The Linux release: a Flatpak bundle, `.../releases/latest/download/<this>`.
-pub const FLATPAK_BUNDLE: &str = "hanstat-x86_64-linux.flatpak";
+const FLATPAK_BUNDLE: &str = "hanstat-x86_64-linux.flatpak";
 #[cfg(target_os = "macos")]
 const ZIP_NAME: &str = "hanstat-aarch64-apple-darwin.zip";
 
@@ -424,7 +424,7 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 /// Install the release zip's files into `dir`. The zip's `hanstat.exe` is
 /// written as `gui_name` (the running exe's file name, in case it was renamed).
 #[cfg(any(not(target_os = "macos"), test))]
-pub fn install(zip: &[u8], dir: &Path, gui_name: &str) -> Result<(), String> {
+fn install(zip: &[u8], dir: &Path, gui_name: &str) -> Result<(), String> {
     let mut files = release_files(zip)?;
     for (name, _) in &mut files {
         if name.eq_ignore_ascii_case("hanstat.exe") {
@@ -547,7 +547,7 @@ fn release_app_files(zip: &[u8]) -> Result<Vec<(PathBuf, Vec<u8>, u32)>, String>
 /// and nothing is left behind but, at worst, a `.hanstat-new` folder that
 /// [`clean_up`] removes.
 #[cfg(any(target_os = "macos", test))]
-pub fn install_app(zip: &[u8], bundle: &Path) -> Result<(), String> {
+fn install_app(zip: &[u8], bundle: &Path) -> Result<(), String> {
     let files = release_app_files(zip)?;
     let err = |what: &str, p: &Path, e: std::io::Error| format!("{what} {}: {e}", p.display());
     let new = with_suffix(bundle, NEW_SUFFIX);
@@ -593,7 +593,7 @@ pub fn install_app(zip: &[u8], bundle: &Path) -> Result<(), String> {
 /// Delete files (macOS: bundles) an earlier update left in `dir`. The
 /// previous exe is still running for a moment after the restart, so keep
 /// trying for a few seconds.
-pub fn clean_up(dir: &Path) {
+fn clean_up(dir: &Path) {
     for _ in 0..40 {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;

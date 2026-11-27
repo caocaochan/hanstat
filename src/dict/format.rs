@@ -15,12 +15,12 @@
 //! | `keys.bloom` | a Bloom filter of the headword hashes |
 //! | `freq.bin` | frequency records: headword, reading ("" = any), value i32, display |
 //! | `freq.idx` | (xxh64 of the headword u64, record offset u64), sorted |
+//! | `freq.bloom` | a Bloom filter of the frequency headword hashes (optional) |
 //! | `media.bin`, `media.json` | images, by their path in the zip |
 //!
 //! All numbers little-endian; strings are a u16 length and UTF-8.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Bumped when the files change: dictionaries of another version are
@@ -36,6 +36,7 @@ pub const KEYS: &str = "keys.idx";
 pub const BLOOM: &str = "keys.bloom";
 pub const FREQ: &str = "freq.bin";
 pub const FREQ_IDX: &str = "freq.idx";
+pub const FREQ_BLOOM: &str = "freq.bloom";
 pub const MEDIA: &str = "media.bin";
 pub const MEDIA_IDX: &str = "media.json";
 
@@ -51,9 +52,6 @@ pub struct Meta {
     pub author: Option<String>,
     pub attribution: Option<String>,
     pub description: Option<String>,
-    pub url: Option<String>,
-    pub source_language: Option<String>,
-    pub target_language: Option<String>,
     pub frequency_mode: Option<String>,
     /// The Yomitan format (1–3).
     pub format: u32,
@@ -61,17 +59,12 @@ pub struct Meta {
     pub glossaries: u64,
     pub freqs: u64,
     pub media: u64,
-    /// Rows not kept, by reason (`pitch`, `ipa`, `kanji`, `kanji_meta`).
-    pub skipped: BTreeMap<String, u64>,
     /// The longest headword, in characters.
     pub max_len: u32,
     /// The dictionary's `styles.css`.
     pub styles: String,
-    pub tags: Vec<Tag>,
     pub update: Option<UpdateUrls>,
     pub source: Option<SourceZip>,
-    /// Unix seconds.
-    pub imported: u64,
     /// Bytes on disk.
     pub bytes: u64,
 }
@@ -85,16 +78,6 @@ impl Meta {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-#[serde(default)]
-pub struct Tag {
-    pub name: String,
-    pub category: String,
-    pub order: i64,
-    pub notes: String,
-    pub score: i64,
-}
-
 /// Where a newer revision is announced (`indexUrl`) and downloaded.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct UpdateUrls {
@@ -103,12 +86,10 @@ pub struct UpdateUrls {
 }
 
 /// The zip a dictionary was imported from.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
 pub struct SourceZip {
-    pub path: PathBuf,
     pub size: u64,
-    /// Unix seconds.
-    pub mtime: u64,
 }
 
 /// The dictionaries, in the user's order.
@@ -137,8 +118,6 @@ pub struct Entry {
 /// The last update check of a dictionary.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Check {
-    /// Unix seconds.
-    pub at: u64,
     pub result: CheckResult,
 }
 
@@ -257,16 +236,16 @@ pub fn u64_at(b: &[u8], i: usize) -> Option<u64> {
     Some(u64::from_le_bytes(b.get(i..i + 8)?.try_into().ok()?))
 }
 
-/// A term record of `terms.bin`: headword, reading, definition tags, rules,
-/// term tags (strings), then score i32, glossary slot u32 and its place in
-/// the dictionary u64 (bank number << 32 | row), which orders equal results
-/// as the dictionary does.
+/// A term record of `terms.bin`: headword, reading, definition tags, rules
+/// (kept on disk for format compatibility, skipped on read), term tags
+/// (strings), then score i32, glossary slot u32 and its place in the
+/// dictionary u64 (bank number << 32 | row), which orders equal results as
+/// the dictionary does.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TermRecord<'a> {
     pub expr: &'a str,
     pub reading: &'a str,
     pub def_tags: &'a str,
-    pub rules: &'a str,
     pub term_tags: &'a str,
     pub score: i32,
     pub slot: u32,
@@ -278,7 +257,8 @@ impl<'a> TermRecord<'a> {
         put_str(out, self.expr);
         put_str(out, self.reading);
         put_str(out, self.def_tags);
-        put_str(out, self.rules);
+        // Empty rules string: keeps the on-disk layout of format version 1.
+        put_str(out, "");
         put_str(out, self.term_tags);
         out.extend_from_slice(&self.score.to_le_bytes());
         out.extend_from_slice(&self.slot.to_le_bytes());
@@ -290,7 +270,10 @@ impl<'a> TermRecord<'a> {
         let expr = get_str(b, &mut p)?;
         let reading = get_str(b, &mut p)?;
         let def_tags = get_str(b, &mut p)?;
-        let rules = get_str(b, &mut p)?;
+        // Skip the unused `rules` field kept in the v1 on-disk layout.
+        let rules_len = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+        b.get(p + 2..p + 2 + rules_len)?;
+        p += 2 + rules_len;
         let term_tags = get_str(b, &mut p)?;
         let score = u32_at(b, p)? as i32;
         let slot = u32_at(b, p + 4)?;
@@ -299,7 +282,6 @@ impl<'a> TermRecord<'a> {
             expr,
             reading,
             def_tags,
-            rules,
             term_tags,
             score,
             slot,
@@ -308,7 +290,8 @@ impl<'a> TermRecord<'a> {
     }
 
     /// Just the headword (cheap: for checking a hash match).
-    pub fn expr_at(b: &'a [u8], at: usize) -> Option<&'a str> {
+    #[cfg(test)]
+    fn expr_at(b: &'a [u8], at: usize) -> Option<&'a str> {
         let mut p = at;
         get_str(b, &mut p)
     }
@@ -338,7 +321,6 @@ mod tests {
             expr: "说话",
             reading: "shuō huà",
             def_tags: "v",
-            rules: "",
             term_tags: "",
             score: -3,
             slot: 77,
@@ -346,9 +328,20 @@ mod tests {
         };
         let mut b = vec![9u8];
         r.write(&mut b);
-        assert_eq!(TermRecord::read(&b, 1), Some(r));
+        assert_eq!(TermRecord::read(&b, 1), Some(r.clone()));
         assert_eq!(TermRecord::expr_at(&b, 1), Some("说话"));
         assert_eq!(TermRecord::read(&b[..b.len() - 1], 1), None, "cut short");
+        // Backwards compatibility with existing v1 `terms.bin` containing non-empty rules.
+        let mut legacy = Vec::new();
+        put_str(&mut legacy, r.expr);
+        put_str(&mut legacy, r.reading);
+        put_str(&mut legacy, r.def_tags);
+        put_str(&mut legacy, "v5");
+        put_str(&mut legacy, r.term_tags);
+        legacy.extend_from_slice(&r.score.to_le_bytes());
+        legacy.extend_from_slice(&r.slot.to_le_bytes());
+        legacy.extend_from_slice(&r.order.to_le_bytes());
+        assert_eq!(TermRecord::read(&legacy, 0), Some(r));
     }
 
     #[test]

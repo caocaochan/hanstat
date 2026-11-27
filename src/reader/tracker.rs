@@ -312,6 +312,7 @@ impl Tracker {
     /// Every book's stats were reset: start a new session from `now`, with
     /// nothing before it to add or take back. The page stays the base, so
     /// turns from it count.
+    #[cfg(test)]
     pub fn restart(&mut self, now: f64) {
         self.session = None;
         self.added.clear();

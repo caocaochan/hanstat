@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// Where the DuChinese session is kept, encrypted.
 pub const SESSION: Slot = Slot {
@@ -101,10 +102,11 @@ pub enum Event {
     Account(Account),
     Catalogue {
         courses: Vec<Course>,
+        #[cfg(test)]
         fetched: u64,
     },
-    /// A series' cover is in the cache.
-    Cover(u64),
+    /// A series' cover, decoded and resized to a thumbnail off the UI thread.
+    Cover(u64, Option<egui::ColorImage>),
     Estimate(u64, Estimate),
     /// Estimates worked out of those wanted; `None` once done.
     Estimating(Option<(usize, usize)>),
@@ -236,10 +238,8 @@ impl Shared {
     fn lessons(&self, c: &Course) -> Result<Vec<Lesson>, Error> {
         let lessons = self.client.lessons(c)?;
         self.learn_premium(&lessons);
-        let signed_in = self.account.lock().unwrap().signed_in == Some(true);
         let _ = Chapters {
             fetched: hanstat::history::now(),
-            signed_in,
             lessons: lessons.clone(),
         }
         .save(&self.root, c.id);
@@ -247,11 +247,29 @@ impl Shared {
     }
 }
 
+/// Decode a cover image and scale it down to thumbnail dimensions (`72×100`)
+/// off the UI thread so texture uploads stay tiny and fast.
+fn decode_cover(bytes: &[u8]) -> Option<egui::ColorImage> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let img = if img.width() > 72 || img.height() > 100 {
+        img.thumbnail(72, 100)
+    } else {
+        img
+    };
+    let rgba = img.into_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        size,
+        rgba.as_raw(),
+    ))
+}
+
 /// The estimates still to work out, and the known words they're for.
 type EstimateQueue = Arc<(Mutex<Option<(Vec<Course>, EstimateInputs)>>, Condvar)>;
 
 pub struct Worker {
     tasks: Arc<(Mutex<VecDeque<Task>>, Condvar)>,
+    covers: Arc<(Mutex<VecDeque<Course>>, Condvar)>,
     estimates: EstimateQueue,
     /// Bumped by each new request for estimates: the running one stops.
     estimate_gen: Arc<AtomicU64>,
@@ -263,6 +281,7 @@ impl Drop for Worker {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         self.tasks.1.notify_all();
+        self.covers.1.notify_all();
         self.estimates.1.notify_all();
     }
 }
@@ -278,6 +297,7 @@ impl Worker {
             account: Mutex::new(Account::default()),
         });
         let tasks: Arc<(Mutex<VecDeque<Task>>, Condvar)> = Arc::default();
+        let covers: Arc<(Mutex<VecDeque<Course>>, Condvar)> = Arc::default();
         let estimates: EstimateQueue = Arc::default();
         let stop = Arc::new(AtomicBool::new(false));
         let estimate_gen = Arc::new(AtomicU64::new(0));
@@ -309,6 +329,36 @@ impl Worker {
                     }
                 })
                 .expect("cannot start the DuChinese thread");
+        }
+        {
+            let (shared, covers, tasks, stop) =
+                (shared.clone(), covers.clone(), tasks.clone(), stop.clone());
+            std::thread::Builder::new()
+                .name("hanstat-duchinese-covers".into())
+                .spawn(move || {
+                    loop {
+                        let c = {
+                            let mut q = covers.0.lock().unwrap();
+                            loop {
+                                if stop.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                                if let Some(c) = q.pop_front() {
+                                    break c;
+                                }
+                                q = covers.1.wait(q).unwrap();
+                            }
+                        };
+                        let path = store::cover_path(&shared.root, c.id);
+                        if let Some(bytes) = store::read_cached(&path) {
+                            shared.send(Event::Cover(c.id, decode_cover(&bytes)));
+                        } else {
+                            tasks.0.lock().unwrap().push_back(Task::Cover(c));
+                            tasks.1.notify_all();
+                        }
+                    }
+                })
+                .expect("cannot start the DuChinese cover thread");
         }
         {
             let (shared, estimates, stop, generation) = (
@@ -343,6 +393,7 @@ impl Worker {
         }
         Worker {
             tasks,
+            covers,
             estimates,
             estimate_gen,
             stop,
@@ -353,6 +404,13 @@ impl Worker {
     pub fn push(&self, t: Task) {
         self.tasks.0.lock().unwrap().push_back(t);
         self.tasks.1.notify_all();
+    }
+
+    /// Load a series' cover off the UI thread (cached files decode immediately
+    /// without waiting behind network tasks; missing ones are fetched).
+    pub fn cover(&self, c: Course) {
+        self.covers.0.lock().unwrap().push_back(c);
+        self.covers.1.notify_all();
     }
 
     /// Work out how much of each of `courses` is known, in that order,
@@ -404,9 +462,8 @@ fn run(s: &Shared, task: Task) {
     match task {
         Task::Catalogue { force } => catalogue(s, force),
         Task::Cover(c) => {
-            if s.cover(&c).is_some() {
-                s.send(Event::Cover(c.id));
-            }
+            let img = s.cover(&c).and_then(|b| decode_cover(&b));
+            s.send(Event::Cover(c.id, img));
         }
         Task::Import(c, make) => {
             let id = c.id;
@@ -523,6 +580,7 @@ fn catalogue(s: &Shared, force: bool) {
     if !cached.courses.is_empty() {
         s.send(Event::Catalogue {
             courses: cached.courses.clone(),
+            #[cfg(test)]
             fetched: cached.fetched,
         });
         if !force && now.saturating_sub(cached.fetched) < CATALOGUE_FOR {
@@ -551,6 +609,7 @@ fn catalogue(s: &Shared, force: bool) {
     let _ = cat.save(&s.root);
     s.send(Event::Catalogue {
         courses: cat.courses,
+        #[cfg(test)]
         fetched: now,
     });
 }
@@ -782,7 +841,6 @@ fn build(
             })
             .collect(),
         locked,
-        imported: before.map_or(now, |b| b.imported),
         checked: now,
         added: before.map_or(0, |b| b.added),
         added_at: before.map_or(0, |b| b.added_at),
@@ -811,11 +869,24 @@ fn run_estimates(
     let mut all = store::load_estimates(&s.root);
     let total = courses.len();
     let mut changed = false;
+    let mut sent_estimating = false;
+    let mut last_progress: Option<Instant> = None;
     for (i, c) in courses.into_iter().enumerate() {
         if stopped() {
             break;
         }
-        s.send(Event::Estimating(Some((i, total))));
+        if all.get(&c.id).is_some_and(|e| {
+            e.key
+                .strip_prefix(&inputs.key)
+                .is_some_and(|rest| rest.starts_with('|'))
+        }) {
+            continue;
+        }
+        if last_progress.is_none_or(|t| t.elapsed() >= Duration::from_millis(50)) {
+            s.send(Event::Estimating(Some((i, total))));
+            last_progress = Some(Instant::now());
+            sent_estimating = true;
+        }
         match estimate_one(s, &c, inputs, all.get(&c.id)) {
             Ok(Some(e)) => {
                 all.insert(c.id, e.clone());
@@ -834,7 +905,9 @@ fn run_estimates(
     if changed {
         let _ = store::save_estimates(&s.root, &all);
     }
-    s.send(Event::Estimating(None));
+    if sent_estimating {
+        s.send(Event::Estimating(None));
+    }
 }
 
 /// The estimate for `c`, unless `have` is still current (`None`).
@@ -883,7 +956,6 @@ pub fn known_share(text: &Text, inputs: &EstimateInputs) -> Result<f64, String> 
             paragraphs,
         }],
         notes: Vec::new(),
-        decode_errors: 0,
         cover: None,
     };
     let (tr, si) = analyze::detect_variant(&book);

@@ -372,36 +372,50 @@ impl Render<'_> {
             meta.push_str(&cover.opus_comment());
             meta.push('\n');
         }
+        let prefix = self.speech.key_prefix();
+        let mut key_buf = String::with_capacity(prefix.len() + 128);
+        key_buf.push_str(&prefix);
+        let prefix_len = key_buf.len();
+        let mut file_buf = Vec::new();
+        let mut samples_buf = Vec::new();
+        let mut resampled_buf = Vec::new();
+        let mut pcm_bytes = Vec::new();
         for (index, chapter) in self.chapters.iter().enumerate() {
             let chapter_start = start;
             for sentence in &chapter.sentences {
                 check_cancel(&self.progress.batch.cancel)?;
-                let key = self.speech.key(&sentence.text);
+                key_buf.truncate(prefix_len);
+                key_buf.push_str(&sentence.text);
+                let key = hanstat::dict::xxh64::xxh64(key_buf.as_bytes(), 0);
                 let path = saved_clip(self.dir, key, self.speech.ext()).ok_or_else(|| {
                     format!(
                         "Audio is missing in “{}”. Try exporting again.",
                         chapter.title
                     )
                 })?;
-                let bytes =
-                    fs::read(&path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
-                let (samples, rate) = self
+                file_buf.clear();
+                File::open(&path)
+                    .and_then(|mut f| f.read_to_end(&mut file_buf))
+                    .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+                let rate = self
                     .speech
-                    .decode(bytes)
+                    .decode_into(&mut file_buf, &mut samples_buf)
                     .map_err(|e| format!("Cannot decode the clip {}: {e}", path.display()))?;
-                let samples = if rate == RATE as u32 {
-                    samples
+                let samples: &[f32] = if rate == RATE as u32 {
+                    &samples_buf
                 } else {
-                    audio::resample(&samples, rate, RATE as u32)
+                    audio::resample_into(&samples_buf, rate, RATE as u32, &mut resampled_buf);
+                    &resampled_buf
                 };
                 if samples.is_empty() {
                     return Err(format!("The saved clip {} is empty.", path.display()).into());
                 }
-                let bytes: Vec<_> = samples
-                    .iter()
-                    .flat_map(|sample| ((sample * 32768.0).round() as i16).to_le_bytes())
-                    .collect();
-                input.write_all(&bytes).map_err(RenderError::Pipe)?;
+                pcm_bytes.clear();
+                pcm_bytes.reserve(samples.len() * 2);
+                for &sample in samples {
+                    pcm_bytes.extend_from_slice(&((sample * 32768.0).round() as i16).to_le_bytes());
+                }
+                input.write_all(&pcm_bytes).map_err(RenderError::Pipe)?;
                 let end = start + samples.len() as u64;
                 cue += 1;
                 if let Some(subs) = subtitles.as_mut() {

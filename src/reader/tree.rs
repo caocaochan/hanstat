@@ -4,6 +4,7 @@
 use super::css::{Decl, Parser, RuleSet};
 use super::epub::{self, Epub};
 use super::style::{self, Display, Len, ListStyle, Style, WhiteSpace};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub type StyleId = u32;
@@ -104,10 +105,11 @@ pub struct Chapter {
     pub chars: Vec<char>,
 }
 
-/// Style sheets parsed once per book, by the list of sheets a chapter links.
+/// Style sheets parsed once per book, by the list of sheets a chapter links
+/// and the hash of its inline `<style>` blocks.
 #[derive(Default)]
 pub struct SheetCache {
-    cache: Vec<(Vec<String>, Arc<RuleSet>)>,
+    cache: HashMap<(Vec<String>, u64), Arc<RuleSet>>,
     ua: Option<Arc<RuleSet>>,
 }
 
@@ -137,9 +139,13 @@ impl SheetCache {
     }
 
     fn get(&mut self, epub: &Epub, key: Vec<String>, inline: &[(String, String)]) -> Arc<RuleSet> {
-        if inline.is_empty()
-            && let Some((_, s)) = self.cache.iter().find(|(k, _)| *k == key)
-        {
+        let mut inline_hash = 0u64;
+        for (text, base) in inline {
+            inline_hash = hanstat::dict::xxh64::xxh64(text.as_bytes(), inline_hash ^ 0x1);
+            inline_hash = hanstat::dict::xxh64::xxh64(base.as_bytes(), inline_hash ^ 0x2);
+        }
+        let cache_key = (key, inline_hash);
+        if let Some(s) = self.cache.get(&cache_key) {
             return s.clone();
         }
         let mut set = RuleSet::default();
@@ -150,15 +156,15 @@ impl SheetCache {
             load: &load,
             seen: Vec::new(),
         };
-        for path in &key {
+        for path in &cache_key.0 {
             p.sheet_file(path);
         }
         for (text, base) in inline {
             p.sheet(text, base);
         }
         let set = Arc::new(set);
-        if inline.is_empty() {
-            self.cache.push((key, set.clone()));
+        if self.cache.len() < 64 {
+            self.cache.insert(cache_key, set.clone());
         }
         set
     }
@@ -572,14 +578,16 @@ impl Builder<'_> {
             link = Some(l);
         }
         if list && marker_style != ListStyle::None {
-            let n = el
-                .prev_siblings()
-                .filter_map(scraper::ElementRef::wrap)
-                .filter(|e| e.value().name() == "li")
-                .count()
-                + 1;
             let marker = match marker_style {
-                ListStyle::Decimal => format!("{n}. "),
+                ListStyle::Decimal => {
+                    let n = el
+                        .prev_siblings()
+                        .filter_map(scraper::ElementRef::wrap)
+                        .filter(|e| e.value().name() == "li")
+                        .count()
+                        + 1;
+                    format!("{n}. ")
+                }
                 _ => "• ".to_owned(),
             };
             run.items.push(Inline::Text {
@@ -791,8 +799,7 @@ impl Builder<'_> {
             });
             return;
         }
-        let is_block = matches!(style.display, Display::Block | Display::ListItem)
-            || style.float != style::Float::None && style.display != Display::Inline;
+        let is_block = matches!(style.display, Display::Block | Display::ListItem);
         if is_block {
             self.flush(block, run);
             let child = self.block(el, style);

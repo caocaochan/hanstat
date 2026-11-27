@@ -169,7 +169,7 @@ const FORMAT: u32 = 3;
 /// The Library's vocabulary stats as last counted. Saved in
 /// `library-stats.json` so the tab is filled at start, before they are
 /// counted again.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Counted {
     format: u32,
     /// Traditional and Simplified spellings were one word.
@@ -306,15 +306,19 @@ impl App {
         let (tx, rx) = channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let books: Vec<(String, Profile)> = files
-                .into_iter()
-                .filter_map(|(t, p)| Profile::load(&p).map(|p| (t, p)))
-                .collect();
-            let profiles: Vec<Profile> = books.iter().map(|(_, p)| p.clone()).collect();
+            let mut titles = Vec::with_capacity(files.len());
+            let mut profiles = Vec::with_capacity(files.len());
+            for (t, p) in files {
+                if let Some(p) = Profile::load(&p) {
+                    titles.push(t);
+                    profiles.push(p);
+                }
+            }
             let chars = plan::stats::char_stats(&profiles, k.as_deref(), key.fold);
-            drop(profiles);
-            let lib = cached
-                .unwrap_or_else(|| Arc::new(plan::Library::build(key.fold, key.skip_hapax, books)));
+            let lib = cached.unwrap_or_else(|| {
+                let books: Vec<(String, Profile)> = titles.into_iter().zip(profiles).collect();
+                Arc::new(plan::Library::build(key.fold, key.skip_hapax, books))
+            });
             let words = lib.stats(&lib.known(k.as_deref()), WIDESPREAD);
             let counted = Counted {
                 format: FORMAT,
@@ -486,7 +490,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Vocabulary").size(18.0).strong());
             if self.stats.job.is_some() {
-                ui.spinner().on_hover_text(
+                crate::palette::spinner(ui).on_hover_text(
                     "Counting again; the figures shown are from the last count until it is done",
                 );
             }

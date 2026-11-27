@@ -12,7 +12,7 @@
 //! no dependency (and no feature of one) is added.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 const DB_FILE: &str = "reading-stats.sqlite";
@@ -206,7 +206,6 @@ pub struct LeftAt {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReadingStats {
-    pub version: u32,
     pub settings: TrackerSettings,
     /// Dated goal changes, oldest first.
     pub goals: Vec<Goal>,
@@ -1070,15 +1069,20 @@ mod writer {
 // Local time.
 
 /// Seconds east of UTC at Unix time `t`, as the OS's time zone has it
-/// (0 where unknown). Cached for the hour.
+/// (0 where unknown). Cached per hour across historical timestamps.
 pub fn utc_offset(t: i64) -> i64 {
-    static CACHE: Mutex<(i64, i64)> = Mutex::new((i64::MIN, 0));
+    static CACHE: LazyLock<Mutex<HashMap<i64, i64>>> = LazyLock::new(Mutex::default);
     let hour = t.div_euclid(3600);
     let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if c.0 != hour {
-        *c = (hour, os_offset(hour * 3600));
+    if let Some(&off) = c.get(&hour) {
+        return off;
     }
-    c.1
+    let off = os_offset(hour * 3600);
+    if c.len() >= 2048 {
+        c.clear();
+    }
+    c.insert(hour, off);
+    off
 }
 
 #[cfg(windows)]

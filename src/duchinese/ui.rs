@@ -12,8 +12,10 @@ use crate::icons::{self, ARROW_CLOCKWISE, FOLDER_OPEN, MAGNIFYING_GLASS, WARNING
 use crate::reader::Notice;
 use crate::{App, BatchMode, palette};
 use eframe::egui::{self, RichText};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Imported books are checked for new chapters this often (seconds).
 const CHECK_EVERY: f64 = 12.0 * 3600.0;
@@ -21,6 +23,8 @@ const CHECK_EVERY: f64 = 12.0 * 3600.0;
 const FIRST_CHECK: f64 = 10.0;
 /// Opening the window checks books not checked for this long (seconds).
 const CHECK_ON_OPEN: u64 = 30 * 60;
+/// Most cover thumbnails kept uploaded in GPU memory at once.
+const MAX_COVERS: usize = 128;
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum Sort {
@@ -53,20 +57,58 @@ struct SignIn {
     error: Option<String>,
 }
 
+/// Cheap signature of the inputs used when estimates were last checked, so
+/// normal frames don't re-hash word lists or clone/sort `segmenter_words()`.
+struct EstimateCheck {
+    merged: Arc<hanstat::anki::Knowledge>,
+    user_words_hash: u64,
+    skip_hapax: bool,
+    fold: bool,
+    segmenter: hanstat::segment::SegmenterKind,
+    catalogue_gen: u64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct RowsKey {
+    search: String,
+    stories: bool,
+    courses: bool,
+    levels: [bool; 6],
+    hide_imported: bool,
+    sort: Sort,
+    catalogue_gen: u64,
+    records_gen: u64,
+    estimates_gen: u64,
+    history_version: u64,
+    history_len: usize,
+}
+
+struct FrozenRows {
+    rows_gen: u64,
+    catalogue_gen: u64,
+    ids: Vec<u64>,
+    indices: Vec<usize>,
+}
+
 pub struct DuState {
     pub open: bool,
     worker: Option<Worker>,
     records: Records,
+    records_gen: u64,
     account: Account,
     catalogue: Vec<Course>,
-    fetched: u64,
+    catalogue_gen: u64,
+    catalogue_index: HashMap<u64, usize>,
     catalogue_asked: bool,
     estimates: BTreeMap<u64, Estimate>,
+    estimates_gen: u64,
     /// What the estimates were last asked for with: known words, and how
     /// many series.
     estimates_asked: Option<(String, usize)>,
+    estimate_check: Option<EstimateCheck>,
     estimating: Option<(usize, usize)>,
     covers: HashMap<u64, Option<egui::TextureHandle>>,
+    cover_order: VecDeque<u64>,
     covers_asked: HashSet<u64>,
     /// Imports and updates under way: chapters fetched of how many.
     progress: HashMap<u64, (usize, usize)>,
@@ -87,9 +129,15 @@ pub struct DuState {
     reopen: Option<u64>,
     /// Sent to Build, not back yet.
     building: HashSet<u64>,
-    /// The list's order, and the pointer over it last frame.
-    frozen: Option<Vec<u64>>,
+    /// Cached filtered and sorted catalogue indices.
+    rows_key: Option<RowsKey>,
+    rows_cache: Vec<usize>,
+    rows_cache_gen: u64,
+    /// The list's order while the pointer is over it, and whether it was over it last frame.
+    frozen: Option<FrozenRows>,
     hovering: bool,
+    /// Cached `is_file()` results for imported books missing from the Library.
+    file_exists: HashMap<PathBuf, bool>,
 }
 
 impl Default for DuState {
@@ -98,14 +146,19 @@ impl Default for DuState {
             open: false,
             worker: None,
             records: Records::load(),
+            records_gen: 0,
             account: Account::default(),
             catalogue: Vec::new(),
-            fetched: 0,
+            catalogue_gen: 0,
+            catalogue_index: HashMap::new(),
             catalogue_asked: false,
             estimates: store::load_estimates(&store::cache_root()),
+            estimates_gen: 0,
             estimates_asked: None,
+            estimate_check: None,
             estimating: None,
             covers: HashMap::new(),
+            cover_order: VecDeque::new(),
             covers_asked: HashSet::new(),
             progress: HashMap::new(),
             stories: true,
@@ -121,8 +174,12 @@ impl Default for DuState {
             library: Vec::new(),
             reopen: None,
             building: HashSet::new(),
+            rows_key: None,
+            rows_cache: Vec::new(),
+            rows_cache_gen: 0,
             frozen: None,
             hovering: false,
+            file_exists: HashMap::new(),
         }
     }
 }
@@ -134,6 +191,12 @@ impl DuState {
 
     fn push(&mut self, ctx: &egui::Context, t: Task) {
         self.worker(ctx).push(t);
+    }
+
+    fn clear_covers(&mut self) {
+        self.covers.clear();
+        self.cover_order.clear();
+        self.covers_asked.clear();
     }
 
     /// The sign-in window is open.
@@ -154,21 +217,14 @@ impl DuState {
 }
 
 impl App {
-    /// The known words for the estimates, if they are loaded.
-    fn du_estimate_inputs(&mut self) -> Option<EstimateInputs> {
-        let knowledge = self.known.merged.clone()?;
-        let inputs = self.lang_inputs()?;
-        let user_words = self.user_words.clone();
-        let known_words = self.known.settings.segmenter_words();
-        Some(EstimateInputs {
-            key: inputs.joined(),
-            knowledge,
-            kind: self.segmenter,
-            user_words,
-            known_words,
-            cache: self.cache.clone(),
-            fold_chars: self.fold_chars(),
-        })
+    /// Whether Anki knowledge is still loading/rebuilding.
+    fn du_anki_pending(&self) -> bool {
+        let anki = &self.anki;
+        anki.rx.is_some()
+            || anki.dirty
+            || (anki.settings.enabled
+                && anki.settings.collection.is_some()
+                && anki.knowledge.is_none())
     }
 
     /// The Library entry of an imported book.
@@ -190,6 +246,9 @@ impl App {
     /// Every frame: events from the worker, checks for new chapters, books
     /// waiting to be analysed or rebuilt.
     pub(crate) fn du_tick(&mut self, ctx: &egui::Context) {
+        if !self.du.open && !self.du.covers.is_empty() {
+            self.du.clear_covers();
+        }
         let now = ctx.input(|i| i.time);
         let events: Vec<Event> = match &self.du.worker {
             Some(w) => w.rx.try_iter().collect(),
@@ -303,10 +362,13 @@ impl App {
                 }
                 self.du.account = a;
             }
-            Event::Catalogue { courses, fetched } => {
+            Event::Catalogue { courses, .. } => {
+                self.du.catalogue_index =
+                    courses.iter().enumerate().map(|(i, c)| (c.id, i)).collect();
                 self.du.catalogue = courses;
-                self.du.fetched = fetched;
+                self.du.catalogue_gen = self.du.catalogue_gen.wrapping_add(1);
                 self.du.estimates_asked = None;
+                self.du.estimate_check = None;
                 // What changed in the series of imported books (chapters announced).
                 let mut changed = false;
                 for c in &self.du.catalogue {
@@ -321,14 +383,37 @@ impl App {
                     }
                 }
                 if changed {
+                    self.du.records_gen = self.du.records_gen.wrapping_add(1);
                     self.du_save();
                 }
             }
-            Event::Cover(id) => {
-                self.du.covers.remove(&id);
+            Event::Cover(id, img) => {
+                if !self.du.open {
+                    return;
+                }
+                let handle = img.map(|ci| {
+                    ctx.load_texture(
+                        format!("duchinese cover {id}"),
+                        ci,
+                        egui::TextureOptions::LINEAR,
+                    )
+                });
+                if !self.du.covers.contains_key(&id) {
+                    while self.du.covers.len() >= MAX_COVERS {
+                        if let Some(old) = self.du.cover_order.pop_front() {
+                            self.du.covers.remove(&old);
+                            self.du.covers_asked.remove(&old);
+                        } else {
+                            break;
+                        }
+                    }
+                    self.du.cover_order.push_back(id);
+                }
+                self.du.covers.insert(id, handle);
             }
             Event::Estimate(id, est) => {
                 self.du.estimates.insert(id, est);
+                self.du.estimates_gen = self.du.estimates_gen.wrapping_add(1);
             }
             Event::Estimating(p) => self.du.estimating = p,
             Event::Progress {
@@ -354,6 +439,7 @@ impl App {
                         r.added_at = hanstat::history::now();
                     }
                 }
+                self.du.records_gen = self.du.records_gen.wrapping_add(1);
                 self.du_save();
                 if !in_reader {
                     self.du.building.insert(id);
@@ -369,6 +455,7 @@ impl App {
                         r.course.placeholder_count = course.placeholder_count;
                     }
                 }
+                self.du.records_gen = self.du.records_gen.wrapping_add(1);
                 self.du_save();
             }
             Event::Built { record, id, before } => self.du_built(record, id, before, ctx),
@@ -490,6 +577,8 @@ impl App {
         }
         let path = record.path.clone();
         self.du.records.put(record);
+        self.du.records_gen = self.du.records_gen.wrapping_add(1);
+        self.du.file_exists.clear();
         self.du_save();
         let new = before.is_none() || old_id.is_none();
         self.du.library.push((path.clone(), new));
@@ -664,6 +753,7 @@ impl App {
     /// Ask for the catalogue and the account's state (the window opened).
     pub(crate) fn du_open(&mut self, ctx: &egui::Context) {
         self.du.open = true;
+        self.du.file_exists.clear();
         if !self.du.catalogue_asked {
             self.du.catalogue_asked = true;
             self.du.push(ctx, Task::Catalogue { force: false });
@@ -739,50 +829,80 @@ impl App {
         }
     }
 
-    fn du_cover(&mut self, c: &Course, ctx: &egui::Context) -> Option<egui::TextureHandle> {
-        if let Some(t) = self.du.covers.get(&c.id) {
+    fn du_cover_by_idx(
+        &mut self,
+        cat_idx: usize,
+        ctx: &egui::Context,
+    ) -> Option<egui::TextureHandle> {
+        let id = self.du.catalogue[cat_idx].id;
+        if let Some(t) = self.du.covers.get(&id) {
             return t.clone();
         }
-        let path = store::cover_path(&store::cache_root(), c.id);
-        if path.is_file() {
-            // The cached file has no image extension: its bytes say what it is.
-            let t = std::fs::read(&path)
-                .ok()
-                .and_then(|b| image::load_from_memory(&b).ok())
-                .map(|img| {
-                    let img = img.into_rgba8();
-                    let size = [img.width() as usize, img.height() as usize];
-                    ctx.load_texture(
-                        format!("duchinese cover {}", c.id),
-                        egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()),
-                        egui::TextureOptions::LINEAR,
-                    )
-                });
-            self.du.covers.insert(c.id, t.clone());
-            return t;
-        }
-        if self.du.covers_asked.insert(c.id) {
-            self.du.push(ctx, Task::Cover(c.clone()));
+        if self.du.covers_asked.insert(id) {
+            let c = self.du.catalogue[cat_idx].clone();
+            self.du.worker(ctx).cover(c);
         }
         None
     }
 
+    fn du_rows_stale(&self) -> bool {
+        match &self.du.rows_key {
+            Some(k) => {
+                k.search != self.du.search
+                    || k.stories != self.du.stories
+                    || k.courses != self.du.courses
+                    || k.levels != self.du.levels
+                    || k.hide_imported != self.du.hide_imported
+                    || k.sort != self.du.sort
+                    || k.catalogue_gen != self.du.catalogue_gen
+                    || k.records_gen != self.du.records_gen
+                    || k.estimates_gen != self.du.estimates_gen
+                    || k.history_version != self.profiles_version
+                    || k.history_len != self.history.entries.len()
+            }
+            None => true,
+        }
+    }
+
+    /// Recompute `self.du.rows_cache` when any filter, sort, or backing data changed.
+    fn du_ensure_rows(&mut self) {
+        if !self.du_rows_stale() {
+            return;
+        }
+        self.du.rows_cache = self.du_rows();
+        self.du.rows_cache_gen = self.du.rows_cache_gen.wrapping_add(1);
+        self.du.rows_key = Some(RowsKey {
+            search: self.du.search.clone(),
+            stories: self.du.stories,
+            courses: self.du.courses,
+            levels: self.du.levels,
+            hide_imported: self.du.hide_imported,
+            sort: self.du.sort,
+            catalogue_gen: self.du.catalogue_gen,
+            records_gen: self.du.records_gen,
+            estimates_gen: self.du.estimates_gen,
+            history_version: self.profiles_version,
+            history_len: self.history.entries.len(),
+        });
+    }
+
     /// The series shown, in order.
     fn du_rows(&self) -> Vec<usize> {
-        let q = hanstat::search::Query::new(&self.du.search);
-        let level_on = |l: Level| {
-            Level::ALL
-                .iter()
-                .position(|x| *x == l)
-                .is_none_or(|i| self.du.levels[i])
+        let search_trimmed = self.du.search.trim();
+        let q = (!search_trimmed.is_empty()).then(|| hanstat::search::Query::new(&self.du.search));
+        let level_on = |l: Level| match l {
+            Level::Newbie => self.du.levels[0],
+            Level::Elementary => self.du.levels[1],
+            Level::Intermediate => self.du.levels[2],
+            Level::UpperIntermediate => self.du.levels[3],
+            Level::Advanced => self.du.levels[4],
+            Level::Master => self.du.levels[5],
+            Level::Unknown => true,
         };
-        let fit = |c: &Course| -> f64 {
-            if let Some(r) = self.du.records.get(c.id)
-                && let Some(k) = self.du_entry(r).and_then(|e| e.stats.known.as_ref())
-            {
-                return k.running_words;
-            }
-            self.du.estimates.get(&c.id).map_or(-1.0, |e| e.percent)
+        let imported: HashSet<u64> = if self.du.hide_imported {
+            self.du.records.books.iter().map(|r| r.course.id).collect()
+        } else {
+            HashSet::new()
         };
         let mut rows: Vec<usize> = (0..self.du.catalogue.len())
             .filter(|&i| {
@@ -792,15 +912,44 @@ impl App {
                 } else {
                     self.du.courses
                 }) && level_on(c.level())
-                    && (!self.du.hide_imported || self.du.records.get(c.id).is_none())
-                    && (self.du.search.trim().is_empty()
-                        || q.matches([c.title.as_str(), c.description.as_str()]))
+                    && (!self.du.hide_imported || !imported.contains(&c.id))
+                    && q.as_ref()
+                        .is_none_or(|q| q.matches([c.title.as_str(), c.description.as_str()]))
             })
             .collect();
         let cat = &self.du.catalogue;
         match self.du.sort {
-            Sort::Fit => rows.sort_by(|&a, &b| fit(&cat[b]).total_cmp(&fit(&cat[a]))),
-            Sort::Level => rows.sort_by_key(|&i| (cat[i].level(), cat[i].title.to_lowercase())),
+            Sort::Fit => {
+                // Precompute full-book fit once per imported record instead of
+                // scanning `records` and `history` inside every sort comparison.
+                let book_fit: HashMap<u64, f64> = self
+                    .du
+                    .records
+                    .books
+                    .iter()
+                    .filter_map(|r| {
+                        let k = self.du_entry(r)?.stats.known.as_ref()?;
+                        Some((r.course.id, k.running_words))
+                    })
+                    .collect();
+                let mut keyed: Vec<(usize, f64)> = rows
+                    .into_iter()
+                    .map(|i| {
+                        let id = cat[i].id;
+                        let score = book_fit
+                            .get(&id)
+                            .copied()
+                            .or_else(|| self.du.estimates.get(&id).map(|e| e.percent))
+                            .unwrap_or(-1.0);
+                        (i, score)
+                    })
+                    .collect();
+                keyed.sort_by(|a, b| b.1.total_cmp(&a.1));
+                rows = keyed.into_iter().map(|(i, _)| i).collect();
+            }
+            Sort::Level => {
+                rows.sort_by_cached_key(|&i| (cat[i].level(), cat[i].title.to_lowercase()));
+            }
             Sort::Newest => rows.sort_by(|&a, &b| cat[b].release_at.cmp(&cat[a].release_at)),
             Sort::Title => rows.sort_by_cached_key(|&i| cat[i].title.trim().to_lowercase()),
         }
@@ -808,46 +957,115 @@ impl App {
     }
 
     fn du_window(&mut self, ctx: &egui::Context) {
+        let anki_pending = self.du_anki_pending();
+        let have_knowledge = !anki_pending && self.known.merged.is_some();
+        if self.known.merged.is_none() {
+            self.du.estimate_check = None;
+        }
         // Estimates for the series shown first, then the rest.
         if !self.du.catalogue.is_empty()
-            && let Some(inputs) = self.du_estimate_inputs()
-            && self.du.estimates_asked.as_ref()
-                != Some(&(inputs.key.clone(), self.du.catalogue.len()))
+            && !anki_pending
+            && let Some(merged) = self.known.merged.clone()
         {
-            self.du.estimates_asked = Some((inputs.key.clone(), self.du.catalogue.len()));
-            let shown = self.du_rows();
-            let mut order: Vec<Course> = shown
-                .iter()
-                .map(|&i| self.du.catalogue[i].clone())
-                .collect();
-            let set: HashSet<u64> = order.iter().map(|c| c.id).collect();
-            order.extend(
-                self.du
-                    .catalogue
-                    .iter()
-                    .filter(|c| !set.contains(&c.id))
-                    .cloned(),
-            );
-            self.du.worker(ctx).estimate(order, inputs);
+            let user_words_hash = {
+                let mut h = std::hash::DefaultHasher::new();
+                self.user_words.hash(&mut h);
+                h.finish()
+            };
+            let skip_hapax = self.settings.skip_hapax;
+            let fold = self.anki.settings.match_across_scripts;
+            let segmenter = self.segmenter;
+            let catalogue_gen = self.du.catalogue_gen;
+            let unchanged = self.du.estimate_check.as_ref().is_some_and(|c| {
+                Arc::ptr_eq(&c.merged, &merged)
+                    && c.user_words_hash == user_words_hash
+                    && c.skip_hapax == skip_hapax
+                    && c.fold == fold
+                    && c.segmenter == segmenter
+                    && c.catalogue_gen == catalogue_gen
+            });
+            if !unchanged && let Some(lang) = self.lang_inputs() {
+                let key = lang.joined();
+                self.du.estimate_check = Some(EstimateCheck {
+                    merged: merged.clone(),
+                    user_words_hash,
+                    skip_hapax,
+                    fold,
+                    segmenter,
+                    catalogue_gen,
+                });
+                if self.du.estimates_asked.as_ref() != Some(&(key.clone(), self.du.catalogue.len()))
+                {
+                    self.du.estimates_asked = Some((key.clone(), self.du.catalogue.len()));
+                    let inputs = EstimateInputs {
+                        key,
+                        knowledge: merged,
+                        kind: segmenter,
+                        user_words: self.user_words.clone(),
+                        known_words: self.known.settings.segmenter_words(),
+                        cache: self.cache.clone(),
+                        fold_chars: self.fold_chars(),
+                    };
+                    self.du_ensure_rows();
+                    let mut order: Vec<Course> = self
+                        .du
+                        .rows_cache
+                        .iter()
+                        .map(|&i| self.du.catalogue[i].clone())
+                        .collect();
+                    let set: HashSet<u64> = order.iter().map(|c| c.id).collect();
+                    order.extend(
+                        self.du
+                            .catalogue
+                            .iter()
+                            .filter(|c| !set.contains(&c.id))
+                            .cloned(),
+                    );
+                    self.du.worker(ctx).estimate(order, inputs);
+                }
+            }
         }
         let mut open = true;
         let mut import: Option<Course> = None;
         let mut check: Option<Vec<Record>> = None;
         let mut read: Option<Record> = None;
+        let mut add_to_library: Option<PathBuf> = None;
         let mut sign_out = false;
         let mut refresh = false;
         let mut settings_changed = false;
         let now = hanstat::history::now();
-        let rows = match &self.du.frozen {
-            Some(f) if self.du.hovering => f
-                .iter()
-                .filter_map(|id| self.du.catalogue.iter().position(|c| c.id == *id))
-                .collect(),
-            _ => self.du_rows(),
-        };
-        self.du.frozen = Some(rows.iter().map(|&i| self.du.catalogue[i].id).collect());
-        let have_knowledge = self.du_estimate_inputs().is_some();
-        let rows_data: Vec<Course> = rows.iter().map(|&i| self.du.catalogue[i].clone()).collect();
+        if self.du.hovering
+            && let Some(f) = &mut self.du.frozen
+        {
+            if f.catalogue_gen != self.du.catalogue_gen {
+                f.indices = f
+                    .ids
+                    .iter()
+                    .filter_map(|id| self.du.catalogue_index.get(id).copied())
+                    .collect();
+                f.catalogue_gen = self.du.catalogue_gen;
+            }
+        } else {
+            self.du_ensure_rows();
+            let needs_freeze = self.du.frozen.as_ref().is_none_or(|f| {
+                f.rows_gen != self.du.rows_cache_gen || f.catalogue_gen != self.du.catalogue_gen
+            });
+            if needs_freeze {
+                let ids = self
+                    .du
+                    .rows_cache
+                    .iter()
+                    .map(|&i| self.du.catalogue[i].id)
+                    .collect();
+                self.du.frozen = Some(FrozenRows {
+                    rows_gen: self.du.rows_cache_gen,
+                    catalogue_gen: self.du.catalogue_gen,
+                    ids,
+                    indices: self.du.rows_cache.clone(),
+                });
+            }
+        }
+        let row_count = self.du.frozen.as_ref().map_or(0, |f| f.indices.len());
         egui::Window::new("DuChinese")
             .id(egui::Id::unique("duchinese-window"))
             .open(&mut open)
@@ -887,18 +1105,18 @@ impl App {
                             }
                         }
                         None => {
-                            ui.spinner();
+                            crate::palette::spinner(ui);
                             ui.label(RichText::new(if a.loaded { "Checking your DuChinese session…" } else { "Reading your DuChinese session…" }).color(palette::weak()));
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let mine: Vec<Record> = self.du.records.books.clone();
+                        let has_books = !self.du.records.books.is_empty();
                         let r = ui
-                            .add_enabled(!self.du.checking && !mine.is_empty(), egui::Button::new(icons::rich(ui, format!("{ARROW_CLOCKWISE} Check for new chapters"))))
+                            .add_enabled(!self.du.checking && has_books, egui::Button::new(icons::rich(ui, format!("{ARROW_CLOCKWISE} Check for new chapters"))))
                             .on_hover_text("Ask DuChinese about every imported story now: new chapters, chapters opened up by a subscription, and edited ones")
                             .on_disabled_hover_text(if self.du.checking { "Checking…" } else { "No story imported yet" });
                         if r.clicked() {
-                            check = Some(mine);
+                            check = Some(self.du.records.books.clone());
                         }
                         if ui
                             .small_button(icons::glyph(ui.ctx(), ARROW_CLOCKWISE, false))
@@ -909,13 +1127,17 @@ impl App {
                         }
                     });
                 });
-                if let Some(e) = self.du.error.clone() {
+                let mut dismiss_error = false;
+                if let Some(e) = &self.du.error {
                     ui.horizontal(|ui| {
                         if ui.small_button(icons::glyph(ui.ctx(), X, false)).on_hover_text("Dismiss").clicked() {
-                            self.du.error = None;
+                            dismiss_error = true;
                         }
                         ui.label(icons::rich(ui, RichText::new(format!("{WARNING} {e}")).color(palette::warn())));
                     });
+                }
+                if dismiss_error {
+                    self.du.error = None;
                 }
                 ui.separator();
                 // Filters.
@@ -945,7 +1167,7 @@ impl App {
                             }
                         });
                     if let Some((done, total)) = self.du.estimating {
-                        ui.spinner();
+                        crate::palette::spinner(ui);
                         ui.label(RichText::new(format!("Working out the fit: {} of {total}", done + 1)).color(palette::weak()))
                             .on_hover_text("Each story's first chapter is fetched once and compared with the words you know; later this is instant");
                     }
@@ -953,7 +1175,7 @@ impl App {
                 ui.add_space(4.0);
                 if self.du.catalogue.is_empty() {
                     ui.horizontal(|ui| {
-                        ui.spinner();
+                        crate::palette::spinner(ui);
                         ui.label("Fetching the list of stories…");
                     });
                 }
@@ -961,16 +1183,32 @@ impl App {
                 let list = egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .max_height(ui.available_height() - 40.0)
-                    .show_rows(ui, row_h, rows_data.len(), |ui, range| {
+                    .show_rows(ui, row_h, row_count, |ui, range| {
                         for i in range {
-                            let c = &rows_data[i];
-                            let rec = self.du.records.get(c.id).cloned();
-                            let entry = rec.as_ref().and_then(|r| self.du_entry(r)).cloned();
+                            let cat_idx = self.du.frozen.as_ref().unwrap().indices[i];
+                            // Asked for only once shown; loaded/decoded off the UI thread.
+                            let cover = self.du_cover_by_idx(cat_idx, ctx);
+                            let course_id = self.du.catalogue[cat_idx].id;
+                            let unindexed_file_exists = if let Some(r) = self.du.records.get(course_id)
+                                && self.du_entry(r).is_none()
+                            {
+                                if let Some(&exists) = self.du.file_exists.get(&r.path) {
+                                    exists
+                                } else {
+                                    let exists = r.path.is_file();
+                                    self.du.file_exists.insert(r.path.clone(), exists);
+                                    exists
+                                }
+                            } else {
+                                false
+                            };
+                            let c = &self.du.catalogue[cat_idx];
+                            let rec = self.du.records.get(c.id);
+                            let entry = rec.and_then(|r| self.du_entry(r));
                             ui.horizontal(|ui| {
                                 ui.set_height(row_h - 6.0);
                                 let (w, h) = (36.0, 50.0);
-                                // Asked for only once shown.
-                                match &self.du_cover(c, ctx) {
+                                match &cover {
                                     Some(t) => {
                                         let [tw, th] = t.size().map(|x| x as f32);
                                         let k = (w / tw).min(h / th);
@@ -990,12 +1228,12 @@ impl App {
                                         ui.add(egui::Label::new(RichText::new(c.title.trim()).strong()).truncate())
                                             .on_hover_text(c.description.trim());
                                         let mut sub = format!("{} · ", c.level().label());
-                                        sub.push_str(&match (&rec, c.placeholder_count) {
+                                        sub.push_str(&match (rec, c.placeholder_count) {
                                             (Some(r), _) => r.progress(),
                                             (None, 0) => format!("{} chapters", c.lesson_count),
                                             (None, p) => format!("{} of {} chapters · ongoing", c.lesson_count, c.lesson_count + p),
                                         });
-                                        if let Some(r) = &rec {
+                                        if let Some(r) = rec {
                                             let n = r.new_chapters(now);
                                             if n > 0 {
                                                 sub.push_str(&format!(" · {n} new"));
@@ -1011,7 +1249,7 @@ impl App {
                                         let f = if total == 0 { 0.0 } else { done as f32 / total as f32 };
                                         let text = if total == 0 { "Starting…".to_owned() } else { format!("Chapter {} of {total}", done + 1) };
                                         ui.add(egui::ProgressBar::new(f).desired_width(110.0).text(text));
-                                    } else if let Some(r) = &rec {
+                                    } else if let Some(r) = rec {
                                         if r.pending.is_some() {
                                             ui.label(RichText::new("Update waits for the reader").color(palette::weak()))
                                                 .on_hover_text("New chapters are fetched: the book is rebuilt once it is closed in the reader");
@@ -1022,9 +1260,9 @@ impl App {
                                             if ui.small_button("Update").on_hover_text("Ask DuChinese for new, opened-up or edited chapters now").clicked() {
                                                 check = Some(vec![r.clone()]);
                                             }
-                                        } else if r.path.is_file() {
+                                        } else if unindexed_file_exists {
                                             if ui.button("Add to Library").on_hover_text("The book was imported but isn't in the Library").clicked() {
-                                                self.du.library.push((r.path.clone(), true));
+                                                add_to_library = Some(r.path.clone());
                                             }
                                         } else if ui.button("Import again").on_hover_text("The book's file is gone").clicked() {
                                             import = Some(c.clone());
@@ -1042,9 +1280,9 @@ impl App {
                                     // Fit.
                                     ui.allocate_ui(egui::vec2(92.0, h), |ui| {
                                         ui.vertical_centered(|ui| {
-                                            let full = entry.as_ref().and_then(|e| e.stats.known.clone());
+                                            let full = entry.and_then(|e| e.stats.known.as_ref());
                                             let est = self.du.estimates.get(&c.id);
-                                            let (pct, note) = match (&full, est) {
+                                            let (pct, note) = match (full, est) {
                                                 (Some(k), _) => (Some(k.running_words), "whole book".to_owned()),
                                                 (None, Some(e)) => (Some(e.percent), format!("from chapter {}", e.chapter)),
                                                 (None, None) => (None, String::new()),
@@ -1111,6 +1349,10 @@ impl App {
             });
         if !open {
             self.du.open = false;
+            self.du.clear_covers();
+        }
+        if let Some(path) = add_to_library {
+            self.du.library.push((path, true));
         }
         if settings_changed && let Err(e) = self.settings.save() {
             self.set_error("settings", e);
@@ -1177,7 +1419,7 @@ impl App {
                                 });
                             }
                             if s.busy {
-                                ui.spinner();
+                                crate::palette::spinner(ui);
                             }
                         });
                     });

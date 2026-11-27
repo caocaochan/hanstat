@@ -17,7 +17,6 @@ struct Snapshot {
     title: Option<String>,
     sections: Vec<SavedSection>,
     notes: Vec<String>,
-    decode_errors: u64,
 }
 
 #[derive(Deserialize)]
@@ -114,7 +113,6 @@ fn get(path: &Path) -> io::Result<Book> {
             })
             .collect(),
         notes: snapshot.notes,
-        decode_errors: snapshot.decode_errors,
         cover,
     })
 }

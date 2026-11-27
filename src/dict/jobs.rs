@@ -151,8 +151,9 @@ pub fn run_import(
     job: &Job,
     unloader: &Unloader,
 ) -> Result<String, String> {
-    // (No crash recovery here: it would delete an update's download. The
-    // lookup thread recovers when it starts.)
+    // Wait for startup crash recovery on the lookup worker so it never
+    // removes our `.tmp-<id>` directory while we are writing to it.
+    unloader.wait_ready();
     let index = import::read_index(zip)?;
     let id = replace
         .or_else(|| manage::existing(root, &index))
@@ -254,6 +255,7 @@ fn download_import(
     https_only: bool,
     wake: &(dyn Fn() + Send + Sync),
 ) -> Result<String, String> {
+    unloader.wait_ready();
     std::fs::create_dir_all(root).map_err(|e| format!("{}: {e}", root.display()))?;
     let zip = manage::download_path(root, tag);
     let room = |len: Option<u64>| -> Result<(), String> {
@@ -332,7 +334,7 @@ pub fn check_updates(root: &Path, https_only: bool) -> usize {
     let _ = manage::edit_manifest(root, |m| {
         for (id, result) in checks {
             if let Some(e) = m.dicts.iter_mut().find(|e| e.id == id) {
-                e.check = Some(Check { at, result });
+                e.check = Some(Check { result });
             }
         }
         m.last_auto_check = at;
@@ -480,7 +482,6 @@ mod tests {
                     revision,
                     download_url,
                 },
-            ..
         }) = Manifest::load(&root).dicts[0].check.clone()
         else {
             panic!("an update is available");

@@ -214,9 +214,8 @@ fn import_and_look_up() {
     assert_eq!((m.terms, m.freqs, m.media), (7, 4, 1));
     assert_eq!(m.glossaries, 5, "the shared glossary (3 terms) once");
     assert_eq!(m.max_len, 3);
-    assert_eq!(m.skipped.get("pitch"), Some(&1));
-    assert_eq!(m.tags[0].notes, "noun");
     assert!(m.update.is_some() && m.styles.contains("data-sc-x"));
+    assert!(root.join(id).join(super::format::FREQ_BLOOM).is_file());
     assert_eq!(
         super::store::read_media(&root.join(id), "img/a.png").as_deref(),
         Some(&b"\x89PNG fake"[..])
@@ -282,6 +281,20 @@ fn import_and_look_up() {
     let a = e.lookup("说话间很好");
     let b = e.lookup("说话间很好");
     assert!(std::sync::Arc::ptr_eq(&a, &b));
+    // Removing optional `freq.bloom` stays backwards-compatible with existing dicts on disk.
+    drop(e);
+    std::fs::remove_file(root.join(id).join(super::format::FREQ_BLOOM)).unwrap();
+    let (mut e, errors) = Engine::load(&root, Some(id));
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(e.lookup("说话").groups[0].freqs[0].values[0].value, 194);
+    // Media index cache invalidates on edit and evicts on delete.
+    let dict_dir = root.join(id);
+    assert_eq!(
+        super::store::read_media(&dict_dir, "img/a.png").as_deref(),
+        Some(&b"\x89PNG fake"[..])
+    );
+    std::fs::remove_file(dict_dir.join(super::format::MEDIA_IDX)).unwrap();
+    assert_eq!(super::store::read_media(&dict_dir, "img/a.png"), None);
     // Unloaded: its files can be deleted.
     e.unload(&[id.to_string()]);
     assert!(e.is_empty());

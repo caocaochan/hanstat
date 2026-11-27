@@ -157,7 +157,7 @@ impl SegmenterKind {
 
 enum Backend {
     Ltp(&'static ltp::CWSModel),
-    Jieba(Box<jieba_rs::Jieba>),
+    Jieba(&'static jieba_rs::Jieba),
     Ckip(&'static Ckip),
 }
 
@@ -186,7 +186,7 @@ impl Segmenter {
         let backend = match kind {
             SegmenterKind::Ltp | SegmenterKind::Auto => Backend::Ltp(ltp_model()?),
             SegmenterKind::Ckip => Backend::Ckip(ckip_model()?),
-            SegmenterKind::Jieba => Backend::Jieba(Box::new(jieba_rs::Jieba::new())),
+            SegmenterKind::Jieba => Backend::Jieba(crate::lexicon::jieba()),
         };
         let words: Vec<&str> = user_words
             .iter()
@@ -243,6 +243,10 @@ impl Segmenter {
         if toks.len() < 2 {
             return toks;
         }
+        let mut matches = ac.find_overlapping_iter(s).peekable();
+        if matches.peek().is_none() {
+            return toks;
+        }
         let base = s.as_ptr() as usize;
         let mut cut = vec![false; s.len() + 1];
         for t in &toks {
@@ -250,8 +254,7 @@ impl Segmenter {
         }
         cut[s.len()] = true;
         // Known words on model boundaries that span more than one token.
-        let mut cands: Vec<(usize, usize)> = ac
-            .find_overlapping_iter(s)
+        let mut cands: Vec<(usize, usize)> = matches
             .map(|m| (m.start(), m.end()))
             .filter(|&(a, b)| cut[a] && cut[b] && cut[a + 1..b].iter().any(|&c| c))
             .collect();
@@ -305,19 +308,42 @@ impl Segmenter {
     /// Make every idiom one token (see the module docs). Matched leftmost-longest
     /// on the text folded to Simplified, which keeps the characters in place.
     fn idioms<'a>(&self, s: &'a str, toks: Vec<&'a str>) -> Vec<&'a str> {
+        self.idioms_with(s, toks, None)
+    }
+
+    fn idioms_with<'a>(
+        &self,
+        s: &'a str,
+        toks: Vec<&'a str>,
+        pre_folded: Option<&str>,
+    ) -> Vec<&'a str> {
         if s.chars().nth(3).is_none() {
             return toks;
         }
-        let folded = script::fold_t2s(s);
-        let same_offsets = folded.len() == s.len()
-            && s.char_indices()
-                .map(|(i, _)| i)
-                .eq(folded.char_indices().map(|(i, _)| i));
-        let spans: Vec<(usize, usize)> = if same_offsets {
-            idiom_matcher()
-                .find_iter(&folded)
-                .map(|m| (m.start(), m.end()))
-                .collect()
+        let (folded, is_orig): (std::borrow::Cow<'_, str>, bool) = match pre_folded {
+            Some(f) => (std::borrow::Cow::Borrowed(f), false),
+            None => {
+                let t2s = &script::TABLES.t2s;
+                if s.chars().any(|c| t2s.contains_key(&c)) {
+                    (std::borrow::Cow::Owned(script::fold_t2s(s)), false)
+                } else {
+                    (std::borrow::Cow::Borrowed(s), true)
+                }
+            }
+        };
+        let same_offsets = is_orig
+            || (folded.len() == s.len()
+                && s.char_indices()
+                    .map(|(i, _)| i)
+                    .eq(folded.char_indices().map(|(i, _)| i)));
+        if same_offsets {
+            make_tokens(
+                s,
+                toks,
+                idiom_matcher()
+                    .find_iter(folded.as_ref())
+                    .map(|m| (m.start(), m.end())),
+            )
         } else {
             // A character changed its UTF-8 length when folded: go by character index.
             let so: Vec<usize> = s.char_indices().map(|(i, _)| i).chain([s.len()]).collect();
@@ -327,21 +353,12 @@ impl Segmenter {
                 .chain([folded.len()])
                 .collect();
             let ci = |b: usize| fo.binary_search(&b).ok();
-            idiom_matcher()
-                .find_iter(&folded)
+            let spans: Vec<(usize, usize)> = idiom_matcher()
+                .find_iter(folded.as_ref())
                 .filter_map(|m| Some((so[ci(m.start())?], so[ci(m.end())?])))
-                .collect()
-        };
-        make_tokens(s, toks, spans.into_iter())
-    }
-
-    /// The tokens of each text, owned.
-    pub fn lemmas_many(&self, texts: &[&str]) -> Result<Vec<Vec<String>>, String> {
-        Ok(self
-            .cut_many(texts)
-            .into_iter()
-            .map(|v| v.into_iter().map(str::to_owned).collect())
-            .collect())
+                .collect();
+            make_tokens(s, toks, spans.into_iter())
+        }
     }
 
     /// Segment many whitespace-free chunks; result `i` tiles `chunks[i]`.
@@ -364,16 +381,20 @@ impl Segmenter {
             _ => chunks
                 .iter()
                 .map(|c| {
-                    let toks = split_scripts(self.cut_one(c));
-                    self.force(c, self.merge_known(c, self.idioms(c, toks)))
+                    let (toks, folded) = self.cut_one(c);
+                    let toks = split_scripts(toks);
+                    self.force(
+                        c,
+                        self.merge_known(c, self.idioms_with(c, toks, folded.as_deref())),
+                    )
                 })
                 .collect(),
         }
     }
 
-    fn cut_one<'a>(&self, orig: &'a str) -> Vec<&'a str> {
+    fn cut_one<'a>(&self, orig: &'a str) -> (Vec<&'a str>, Option<String>) {
         if !self.fold_t2s {
-            return self.model_cut(orig);
+            return (self.model_cut(orig), None);
         }
         let folded = script::fold_t2s(orig);
         let toks = self.model_cut(&folded);
@@ -391,7 +412,7 @@ impl Segmenter {
             out.push(&orig[offs[ci]..offs[end]]);
             ci = end;
         }
-        out
+        (out, Some(folded))
     }
 
     /// Model output on text already in model script. Result tiles `s`.

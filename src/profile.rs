@@ -210,7 +210,8 @@ impl Positions {
     /// the fraction: its offset over its own chapter text's length, which
     /// counts the text differently from the analysis (about 13% shorter on
     /// JJWXC books), so the analysis's characters can't be used.
-    pub fn running_word_at(&self, href: &str, fraction: f64) -> Option<u64> {
+    #[cfg(test)]
+    fn running_word_at(&self, href: &str, fraction: f64) -> Option<u64> {
         running_word_in(&self.sections, href, fraction)
     }
 
@@ -304,7 +305,8 @@ impl Positions {
     }
 }
 
-/// [`Positions::running_word_at`] over `sections`.
+/// The running word `fraction` of the way through the section with `href`
+/// (compared without case) in `sections`, if present.
 pub fn running_word_in(sections: &[PosSection], href: &str, fraction: f64) -> Option<u64> {
     let s = sections.iter().find(|s| {
         s.href
@@ -352,23 +354,6 @@ impl Cursor<'_> {
     }
 }
 
-/// Write `p`'s [`Positions`] beside it, made from the analysis.
-pub fn save_positions(
-    history: &Path,
-    p: &Profile,
-    book: &crate::extract::Book,
-    prep: &crate::analyze::Prepared,
-    included: &[bool],
-) -> Result<(), String> {
-    Positions::from_analysis(book, prep, included, &p.words)
-        .save(&positions_path_in(history, &p.id), p.digest())
-}
-
-/// Whether profile `id` has positions beside it (not checked against it).
-pub fn has_positions(history: &Path, id: &str) -> bool {
-    positions_path_in(history, id).is_file()
-}
-
 /// Analyse a book file the way the window does, for a Library book analysed
 /// in the background. `included`: the sections to include (the book's
 /// defaults if `None` or not of its length). `words` and
@@ -395,15 +380,17 @@ pub fn analyse_file(
     fold_chars: bool,
 ) -> Result<Analysed, String> {
     use crate::{analyze, discover, extract};
-    let book = extract::load(path, extract::EncodingChoice::Auto)?;
+    let book = crate::book_cache::load(path, extract::EncodingChoice::Auto, cache)?;
     let (tr, si) = analyze::detect_variant(&book);
-    if let Some(m) = crate::segment::model_for(kind.resolve(crate::script::classify(tr, si)))
+    let variant = crate::script::classify(tr, si);
+    if let Some(m) = crate::segment::model_for(kind.resolve(variant))
         && !m.is_cached()
     {
         m.ensure(&|_, _| {})?;
     }
     let user = words.to_vec();
-    let prep = analyze::analyze_book_cached(&book, kind, &user, known, cache, &|_, _| {})?;
+    let prep =
+        analyze::analyze_book_with_variant(&book, kind, variant, &user, known, cache, &|_, _| {})?;
     let included: Vec<bool> = match included {
         Some(inc) if inc.len() == book.sections.len() => inc.to_vec(),
         _ => book.sections.iter().map(|s| s.default_included()).collect(),
@@ -491,7 +478,6 @@ mod tests {
                 format: "epub",
                 sections,
                 notes: Vec::new(),
-                decode_errors: 0,
                 cover: None,
             },
             crate::analyze::Prepared {

@@ -60,11 +60,14 @@ pub fn find(chars: &[char], q: &[char], max: usize) -> Vec<Range<u32>> {
         return out;
     }
     // The text as matching sees it, with where each character was.
-    let (text, at): (Vec<char>, Vec<u32>) = chars
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &c)| norm(c).map(|n| (n, i as u32)))
-        .unzip();
+    let mut text = Vec::with_capacity(chars.len());
+    let mut at = Vec::with_capacity(chars.len());
+    for (i, &c) in chars.iter().enumerate() {
+        if let Some(n) = norm(c) {
+            text.push(n);
+            at.push(i as u32);
+        }
+    }
     let mut i = 0;
     while i + q.len() <= text.len() && out.len() < max {
         if text[i] == q[0] && text[i..i + q.len()] == *q {
@@ -114,12 +117,14 @@ fn hit(spine: usize, chars: &[char], range: Range<u32>) -> Hit {
 }
 
 enum Msg {
-    /// A chapter searched: its results (`gen` of the query).
+    /// A chapter searched: its results (`generation` of the query).
     Chapter {
         generation: u64,
         hits: Vec<Hit>,
         done: usize,
     },
+    /// Search finished (every chapter searched, or hit cap reached).
+    Done { generation: u64, done: usize },
 }
 
 /// Search every chapter for `q`, in order, waiting for chapters still
@@ -134,6 +139,7 @@ fn run(
 ) {
     let n = chapters.lock().unwrap().len();
     let mut left = MAX_HITS;
+    let mut last_repaint = std::time::Instant::now();
     for spine in 0..n {
         let ch = loop {
             if latest.load(Ordering::Relaxed) != generation {
@@ -148,6 +154,7 @@ fn run(
             .into_iter()
             .map(|r| hit(spine, &ch.chars, r))
             .collect();
+        let has_hits = !hits.is_empty();
         left -= hits.len();
         if tx
             .send(Msg::Chapter {
@@ -159,17 +166,24 @@ fn run(
         {
             return;
         }
-        repaint();
+        if has_hits || last_repaint.elapsed() >= Duration::from_millis(50) {
+            repaint();
+            last_repaint = std::time::Instant::now();
+        }
         if left == 0 {
-            let _ = tx.send(Msg::Chapter {
+            let _ = tx.send(Msg::Done {
                 generation,
-                hits: Vec::new(),
                 done: n,
             });
             repaint();
             return;
         }
     }
+    let _ = tx.send(Msg::Done {
+        generation,
+        done: n,
+    });
+    repaint();
 }
 
 /// What a click in the sidebar asks the reader for.
@@ -192,6 +206,9 @@ pub struct Search {
     latest: Arc<AtomicU64>,
     rx: Option<Receiver<Msg>>,
     pub hits: Vec<Hit>,
+    /// Distinct chapters with hits (maintained incrementally as chapters arrive).
+    distinct_chapters: usize,
+    last_hit_spine: Option<usize>,
     /// Chapters searched, of all.
     done: usize,
     chapters_n: usize,
@@ -223,6 +240,8 @@ impl Search {
             latest: Arc::new(AtomicU64::new(0)),
             rx: None,
             hits: Vec::new(),
+            distinct_chapters: 0,
+            last_hit_spine: None,
             done: 0,
             chapters_n: n,
             chosen: None,
@@ -251,6 +270,8 @@ impl Search {
         let generation = self.latest.fetch_add(1, Ordering::Relaxed) + 1;
         self.searched = self.query.clone();
         self.hits.clear();
+        self.distinct_chapters = 0;
+        self.last_hit_spine = None;
         self.chosen = None;
         self.done = 0;
         let q = norm_query(&self.query);
@@ -282,18 +303,37 @@ impl Search {
             }
         }
         let generation = self.latest.load(Ordering::Relaxed);
+        let mut finished = false;
         if let Some(rx) = &self.rx {
             for m in rx.try_iter() {
-                let Msg::Chapter {
-                    generation: g,
-                    hits,
-                    done,
-                } = m;
-                if g == generation {
-                    self.hits.extend(hits);
-                    self.done = done;
+                match m {
+                    Msg::Chapter {
+                        generation: g,
+                        hits,
+                        done,
+                    } if g == generation => {
+                        if let Some(first) = hits.first()
+                            && self.last_hit_spine != Some(first.spine)
+                        {
+                            self.last_hit_spine = Some(first.spine);
+                            self.distinct_chapters += 1;
+                        }
+                        self.hits.extend(hits);
+                        self.done = done;
+                    }
+                    Msg::Done {
+                        generation: g,
+                        done,
+                    } if g == generation => {
+                        self.done = done;
+                        finished = true;
+                    }
+                    _ => {}
                 }
             }
+        }
+        if finished {
+            self.rx = None;
         }
     }
 
@@ -387,11 +427,7 @@ impl Search {
                     let status = if self.searched.trim().is_empty() {
                         String::new()
                     } else {
-                        let chapters = {
-                            let mut s: Vec<usize> = self.hits.iter().map(|h| h.spine).collect();
-                            s.dedup();
-                            s.len()
-                        };
+                        let chapters = self.distinct_chapters;
                         let n = self.hits.len();
                         let mut t = match n {
                             0 if self.searching() => "Searching…".to_owned(),

@@ -135,6 +135,19 @@ pub struct Speech {
 }
 
 impl Speech {
+    /// The prefix hashed before every sentence's text in [`Self::key`].
+    pub(super) fn key_prefix(&self) -> String {
+        match &self.local {
+            None => format!(
+                "{}\u{1}{}\u{1}{}\u{1}",
+                self.voice,
+                self.rate,
+                azure::FORMAT
+            ),
+            Some(l) => format!("{}\u{1}", l.key_text()),
+        }
+    }
+
     /// The cache key of `text` read this way.
     pub fn key(&self, text: &str) -> u64 {
         let s = match &self.local {
@@ -172,6 +185,20 @@ impl Speech {
             opus::decode(bytes)
         } else {
             audio::decode_mp3(bytes)
+        }
+    }
+
+    /// Decode a saved clip into `out` (reusing its allocation). For Opus clips,
+    /// `bytes` is borrowed in place so its buffer can be reused too.
+    pub(super) fn decode_into(
+        &self,
+        bytes: &mut Vec<u8>,
+        out: &mut Vec<f32>,
+    ) -> Result<u32, String> {
+        if self.local.is_some() {
+            opus::decode_into(bytes, out)
+        } else {
+            audio::decode_mp3_into(std::mem::take(bytes), out)
         }
     }
 }
@@ -513,6 +540,9 @@ pub struct Tts {
     /// Sentences and billed characters: per chapter, and the book's.
     estimates: std::collections::HashMap<(usize, i32), (usize, usize)>,
     book_estimate: Option<(i32, usize, usize)>,
+    book_estimate_job: Option<(i32, Receiver<(usize, usize)>)>,
+    /// Whether Azure's voice-speed slider is currently being dragged.
+    rate_dragging: bool,
     /// The sentence heard last frame and whether it was on the pages shown
     /// (the pages follow it only then).
     pub last_at: Option<(usize, u32)>,
@@ -570,6 +600,8 @@ impl Tts {
             local_spine: 0,
             estimates: Default::default(),
             book_estimate: None,
+            book_estimate_job: None,
+            rate_dragging: false,
             last_at: None,
             last_visible: false,
             sent_playback: None,
@@ -698,6 +730,12 @@ impl Tts {
         {
             self.cache_size = Some(r);
             self.cache_job = None;
+        }
+        if let Some((rate, rx)) = &self.book_estimate_job
+            && let Ok((sent, billed)) = rx.try_recv()
+        {
+            self.book_estimate = Some((*rate, sent, billed));
+            self.book_estimate_job = None;
         }
         let Some(engine) = &self.engine else { return };
         let now = engine.now();
@@ -991,37 +1029,63 @@ impl Tts {
             .cloned()
             .flatten()?;
         let s = sentences(&ch.chars);
-        let billed = s
-            .iter()
-            .map(|r| {
-                let t: String = ch.chars[r.start as usize..r.end as usize].iter().collect();
-                azure::billed(&t, rate)
-            })
-            .sum();
+        let mut buf = String::new();
+        let mut billed = 0usize;
+        for r in &s {
+            buf.clear();
+            buf.extend(&ch.chars[r.start as usize..r.end as usize]);
+            billed += azure::billed(&buf, rate);
+        }
         let e = (s.len(), billed);
         self.estimates.insert((spine, rate), e);
         Some(e)
     }
 
-    /// The book's, once every chapter is built.
+    /// The book's, computed asynchronously once every chapter is built.
     fn book_estimate(&mut self, rate: i32) -> Option<(usize, usize)> {
         if let Some((r, n, b)) = self.book_estimate
             && r == rate
         {
             return Some((n, b));
         }
-        let n = self.chapters.lock().unwrap().len();
-        if self.chapters.lock().unwrap().iter().any(Option::is_none) {
+        if self.rate_dragging {
             return None;
         }
-        let (mut sent, mut billed) = (0, 0);
-        for i in 0..n {
-            let (s, b) = self.estimate(i, rate)?;
-            sent += s;
-            billed += b;
+        if self
+            .book_estimate_job
+            .as_ref()
+            .is_some_and(|(r, _)| *r == rate)
+        {
+            return None;
         }
-        self.book_estimate = Some((rate, sent, billed));
-        Some((sent, billed))
+        let chapters: Vec<Arc<Chapter>> = {
+            let guard = self.chapters.lock().unwrap();
+            if guard.iter().any(Option::is_none) {
+                return None;
+            }
+            guard.iter().filter_map(Clone::clone).collect()
+        };
+        let (tx, rx) = channel();
+        let repaint = self.repaint.clone();
+        let _ = std::thread::Builder::new()
+            .name("tts-book-estimate".into())
+            .spawn(move || {
+                let (mut sent, mut billed) = (0usize, 0usize);
+                let mut buf = String::new();
+                for ch in &chapters {
+                    let s = sentences(&ch.chars);
+                    sent += s.len();
+                    for r in &s {
+                        buf.clear();
+                        buf.extend(&ch.chars[r.start as usize..r.end as usize]);
+                        billed += azure::billed(&buf, rate);
+                    }
+                }
+                let _ = tx.send((sent, billed));
+                repaint();
+            });
+        self.book_estimate_job = Some((rate, rx));
+        None
     }
 
     /// Use `key` for this session only (tests: nothing is stored).
@@ -1058,6 +1122,7 @@ impl Tts {
     /// The controls in the reader's bar: the panel's button and, while
     /// reading, the transport icons and the playback speed.
     pub fn bar(&mut self, ui: &mut egui::Ui, s: &mut TtsSettings) -> egui::Response {
+        self.local.apply_pending_designed(&mut s.local);
         let b = ui
             .selectable_label(self.panel_open, RichText::new("Read aloud").size(14.0))
             .on_hover_text("Have the book read to you by an Azure voice or one on this computer");
@@ -1142,6 +1207,8 @@ impl Tts {
     ) -> Option<Action> {
         let mut action = None;
         let mut close = false;
+        self.local.apply_pending_designed(&mut s.local);
+        self.rate_dragging = false;
         let ctx = button.ctx.clone();
         let mut open = self.panel_open;
         let design_was_open = self.design_window_open();
@@ -1222,7 +1289,7 @@ impl Tts {
                         self.voice_choice(ui, s);
                         ui.end_row();
                         ui.label("Voice speed");
-                        ui.add(
+                        let rate_resp = ui.add(
                             egui::Slider::new(&mut s.rate, -50..=100)
                                 .step_by(5.0)
                                 .custom_formatter(|v, _| {
@@ -1230,6 +1297,7 @@ impl Tts {
                                 }),
                         )
                         .on_hover_text("Azure reads faster or slower: makes the audio again. For a speed that needs no new audio, use Playback speed");
+                        self.rate_dragging = rate_resp.dragged();
                         ui.end_row();
                         ui.label("Dictionary");
                         ui.checkbox(&mut s.pause_for_popup, "Pause while the popup is open")
@@ -1518,23 +1586,19 @@ impl Tts {
             .batch
             .as_ref()
             .is_some_and(|b| !b.finished() && !b.cancel.load(Ordering::Relaxed));
-        let n_spines = self.chapters.lock().unwrap().len();
-        // What, its sentences and billed characters, its chapters.
-        type Row = (&'static str, Option<(usize, usize)>, Vec<usize>);
-        let rows: [Row; 2] = [
-            ("This chapter", self.estimate(spine, s.rate), vec![spine]),
-            (
-                "The whole book",
-                self.book_estimate(s.rate),
-                (0..n_spines).collect(),
-            ),
-        ];
         if !local {
+            // What, its sentences and billed characters, whether it's the whole book.
+            type Row = (&'static str, Option<(usize, usize)>, bool);
+            let rows: [Row; 2] = [
+                ("This chapter", self.estimate(spine, s.rate), false),
+                ("The whole book", self.book_estimate(s.rate), true),
+            ];
+            let mut make: Option<(&'static str, bool)> = None;
             egui::Grid::new("reader-tts-ahead")
                 .num_columns(3)
                 .spacing([12.0, 6.0])
                 .show(ui, |ui| {
-                    for (what, est, spines) in rows {
+                    for (what, est, whole_book) in rows {
                         ui.label(what);
                         match est {
                             Some((n, billed)) => ui.label(
@@ -1558,12 +1622,21 @@ impl Tts {
                             )
                             .clicked()
                         {
-                            let w = what.to_lowercase();
-                            self.pregenerate(s, spines, &w);
+                            make = Some((what, whole_book));
                         }
                         ui.end_row();
                     }
                 });
+            if let Some((what, whole_book)) = make {
+                let spines = if whole_book {
+                    let n_spines = self.chapters.lock().unwrap().len();
+                    (0..n_spines).collect()
+                } else {
+                    vec![spine]
+                };
+                let w = what.to_lowercase();
+                self.pregenerate(s, spines, &w);
+            }
         }
         self.batch_progress(ui);
         let sizes = self.cache_size;

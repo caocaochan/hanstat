@@ -7,7 +7,9 @@
 use super::tts::{local, opus};
 use crate::reading_stats as rs;
 use eframe::egui::{self, Color32, RichText};
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
@@ -51,6 +53,7 @@ fn is_made(set: &rs::TrackerSettings) -> bool {
 
 /// The sound to play: the one made for the chosen voice and message, while
 /// they are what it was made for and it can be read; else the built-in one.
+#[cfg(test)]
 pub(super) fn clip(set: &rs::TrackerSettings, path: &Path) -> Vec<u8> {
     if is_made(set)
         && let Ok(b) = hanstat::saver::read(path)
@@ -109,31 +112,43 @@ fn seconds(pcm: &[f32], rate: u32) -> f64 {
 #[cfg(test)]
 pub(super) static PLAYED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Play the sound for `set` and return how long it lasts.
-pub(super) fn play(set: &rs::TrackerSettings) -> f64 {
-    let (pcm, rate) = opus::decode(clip(set, &path()))
-        .or_else(|_| opus::decode(CHEER.to_vec()))
-        .unwrap_or_default();
-    let secs = seconds(&pcm, rate);
-    output(pcm, rate);
-    secs
-}
-
+/// Play the sound for `set` off the UI thread and return its estimated
+/// duration (for pausing read-aloud without blocking the UI on disk/Opus).
 #[cfg(test)]
-fn output(_: Vec<f32>, _: u32) {
+pub(super) fn play(set: &rs::TrackerSettings, cached_secs: Option<f64>) -> f64 {
     PLAYED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if is_made(set) {
+        cached_secs.unwrap_or(4.5)
+    } else {
+        4.0
+    }
 }
 
-/// Play `pcm` on an output of its own, beside read aloud, off the UI
-/// thread. Without a sound device it stays silent.
+/// Play the sound for `set` on an output of its own, reading and decoding
+/// off the UI thread. Without a sound device it stays silent.
 #[cfg(not(test))]
-fn output(pcm: Vec<f32>, rate: u32) {
-    if pcm.is_empty() {
-        return;
-    }
+pub(super) fn play(set: &rs::TrackerSettings, cached_secs: Option<f64>) -> f64 {
+    let use_made = is_made(set);
+    let secs = if use_made {
+        cached_secs.unwrap_or(4.5)
+    } else {
+        4.0
+    };
+    let file = path();
     let _ = std::thread::Builder::new()
         .name("goal-met-sound".into())
         .spawn(move || {
+            let bytes = if use_made && let Ok(b) = hanstat::saver::read(&file) {
+                b
+            } else {
+                CHEER.to_vec()
+            };
+            let (pcm, rate) = opus::decode(bytes)
+                .or_else(|_| opus::decode(CHEER.to_vec()))
+                .unwrap_or_default();
+            if pcm.is_empty() {
+                return;
+            }
             let Ok(out) = super::tts::audio::Output::open(Arc::new(|| {})) else {
                 return;
             };
@@ -145,6 +160,7 @@ fn output(pcm: Vec<f32>, rate: u32) {
             }
             std::thread::sleep(std::time::Duration::from_millis(150));
         });
+    secs
 }
 
 /// Say `text` with `s` (the model loads first if it isn't): the sound as
@@ -159,6 +175,15 @@ fn make(text: &str, s: &local::LocalSettings) -> Result<(Vec<u8>, f64), String> 
 /// file and its seconds).
 type Job = (String, Receiver<Result<(Vec<u8>, f64), String>>);
 
+#[derive(Default)]
+enum MadeSecs {
+    #[default]
+    Unknown,
+    Loading(String, Receiver<Option<f64>>),
+    Known(String, f64),
+    Failed(String),
+}
+
 /// Making a sound, and what the panel says about it.
 #[derive(Default)]
 pub(super) struct State {
@@ -166,8 +191,8 @@ pub(super) struct State {
     job: Option<Job>,
     /// The last making failed: why.
     error: Option<String>,
-    /// The made sound's length, by its key.
-    made_secs: Option<(String, f64)>,
+    /// The made sound's length, computed off the UI thread, by its key.
+    made_secs: MadeSecs,
     /// The voices to choose from, listed when the panel opens.
     voices: Option<Vec<(String, String)>>,
 }
@@ -187,9 +212,30 @@ impl State {
         self.job.is_some()
     }
 
+    /// Cached duration of the made sound for `set`, if already measured.
+    pub(super) fn known_secs(&self, set: &rs::TrackerSettings) -> Option<f64> {
+        match (&self.made_secs, key(set)) {
+            (MadeSecs::Known(k, s), Some(want)) if *k == want => Some(*s),
+            _ => None,
+        }
+    }
+
     /// Once a frame: a sound made is saved, and its key returned for the
-    /// settings (it plays from then on).
+    /// settings (it plays from then on). Also polls background duration probes.
     pub(super) fn poll(&mut self) -> Option<String> {
+        if let MadeSecs::Loading(k, rx) = &self.made_secs {
+            match rx.try_recv() {
+                Ok(Some(s)) => {
+                    let k = k.clone();
+                    self.made_secs = MadeSecs::Known(k, s);
+                }
+                Ok(None) | Err(TryRecvError::Disconnected) => {
+                    let k = k.clone();
+                    self.made_secs = MadeSecs::Failed(k);
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
         let (key, rx) = self.job.as_ref()?;
         let answer = match rx.try_recv() {
             Ok(a) => a,
@@ -205,7 +251,7 @@ impl State {
         }) {
             Ok(secs) => {
                 self.error = None;
-                self.made_secs = Some((key.clone(), secs));
+                self.made_secs = MadeSecs::Known(key.clone(), secs);
                 Some(key)
             }
             Err(e) => {
@@ -218,6 +264,7 @@ impl State {
     /// The settings rows under "Play a sound when it's met": the voice, its
     /// message, Make and Play, and how it stands. `base`: read aloud's
     /// local voice settings, whose sampling a made sound uses.
+    /// Returns `(text_changed, text_focused)` for the message text box.
     pub(super) fn rows(
         &mut self,
         ui: &mut egui::Ui,
@@ -225,33 +272,37 @@ impl State {
         base: &local::LocalSettings,
         muted: Color32,
         red: Color32,
-    ) {
-        let voices = self.voices.get_or_insert_with(voices).clone();
-        ui.label("Voice");
-        let shown = match &set.goal_sound_voice {
-            None => BUILT_IN.to_owned(),
-            Some(v) => voices
-                .iter()
-                .find(|(id, _)| id == v)
-                .map_or_else(|| "A voice no longer here".to_owned(), |(_, l)| l.clone()),
-        };
-        egui::ComboBox::from_id_salt("goal-sound-voice")
-            .selected_text(shown)
-            .width(230.0)
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut set.goal_sound_voice, None, BUILT_IN);
-                for (id, label) in &voices {
-                    ui.selectable_value(&mut set.goal_sound_voice, Some(id.clone()), label);
-                }
-            })
-            .response
-            .on_hover_text(if voices.is_empty() {
-                "To use a voice of your own saying your own message, download the local voice under Read aloud (and design voices there)."
-            } else {
-                "The built-in sound, or one of your local voices saying a message of your own"
-            });
-        ui.end_row();
+    ) -> (bool, bool) {
+        {
+            let voices = self.voices.get_or_insert_with(voices);
+            ui.label("Voice");
+            let shown = match &set.goal_sound_voice {
+                None => BUILT_IN.to_owned(),
+                Some(v) => voices
+                    .iter()
+                    .find(|(id, _)| id == v)
+                    .map_or_else(|| "A voice no longer here".to_owned(), |(_, l)| l.clone()),
+            };
+            egui::ComboBox::from_id_salt("goal-sound-voice")
+                .selected_text(shown)
+                .width(230.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut set.goal_sound_voice, None, BUILT_IN);
+                    for (id, label) in voices.iter() {
+                        ui.selectable_value(&mut set.goal_sound_voice, Some(id.clone()), label);
+                    }
+                })
+                .response
+                .on_hover_text(if voices.is_empty() {
+                    "To use a voice of your own saying your own message, download the local voice under Read aloud (and design voices there)."
+                } else {
+                    "The built-in sound, or one of your local voices saying a message of your own"
+                });
+            ui.end_row();
+        }
 
+        let mut text_changed = false;
+        let mut text_focused = false;
         if set.goal_sound_voice.is_some() {
             if set.goal_sound_text.trim().is_empty() {
                 set.goal_sound_text = CHEER_TEXT.to_owned();
@@ -261,14 +312,17 @@ impl State {
                 // As wide as there is room for, beside the count: the
                 // longest message shows whole.
                 let width = (ui.available_width() - 44.0).max(200.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut set.goal_sound_text)
-                        .char_limit(MAX_CHARS)
-                        .desired_width(width),
-                )
-                .on_hover_text(format!(
-                    "Up to {MAX_CHARS} characters, so it stays under about 5 seconds"
-                ));
+                let resp = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut set.goal_sound_text)
+                            .char_limit(MAX_CHARS)
+                            .desired_width(width),
+                    )
+                    .on_hover_text(format!(
+                        "Up to {MAX_CHARS} characters, so it stays under about 5 seconds"
+                    ));
+                text_changed = resp.changed();
+                text_focused = resp.has_focus();
                 ui.label(
                     RichText::new(format!(
                         "{}/{MAX_CHARS}",
@@ -318,7 +372,7 @@ impl State {
                 .on_hover_text("Hear the sound that plays when the goal is met")
                 .clicked()
             {
-                play(set);
+                play(set, self.known_secs(set));
             }
         });
         ui.end_row();
@@ -330,16 +384,29 @@ impl State {
         } else if set.goal_sound_voice.is_none() {
             None
         } else if made {
-            let secs = self
-                .made_secs
-                .as_ref()
-                .filter(|(k, _)| Some(k) == key(set).as_ref());
-            let secs = secs.map(|(_, s)| *s).or_else(|| {
-                let (pcm, rate) = opus::decode(clip(set, &path())).ok()?;
-                let s = seconds(&pcm, rate);
-                self.made_secs = key(set).map(|k| (k, s));
-                Some(s)
-            });
+            let cur_key = key(set);
+            let secs = match (&self.made_secs, &cur_key) {
+                (MadeSecs::Known(k, s), Some(want)) if k == want => Some(*s),
+                (MadeSecs::Loading(k, _) | MadeSecs::Failed(k), Some(want)) if k == want => None,
+                (_, Some(want)) => {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let file = path();
+                    let ctx = ui.ctx().clone();
+                    let _ = std::thread::Builder::new()
+                        .name("goal-sound-probe".into())
+                        .spawn(move || {
+                            let dur = hanstat::saver::read(&file)
+                                .ok()
+                                .and_then(|b| opus::decode(b).ok())
+                                .map(|(pcm, rate)| seconds(&pcm, rate));
+                            let _ = tx.send(dur);
+                            ctx.request_repaint();
+                        });
+                    self.made_secs = MadeSecs::Loading(want.clone(), rx);
+                    None
+                }
+                _ => None,
+            };
             Some(match secs {
                 Some(s) if s > 5.0 => (
                     format!("Made: {s:.1} s. A shorter message keeps it under 5 s."),
@@ -359,6 +426,7 @@ impl State {
             ui.label(RichText::new(text).color(color).small());
             ui.end_row();
         }
+        (text_changed, text_focused)
     }
 }
 

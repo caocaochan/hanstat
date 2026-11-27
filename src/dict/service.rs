@@ -7,8 +7,8 @@
 
 use super::lookup::{DictInfo, Engine, Lookup};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 enum Request {
@@ -36,6 +36,7 @@ pub enum Reply {
 pub struct Service {
     tx: Sender<Request>,
     rx: Receiver<Reply>,
+    ready: Arc<(Mutex<bool>, Condvar)>,
     next_id: u64,
 }
 
@@ -47,17 +48,20 @@ impl Service {
         freq_sort: Option<String>,
         wake: Arc<dyn Fn() + Send + Sync>,
     ) -> Service {
-        // Recovery deletes unfinished imports and downloads: done before
-        // anything can start one (an import or update job, the default
-        // dictionary's download), never alongside.
-        super::manage::recover(&root);
         let (tx, rx_req) = channel::<Request>();
         let (tx_rep, rx) = channel::<Reply>();
+        let ready = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_ready = Arc::clone(&ready);
         std::thread::Builder::new()
             .name("dict-lookup".into())
-            .spawn(move || worker(root, freq_sort, rx_req, tx_rep, wake))
+            .spawn(move || worker(root, freq_sort, worker_ready, rx_req, tx_rep, wake))
             .expect("dictionary thread");
-        Service { tx, rx, next_id: 0 }
+        Service {
+            tx,
+            rx,
+            ready,
+            next_id: 0,
+        }
     }
 
     /// Ask for a lookup; its reply carries the returned id.
@@ -75,20 +79,13 @@ impl Service {
         let _ = self.tx.send(Request::Reload { freq_sort });
     }
 
-    /// Drop `ids` and wait (up to 10 s) until they are closed.
-    pub fn unload(&self, ids: Vec<String>) -> Result<(), String> {
-        let (done, wait) = channel();
-        self.tx
-            .send(Request::Unload { ids, done })
-            .map_err(|_| "the dictionary thread stopped".to_string())?;
-        wait.recv_timeout(Duration::from_secs(10))
-            .map_err(|_| "the dictionary thread didn't answer".to_string())
-    }
-
     /// A handle that can unload from another thread (an import or update
     /// putting its files in place).
     pub fn unloader(&self) -> Unloader {
-        Unloader(self.tx.clone())
+        Unloader {
+            tx: self.tx.clone(),
+            ready: Arc::clone(&self.ready),
+        }
     }
 
     pub fn try_recv(&self) -> Option<Reply> {
@@ -101,17 +98,30 @@ impl Service {
 }
 
 #[derive(Clone)]
-pub struct Unloader(Sender<Request>);
+pub struct Unloader {
+    tx: Sender<Request>,
+    ready: Arc<(Mutex<bool>, Condvar)>,
+}
 
 impl Unloader {
+    /// Wait until startup crash recovery on the lookup worker has finished,
+    /// so a new `.tmp-` or `.download-` is never removed by it.
+    pub(crate) fn wait_ready(&self) {
+        let (lock, cvar) = &*self.ready;
+        let mut done = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while !*done {
+            done = cvar.wait(done).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
     /// Reopen the dictionaries after a job finishes putting files in place.
     pub fn refresh(&self) {
-        let _ = self.0.send(Request::Refresh);
+        let _ = self.tx.send(Request::Refresh);
     }
 
     pub fn unload(&self, ids: Vec<String>) -> Result<(), String> {
         let (done, wait) = channel();
-        self.0
+        self.tx
             .send(Request::Unload { ids, done })
             .map_err(|_| "the dictionary thread stopped".to_string())?;
         wait.recv_timeout(Duration::from_secs(10))
@@ -122,10 +132,25 @@ impl Unloader {
 fn worker(
     root: PathBuf,
     freq_sort: Option<String>,
+    ready: Arc<(Mutex<bool>, Condvar)>,
     rx: Receiver<Request>,
     tx: Sender<Reply>,
     wake: Arc<dyn Fn() + Send + Sync>,
 ) {
+    struct MarkReady(Arc<(Mutex<bool>, Condvar)>);
+    impl Drop for MarkReady {
+        fn drop(&mut self) {
+            let (lock, cvar) = &*self.0;
+            *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            cvar.notify_all();
+        }
+    }
+    // Recovery deletes unfinished imports and downloads before opening the
+    // dictionaries (run on this thread so startup never blocks the UI thread).
+    {
+        let _mark = MarkReady(ready);
+        super::manage::recover(&root);
+    }
     let mut freq_sort = freq_sort;
     let loaded = |e: &Engine, errors: Vec<String>| Reply::Loaded {
         dicts: e.dicts.clone(),

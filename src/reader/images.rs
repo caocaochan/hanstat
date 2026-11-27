@@ -12,6 +12,15 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 /// Texture memory kept (RGBA bytes) before the least recently drawn go.
 const BUDGET: usize = 384 << 20;
+/// Compressed image bytes kept between `dims()` and the first `texture()` decode.
+const RAW_BUDGET: usize = 32 << 20;
+
+/// State of an image texture requested for painting.
+pub enum TexState {
+    Ready(egui::TextureId),
+    Pending,
+    Failed,
+}
 
 struct Tex {
     handle: TextureHandle,
@@ -22,7 +31,7 @@ struct Tex {
     used: u64,
 }
 
-type Decoded = (String, bool, Option<(ColorImage, bool)>);
+type Decoded = (u64, String, bool, Option<(ColorImage, bool)>);
 
 /// Reads a file's bytes by path.
 pub type Source = Arc<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>;
@@ -35,10 +44,16 @@ pub struct Images {
     /// Texture names start with it, so two sources never share one.
     name: String,
     dims: HashMap<String, Option<[u32; 2]>>,
+    /// Compressed bytes read during `dims()`, reused once by the first decode
+    /// so we don't read the same ZIP entry twice.
+    raw: HashMap<String, Vec<u8>>,
+    raw_bytes: usize,
     tex: HashMap<String, Tex>,
     pending: HashSet<String>,
     failed: HashSet<String>,
-    /// Decoded: (path, inverted, image and whether it is at full size).
+    /// Bumped on `clear()` so in-flight decodes from earlier sources are ignored.
+    generation: u64,
+    /// Decoded: (generation, path, inverted, image and whether it is at full size).
     tx: Sender<Decoded>,
     rx: Receiver<Decoded>,
     frame: u64,
@@ -59,6 +74,18 @@ impl Images {
         }
     }
 
+    /// Drop every cached dimension, texture and in-flight decode (e.g. when
+    /// dictionaries are reloaded or removed).
+    pub fn clear(&mut self) {
+        self.generation += 1;
+        self.dims.clear();
+        self.raw.clear();
+        self.raw_bytes = 0;
+        self.tex.clear();
+        self.pending.clear();
+        self.failed.clear();
+    }
+
     pub fn with_source(name: &str, read: Source) -> Images {
         let (tx, rx) = channel();
         Images {
@@ -66,9 +93,12 @@ impl Images {
             invert_grey: false,
             name: name.to_owned(),
             dims: HashMap::new(),
+            raw: HashMap::new(),
+            raw_bytes: 0,
             tex: HashMap::new(),
             pending: HashSet::new(),
             failed: HashSet::new(),
+            generation: 0,
             tx,
             rx,
             frame: 0,
@@ -81,23 +111,32 @@ impl Images {
             return *d;
         }
         let d = (self.read)(path).and_then(|b| {
-            image::ImageReader::new(Cursor::new(b))
+            let dims = image::ImageReader::new(Cursor::new(&b))
                 .with_guessed_format()
                 .ok()?
                 .into_dimensions()
                 .ok()
-                .map(|(w, h)| [w, h])
+                .map(|(w, h)| [w, h]);
+            if dims.is_some()
+                && b.len() <= RAW_BUDGET
+                && self.raw_bytes + b.len() <= RAW_BUDGET
+                && !self.raw.contains_key(path)
+            {
+                self.raw_bytes += b.len();
+                self.raw.insert(path.to_owned(), b);
+            }
+            dims
         });
         self.dims.insert(path.to_owned(), d);
         d
     }
 
-    /// Take in decoded images; `true` if any arrived.
-    pub fn poll(&mut self, ctx: &egui::Context) -> bool {
+    /// Take in decoded images.
+    pub fn poll(&mut self, ctx: &egui::Context) {
         let mut any = false;
-        while let Ok((path, inverted, img)) = self.rx.try_recv() {
-            if inverted != self.invert_grey {
-                // Asked before the popup's theme changed.
+        while let Ok((generation, path, inverted, img)) = self.rx.try_recv() {
+            if generation != self.generation || inverted != self.invert_grey {
+                // Asked before the source or the popup's theme changed.
                 continue;
             }
             self.pending.remove(&path);
@@ -128,7 +167,6 @@ impl Images {
         if any {
             self.evict();
         }
-        any
     }
 
     pub fn next_frame(&mut self) {
@@ -136,10 +174,11 @@ impl Images {
     }
 
     /// The texture to draw `path` with at `px` physical pixels, asking for a
-    /// sharper decode when the one there is too small.
-    pub fn texture(&mut self, path: &str, px: [u32; 2]) -> Option<egui::TextureId> {
+    /// sharper decode when the one there is too small. Calls
+    /// `ctx.request_repaint()` from the worker once decoding finishes.
+    pub fn texture(&mut self, ctx: &egui::Context, path: &str, px: [u32; 2]) -> TexState {
         if self.failed.contains(path) {
-            return None;
+            return TexState::Failed;
         }
         let want_more = match self.tex.get(path) {
             Some(t) => {
@@ -151,18 +190,27 @@ impl Images {
         };
         if want_more && !self.pending.contains(path) {
             self.pending.insert(path.to_owned());
+            let cached = self.raw.remove(path).inspect(|b| self.raw_bytes -= b.len());
             let read = self.read.clone();
             let invert = self.invert_grey;
+            let generation = self.generation;
             let tx = self.tx.clone();
             let p = path.to_owned();
+            let ctx = ctx.clone();
             rayon::spawn(move || {
-                let img = read(&p).and_then(|b| decode(&b, px, invert));
-                let _ = tx.send((p, invert, img));
+                let bytes = cached.or_else(|| read(&p));
+                let img = bytes.and_then(|b| decode(&b, px, invert));
+                let _ = tx.send((generation, p, invert, img));
+                ctx.request_repaint();
             });
         }
-        let t = self.tex.get_mut(path)?;
-        t.used = self.frame;
-        Some(t.handle.id())
+        match self.tex.get_mut(path) {
+            Some(t) => {
+                t.used = self.frame;
+                TexState::Ready(t.handle.id())
+            }
+            None => TexState::Pending,
+        }
     }
 
     /// Decode now (for rendering pages to files, where nothing waits a frame).

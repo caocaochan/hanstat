@@ -11,33 +11,33 @@
 
 use eframe::egui::{self, Color32, Stroke};
 
-pub struct Theme {
+pub(super) struct Theme {
     /// Saved in the reader's settings.
-    pub id: &'static str,
-    pub name: &'static str,
-    pub dark: bool,
+    pub(super) id: &'static str,
+    pub(super) name: &'static str,
+    pub(super) dark: bool,
     /// The sheet of paper.
-    pub page: Color32,
+    pub(super) page: Color32,
     /// Around the pages.
-    pub desk: Color32,
+    pub(super) desk: Color32,
     /// The top bar and panels.
-    pub bar: Color32,
+    pub(super) bar: Color32,
     /// Body text.
-    pub ink: Color32,
+    pub(super) ink: Color32,
     /// Interface text: the title, menus, labels.
-    pub text: Color32,
+    pub(super) text: Color32,
     /// Secondary labels.
-    pub subtle: Color32,
+    pub(super) subtle: Color32,
     /// Running heads, folios, hints.
-    pub muted: Color32,
+    pub(super) muted: Color32,
     /// Links and selection.
-    pub accent: Color32,
+    pub(super) accent: Color32,
     /// The word looked up (see-through).
-    pub yellow: Color32,
+    pub(super) yellow: Color32,
     /// The sentence read aloud (see-through).
-    pub cyan: Color32,
-    pub red: Color32,
-    pub orange: Color32,
+    pub(super) cyan: Color32,
+    pub(super) red: Color32,
+    pub(super) orange: Color32,
 }
 
 const fn hex(x: u32) -> Color32 {
@@ -70,7 +70,7 @@ const fn theme(id: &'static str, name: &'static str, dark: bool, c: [u32; 12]) -
 /// Every colour is the palette's own, unchanged (some are low in contrast by
 /// design); only which palette colour plays which part is chosen here.
 #[rustfmt::skip]
-pub static THEMES: [Theme; 16] = [
+pub(super) static THEMES: [Theme; 16] = [
     // Solarized: base3 page, base2 desk and bar; base00 body text, base01
     // emphasised (the title, menus), base1 secondary.
     theme("solarized-light", "Solarized Light", false, [
@@ -164,7 +164,7 @@ pub static THEMES: [Theme; 16] = [
 
 /// The index of the theme saved as `id` (the first, Solarized Light, if
 /// none is: a theme removed in a later release, or a hand-edited file).
-pub fn index(id: &str) -> usize {
+pub(super) fn index(id: &str) -> usize {
     THEMES.iter().position(|t| t.id == id).unwrap_or(0)
 }
 
@@ -173,17 +173,17 @@ fn key() -> egui::Id {
 }
 
 /// The theme in use in `ctx`.
-pub fn get(ctx: &egui::Context) -> &'static Theme {
+pub(super) fn get(ctx: &egui::Context) -> &'static Theme {
     &THEMES[ctx.data(|d| d.get_temp::<usize>(key())).unwrap_or(0) % THEMES.len()]
 }
 
 /// Use theme `i` in `ctx`.
-pub fn set(ctx: &egui::Context, i: usize) {
+pub(super) fn set(ctx: &egui::Context, i: usize) {
     ctx.data_mut(|d| d.insert_temp(key(), i % THEMES.len()));
 }
 
 /// `fg` laid over `bg` at `a`, as an opaque colour.
-pub fn mix(fg: Color32, bg: Color32, a: f32) -> Color32 {
+pub(super) fn mix(fg: Color32, bg: Color32, a: f32) -> Color32 {
     let m = |f: u8, b: u8| (f as f32 * a + b as f32 * (1.0 - a)).round() as u8;
     Color32::from_rgb(m(fg.r(), bg.r()), m(fg.g(), bg.g()), m(fg.b(), bg.b()))
 }
@@ -201,14 +201,14 @@ fn luminance(c: Color32) -> f32 {
 }
 
 /// WCAG contrast ratio of two opaque colours.
-pub fn contrast(a: Color32, b: Color32) -> f32 {
+fn contrast(a: Color32, b: Color32) -> f32 {
     let (x, y) = (luminance(a), luminance(b));
     (x.max(y) + 0.05) / (x.min(y) + 0.05)
 }
 
 /// The colour with its HSL lightness turned over (hue, saturation and alpha
 /// kept): a book's dark blue becomes a light blue, a pale grey box a dark one.
-pub fn flip(c: Color32) -> Color32 {
+fn flip(c: Color32) -> Color32 {
     let [r, g, b, a] = c.to_srgba_unmultiplied();
     let [r, g, b] = [r, g, b].map(|v| v as f32 / 255.0);
     let max = r.max(g).max(b);
@@ -246,7 +246,7 @@ pub fn flip(c: Color32) -> Color32 {
 
 /// A book's text colour, readable on `page`: on a dark page, colours that
 /// would be hard to read there (the book's dark grey or navy) turn light.
-pub fn book_text(c: Color32, page: Color32, dark: bool) -> Color32 {
+pub(super) fn book_text(c: Color32, page: Color32, dark: bool) -> Color32 {
     if !dark || c.a() == 0 {
         return c;
     }
@@ -260,31 +260,31 @@ pub fn book_text(c: Color32, page: Color32, dark: bool) -> Color32 {
 }
 
 /// A book's background: on a dark page, light boxes turn dark.
-pub fn book_fill(c: Color32, dark: bool) -> Color32 {
+pub(super) fn book_fill(c: Color32, dark: bool) -> Color32 {
     if dark { flip(c) } else { c }
 }
 
 impl Theme {
     /// The word looked up.
     /// A search match on the page (see-through).
-    pub fn search_hit(&self) -> Color32 {
+    pub(super) fn search_hit(&self) -> Color32 {
         self.orange
             .gamma_multiply(if self.dark { 0.32 } else { 0.38 })
     }
 
-    pub fn highlight(&self) -> Color32 {
+    pub(super) fn highlight(&self) -> Color32 {
         let [r, g, b, _] = self.yellow.to_array();
         Color32::from_rgba_unmultiplied(r, g, b, if self.dark { 80 } else { 96 })
     }
 
     /// The sentence read aloud.
-    pub fn reading(&self) -> Color32 {
+    pub(super) fn reading(&self) -> Color32 {
         let [r, g, b, _] = self.cyan.to_array();
         Color32::from_rgba_unmultiplied(r, g, b, if self.dark { 60 } else { 56 })
     }
 
     /// The shade toward a spread's fold, at full strength.
-    pub fn fold(&self) -> (Color32, f32) {
+    pub(super) fn fold(&self) -> (Color32, f32) {
         if self.dark {
             (Color32::BLACK, 40.0)
         } else {
@@ -293,7 +293,7 @@ impl Theme {
     }
 
     /// The bar, menus and windows while the reader is open.
-    pub fn visuals(&self) -> egui::Visuals {
+    pub(super) fn visuals(&self) -> egui::Visuals {
         let mut v = if self.dark {
             egui::Visuals::dark()
         } else {
@@ -339,12 +339,17 @@ impl Theme {
 
 /// One theme in the chooser: a strip of its page with its name in its ink,
 /// and dots of its link, highlight and read-aloud colours.
-pub fn swatch(ui: &mut egui::Ui, t: &Theme, selected: bool) -> egui::Response {
+pub(super) fn swatch(ui: &mut egui::Ui, t: &Theme, selected: bool) -> egui::Response {
     swatch_as(ui, t, t.name, selected)
 }
 
 /// [`swatch`] with another name on it.
-pub fn swatch_as(ui: &mut egui::Ui, t: &Theme, name: &str, selected: bool) -> egui::Response {
+pub(super) fn swatch_as(
+    ui: &mut egui::Ui,
+    t: &Theme,
+    name: &str,
+    selected: bool,
+) -> egui::Response {
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 30.0), egui::Sense::click());
     resp.widget_info(|| {

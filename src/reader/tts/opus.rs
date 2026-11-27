@@ -82,6 +82,15 @@ pub fn encode(pcm: &[i16]) -> Result<Vec<u8>, String> {
 
 /// The samples (mono, [`RATE`], -1..1) of a file made by [`encode`].
 pub fn decode(bytes: Vec<u8>) -> Result<(Vec<f32>, u32), String> {
+    let mut out = Vec::new();
+    let rate = decode_into(&bytes, &mut out)?;
+    Ok((out, rate))
+}
+
+/// Decode an Ogg Opus clip into `out` (reusing its allocation), returning the
+/// sample rate.
+pub(super) fn decode_into(bytes: &[u8], out: &mut Vec<f32>) -> Result<u32, String> {
+    out.clear();
     let bad = |e: &dyn std::fmt::Display| format!("The audio can't be read: {e}");
     let mut r = ogg::PacketReader::new(Cursor::new(bytes));
     let head = r
@@ -93,7 +102,6 @@ pub fn decode(bytes: Vec<u8>) -> Result<(Vec<f32>, u32), String> {
     }
     let pre_skip = u16::from_le_bytes([head.data[10], head.data[11]]) as u64;
     let mut dec = Decoder::new(RATE, Channels::Mono).map_err(|e| bad(&e))?;
-    let mut out: Vec<f32> = Vec::new();
     // 120 ms, the longest Opus packet.
     let mut buf = vec![0f32; RATE as usize * 120 / 1000];
     let mut end = None;
@@ -119,7 +127,8 @@ pub fn decode(bytes: Vec<u8>) -> Result<(Vec<f32>, u32), String> {
     });
     out.truncate(len.min(out.len()));
     let start = skip.min(out.len());
-    Ok((out.split_off(start), RATE))
+    out.drain(..start);
+    Ok(RATE)
 }
 
 #[cfg(test)]

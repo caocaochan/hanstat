@@ -85,6 +85,26 @@ impl Look {
 /// from the bold family.
 pub(crate) static WENKAI: &[u8] = include_bytes!("../assets/fonts/LXGWWenKai-Medium.ttf");
 
+#[cfg(windows)]
+fn cached_win_font(file: &str) -> Option<Arc<egui::FontData>> {
+    use std::sync::{LazyLock, Mutex};
+    static CACHE: LazyLock<Mutex<HashMap<String, Option<Arc<egui::FontData>>>>> =
+        LazyLock::new(Mutex::default);
+    let mut map = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = map.get(file) {
+        return entry.clone();
+    }
+    let dir = std::env::var_os("WINDIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
+        .join("Fonts");
+    let data = std::fs::read(dir.join(file))
+        .ok()
+        .map(|bytes| Arc::new(egui::FontData::from_owned(bytes)));
+    map.insert(file.to_owned(), data.clone());
+    data
+}
+
 /// The page's two extra families. Bold: the system's bold CJK faces
 /// (Windows), ahead of the regular fonts for what they lack; elsewhere the
 /// regular ones. Book titles: the bundled LXGW WenKai, then the bold family.
@@ -93,17 +113,12 @@ fn add_fonts(defs: &mut egui::FontDefinitions) {
     let mut bold_family = Vec::new();
     #[cfg(windows)]
     {
-        let dir = std::env::var_os("WINDIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
-            .join("Fonts");
         for (name, file) in [
             ("report-yahei-bold", "msyhbd.ttc"),
             ("report-malgun-bold", "malgunbd.ttf"),
         ] {
-            if let Ok(bytes) = std::fs::read(dir.join(file)) {
-                defs.font_data
-                    .insert(name.to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
+            if let Some(data) = cached_win_font(file) {
+                defs.font_data.insert(name.to_owned(), data);
                 bold_family.push(name.to_owned());
             }
         }
@@ -118,21 +133,15 @@ fn add_fonts(defs: &mut egui::FontDefinitions) {
     // font provider, which the page's own context has not got; macOS and
     // Linux have it in the window's font list.
     #[cfg(windows)]
-    if let Some(dir) = std::env::var_os("WINDIR") {
-        let path = std::path::PathBuf::from(dir).join(r"Fonts\malgun.ttf");
-        if let Ok(bytes) = std::fs::read(path) {
-            defs.font_data.insert(
-                "report-malgun".to_owned(),
-                Arc::new(egui::FontData::from_owned(bytes)),
-            );
-            for fam in [FontFamily::Proportional, FontFamily::Monospace] {
-                defs.families
-                    .entry(fam)
-                    .or_default()
-                    .push("report-malgun".to_owned());
-            }
-            bold_family.push("report-malgun".to_owned());
+    if let Some(data) = cached_win_font("malgun.ttf") {
+        defs.font_data.insert("report-malgun".to_owned(), data);
+        for fam in [FontFamily::Proportional, FontFamily::Monospace] {
+            defs.families
+                .entry(fam)
+                .or_default()
+                .push("report-malgun".to_owned());
         }
+        bold_family.push("report-malgun".to_owned());
     }
     defs.font_data.insert(
         "report-wenkai".to_owned(),
@@ -681,8 +690,35 @@ fn coverage_points(counts: &[u32]) -> Vec<(usize, f64)> {
     out
 }
 
+enum ExportJob {
+    Library {
+        entries: Vec<history::Entry>,
+        cover_paths: Vec<(String, std::path::PathBuf)>,
+        read_at: HashMap<String, u64>,
+        counted: Option<Box<Counted>>,
+        speeds: f64,
+        style_scores: HashMap<String, f32>,
+        style_offsets: HashMap<String, f64>,
+        style_scale: crate::style_scale::StyleScale,
+    },
+    Book {
+        report: Box<hanstat::analyze::Report>,
+        title: String,
+        cover_bytes: Option<Vec<u8>>,
+        cover_path: Option<std::path::PathBuf>,
+        style_off: f64,
+        style_rating: Option<String>,
+        included: usize,
+        sections: usize,
+        minutes: f64,
+        speed: String,
+    },
+}
+
 impl App {
-    /// Ask where to save, lay out the page now and draw it in the background.
+    /// Ask where to save, then snapshot the lightweight data on the UI thread
+    /// and run font loading, cover decoding, layout, tessellation, and PNG
+    /// encoding on a background thread.
     pub(crate) fn export_image(&mut self, ctx: &egui::Context, what: ImageExport) {
         let name = match what {
             ImageExport::Library => "hanstat library.png".to_owned(),
@@ -701,23 +737,159 @@ impl App {
         else {
             return;
         };
-        let look = Look::new(ctx.theme() == egui::Theme::Dark);
-        let scene = raster::lay_out(
-            ctx,
-            PAGE,
-            SCALE,
-            look.bg,
-            add_fonts,
-            |s| look.style(s),
-            |c| self.covers_for(c, what),
-            |ui, covers| match what {
-                ImageExport::Library => self.library_page(ui, look, covers),
-                ImageExport::Book => self.book_page(ui, look, covers),
-            },
-        );
+        let dark = ctx.theme() == egui::Theme::Dark;
+        let look = Look::new(dark);
+        let defs = ctx.fonts(|f| f.definitions().clone());
+        let theme = ctx.theme();
+        let base_style = (*ctx.global_style()).clone();
+        let job = match what {
+            ImageExport::Library => {
+                let style_on = self.style_on();
+                let style_scores: HashMap<String, f32> = if style_on {
+                    self.style
+                        .store
+                        .current()
+                        .into_iter()
+                        .map(|(k, v)| (k.to_owned(), v))
+                        .collect()
+                } else {
+                    HashMap::new()
+                };
+                let style_scale = self.style_scale();
+                let mut style_offsets = HashMap::new();
+                if style_on {
+                    for e in &self.history.entries {
+                        let off = self.style_offset(&e.id);
+                        if off != 0.0 {
+                            style_offsets.insert(e.id.clone(), off);
+                        }
+                    }
+                }
+                let cover_paths = self
+                    .history
+                    .entries
+                    .iter()
+                    .map(|e| (e.id.clone(), self.history.cover(&e.id)))
+                    .collect();
+                ExportJob::Library {
+                    entries: self.history.entries.clone(),
+                    cover_paths,
+                    read_at: self.read_dates(),
+                    counted: self.stats.shown.clone().map(Box::new),
+                    speeds: self.speeds(),
+                    style_scores,
+                    style_offsets,
+                    style_scale,
+                }
+            }
+            ImageExport::Book => {
+                let Some(r) = self.report.clone() else {
+                    return;
+                };
+                let title = r
+                    .title
+                    .clone()
+                    .or_else(|| self.path.as_deref().map(crate::file_stem))
+                    .unwrap_or_default();
+                let style_off = self
+                    .report_id
+                    .as_deref()
+                    .map_or(0.0, |id| self.style_offset(id));
+                let style_rating = self
+                    .style_on()
+                    .then(|| {
+                        let id = self.report_id.as_deref()?;
+                        let s = self.style.store.get(id)?;
+                        Some(format!(
+                            "Writing style {} · {}",
+                            self.style_scale().pct(s.score),
+                            s.label()
+                        ))
+                    })
+                    .flatten();
+                let (included, sections) = (
+                    self.included.iter().filter(|x| **x).count(),
+                    self.included.len(),
+                );
+                let v = self.cpm.unwrap_or(self.cpm()) as f64;
+                let minutes = r.han_total as f64 / v;
+                let speed = format!("{v:.0} characters a minute");
+                let cover_bytes = self.book.as_ref().and_then(|b| b.cover.clone());
+                let cover_path = self.report_id.as_deref().map(|id| self.history.cover(id));
+                ExportJob::Book {
+                    report: Box::new(r),
+                    title,
+                    cover_bytes,
+                    cover_path,
+                    style_off,
+                    style_rating,
+                    included,
+                    sections,
+                    minutes,
+                    speed,
+                }
+            }
+        };
         let (tx, rx) = channel();
         let repaint = ctx.clone();
         std::thread::spawn(move || {
+            let scene = raster::lay_out_from(
+                defs,
+                theme,
+                base_style,
+                PAGE,
+                SCALE,
+                look.bg,
+                add_fonts,
+                |s| look.style(s),
+                |c| load_covers(c, &job),
+                |ui, covers| match &job {
+                    ExportJob::Library {
+                        entries,
+                        read_at,
+                        counted,
+                        speeds,
+                        style_scores,
+                        style_offsets,
+                        style_scale,
+                        ..
+                    } => draw_library_page(
+                        ui,
+                        look,
+                        covers,
+                        entries,
+                        read_at,
+                        counted.as_deref(),
+                        *speeds,
+                        style_scores,
+                        style_offsets,
+                        style_scale,
+                    ),
+                    ExportJob::Book {
+                        report,
+                        title,
+                        style_off,
+                        style_rating,
+                        included,
+                        sections,
+                        minutes,
+                        speed,
+                        ..
+                    } => draw_book_page(
+                        ui,
+                        look,
+                        covers,
+                        report,
+                        title,
+                        *style_off,
+                        style_rating.as_deref(),
+                        *included,
+                        *sections,
+                        *minutes,
+                        speed,
+                    ),
+                },
+            );
             let msg = match scene.write_png(&path) {
                 Ok(()) => {
                     let [w, h] = scene.size();
@@ -750,699 +922,691 @@ impl App {
     pub(crate) fn image_busy(&self) -> bool {
         self.image_job.is_some()
     }
+}
 
-    fn covers_for(&self, ctx: &egui::Context, what: ImageExport) -> Covers {
-        let mut out = Covers::new();
-        match what {
-            ImageExport::Library => {
-                for e in &self.history.entries {
-                    if let Ok(img) = image::open(self.history.cover(&e.id)) {
-                        out.insert(e.id.clone(), texture(ctx, &e.id, img));
-                    }
-                }
-            }
-            ImageExport::Book => {
-                // The book's own cover, sharper than the Library's thumbnail.
-                let full = self
-                    .book
-                    .as_ref()
-                    .and_then(|b| b.cover.as_deref())
-                    .and_then(|b| image::load_from_memory(b).ok())
-                    .map(|i| i.thumbnail(480, 680));
-                let img = full.or_else(|| {
-                    let id = self.report_id.as_deref()?;
-                    image::open(self.history.cover(id)).ok()
-                });
-                if let Some(img) = img {
-                    out.insert(String::new(), texture(ctx, "cover", img));
+fn load_covers(ctx: &egui::Context, job: &ExportJob) -> Covers {
+    let mut out = Covers::new();
+    match job {
+        ExportJob::Library { cover_paths, .. } => {
+            for (id, p) in cover_paths {
+                if let Ok(img) = image::open(p) {
+                    out.insert(id.clone(), texture(ctx, id, img));
                 }
             }
         }
-        out
-    }
-
-    fn library_page(&self, ui: &mut egui::Ui, look: Look, covers: &Covers) {
-        let speeds = self.speeds();
-        let entries = &self.history.entries;
-        let read_at = self.read_dates();
-
-        page(ui, look, |ui| {
-            let books = entries.len();
-            header(
-                ui,
-                look,
-                "hanstat · Library",
-                "My reading library",
-                &format!(
-                    "{} {}",
-                    fmt_int(books as u64),
-                    if books == 1 { "book" } else { "books" }
-                ),
-            );
-
-            section(ui, look, "At a glance", "Every book's last analysis");
-            let han: u64 = entries.iter().map(|e| e.stats.han_total).sum();
-            let words: u64 = entries.iter().map(|e| e.stats.words_total).sum();
-            let minutes: f64 = entries
-                .iter()
-                .map(|e| reading_minutes(&e.stats, speeds))
-                .sum();
-            let read = entries
-                .iter()
-                .filter(|e| read_at.contains_key(&e.id))
-                .count();
-            let mut t = vec![
-                tile(
-                    "Characters",
-                    fmt_int(han),
-                    format!("{} per book", fmt_int(han / books.max(1) as u64)),
-                ),
-                tile(
-                    "Words",
-                    fmt_int(words),
-                    format!("{} per book", fmt_int(words / books.max(1) as u64)),
-                ),
-                tile(
-                    "Reading time",
-                    fmt_time(minutes),
-                    format!("{:.0} days of reading 1 h a day", minutes / 60.0),
-                ),
-                tile(
-                    "Books read",
-                    fmt_int(read as u64),
-                    format!(
-                        "{:.0}% of the {} books",
-                        pct(read, books),
-                        fmt_int(books as u64)
-                    ),
-                )
-                .color(if read > 0 { palette::good() } else { look.text }),
-            ];
-            if let Some(e) = entries.iter().max_by_key(|e| length(&e.stats)) {
-                t.push(
-                    tile(
-                        "Longest book",
-                        e.title.clone(),
-                        format!("{} characters", fmt_int(length(&e.stats))),
-                    )
-                    .book(),
-                );
+        ExportJob::Book {
+            cover_bytes,
+            cover_path,
+            ..
+        } => {
+            // The book's own cover, sharper than the Library's thumbnail.
+            let full = cover_bytes
+                .as_deref()
+                .and_then(|b| image::load_from_memory(b).ok())
+                .map(|i| i.thumbnail(480, 680));
+            let img = full.or_else(|| {
+                let p = cover_path.as_deref()?;
+                image::open(p).ok()
+            });
+            if let Some(img) = img {
+                out.insert(String::new(), texture(ctx, "cover", img));
             }
-            tiles(ui, look, 3, &t);
-
-            self.vocabulary_block(ui, look, covers, &read_at, speeds);
-        });
+        }
     }
+    out
+}
 
-    /// The books' vocabulary against what is known now, then every book.
-    fn vocabulary_block(
-        &self,
-        ui: &mut egui::Ui,
-        look: Look,
-        covers: &Covers,
-        read_at: &HashMap<String, u64>,
-        speeds: f64,
-    ) {
-        let books: Vec<&history::Entry> = self.history.entries.iter().collect();
-        let counted: Option<&Counted> = self.stats.shown.as_ref();
-        let source = counted.and_then(|c| c.source.as_deref());
-
-        section(
+#[allow(clippy::too_many_arguments)]
+fn draw_library_page(
+    ui: &mut egui::Ui,
+    look: Look,
+    covers: &Covers,
+    entries: &[history::Entry],
+    read_at: &HashMap<String, u64>,
+    counted: Option<&Counted>,
+    speeds: f64,
+    style_scores: &HashMap<String, f32>,
+    style_offsets: &HashMap<String, f64>,
+    style_scale: &crate::style_scale::StyleScale,
+) {
+    page(ui, look, |ui| {
+        let books = entries.len();
+        header(
             ui,
             look,
-            "Vocabulary",
-            &match source {
-                Some(s) => format!("The books' words; known now: {s}"),
-                None => "The books' words".to_owned(),
-            },
+            "hanstat · Library",
+            "My reading library",
+            &format!(
+                "{} {}",
+                fmt_int(books as u64),
+                if books == 1 { "book" } else { "books" }
+            ),
         );
-        let mut t = Vec::new();
-        if let Some(c) = counted {
-            let w = &c.words;
-            t.push(tile(
-                "Distinct words",
-                fmt_int(w.vocab as u64),
-                format!(
-                    "{} in one book only",
-                    fmt_int(w.spread.first().copied().unwrap_or(0) as u64)
-                ),
-            ));
-            t.push(tile(
-                "Distinct characters",
-                fmt_int(c.chars.unique as u64),
-                format!("{} in all", fmt_int(c.chars.total)),
-            ));
-            t.push(tile(
-                "Words for 98%",
-                fmt_int(w.cover_at[3] as u64),
-                format!("{} for 95%", fmt_int(w.cover_at[2] as u64)),
-            ));
-            if source.is_some() {
-                let d = Difficulty::from_percent(w.known_running);
-                t.push(
-                    tile(
-                        "Running words known",
-                        format!("{:.1}%", w.known_running),
-                        format!("{}, across every book", d.label()),
-                    )
-                    .color(difficulty_color(d)),
-                );
-                t.push(tile(
-                    "Words known",
-                    format!("{:.1}%", pct(w.known_words, w.vocab)),
-                    format!(
-                        "{} of {}",
-                        fmt_int(w.known_words as u64),
-                        fmt_int(w.vocab as u64)
-                    ),
-                ));
-                t.push(tile(
-                    "Characters known",
-                    format!("{:.1}%", pct(c.chars.known, c.chars.unique)),
-                    format!(
-                        "{} of {}",
-                        fmt_int(c.chars.known as u64),
-                        fmt_int(c.chars.unique as u64)
-                    ),
-                ));
-            }
-        }
-        if !t.is_empty() {
-            tiles(ui, look, cols_for(t.len()), &t);
-        }
 
-        // How hard the books are now.
-        let known_now: HashMap<&str, f64> = match (counted, source.is_some()) {
-            (Some(c), true) => c
-                .ids
-                .iter()
-                .zip(&c.words.book_known)
-                .map(|(id, &p)| (id.as_str(), p))
-                .collect(),
-            _ => HashMap::new(),
-        };
-        if !known_now.is_empty() {
-            let mut counts = [0usize; 5];
-            for (id, &p) in &known_now {
-                counts[Difficulty::from_percent(p - self.style_offset(id)) as usize] += 1;
-            }
-            ui.add_space(8.0);
-            let (r, _) = ui.allocate_exact_size(vec2(CONTENT, 16.0), Sense::hover());
-            caps(ui.painter(), r.left_top(), "Difficulty now", look.weak);
-            ui.add_space(8.0);
-            let parts: Vec<(Difficulty, usize)> = DIFFICULTIES
-                .iter()
-                .map(|&d| (d, counts[d as usize]))
-                .collect();
-            difficulty_bar(ui, look, &parts);
-            ui.add_space(GAP + 8.0);
-        }
-
-        // Charts, two side by side.
-        if let Some(c) = counted {
-            ui.columns(2, |cols| {
-                let w = &c.words;
-                let marks: Vec<(f64, usize)> = hanstat::plan::stats::COVER_AT
-                    .iter()
-                    .copied()
-                    .zip(w.cover_at)
-                    .filter(|(p, _)| *p >= 90.0)
-                    .collect();
-                let level = source.is_some().then(|| {
-                    (
-                        w.known_running,
-                        format!("You know {:.1}% of the running words", w.known_running),
-                    )
-                });
-                chart_card(
-                    &mut cols[0],
-                    look,
-                    "Vocabulary coverage",
-                    "How much of all the books the most frequent words make up (log scale)",
-                    |ui| {
-                        charts::coverage_curve(
-                            ui,
-                            &w.coverage,
-                            &marks,
-                            level,
-                            palette::accent(),
-                            "words",
-                            CHART_HEIGHT,
-                        )
-                    },
-                );
-                if known_now.is_empty() {
-                    let lens: Vec<charts::Bar> = {
-                        let mut v: Vec<&&history::Entry> = books.iter().collect();
-                        v.sort_by_key(|e| std::cmp::Reverse(length(&e.stats)));
-                        v.iter()
-                            .map(|e| charts::Bar {
-                                value: length(&e.stats) as f64,
-                                color: palette::accent(),
-                                hover: String::new(),
-                            })
-                            .collect()
-                    };
-                    chart_card(
-                        &mut cols[1],
-                        look,
-                        "Book lengths (characters)",
-                        "Longest first",
-                        |ui| charts::columns(ui, &lens, None, CHART_HEIGHT, &charts::compact),
-                    );
-                } else {
-                    let points: Vec<Point> = books
-                        .iter()
-                        .filter_map(|e| {
-                            let p = *known_now.get(e.id.as_str())?;
-                            let d = Difficulty::from_percent(p - self.style_offset(&e.id));
-                            Some(Point {
-                                x: length(&e.stats).max(1) as f64,
-                                y: p,
-                                color: difficulty_fill(d),
-                                hover: String::new(),
-                            })
-                        })
-                        .collect();
-                    let lowest = points.iter().map(|p| p.y).fold(100.0, f64::min);
-                    let y_lo = ((lowest - 2.0).min(78.0) / 5.0).floor().max(0.0) * 5.0;
-                    let mut bands = Vec::new();
-                    let mut hi = 100.0;
-                    for (lo, d) in Difficulty::BANDS {
-                        bands.push(Band {
-                            lo,
-                            hi,
-                            color: difficulty_fill(d),
-                            label: d.label(),
-                        });
-                        hi = lo;
-                    }
-                    bands.push(Band {
-                        lo: 0.0,
-                        hi,
-                        color: difficulty_fill(Difficulty::VeryHard),
-                        label: Difficulty::VeryHard.label(),
-                    });
-                    chart_card(
-                        &mut cols[1],
-                        look,
-                        "Length and difficulty",
-                        "Running words known now against length in characters (log scale)",
-                        |ui| charts::scatter(ui, &points, &bands, (y_lo, 100.0), CHART_HEIGHT),
-                    );
-                }
-            });
-        }
-
-        // Every book.
-        ui.add_space(26.0);
-        let (r, _) = ui.allocate_exact_size(vec2(CONTENT, 16.0), Sense::hover());
-        caps(ui.painter(), r.left_top(), "Books", look.weak);
-        ui.add_space(12.0);
-        let style_on = self.style_on();
-        let scores: HashMap<&str, f32> = if style_on {
-            self.style.store.current()
-        } else {
-            HashMap::new()
-        };
-        let scale = self.style_scale();
-        const CARD_H: f32 = 156.0;
-        let w = (CONTENT - GAP) / 2.0;
-        for pair in books.chunks(2) {
-            let (row, _) = ui.allocate_exact_size(vec2(CONTENT, CARD_H), Sense::hover());
-            for (i, e) in pair.iter().enumerate() {
-                let r = Rect::from_min_size(
-                    pos2(row.left() + i as f32 * (w + GAP), row.top()),
-                    vec2(w, CARD_H),
-                );
-                let style = scores
-                    .get(e.id.as_str())
-                    .map(|&x| format!("Style {}", scale.pct(x)));
-                self.book_card(
-                    ui,
-                    look,
-                    r,
-                    e,
-                    covers.get(&e.id),
-                    read_at.get(&e.id).copied(),
-                    style,
-                    speeds,
-                );
-            }
-            ui.add_space(GAP);
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn book_card(
-        &self,
-        ui: &egui::Ui,
-        look: Look,
-        r: Rect,
-        e: &history::Entry,
-        tex: Option<&TextureHandle>,
-        read: Option<u64>,
-        style: Option<String>,
-        speeds: f64,
-    ) {
-        let p = ui.painter();
-        card(p, r, look);
-        let s = &e.stats;
-        let variant = variant_of(s);
-        let (badge, lang_color) = script_badge(variant);
-        let bx = Rect::from_min_size(r.min + vec2(18.0, 18.0), vec2(86.0, r.height() - 36.0));
-        cover(ui, look, bx, tex, &e.title, lang_color);
-
-        let left = bx.right() + 20.0;
-        let width = r.right() - 20.0 - left;
-        let top = r.top() + 18.0;
-        let g = galley(p, &e.title, title_font(19.0), look.text, width, 2);
-        let title_h = g.size().y;
-        p.galley(pos2(left, top), g, look.text);
-
-        // Script, difficulty, read, writing style.
-        let y = top + title_h + 16.0;
-        let mut x = left;
-        x += pill(p, pos2(x, y), badge, 11.5, palette::cat().crust, lang_color) + 6.0;
-        if let Some(k) = &s.known {
-            let counted = k.running_words - self.style_offset(&e.id);
-            let d = Difficulty::from_percent(counted);
-            let c = difficulty_color(d);
-            x += pill(
-                p,
-                pos2(x, y),
-                &format!("{} · {:.1}% known", d.label(), k.running_words),
-                11.5,
-                c,
-                mix(c, look.card, 0.16),
-            ) + 6.0;
-        }
-        if read.is_some() {
-            let c = palette::good();
-            x += pill(
-                p,
-                pos2(x, y),
-                &format!("{} Read", crate::icons::CHECK),
-                11.5,
-                c,
-                mix(c, look.card, 0.16),
-            ) + 6.0;
-        }
-        if let Some(st) = style
-            && x + 80.0 < r.right()
-        {
-            pill(p, pos2(x, y), &st, 11.5, look.weak, look.faint);
-        }
-
-        // Figures along the bottom.
-        let figures: Vec<(&str, String)> = vec![
-            ("Characters", fmt_int(s.han_total)),
-            ("Words", fmt_int(s.words_total)),
-            ("Unique words", fmt_int(s.words_unique)),
-            ("Reading", fmt_time(reading_minutes(s, speeds))),
-        ];
-        let col = width / figures.len() as f32;
-        let bottom = r.bottom() - 18.0;
-        for (i, (label, value)) in figures.iter().enumerate() {
-            let fx = left + i as f32 * col;
-            p.text(
-                pos2(fx, bottom),
-                Align2::LEFT_BOTTOM,
-                *label,
-                regular(11.5),
-                look.weak,
-            );
-            p.text(
-                pos2(fx, bottom - 16.0),
-                Align2::LEFT_BOTTOM,
-                value,
-                bold(17.0),
-                look.text,
-            );
-        }
-    }
-
-    fn book_page(&self, ui: &mut egui::Ui, look: Look, covers: &Covers) {
-        let Some(r) = self.report.as_ref() else {
-            return;
-        };
-        let title = r
-            .title
-            .clone()
-            .or_else(|| self.path.as_deref().map(crate::file_stem))
-            .unwrap_or_default();
-        let (badge, lang_color) = script_badge(Some(r.variant));
-        let style_off = self
-            .report_id
-            .as_deref()
-            .map_or(0.0, |id| self.style_offset(id));
-        let style_rating = self
-            .style_on()
-            .then(|| {
-                let id = self.report_id.as_deref()?;
-                let s = self.style.store.get(id)?;
-                Some(format!(
-                    "Writing style {} · {}",
-                    self.style_scale().pct(s.score),
-                    s.label()
-                ))
-            })
-            .flatten();
-        let (included, sections) = (
-            self.included.iter().filter(|x| **x).count(),
-            self.included.len(),
-        );
-        // Reading speed as set on the Overview.
-        let (minutes, speed) = {
-            let v = self.cpm.unwrap_or(self.cpm()) as f64;
-            (
-                r.han_total as f64 / v,
-                format!("{v:.0} characters a minute"),
-            )
-        };
-        let cover_at = |cov: &[hanstat::analyze::Coverage], p: f64| {
-            cov.iter()
-                .find(|c| c.percent == p)
-                .map_or(0, |c| c.items as u64)
-        };
-
-        page(ui, look, |ui| {
-            // The cover and the title.
-            frame(look).inner_margin(28).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal_top(|ui| {
-                    let (bx, _) = ui.allocate_exact_size(vec2(170.0, 240.0), Sense::hover());
-                    cover(ui, look, bx, covers.get(""), &title, lang_color);
-                    ui.add_space(14.0);
-                    ui.vertical(|ui| {
-                        let (r0, _) = ui
-                            .allocate_exact_size(vec2(ui.available_width(), 16.0), Sense::hover());
-                        caps(
-                            ui.painter(),
-                            r0.left_top(),
-                            "hanstat · Book report",
-                            palette::accent(),
-                        );
-                        ui.add_space(8.0);
-                        ui.label(
-                            RichText::new(&title)
-                                .size(38.0)
-                                .family(FontFamily::Name(TITLE.into()))
-                                .color(look.text),
-                        );
-                        ui.add_space(12.0);
-                        let mut items = vec![(badge.to_owned(), palette::cat().crust, lang_color)];
-                        items.push((r.format.to_owned(), look.weak, look.faint));
-                        items.push((r.segmenter.label().to_owned(), look.weak, look.faint));
-                        items.push((
-                            format!("{included} of {sections} sections"),
-                            look.weak,
-                            look.faint,
-                        ));
-                        pills(ui, &items, 12.5);
-                        ui.add_space(18.0);
-                        if let Some(c) = &r.anki {
-                            let p_known = c.running_words.percent();
-                            let counted = p_known - style_off;
-                            let d = Difficulty::from_percent(counted);
-                            ui.label(bold_text(d.label(), 30.0, difficulty_color(d)));
-                            ui.add_space(4.0);
-                            let mut sub = format!(
-                                "{} · {p_known:.1}% of running words known",
-                                d.description()
-                            );
-                            if let Some(s) = &style_rating {
-                                sub.push_str(&format!(" · {s}"));
-                            }
-                            ui.label(RichText::new(sub).size(14.5).color(look.weak));
-                            ui.add_space(6.0);
-                            gauge(ui, look, p_known, counted);
-                        } else if let Some(s) = &style_rating {
-                            ui.label(RichText::new(s).size(15.0).color(look.weak));
-                        }
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new(format!(
-                                "About {} of reading at {speed}",
-                                fmt_time(minutes)
-                            ))
-                            .size(15.0)
-                            .color(look.text),
-                        );
-                    });
-                });
-            });
-
-            // The text.
-            section(ui, look, "The text", "");
-            let mut t = vec![tile(
+        section(ui, look, "At a glance", "Every book's last analysis");
+        let han: u64 = entries.iter().map(|e| e.stats.han_total).sum();
+        let words: u64 = entries.iter().map(|e| e.stats.words_total).sum();
+        let minutes: f64 = entries
+            .iter()
+            .map(|e| reading_minutes(&e.stats, speeds))
+            .sum();
+        let read = entries
+            .iter()
+            .filter(|e| read_at.contains_key(&e.id))
+            .count();
+        let mut t = vec![
+            tile(
                 "Characters",
-                fmt_int(r.han_total),
-                format!(
-                    "{} unique · {} once",
-                    fmt_int(r.han_unique as u64),
-                    fmt_int(r.han_hapax as u64)
-                ),
-            )];
-            t.push(tile(
+                fmt_int(han),
+                format!("{} per book", fmt_int(han / books.max(1) as u64)),
+            ),
+            tile(
                 "Words",
-                fmt_int(r.words_total),
-                format!(
-                    "{} unique · {} once",
-                    fmt_int(r.words_unique as u64),
-                    fmt_int(r.words_hapax as u64)
-                ),
-            ));
-            t.push(tile(
-                "Characters for 99%",
-                fmt_int(cover_at(&r.char_coverage, 99.0)),
-                format!("{} for 95%", fmt_int(cover_at(&r.char_coverage, 95.0))),
-            ));
-            t.push(tile(
-                "Words for 98%",
-                fmt_int(cover_at(&r.word_coverage, 98.0)),
-                format!("{} for 95%", fmt_int(cover_at(&r.word_coverage, 95.0))),
-            ));
-            t.push(tile(
+                fmt_int(words),
+                format!("{} per book", fmt_int(words / books.max(1) as u64)),
+            ),
+            tile(
                 "Reading time",
                 fmt_time(minutes),
-                format!("at {speed}"),
-            ));
-            t.push(tile(
-                "Sentences",
-                fmt_int(r.sentences),
-                format!("{:.1} characters each", r.avg_sentence_han),
-            ));
-            t.push(tile(
-                "Paragraphs",
-                fmt_int(r.paragraphs),
-                format!("{:.1} characters each", r.avg_paragraph_han),
-            ));
-            t.push(tile(
-                "Average word",
-                format!("{:.2}", r.avg_word_len),
-                "characters long",
-            ));
-            tiles(ui, look, cols_for(t.len()), &t);
+                format!("{:.0} days of reading 1 h a day", minutes / 60.0),
+            ),
+            tile(
+                "Books read",
+                fmt_int(read as u64),
+                format!(
+                    "{:.0}% of the {} books",
+                    pct(read, books),
+                    fmt_int(books as u64)
+                ),
+            )
+            .color(if read > 0 { palette::good() } else { look.text }),
+        ];
+        if let Some(e) = entries.iter().max_by_key(|e| length(&e.stats)) {
+            t.push(
+                tile(
+                    "Longest book",
+                    e.title.clone(),
+                    format!("{} characters", fmt_int(length(&e.stats))),
+                )
+                .book(),
+            );
+        }
+        tiles(ui, look, 3, &t);
 
-            // What is known.
-            if let Some(c) = &r.anki {
-                let lists = &c.listed.source;
-                let source = match (c.from_anki, lists.is_empty()) {
-                    (true, true) => "Anki".to_owned(),
-                    (true, false) => format!("Anki + {lists}"),
-                    (false, _) => lists.clone(),
-                };
-                section(
-                    ui,
-                    look,
-                    "What you know",
-                    &format!("Known from {source}; names are left out"),
-                );
-                let rw = &c.running_words;
-                let unknown = rw.not_known();
-                let d = Difficulty::from_percent(rw.percent() - style_off);
-                let mut t = vec![
-                    tile(
-                        "Running words known",
-                        format!("{:.1}%", rw.percent()),
-                        if unknown > 0 {
-                            format!(
-                                "1 unknown every {:.1} words",
-                                rw.total as f64 / unknown as f64
-                            )
-                        } else {
-                            "no unknown words".to_owned()
-                        },
+        draw_vocabulary_block(
+            ui,
+            look,
+            covers,
+            entries,
+            read_at,
+            counted,
+            speeds,
+            style_scores,
+            style_offsets,
+            style_scale,
+        );
+    });
+}
+
+/// The books' vocabulary against what is known now, then every book.
+#[allow(clippy::too_many_arguments)]
+fn draw_vocabulary_block(
+    ui: &mut egui::Ui,
+    look: Look,
+    covers: &Covers,
+    entries: &[history::Entry],
+    read_at: &HashMap<String, u64>,
+    counted: Option<&Counted>,
+    speeds: f64,
+    style_scores: &HashMap<String, f32>,
+    style_offsets: &HashMap<String, f64>,
+    style_scale: &crate::style_scale::StyleScale,
+) {
+    let books: Vec<&history::Entry> = entries.iter().collect();
+    let source = counted.and_then(|c| c.source.as_deref());
+    let style_offset = |id: &str| style_offsets.get(id).copied().unwrap_or(0.0);
+
+    section(
+        ui,
+        look,
+        "Vocabulary",
+        &match source {
+            Some(s) => format!("The books' words; known now: {s}"),
+            None => "The books' words".to_owned(),
+        },
+    );
+    let mut t = Vec::new();
+    if let Some(c) = counted {
+        let w = &c.words;
+        t.push(tile(
+            "Distinct words",
+            fmt_int(w.vocab as u64),
+            format!(
+                "{} in one book only",
+                fmt_int(w.spread.first().copied().unwrap_or(0) as u64)
+            ),
+        ));
+        t.push(tile(
+            "Distinct characters",
+            fmt_int(c.chars.unique as u64),
+            format!("{} in all", fmt_int(c.chars.total)),
+        ));
+        t.push(tile(
+            "Words for 98%",
+            fmt_int(w.cover_at[3] as u64),
+            format!("{} for 95%", fmt_int(w.cover_at[2] as u64)),
+        ));
+        if source.is_some() {
+            let d = Difficulty::from_percent(w.known_running);
+            t.push(
+                tile(
+                    "Running words known",
+                    format!("{:.1}%", w.known_running),
+                    format!("{}, across every book", d.label()),
+                )
+                .color(difficulty_color(d)),
+            );
+            t.push(tile(
+                "Words known",
+                format!("{:.1}%", pct(w.known_words, w.vocab)),
+                format!(
+                    "{} of {}",
+                    fmt_int(w.known_words as u64),
+                    fmt_int(w.vocab as u64)
+                ),
+            ));
+            t.push(tile(
+                "Characters known",
+                format!("{:.1}%", pct(c.chars.known, c.chars.unique)),
+                format!(
+                    "{} of {}",
+                    fmt_int(c.chars.known as u64),
+                    fmt_int(c.chars.unique as u64)
+                ),
+            ));
+        }
+    }
+    if !t.is_empty() {
+        tiles(ui, look, cols_for(t.len()), &t);
+    }
+
+    // How hard the books are now.
+    let known_now: HashMap<&str, f64> = match (counted, source.is_some()) {
+        (Some(c), true) => c
+            .ids
+            .iter()
+            .zip(&c.words.book_known)
+            .map(|(id, &p)| (id.as_str(), p))
+            .collect(),
+        _ => HashMap::new(),
+    };
+    if !known_now.is_empty() {
+        let mut counts = [0usize; 5];
+        for (id, &p) in &known_now {
+            counts[Difficulty::from_percent(p - style_offset(id)) as usize] += 1;
+        }
+        ui.add_space(8.0);
+        let (r, _) = ui.allocate_exact_size(vec2(CONTENT, 16.0), Sense::hover());
+        caps(ui.painter(), r.left_top(), "Difficulty now", look.weak);
+        ui.add_space(8.0);
+        let parts: Vec<(Difficulty, usize)> = DIFFICULTIES
+            .iter()
+            .map(|&d| (d, counts[d as usize]))
+            .collect();
+        difficulty_bar(ui, look, &parts);
+        ui.add_space(GAP + 8.0);
+    }
+
+    // Charts, two side by side.
+    if let Some(c) = counted {
+        ui.columns(2, |cols| {
+            let w = &c.words;
+            let marks: Vec<(f64, usize)> = hanstat::plan::stats::COVER_AT
+                .iter()
+                .copied()
+                .zip(w.cover_at)
+                .filter(|(p, _)| *p >= 90.0)
+                .collect();
+            let level = source.is_some().then(|| {
+                (
+                    w.known_running,
+                    format!("You know {:.1}% of the running words", w.known_running),
+                )
+            });
+            chart_card(
+                &mut cols[0],
+                look,
+                "Vocabulary coverage",
+                "How much of all the books the most frequent words make up (log scale)",
+                |ui| {
+                    charts::coverage_curve(
+                        ui,
+                        &w.coverage,
+                        &marks,
+                        level,
+                        palette::accent(),
+                        "words",
+                        CHART_HEIGHT,
                     )
-                    .color(difficulty_color(d)),
-                    tile(
-                        "Unique words known",
-                        format!("{:.1}%", c.unique_words.percent()),
-                        format!(
-                            "{} of {} · {} not known",
-                            fmt_int(c.unique_words.known),
-                            fmt_int(c.unique_words.total),
-                            fmt_int(c.unique_words.not_known())
-                        ),
-                    ),
-                ];
-                t.push(tile(
-                    "Characters known",
-                    format!("{:.1}%", c.unique_chars.percent()),
-                    format!(
-                        "{} of {}",
-                        fmt_int(c.unique_chars.known),
-                        fmt_int(c.unique_chars.total)
-                    ),
-                ));
-                t.push(tile("Difficulty", d.label(), d.description()).color(difficulty_color(d)));
-                tiles(ui, look, cols_for(t.len()), &t);
-            }
-
-            // Coverage: the curve and the table.
-            ui.add_space(GAP);
-            ui.columns(2, |cols| {
-                let counts: Vec<u32> = r.word_freq.iter().map(|x| x.1).collect();
-                let pts = coverage_points(&counts);
-                let marks: Vec<(f64, usize)> = [95.0, 98.0]
-                    .into_iter()
-                    .map(|p| (p, cover_at(&r.word_coverage, p) as usize))
-                    .filter(|x| x.1 > 0)
-                    .collect();
-                let level = r.anki.as_ref().map(|c| {
-                    let p = c.running_words.percent();
-                    (p, format!("You know {p:.1}% of the running words"))
-                });
-                // The table first: the curve fills a card as tall as it.
-                let table = chart_card(
+                },
+            );
+            if known_now.is_empty() {
+                let lens: Vec<charts::Bar> = {
+                    let mut v: Vec<&&history::Entry> = books.iter().collect();
+                    v.sort_by_key(|e| std::cmp::Reverse(length(&e.stats)));
+                    v.iter()
+                        .map(|e| charts::Bar {
+                            value: length(&e.stats) as f64,
+                            color: palette::accent(),
+                            hover: String::new(),
+                        })
+                        .collect()
+                };
+                chart_card(
                     &mut cols[1],
                     look,
-                    "Words to know",
-                    "The most frequent items needed to recognise a share of the running text",
-                    |ui| coverage_table(ui, look, r),
+                    "Book lengths (characters)",
+                    "Longest first",
+                    |ui| charts::columns(ui, &lens, None, CHART_HEIGHT, &charts::compact),
                 );
-                sized_card(
-                    &mut cols[0],
+            } else {
+                let points: Vec<Point> = books
+                    .iter()
+                    .filter_map(|e| {
+                        let p = *known_now.get(e.id.as_str())?;
+                        let d = Difficulty::from_percent(p - style_offset(&e.id));
+                        Some(Point {
+                            x: length(&e.stats).max(1) as f64,
+                            y: p,
+                            color: difficulty_fill(d),
+                            hover: String::new(),
+                        })
+                    })
+                    .collect();
+                let lowest = points.iter().map(|p| p.y).fold(100.0, f64::min);
+                let y_lo = ((lowest - 2.0).min(78.0) / 5.0).floor().max(0.0) * 5.0;
+                let mut bands = Vec::new();
+                let mut hi = 100.0;
+                for (lo, d) in Difficulty::BANDS {
+                    bands.push(Band {
+                        lo,
+                        hi,
+                        color: difficulty_fill(d),
+                        label: d.label(),
+                    });
+                    hi = lo;
+                }
+                bands.push(Band {
+                    lo: 0.0,
+                    hi,
+                    color: difficulty_fill(Difficulty::VeryHard),
+                    label: Difficulty::VeryHard.label(),
+                });
+                chart_card(
+                    &mut cols[1],
                     look,
-                    "Vocabulary coverage",
-                    "How much of the text its most frequent words make up (log scale)",
-                    Some(table),
-                    |ui, height| {
-                        charts::coverage_curve(
-                            ui,
-                            &pts,
-                            &marks,
-                            level,
-                            palette::accent(),
-                            "words",
-                            height,
-                        )
-                    },
+                    "Length and difficulty",
+                    "Running words known now against length in characters (log scale)",
+                    |ui| charts::scatter(ui, &points, &bands, (y_lo, 100.0), CHART_HEIGHT),
                 );
-            });
+            }
         });
     }
+
+    // Every book.
+    ui.add_space(26.0);
+    let (r, _) = ui.allocate_exact_size(vec2(CONTENT, 16.0), Sense::hover());
+    caps(ui.painter(), r.left_top(), "Books", look.weak);
+    ui.add_space(12.0);
+    const CARD_H: f32 = 156.0;
+    let w = (CONTENT - GAP) / 2.0;
+    for pair in books.chunks(2) {
+        let (row, _) = ui.allocate_exact_size(vec2(CONTENT, CARD_H), Sense::hover());
+        for (i, e) in pair.iter().enumerate() {
+            let r = Rect::from_min_size(
+                pos2(row.left() + i as f32 * (w + GAP), row.top()),
+                vec2(w, CARD_H),
+            );
+            let style = style_scores
+                .get(e.id.as_str())
+                .map(|&x| format!("Style {}", style_scale.pct(x)));
+            draw_book_card(
+                ui,
+                look,
+                r,
+                e,
+                covers.get(&e.id),
+                read_at.get(&e.id).copied(),
+                style,
+                style_offset(&e.id),
+                speeds,
+            );
+        }
+        ui.add_space(GAP);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_book_card(
+    ui: &egui::Ui,
+    look: Look,
+    r: Rect,
+    e: &history::Entry,
+    tex: Option<&TextureHandle>,
+    read: Option<u64>,
+    style: Option<String>,
+    style_off: f64,
+    speeds: f64,
+) {
+    let p = ui.painter();
+    card(p, r, look);
+    let s = &e.stats;
+    let variant = variant_of(s);
+    let (badge, lang_color) = script_badge(variant);
+    let bx = Rect::from_min_size(r.min + vec2(18.0, 18.0), vec2(86.0, r.height() - 36.0));
+    cover(ui, look, bx, tex, &e.title, lang_color);
+
+    let left = bx.right() + 20.0;
+    let width = r.right() - 20.0 - left;
+    let top = r.top() + 18.0;
+    let g = galley(p, &e.title, title_font(19.0), look.text, width, 2);
+    let title_h = g.size().y;
+    p.galley(pos2(left, top), g, look.text);
+
+    // Script, difficulty, read, writing style.
+    let y = top + title_h + 16.0;
+    let mut x = left;
+    x += pill(p, pos2(x, y), badge, 11.5, palette::cat().crust, lang_color) + 6.0;
+    if let Some(k) = &s.known {
+        let counted = k.running_words - style_off;
+        let d = Difficulty::from_percent(counted);
+        let c = difficulty_color(d);
+        x += pill(
+            p,
+            pos2(x, y),
+            &format!("{} · {:.1}% known", d.label(), k.running_words),
+            11.5,
+            c,
+            mix(c, look.card, 0.16),
+        ) + 6.0;
+    }
+    if read.is_some() {
+        let c = palette::good();
+        x += pill(
+            p,
+            pos2(x, y),
+            &format!("{} Read", crate::icons::CHECK),
+            11.5,
+            c,
+            mix(c, look.card, 0.16),
+        ) + 6.0;
+    }
+    if let Some(st) = style
+        && x + 80.0 < r.right()
+    {
+        pill(p, pos2(x, y), &st, 11.5, look.weak, look.faint);
+    }
+
+    // Figures along the bottom.
+    let figures: Vec<(&str, String)> = vec![
+        ("Characters", fmt_int(s.han_total)),
+        ("Words", fmt_int(s.words_total)),
+        ("Unique words", fmt_int(s.words_unique)),
+        ("Reading", fmt_time(reading_minutes(s, speeds))),
+    ];
+    let col = width / figures.len() as f32;
+    let bottom = r.bottom() - 18.0;
+    for (i, (label, value)) in figures.iter().enumerate() {
+        let fx = left + i as f32 * col;
+        p.text(
+            pos2(fx, bottom),
+            Align2::LEFT_BOTTOM,
+            *label,
+            regular(11.5),
+            look.weak,
+        );
+        p.text(
+            pos2(fx, bottom - 16.0),
+            Align2::LEFT_BOTTOM,
+            value,
+            bold(17.0),
+            look.text,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_book_page(
+    ui: &mut egui::Ui,
+    look: Look,
+    covers: &Covers,
+    r: &hanstat::analyze::Report,
+    title: &str,
+    style_off: f64,
+    style_rating: Option<&str>,
+    included: usize,
+    sections: usize,
+    minutes: f64,
+    speed: &str,
+) {
+    let (badge, lang_color) = script_badge(Some(r.variant));
+    let cover_at = |cov: &[hanstat::analyze::Coverage], p: f64| {
+        cov.iter()
+            .find(|c| c.percent == p)
+            .map_or(0, |c| c.items as u64)
+    };
+
+    page(ui, look, |ui| {
+        // The cover and the title.
+        frame(look).inner_margin(28).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_top(|ui| {
+                let (bx, _) = ui.allocate_exact_size(vec2(170.0, 240.0), Sense::hover());
+                cover(ui, look, bx, covers.get(""), title, lang_color);
+                ui.add_space(14.0);
+                ui.vertical(|ui| {
+                    let (r0, _) =
+                        ui.allocate_exact_size(vec2(ui.available_width(), 16.0), Sense::hover());
+                    caps(
+                        ui.painter(),
+                        r0.left_top(),
+                        "hanstat · Book report",
+                        palette::accent(),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(title)
+                            .size(38.0)
+                            .family(FontFamily::Name(TITLE.into()))
+                            .color(look.text),
+                    );
+                    ui.add_space(12.0);
+                    let mut items = vec![(badge.to_owned(), palette::cat().crust, lang_color)];
+                    items.push((r.format.to_owned(), look.weak, look.faint));
+                    items.push((r.segmenter.label().to_owned(), look.weak, look.faint));
+                    items.push((
+                        format!("{included} of {sections} sections"),
+                        look.weak,
+                        look.faint,
+                    ));
+                    pills(ui, &items, 12.5);
+                    ui.add_space(18.0);
+                    if let Some(c) = &r.anki {
+                        let p_known = c.running_words.percent();
+                        let counted = p_known - style_off;
+                        let d = Difficulty::from_percent(counted);
+                        ui.label(bold_text(d.label(), 30.0, difficulty_color(d)));
+                        ui.add_space(4.0);
+                        let mut sub =
+                            format!("{} · {p_known:.1}% of running words known", d.description());
+                        if let Some(s) = style_rating {
+                            sub.push_str(&format!(" · {s}"));
+                        }
+                        ui.label(RichText::new(sub).size(14.5).color(look.weak));
+                        ui.add_space(6.0);
+                        gauge(ui, look, p_known, counted);
+                    } else if let Some(s) = style_rating {
+                        ui.label(RichText::new(s).size(15.0).color(look.weak));
+                    }
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(format!("About {} of reading at {speed}", fmt_time(minutes)))
+                            .size(15.0)
+                            .color(look.text),
+                    );
+                });
+            });
+        });
+
+        // The text.
+        section(ui, look, "The text", "");
+        let mut t = vec![tile(
+            "Characters",
+            fmt_int(r.han_total),
+            format!(
+                "{} unique · {} once",
+                fmt_int(r.han_unique as u64),
+                fmt_int(r.han_hapax as u64)
+            ),
+        )];
+        t.push(tile(
+            "Words",
+            fmt_int(r.words_total),
+            format!(
+                "{} unique · {} once",
+                fmt_int(r.words_unique as u64),
+                fmt_int(r.words_hapax as u64)
+            ),
+        ));
+        t.push(tile(
+            "Characters for 99%",
+            fmt_int(cover_at(&r.char_coverage, 99.0)),
+            format!("{} for 95%", fmt_int(cover_at(&r.char_coverage, 95.0))),
+        ));
+        t.push(tile(
+            "Words for 98%",
+            fmt_int(cover_at(&r.word_coverage, 98.0)),
+            format!("{} for 95%", fmt_int(cover_at(&r.word_coverage, 95.0))),
+        ));
+        t.push(tile(
+            "Reading time",
+            fmt_time(minutes),
+            format!("at {speed}"),
+        ));
+        t.push(tile(
+            "Sentences",
+            fmt_int(r.sentences),
+            format!("{:.1} characters each", r.avg_sentence_han),
+        ));
+        t.push(tile(
+            "Paragraphs",
+            fmt_int(r.paragraphs),
+            format!("{:.1} characters each", r.avg_paragraph_han),
+        ));
+        t.push(tile(
+            "Average word",
+            format!("{:.2}", r.avg_word_len),
+            "characters long",
+        ));
+        tiles(ui, look, cols_for(t.len()), &t);
+
+        // What is known.
+        if let Some(c) = &r.anki {
+            let lists = &c.listed.source;
+            let source = match (c.from_anki, lists.is_empty()) {
+                (true, true) => "Anki".to_owned(),
+                (true, false) => format!("Anki + {lists}"),
+                (false, _) => lists.clone(),
+            };
+            section(
+                ui,
+                look,
+                "What you know",
+                &format!("Known from {source}; names are left out"),
+            );
+            let rw = &c.running_words;
+            let unknown = rw.not_known();
+            let d = Difficulty::from_percent(rw.percent() - style_off);
+            let mut t = vec![
+                tile(
+                    "Running words known",
+                    format!("{:.1}%", rw.percent()),
+                    if unknown > 0 {
+                        format!(
+                            "1 unknown every {:.1} words",
+                            rw.total as f64 / unknown as f64
+                        )
+                    } else {
+                        "no unknown words".to_owned()
+                    },
+                )
+                .color(difficulty_color(d)),
+                tile(
+                    "Unique words known",
+                    format!("{:.1}%", c.unique_words.percent()),
+                    format!(
+                        "{} of {} · {} not known",
+                        fmt_int(c.unique_words.known),
+                        fmt_int(c.unique_words.total),
+                        fmt_int(c.unique_words.not_known())
+                    ),
+                ),
+            ];
+            t.push(tile(
+                "Characters known",
+                format!("{:.1}%", c.unique_chars.percent()),
+                format!(
+                    "{} of {}",
+                    fmt_int(c.unique_chars.known),
+                    fmt_int(c.unique_chars.total)
+                ),
+            ));
+            t.push(tile("Difficulty", d.label(), d.description()).color(difficulty_color(d)));
+            tiles(ui, look, cols_for(t.len()), &t);
+        }
+
+        // Coverage: the curve and the table.
+        ui.add_space(GAP);
+        ui.columns(2, |cols| {
+            let counts: Vec<u32> = r.word_freq.iter().map(|x| x.1).collect();
+            let pts = coverage_points(&counts);
+            let marks: Vec<(f64, usize)> = [95.0, 98.0]
+                .into_iter()
+                .map(|p| (p, cover_at(&r.word_coverage, p) as usize))
+                .filter(|x| x.1 > 0)
+                .collect();
+            let level = r.anki.as_ref().map(|c| {
+                let p = c.running_words.percent();
+                (p, format!("You know {p:.1}% of the running words"))
+            });
+            // The table first: the curve fills a card as tall as it.
+            let table = chart_card(
+                &mut cols[1],
+                look,
+                "Words to know",
+                "The most frequent items needed to recognise a share of the running text",
+                |ui| coverage_table(ui, look, r),
+            );
+            sized_card(
+                &mut cols[0],
+                look,
+                "Vocabulary coverage",
+                "How much of the text its most frequent words make up (log scale)",
+                Some(table),
+                |ui, height| {
+                    charts::coverage_curve(
+                        ui,
+                        &pts,
+                        &marks,
+                        level,
+                        palette::accent(),
+                        "words",
+                        height,
+                    )
+                },
+            );
+        });
+    });
 }
 
 /// Rows of coverage: percent, characters, words.

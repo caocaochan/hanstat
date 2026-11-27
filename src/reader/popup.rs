@@ -120,6 +120,8 @@ pub struct Level {
     /// Heights of the parts laid out so far (the rest are estimated until
     /// they scroll into view).
     heights: HashMap<(usize, usize), f32>,
+    /// `(content_w.to_bits(), size.to_bits())` that `heights` were measured for.
+    heights_key: (u32, u32),
     /// Where it was drawn.
     pub rect: Option<Rect>,
     /// Put above the other popups (once, when it first shows).
@@ -128,6 +130,7 @@ pub struct Level {
     /// of the popup it replaces otherwise).
     fresh: bool,
     /// How far its entries are scrolled.
+    #[cfg(test)]
     pub scroll_y: f32,
     /// Where its Anki buttons and its entries' scroll area (the bar at its
     /// right) were drawn.
@@ -217,10 +220,12 @@ pub struct Popup {
     /// The page word's box on screen this frame (where the first popup goes).
     pub anchor: Option<Rect>,
     /// The last lookup's time on the lookup thread.
+    #[cfg(test)]
     pub last_micros: u64,
     /// With no key: the character the pointer rests on, since when.
     rest: Option<(Origin, f64)>,
     /// Time to build and lay out the entries drawn last frame (ms).
+    #[cfg(test)]
     pub last_layout_ms: f32,
     /// Lines to scroll the top popup by (↑ ↓), taken when it is drawn.
     pub scroll_lines: i32,
@@ -495,8 +500,10 @@ impl Popup {
             asked: None,
             levels: Vec::new(),
             anchor: None,
+            #[cfg(test)]
             last_micros: 0,
             rest: None,
+            #[cfg(test)]
             last_layout_ms: 0.0,
             scroll_lines: 0,
             size: None,
@@ -608,7 +615,12 @@ impl Popup {
                 self.levels.clear();
             }
             Reply::Lookup { id, result, micros } => {
-                self.last_micros = micros;
+                #[cfg(test)]
+                {
+                    self.last_micros = micros;
+                }
+                #[cfg(not(test))]
+                let _ = micros;
                 let Some(a) = &self.asked else { return };
                 if a.id != id {
                     return;
@@ -635,9 +647,11 @@ impl Popup {
                     details: HashMap::new(),
                     bars: HashSet::new(),
                     heights: HashMap::new(),
+                    heights_key: (0, 0),
                     rect: None,
                     raised: false,
                     fresh: true,
+                    #[cfg(test)]
                     scroll_y: 0.0,
                     #[cfg(test)]
                     drawn: (Vec::new(), Rect::NOTHING),
@@ -846,6 +860,7 @@ impl Popup {
             self.levels.truncate(top + 1);
             self.asked = None;
         }
+        #[cfg(test)]
         let t = std::time::Instant::now();
         let mut level = 0;
         while level < self.levels.len() {
@@ -882,7 +897,10 @@ impl Popup {
                 l.raised = true;
             }
         }
-        self.last_layout_ms = t.elapsed().as_secs_f32() * 1e3;
+        #[cfg(test)]
+        {
+            self.last_layout_ms = t.elapsed().as_secs_f32() * 1e3;
+        }
     }
 
     /// Draw popup `level` beside `anchor`; returns a lookup asked from it.
@@ -966,13 +984,17 @@ impl Popup {
         // Dictionaries' colours as they are (as before themes).
         entry_params.page = look.base;
         entry_params.dark = false;
+        let hkey = (content_w.to_bits(), size.to_bits());
+        if self.levels[level].heights_key != hkey {
+            self.levels[level].heights.clear();
+            self.levels[level].heights_key = hkey;
+        }
         let result = self.levels[level].result.clone();
         // The word a child popup was opened for: (group, part, src, len).
         let child_hl = self.levels.get(level + 1).and_then(|c| match c.origin {
             Origin::Popup((l, g, p, src)) if l == level => Some((g, p, src, c.result.matched())),
             _ => None,
         });
-        let dicts = self.dicts.clone();
         // ↑ ↓ scroll the topmost popup.
         let scroll = if level + 1 == self.levels.len() {
             std::mem::take(&mut self.scroll_lines)
@@ -987,6 +1009,7 @@ impl Popup {
             .iter()
             .map(|g| self.known_state(&book_word(&result, g)))
             .collect();
+        let dicts = &self.dicts;
         let cards = &self.cards;
         let card_ready = cards.cfg.ready();
         let mut toggle_bar = None;
@@ -1002,6 +1025,7 @@ impl Popup {
         let clicked = ctx.input(|i| i.pointer.primary_clicked());
         let ppp = ctx.pixels_per_point();
         let fresh = self.levels[level].fresh;
+        #[cfg(test)]
         let mut scroll_y = 0.0;
         #[cfg(test)]
         let mut drawn = (Vec::new(), Rect::NOTHING);
@@ -1028,6 +1052,13 @@ impl Popup {
                     .inner_margin(egui::Margin::symmetric(12, 10))
                     .show(ui, |ui| {
                         ui.set_width(inner_w);
+                        if let Some(err) = &cards.browse_error {
+                            ui.label(
+                                RichText::new(format!("Anki browser: {err}"))
+                                    .size(size * 0.8)
+                                    .color(look.red),
+                            );
+                        }
                         // Above its word, a popup takes all the room there: its
                         // bottom stays by the word whatever its entries' height
                         // (egui places it from last frame's size).
@@ -1040,7 +1071,10 @@ impl Popup {
                             scroll_area = scroll_area.vertical_scroll_offset(0.0);
                         }
                         let _shown = scroll_area.show(ui, |ui| {
-                            scroll_y = (ui.clip_rect().top() - ui.cursor().top()).max(0.0);
+                            #[cfg(test)]
+                            {
+                                scroll_y = (ui.clip_rect().top() - ui.cursor().top()).max(0.0);
+                            }
                             ui.spacing_mut().item_spacing.y = 4.0;
                             // Headers (their Anki buttons) and rules too.
                             ui.set_max_width(content_w);
@@ -1063,7 +1097,7 @@ impl Popup {
                                     ui,
                                     gi,
                                     g,
-                                    &dicts,
+                                    dicts,
                                     size,
                                     show_freq,
                                     card,
@@ -1117,15 +1151,27 @@ impl Popup {
                                     if !open {
                                         continue;
                                     }
-                                    // Below the view (and a screen more): its height
-                                    // as last laid out, or estimated; laid out once
-                                    // it scrolls near.
+                                    // Below or above the view: reuse the measured (or
+                                    // estimated) height without laying out or hashing.
                                     let clip = ui.clip_rect();
-                                    if ui.cursor().top() > clip.bottom() + max_h {
+                                    let top = ui.cursor().top();
+                                    if top > clip.bottom() + max_h {
                                         let h = lvl.heights.get(&(gi, pi)).copied().unwrap_or_else(
                                             || estimate(&p.glossaries, content_w, size),
                                         );
-                                        ui.allocate_exact_size(vec2(content_w, h), Sense::hover());
+                                        ui.allocate_exact_size(
+                                            vec2(content_w, h.max(1.0)),
+                                            Sense::hover(),
+                                        );
+                                        continue;
+                                    }
+                                    if let Some(&h) = lvl.heights.get(&(gi, pi))
+                                        && top + h.max(1.0) < clip.top() - 2.0
+                                    {
+                                        ui.allocate_exact_size(
+                                            vec2(content_w, h.max(1.0)),
+                                            Sense::hover(),
+                                        );
                                         continue;
                                     }
                                     let empty = HashSet::new();
@@ -1137,7 +1183,9 @@ impl Popup {
                                         opened,
                                         &entry_params,
                                     );
-                                    heights.push(((gi, pi), e.height));
+                                    if lvl.heights.get(&(gi, pi)) != Some(&e.height) {
+                                        heights.push(((gi, pi), e.height));
+                                    }
                                     let (rect, _) = ui.allocate_exact_size(
                                         vec2(content_w, e.height.max(1.0)),
                                         Sense::hover(),
@@ -1296,12 +1344,12 @@ impl Popup {
         }
         let l = &mut self.levels[level];
         l.fresh = false;
-        l.scroll_y = scroll_y;
-        l.rect = Some(area.response.rect);
         #[cfg(test)]
         {
+            l.scroll_y = scroll_y;
             l.drawn = drawn;
         }
+        l.rect = Some(area.response.rect);
         l.heights.extend(heights);
         if let Some(b) = toggle_bar
             && !l.bars.remove(&b)
@@ -1309,6 +1357,7 @@ impl Popup {
             l.bars.insert(b);
         }
         if let Some((g, p, n)) = toggle_details {
+            l.heights.remove(&(g, p));
             let s = l.details.entry((g, p)).or_default();
             if !s.remove(&n) {
                 s.insert(n);

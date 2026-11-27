@@ -213,7 +213,6 @@ pub fn load(bytes: &[u8], choice: EncodingChoice) -> Book {
         format: "TXT",
         sections,
         notes,
-        decode_errors,
         cover: None,
     }
 }

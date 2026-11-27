@@ -192,28 +192,6 @@ pub fn discover_cancellable(
     discover_impl(book, included, word_freq, known, opts, &is_general, cancel)
 }
 
-/// [`discover`] with another general dictionary: `is_general` says whether a
-/// string (in the book's script) is a word of the general language.
-pub fn discover_with(
-    book: &Book,
-    included: &[bool],
-    word_freq: &[(String, u32)],
-    known: &HashSet<String>,
-    opts: &Options,
-    is_general: &(dyn Fn(&str) -> bool + Sync),
-) -> Vec<Candidate> {
-    discover_impl(
-        book,
-        included,
-        word_freq,
-        known,
-        opts,
-        is_general,
-        &AtomicBool::new(false),
-    )
-    .unwrap_or_default()
-}
-
 fn discover_impl(
     book: &Book,
     included: &[bool],
@@ -297,9 +275,9 @@ fn discover_impl(
 
     // Cohesion filter (cheap, frequency-only).
     let get = |cs: &[char]| freq[cs.len()].get(&key(cs)).copied().unwrap_or(0) as f64;
-    // key -> (cohesion, dependency, left neighbours, right neighbours)
     type Neighbours = FxHashMap<u32, u32>;
-    let mut cand: FxHashMap<u128, (f64, f64, Neighbours, Neighbours)> = FxHashMap::default();
+    let mut cand_meta: Vec<(u128, f64, f64)> = Vec::new();
+    let mut cand_by_len: Vec<FxHashMap<u128, usize>> = vec![FxHashMap::default(); MAX_N + 1];
     for n in 2..=MAX_N {
         for (&k, &f) in &freq[n] {
             let cs: Vec<char> = unkey(k).chars().collect();
@@ -313,7 +291,9 @@ fn discover_impl(
                 .map(|s| f as f64 / get(&cs[..s]).min(get(&cs[s..])).max(1.0))
                 .fold(f64::INFINITY, f64::min);
             if coh >= 20.0 {
-                cand.insert(k, (coh, dep, FxHashMap::default(), FxHashMap::default()));
+                let idx = cand_meta.len();
+                cand_meta.push((k, coh, dep));
+                cand_by_len[n].insert(k, idx);
             }
         }
     }
@@ -322,30 +302,65 @@ fn discover_impl(
         return None;
     }
     // Neighbour distributions for surviving candidates.
-    for r in &runs {
-        for n in 2..=MAX_N.min(r.len()) {
-            for i in 0..=r.len() - n {
-                if let Some((_, _, l, rt)) = cand.get_mut(&key(&r[i..i + n])) {
-                    *l.entry(if i == 0 { EDGE } else { r[i - 1] as u32 })
-                        .or_default() += 1;
-                    *rt.entry(if i + n == r.len() {
-                        EDGE
-                    } else {
-                        r[i + n] as u32
-                    })
-                    .or_default() += 1;
-                }
-            }
-        }
-    }
+    let n_cands = cand_meta.len();
+    let neighbours: Vec<(Neighbours, Neighbours)> = if n_cands == 0 {
+        Vec::new()
+    } else {
+        runs.par_chunks(512)
+            .fold(
+                || vec![(FxHashMap::default(), FxHashMap::default()); n_cands],
+                |mut acc, chunk| {
+                    if cancelled() {
+                        return acc;
+                    }
+                    for r in chunk {
+                        for n in 2..=MAX_N.min(r.len()) {
+                            let map = &cand_by_len[n];
+                            if map.is_empty() {
+                                continue;
+                            }
+                            for i in 0..=r.len() - n {
+                                if let Some(&idx) = map.get(&key(&r[i..i + n])) {
+                                    let (l, rt) = &mut acc[idx];
+                                    *l.entry(if i == 0 { EDGE } else { r[i - 1] as u32 })
+                                        .or_default() += 1;
+                                    *rt.entry(if i + n == r.len() {
+                                        EDGE
+                                    } else {
+                                        r[i + n] as u32
+                                    })
+                                    .or_default() += 1;
+                                }
+                            }
+                        }
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || vec![(FxHashMap::default(), FxHashMap::default()); n_cands],
+                |mut a, b| {
+                    for (dst, src) in a.iter_mut().zip(b) {
+                        for (k, v) in src.0 {
+                            *dst.0.entry(k).or_default() += v;
+                        }
+                        for (k, v) in src.1 {
+                            *dst.1.entry(k).or_default() += v;
+                        }
+                    }
+                    a
+                },
+            )
+    };
 
     if cancelled() {
         return None;
     }
     let tokens = within_token_counts(word_freq, is_general);
-    let mut out: Vec<Candidate> = cand
+    let mut out: Vec<Candidate> = cand_meta
         .into_iter()
-        .filter_map(|(k, (coh, dep, l, r))| {
+        .zip(neighbours)
+        .filter_map(|((k, coh, dep), (l, r))| {
             let word = unkey(k);
             if known.contains(&word) {
                 return None;
@@ -403,13 +418,16 @@ fn discover_impl(
         })
     });
     out.sort_by(|a, b| {
-        b.recommended.cmp(&a.recommended).then_with(|| {
-            if a.recommended {
-                b.split_occurrences().cmp(&a.split_occurrences())
-            } else {
-                b.dependency.total_cmp(&a.dependency)
-            }
-        })
+        b.recommended
+            .cmp(&a.recommended)
+            .then_with(|| {
+                if a.recommended {
+                    b.split_occurrences().cmp(&a.split_occurrences())
+                } else {
+                    b.dependency.total_cmp(&a.dependency)
+                }
+            })
+            .then_with(|| a.word.cmp(&b.word))
     });
     Some(out)
 }

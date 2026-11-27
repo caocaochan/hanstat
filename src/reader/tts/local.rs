@@ -20,6 +20,7 @@ use hanstat::models::{
     Model, QWEN_TTS, QWEN_TTS_CODEC, QWEN_TTS_DESIGN, QWEN_TTS_MODEL, QWEN_TTS_SERVER,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -851,8 +852,9 @@ pub struct Server {
     asked: usize,
     /// Started with [`SPILL`].
     spill: bool,
-    /// Check and register together so batch workers don't all upload the WAV.
-    registry: Mutex<()>,
+    /// Voice IDs registered with this server process (cleared automatically on
+    /// restart). Guarded by a mutex so batch workers don't all upload the WAV.
+    registry: Mutex<HashSet<String>>,
     /// Requests in flight, at most `parallel` (more would wait in the
     /// server's queue behind what was asked first).
     busy: Mutex<usize>,
@@ -1055,7 +1057,7 @@ impl Server {
             parallel,
             asked,
             spill,
-            registry: Mutex::new(()),
+            registry: Mutex::new(HashSet::new()),
             busy: Mutex::new(0),
             freed: Condvar::new(),
             log,
@@ -1156,16 +1158,26 @@ impl Server {
         if let Voice::Base(reference) = voice {
             self.register(reference)?;
         }
-        self.post(
+        let result = self.post(
             "/v1/audio/speech",
             request_body(text, s, seed, budget, voice),
-        )
+        );
+        if result.is_err()
+            && let Voice::Base(reference) = voice
+        {
+            self.registry.lock().unwrap().remove(&reference.id);
+        }
+        result
     }
 
-    /// The registry is in the Base process's memory. It starts empty and
-    /// can lose a voice, so check the list before using the reference.
+    /// The registry is in the Base process's memory. Once a voice ID is
+    /// verified/registered on this server process, skip the GET round-trip
+    /// until the server restarts (or a request fails).
     fn register(&self, reference: &Reference) -> Result<(), String> {
-        let _guard = self.registry.lock().unwrap();
+        let mut registered = self.registry.lock().unwrap();
+        if registered.contains(&reference.id) {
+            return Ok(());
+        }
         let mut resp = self
             .agent
             .get(format!("{}/v1/audio/voices", self.url))
@@ -1201,6 +1213,7 @@ impl Server {
                 }),
             )?;
         }
+        registered.insert(reference.id.clone());
         Ok(())
     }
 
@@ -1455,7 +1468,7 @@ pub fn make_chunk(
         .map(|id| VoiceStore::default().reference(id))
         .transpose()
         .map_err(Fail::Refused)?;
-    let voice = reference.as_ref().map_or(Voice::Custom, Voice::Base);
+    let voice = reference.as_deref().map_or(Voice::Custom, Voice::Base);
     let (text, all, all_paras) = assemble(texts, paras, lead);
     let chars: usize = all.iter().map(|t| t.chars().count()).sum();
     // The seed follows the chunk's own text, lead-in or not.
@@ -1521,7 +1534,7 @@ pub fn preview(text: &str, s: &LocalSettings) -> Result<Vec<i16>, String> {
         .as_deref()
         .map(|id| VoiceStore::default().reference(id))
         .transpose()?;
-    let voice = reference.as_ref().map_or(Voice::Custom, Voice::Base);
+    let voice = reference.as_deref().map_or(Voice::Custom, Voice::Base);
     let seed = hanstat::dict::xxh64::xxh64(text.as_bytes(), s.seed as u64);
     // A preview cut short is still worth hearing.
     server(s.mode(), s.parallel, |server| {

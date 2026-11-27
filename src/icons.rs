@@ -10,13 +10,17 @@
 //! or an icon stands alone as [`glyph`].
 
 use eframe::egui::{self, Color32, FontDefinitions, FontFamily, FontId, Pos2, RichText};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 static REGULAR: &[u8] = include_bytes!("../assets/fonts/Phosphor.ttf");
 static FILL: &[u8] = include_bytes!("../assets/fonts/Phosphor-Fill.ttf");
 
 const REGULAR_NAME: &str = "phosphor";
 const FILL_NAME: &str = "phosphor-fill";
+
+static REGULAR_FAMILY: LazyLock<FontFamily> =
+    LazyLock::new(|| FontFamily::Name(Arc::from(REGULAR_NAME)));
+static FILL_FAMILY: LazyLock<FontFamily> = LazyLock::new(|| FontFamily::Name(Arc::from(FILL_NAME)));
 
 macro_rules! glyphs {
     ($($(#[$m:meta])* $name:ident = $cp:literal, $ph:literal;)*) => {
@@ -94,11 +98,21 @@ pub fn install(defs: &mut FontDefinitions) {
 }
 
 fn family(fill: bool) -> FontFamily {
-    FontFamily::Name(if fill { FILL_NAME } else { REGULAR_NAME }.into())
+    if fill {
+        FILL_FAMILY.clone()
+    } else {
+        REGULAR_FAMILY.clone()
+    }
 }
 
 fn installed(ctx: &egui::Context) -> bool {
-    ctx.fonts(|f| f.definitions().families.contains_key(&family(false)))
+    let id = egui::Id::unique("hanstat_icons_installed");
+    if let Some(v) = ctx.data(|d| d.get_temp::<bool>(id)) {
+        return v;
+    }
+    let v = ctx.fonts(|f| f.definitions().families.contains_key(&*REGULAR_FAMILY));
+    ctx.data_mut(|d| d.insert_temp(id, v));
+    v
 }
 
 /// The icon font at `size`, if installed.

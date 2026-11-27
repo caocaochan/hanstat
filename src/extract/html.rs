@@ -120,7 +120,7 @@ const VOID: &[&str] = &[
 /// as an explicit start/end pair. EPUB content documents are XHTML, but the HTML
 /// parser ignores the `/` on non-void elements, so `<title/>` would open an RCDATA
 /// element that swallows the whole rest of the document.
-fn expand_self_closing(src: &str) -> std::borrow::Cow<'_, str> {
+pub fn expand_self_closing(src: &str) -> std::borrow::Cow<'_, str> {
     if !src.contains("/>") {
         return src.into();
     }

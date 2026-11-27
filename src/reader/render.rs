@@ -47,9 +47,11 @@ const CACHE: usize = 160;
 
 /// Time spent building entries (µs): HTML, parsing, styling, layout; and
 /// how many (for measuring).
+#[cfg(test)]
 pub static STAGES: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
+#[cfg(test)]
 fn stage(i: usize, since: std::time::Instant) -> std::time::Instant {
     let now = std::time::Instant::now();
     STAGES[i].fetch_add(
@@ -74,10 +76,25 @@ struct Key {
     open: Vec<u32>,
 }
 
+fn content_hash(dict_id: &str, glossaries: &[Gloss]) -> u64 {
+    let mut h = hanstat::dict::xxh64::key(dict_id);
+    h = hanstat::dict::xxh64::xxh64(&(glossaries.len() as u64).to_le_bytes(), h);
+    for g in glossaries {
+        h = hanstat::dict::xxh64::xxh64(g.def_tags.as_bytes(), h ^ 0x1);
+        h = hanstat::dict::xxh64::xxh64(g.term_tags.as_bytes(), h ^ 0x2);
+        match &g.json {
+            Ok(j) => h = hanstat::dict::xxh64::xxh64(j.as_bytes(), h ^ 0x3),
+            Err(e) => h = hanstat::dict::xxh64::xxh64(e.as_bytes(), h ^ 0x4),
+        }
+    }
+    h
+}
+
 pub struct Renderer {
     ua: Arc<RuleSet>,
     sheets: HashMap<String, Arc<RuleSet>>,
-    cache: Vec<(Key, Arc<Entry>)>,
+    cache: HashMap<Key, (u64, Arc<Entry>)>,
+    tick: u64,
     pub images: Images,
     /// Each dictionary's folder, for its images.
     dirs: Arc<Mutex<HashMap<String, PathBuf>>>,
@@ -100,7 +117,8 @@ impl Renderer {
         let mut r = Renderer {
             ua: Arc::new(RuleSet::default()),
             sheets: HashMap::new(),
-            cache: Vec::new(),
+            cache: HashMap::new(),
+            tick: 0,
             images,
             dirs,
             theme: "",
@@ -126,10 +144,11 @@ impl Renderer {
         self.images.set_invert_grey(look.theme.dark);
     }
 
-    /// The dictionaries changed: their sheets and folders are read again.
+    /// The dictionaries changed: their sheets, images and folders are read again.
     pub fn set_dicts(&mut self, dicts: &[DictInfo]) {
         self.sheets.clear();
         self.cache.clear();
+        self.images.clear();
         let mut d = self.dirs.lock().unwrap();
         d.clear();
         for x in dicts {
@@ -147,7 +166,24 @@ impl Renderer {
         open: &HashSet<u32>,
         params: &Params,
     ) -> Arc<Entry> {
+        #[cfg(test)]
         let t = std::time::Instant::now();
+        let mut open_v: Vec<u32> = open.iter().copied().collect();
+        open_v.sort_unstable();
+        let key = Key {
+            content: content_hash(&dict.id, glossaries),
+            width: params.content_w.to_bits(),
+            size: params.base.to_bits(),
+            fonts: params.fonts.key.clone(),
+            open: open_v,
+        };
+        if let Some((used, entry)) = self.cache.get_mut(&key) {
+            self.tick += 1;
+            *used = self.tick;
+            return entry.clone();
+        }
+        #[cfg(test)]
+        STAGES[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut html = String::from("<html><body><div class=\"entries\">");
         for g in glossaries {
             html.push_str("<div class=\"entry\">");
@@ -172,23 +208,7 @@ impl Renderer {
             html.push_str("</div>");
         }
         html.push_str("</div></body></html>");
-        let mut open_v: Vec<u32> = open.iter().copied().collect();
-        open_v.sort_unstable();
-        let key = Key {
-            content: hanstat::dict::xxh64::xxh64(html.as_bytes(), 0)
-                ^ hanstat::dict::xxh64::key(&dict.id),
-            width: params.content_w.to_bits(),
-            size: params.base.to_bits(),
-            fonts: params.fonts.key.clone(),
-            open: open_v,
-        };
-        if let Some(i) = self.cache.iter().position(|(k, _)| *k == key) {
-            let e = self.cache.remove(i);
-            let r = e.1.clone();
-            self.cache.push(e);
-            return r;
-        }
-        STAGES[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
         let t = stage(0, t);
         let sheet = self
             .sheets
@@ -196,6 +216,7 @@ impl Renderer {
             .or_insert_with(|| Arc::new(tree::rules(&dict.styles)))
             .clone();
         let doc = scraper::Html::parse_document(&html);
+        #[cfg(test)]
         let t = stage(1, t);
         let chapter = tree::build_doc(
             &doc,
@@ -207,9 +228,11 @@ impl Renderer {
                 ink: params.text,
             },
         );
+        #[cfg(test)]
         let t = stage(2, t);
         let images = &mut self.images;
         let layout = ctx.fonts_mut(|f| layout::layout(&chapter, params, f, images));
+        #[cfg(test)]
         stage(3, t);
         let height = layout.flow_height();
         let e = Arc::new(Entry {
@@ -217,10 +240,17 @@ impl Renderer {
             layout,
             height,
         });
-        if self.cache.len() >= CACHE {
-            self.cache.remove(0);
+        if self.cache.len() >= CACHE
+            && let Some(oldest) = self
+                .cache
+                .iter()
+                .min_by_key(|(_, (u, _))| *u)
+                .map(|(k, _)| k.clone())
+        {
+            self.cache.remove(&oldest);
         }
-        self.cache.push((key, e.clone()));
+        self.tick += 1;
+        self.cache.insert(key, (self.tick, e.clone()));
         e
     }
 }

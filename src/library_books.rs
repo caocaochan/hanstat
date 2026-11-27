@@ -13,7 +13,7 @@ use crate::library_columns::{
 use crate::reading_stats::{self as rs, LeftAt};
 use crate::{
     App, COVER_ROW, COVER_SIZE, READ_COL, UNDO_SECS, book_matches, chapter_lengths,
-    difficulty_color, fmt_int, load_cover, palette, script_badge, sort_header,
+    difficulty_color, fmt_int, palette, script_badge, sort_header,
 };
 use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
@@ -674,38 +674,70 @@ impl App {
         let used = |c: HistCol| cols.is_shown(c) || cols.filter(c).is_some() || col == c;
         let mut series = HashMap::new();
         if used(HistCol::Series) {
-            let metas: Vec<Option<hanstat::series::Meta>> = entries
-                .iter()
-                .map(|e| crate::book_series::meta(&e.id))
-                .collect();
-            let named: Vec<(hanstat::series::Volume, String)> = entries
-                .iter()
-                .zip(&metas)
-                .map(|(e, m)| hanstat::series::named(&e.title, m.as_ref()))
-                .collect();
-            let vols: Vec<hanstat::series::Volume> = named.iter().map(|(v, _)| v.clone()).collect();
-            let groups = hanstat::series::group(&vols);
-            // A series is named by a book whose metadata names it, else by
-            // its first book.
-            let mut names: HashMap<u32, (String, bool)> = HashMap::new();
-            for (i, g) in groups.iter().enumerate() {
-                if let Some((gid, _)) = g {
-                    let meta = metas[i].is_some();
-                    let e = names
-                        .entry(*gid)
-                        .or_insert_with(|| (named[i].1.clone(), meta));
-                    if meta && !e.1 {
-                        *e = (named[i].1.clone(), true);
+            #[derive(Clone)]
+            struct SeriesCache {
+                key: u64,
+                map: HashMap<String, (String, Vec<u32>, bool)>,
+            }
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            crate::book_series::revision().hash(&mut h);
+            entries.len().hash(&mut h);
+            for e in entries {
+                e.id.hash(&mut h);
+                e.title.hash(&mut h);
+            }
+            let key = h.finish();
+            let cache_id = egui::Id::unique("library_books_series_cache");
+            let cached: std::sync::Arc<SeriesCache> = if let Some(hit) = ctx
+                .data(|d| d.get_temp::<std::sync::Arc<SeriesCache>>(cache_id))
+                .filter(|hit| hit.key == key)
+            {
+                hit
+            } else {
+                let metas: Vec<Option<hanstat::series::Meta>> = entries
+                    .iter()
+                    .map(|e| crate::book_series::meta(&e.id))
+                    .collect();
+                let named: Vec<(hanstat::series::Volume, String)> = entries
+                    .iter()
+                    .zip(&metas)
+                    .map(|(e, m)| hanstat::series::named(&e.title, m.as_ref()))
+                    .collect();
+                let vols: Vec<hanstat::series::Volume> =
+                    named.iter().map(|(v, _)| v.clone()).collect();
+                let groups = hanstat::series::group(&vols);
+                // A series is named by a book whose metadata names it, else by
+                // its first book.
+                let mut names: HashMap<u32, (String, bool)> = HashMap::new();
+                for (i, g) in groups.iter().enumerate() {
+                    if let Some((gid, _)) = g {
+                        let meta = metas[i].is_some();
+                        let e = names
+                            .entry(*gid)
+                            .or_insert_with(|| (named[i].1.clone(), meta));
+                        if meta && !e.1 {
+                            *e = (named[i].1.clone(), true);
+                        }
                     }
                 }
-            }
-            for (i, g) in groups.into_iter().enumerate() {
-                if let Some((gid, vol)) = g {
-                    let (name, _) = &names[&gid];
-                    series.insert(
-                        entries[i].id.as_str(),
-                        (name.clone(), vol, metas[i].is_some()),
-                    );
+                let mut map = HashMap::new();
+                for (i, g) in groups.into_iter().enumerate() {
+                    if let Some((gid, vol)) = g {
+                        let (name, _) = &names[&gid];
+                        map.insert(
+                            entries[i].id.clone(),
+                            (name.clone(), vol, metas[i].is_some()),
+                        );
+                    }
+                }
+                let arc = std::sync::Arc::new(SeriesCache { key, map });
+                ctx.data_mut(|d| d.insert_temp(cache_id, arc.clone()));
+                arc
+            };
+            for e in entries {
+                if let Some(v) = cached.map.get(&e.id) {
+                    series.insert(e.id.as_str(), v.clone());
                 }
             }
         }
@@ -738,6 +770,14 @@ impl App {
         // Rows: the search (title, file name, the user's Text columns) and
         // every filter.
         let query = search::Query::new(&self.library_filter);
+        let filter_queries: Vec<(HistCol, &Filter, Option<search::Query>)> = cols
+            .filters
+            .iter()
+            .map(|(c, f)| {
+                let q = (!f.text.trim().is_empty()).then(|| search::Query::new(&f.text));
+                (*c, f, q)
+            })
+            .collect();
         let today = today();
         let mut rows: Vec<usize> = (0..entries.len())
             .filter(|&i| {
@@ -745,9 +785,9 @@ impl App {
                 book_matches(&query, &e.title, &e.path, cols.texts(&e.id))
             })
             .filter(|&i| {
-                cols.filters
+                filter_queries
                     .iter()
-                    .all(|(c, f)| f.passes(&data.val(*c, i), today, &day_of))
+                    .all(|(c, f, q)| f.passes_with(&data.val(*c, i), today, &day_of, q.as_ref()))
             })
             .collect();
         rows.sort_by_cached_key(|&i| data.key(col, i));
@@ -773,7 +813,26 @@ impl App {
             .iter()
             .map(|c| base_width(*c, cols).max(text_w(&cols.name(*c)) + HEADER_EXTRA))
             .collect();
-        let longest = entries.iter().map(|e| text_w(&e.title)).fold(0.0, f32::max);
+        let longest = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            font.size.to_bits().hash(&mut h);
+            entries.len().hash(&mut h);
+            for e in entries {
+                e.title.hash(&mut h);
+            }
+            let key = h.finish();
+            let id = egui::Id::unique("library_books_longest_title");
+            if let Some((k, w)) = ctx.data(|d| d.get_temp::<(u64, f32)>(id))
+                && k == key
+            {
+                w
+            } else {
+                let w = entries.iter().map(|e| text_w(&e.title)).fold(0.0, f32::max);
+                ctx.data_mut(|d| d.insert_temp(id, (key, w)));
+                w
+            }
+        };
         let book_want = COVER_SIZE.0 + 6.0 + 2.0 * gap + longest + 4.0;
         let book_floor = book_want.clamp(BOOK_MIN, BOOK_FLOOR_MAX);
         let pinned = READ_COL + MARK_COL + REMOVE_COL + 4.0 * gap + 12.0;
@@ -809,17 +868,21 @@ impl App {
                         .on_hover_text("Click to change this filter");
                     let mut nf = f.clone();
                     let kind = c.filter_kind(&cols.fields);
-                    let choices = if kind == FilterKind::Choice {
-                        data.choices(*c)
-                    } else {
-                        Vec::new()
-                    };
-                    let span = span(&data, *c);
                     let mut changed = false;
                     egui::Popup::from_toggle_button_response(&r)
                         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                         .show(|ui| {
-                            changed = filter_editor(ui, *c, kind, &mut nf, &choices, span);
+                            let choices = if kind == FilterKind::Choice {
+                                data.choices(*c)
+                            } else {
+                                Vec::new()
+                            };
+                            let sp = if kind == FilterKind::Range {
+                                span(&data, *c)
+                            } else {
+                                (0.0, 0.0)
+                            };
+                            changed = filter_editor(ui, *c, kind, &mut nf, &choices, sp);
                         });
                     if changed {
                         acts.push(Act::Filter(*c, nf));
@@ -953,10 +1016,8 @@ impl App {
                         let e = &entries[i];
                         let s = &e.stats;
                         row.col(|ui| {
-                            let tex = covers
-                                .entry(e.id.clone())
-                                .or_insert_with(|| load_cover(ctx, &hist.cover(&e.id)));
-                            book_cell(ui, e, tex.as_ref(), exists.get(&e.path), du.library_tag(&e.path, data.now), &mut acts);
+                            let tex = covers.get_or_request(ctx, &e.id, hist.cover(&e.id));
+                            book_cell(ui, e, tex, exists.get(&e.path), du.library_tag(&e.path, data.now), &mut acts);
                         });
                         row.col(|ui| {
                             // As on the Overview: the reader takes EPUBs and TXTs.

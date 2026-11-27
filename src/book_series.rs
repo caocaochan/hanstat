@@ -9,11 +9,18 @@ use hanstat::series::Meta;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 const FILE: &str = "book-series.json";
 /// Bump when the reading rule changes: every book is read again.
 const VERSION: u32 = 1;
+
+static REVISION: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn revision() -> u64 {
+    REVISION.load(Ordering::Relaxed)
+}
 
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -47,6 +54,7 @@ fn store() -> MutexGuard<'static, Store> {
             && saved.version == VERSION
         {
             s.books = saved.books;
+            REVISION.fetch_add(1, Ordering::Relaxed);
         }
     }
     s
@@ -127,6 +135,7 @@ fn run(ctx: egui::Context) {
         match read {
             Ok(m) => {
                 s.books.insert(id, m);
+                REVISION.fetch_add(1, Ordering::Relaxed);
                 since_save += 1;
                 // Every so often on a large Library, not after each book.
                 if since_save >= 50 {
@@ -145,6 +154,7 @@ fn run(ctx: egui::Context) {
 pub(crate) fn forget(id: &str) {
     let mut s = store();
     if s.books.remove(id).is_some() {
+        REVISION.fetch_add(1, Ordering::Relaxed);
         save(&s);
     }
     s.failed.remove(id);

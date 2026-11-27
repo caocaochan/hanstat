@@ -29,11 +29,19 @@ pub(super) struct Cache {
     /// those before the open chapter.
     book_han: Option<u64>,
     before: Option<(usize, u64)>,
+    /// `(chapters_built, spine)` at the last `stats_place` scan of `self.chapters`.
+    han_checked: Option<(usize, usize)>,
     saved_at: f64,
     unsaved: bool,
     last_state: Option<State>,
     confirm_discard: bool,
     goal_edit: Option<(u32, u64)>,
+    /// In-progress settings edit while dragging a DragValue or debouncing text.
+    settings_edit: Option<rs::TrackerSettings>,
+    /// When `goal_sound_text` was last edited (for debouncing SQLite saves).
+    text_edited_at: Option<f64>,
+    /// Cached formatted status line under the pages.
+    line_cache: Option<(LineKey, Arc<Line>)>,
     /// Whether today's goal was met at the last look, and for which day,
     /// goal and counting of listening: the glow starts only when the same
     /// one turns met.
@@ -42,6 +50,24 @@ pub(super) struct Cache {
     pub(super) glow_since: Option<f64>,
     /// The goal-met sound being made, and the voices for it.
     pub(super) sound: goal_sound::State,
+}
+
+#[derive(PartialEq, Eq)]
+struct LineKey {
+    state: State,
+    listening: bool,
+    read_mins: u64,
+    time_mins: u64,
+    read_chars: u64,
+    shown_chars: u64,
+    speed_rounded: Option<u64>,
+    idle_mins: u32,
+    base: Option<(usize, u32, u32)>,
+    right_speed: u64,
+    right_source: u8,
+    book_han: Option<u64>,
+    before: Option<(usize, u64)>,
+    goal: Option<(u32, u64, bool, u64, u64, bool, u32)>,
 }
 
 /// What a goal's "met" is about: the day, the goal, whether listening counts.
@@ -163,18 +189,19 @@ fn glow_band(painter: &egui::Painter, rect: Rect, width: f32, outer: f32, inner:
 }
 
 /// Where the speed for "time left" comes from: set by hand, or the best
-/// measured one.
-fn speed_source(c: &Cache, cpm: f32, by_hand: bool) -> (f64, &'static str) {
+/// measured one (plus a tag for cache keys).
+fn speed_source(c: &Cache, cpm: f32, by_hand: bool) -> (f64, &'static str, u8) {
     if by_hand {
-        (cpm.max(1.0) as f64, "set by hand in Settings")
+        (cpm.max(1.0) as f64, "set by hand in Settings", 0)
     } else if let Some(v) = c.book_speed {
-        (v, "your speed in this book")
+        (v, "your speed in this book", 1)
     } else if let Some(v) = c.speed {
-        (v, "your speed over the last 30 days")
+        (v, "your speed over the last 30 days", 2)
     } else {
         (
             cpm.max(1.0) as f64,
             "the reading speed in Settings, until yours is measured",
+            3,
         )
     }
 }
@@ -269,7 +296,8 @@ impl Reader {
                 self.stats.glow_since = Some(now);
             }
             if sound {
-                let secs = goal_sound::play(&self.stats.settings);
+                let cached = self.stats.sound.known_secs(&self.stats.settings);
+                let secs = goal_sound::play(&self.stats.settings, cached);
                 // Not over read aloud: it pauses, and goes on after (with a
                 // little for the sound device to open).
                 self.tts.pause_until(now + secs + 0.4);
@@ -280,7 +308,7 @@ impl Reader {
         if let Some(made) = self.stats.sound.poll() {
             rs::update_meta(|s| s.settings.goal_sound_made = made);
             self.stats.unsaved = true;
-            if self.persist {
+            if self.should_persist() {
                 self.stats_save(now);
             }
         }
@@ -339,19 +367,34 @@ impl Reader {
         };
         rs::edit(|s| self.tracker.place(s, p, &between, now));
         if self.stats.book_han.is_none() || self.stats.before.is_none_or(|b| b.0 != self.spine) {
-            let c = self.chapters.lock().unwrap();
-            let sum = |r: std::ops::Range<usize>| -> Option<u64> {
-                c[r].iter()
-                    .map(|ch| ch.as_ref().map(|ch| ch.han_len as u64))
-                    .sum()
-            };
-            let total = sum(0..c.len());
-            let before = sum(0..self.spine.min(c.len())).map(|n| (self.spine, n));
-            drop(c);
-            self.stats.before = before;
-            if let (None, Some(n)) = (self.stats.book_han, total) {
-                self.stats.book_han = Some(n);
-                rs::edit(|s| self.tracker.book_han(s, n));
+            if let Some((ref prefix, total)) = self.han_totals {
+                let before = prefix.get(self.spine).copied().unwrap_or(total);
+                self.stats.before = Some((self.spine, before));
+                if self.stats.book_han.is_none() {
+                    self.stats.book_han = Some(total);
+                    rs::edit(|s| self.tracker.book_han(s, total));
+                }
+            } else {
+                let built = self
+                    .chapters_built
+                    .load(std::sync::atomic::Ordering::Acquire);
+                if self.stats.han_checked != Some((built, self.spine)) {
+                    self.stats.han_checked = Some((built, self.spine));
+                    let c = self.chapters.lock().unwrap();
+                    let sum = |r: std::ops::Range<usize>| -> Option<u64> {
+                        c[r].iter()
+                            .map(|ch| ch.as_ref().map(|ch| ch.han_len as u64))
+                            .sum()
+                    };
+                    let total = sum(0..c.len());
+                    let before = sum(0..self.spine.min(c.len())).map(|n| (self.spine, n));
+                    drop(c);
+                    self.stats.before = before;
+                    if let (None, Some(n)) = (self.stats.book_han, total) {
+                        self.stats.book_han = Some(n);
+                        rs::edit(|s| self.tracker.book_han(s, n));
+                    }
+                }
             }
         }
         self.stats_after(now);
@@ -364,7 +407,7 @@ impl Reader {
             self.finished = true;
         }
         self.stats_after(now);
-        if self.stats.unsaved && self.persist {
+        if self.stats.unsaved && self.should_persist() {
             self.stats_save(now);
         }
     }
@@ -375,19 +418,30 @@ impl Reader {
         self.stats_after(now);
     }
 
-    /// Every book's stats were reset ([`rs::reset_all`]): this book's
-    /// session starts again now.
-    pub fn stats_reset(&mut self) {
-        self.tracker.restart(rs::now());
-        self.stats.unsaved = false;
+    /// Flush any deferred settings edit (e.g. a debounced text box edit).
+    fn flush_stats_settings(&mut self, now: f64) {
+        self.stats.text_edited_at = None;
+        if let Some(set) = self.stats.settings_edit.take()
+            && set != self.stats.settings
+        {
+            rs::update_meta(|s| {
+                s.settings = set;
+                self.tracker.settings(s);
+            });
+            self.stats.unsaved = true;
+            if self.should_persist() {
+                self.stats_save(now);
+            }
+        }
     }
 
     /// The book closes (or the app): add the running stretch and save.
     pub fn end_stats(&mut self) {
         let now = rs::now();
+        self.flush_stats_settings(now);
         rs::edit(|s| self.tracker.end(s, now));
         self.stats_after(now);
-        if self.stats.unsaved && self.persist {
+        if self.stats.unsaved && self.should_persist() {
             self.stats_save(now);
         }
     }
@@ -402,7 +456,7 @@ impl Reader {
         }
         let state = self.tracker.state();
         if self.stats.unsaved
-            && self.persist
+            && self.should_persist()
             && (self.stats.last_state != Some(state)
                 || now - self.stats.saved_at >= super::tracker::FLUSH_SECS)
         {
@@ -455,7 +509,7 @@ impl Reader {
     }
 
     /// The line under the pages, unless hidden.
-    pub(super) fn stats_line(&mut self, now: f64) -> Option<Line> {
+    pub(super) fn stats_line(&mut self, now: f64) -> Option<Arc<Line>> {
         self.stats_refresh(now);
         if !self.stats.settings.live_line {
             return None;
@@ -470,6 +524,48 @@ impl Reader {
         } else {
             (read, chars)
         };
+        let read_mins = (read.max(0.0) / 60.0).floor() as u64;
+        let time_mins = (time.max(0.0) / 60.0).floor() as u64;
+        let speed_rounded =
+            (read >= 60.0 && chars > 0).then(|| (chars as f64 / (read / 60.0)).round() as u64);
+        let (right_speed, right_source, right_source_tag) =
+            speed_source(&self.stats, self.cpm, self.cpm_by_hand);
+        let base_place = t.base();
+        let goal_day = self
+            .stats
+            .goal
+            .map(|g| (g, self.stats.settings.goal_day(&self.today_now(now))));
+        let key = LineKey {
+            state: t.state(),
+            listening,
+            read_mins,
+            time_mins,
+            read_chars: chars,
+            shown_chars: n,
+            speed_rounded,
+            idle_mins: self.stats.settings.idle_mins,
+            base: base_place.map(|p| (p.spine, p.han, p.chapter_han)),
+            right_speed: right_speed.to_bits(),
+            right_source: right_source_tag,
+            book_han: self.stats.book_han,
+            before: self.stats.before,
+            goal: goal_day.map(|(g, d)| {
+                (
+                    g.minutes,
+                    g.chars,
+                    self.stats.settings.goal_listening,
+                    (d.read_secs / 60.0).floor() as u64,
+                    d.read_chars,
+                    g.met(&d),
+                    (g.progress(&d) * 2000.0).round() as u32,
+                )
+            }),
+        };
+        if let Some((cached_key, line)) = &self.stats.line_cache
+            && *cached_key == key
+        {
+            return Some(line.clone());
+        }
         let mut parts = Vec::new();
         let state = match t.state() {
             State::Running if listening => Some("Listening".to_owned()),
@@ -523,12 +619,11 @@ impl Reader {
             },
         );
         // Time left, at the best speed known.
-        let right = self.tracker.base().map(|p| {
-            let (speed, source) = speed_source(&self.stats, self.cpm, self.cpm_by_hand);
-            let chapter = p.chapter_han.saturating_sub(p.han) as f64 / speed * 60.0;
+        let right = base_place.map(|p| {
+            let chapter = p.chapter_han.saturating_sub(p.han) as f64 / right_speed * 60.0;
             let book = match (self.stats.book_han, self.stats.before) {
                 (Some(total), Some((spine, before))) if spine == p.spine => {
-                    Some(total.saturating_sub(before + p.han as u64) as f64 / speed * 60.0)
+                    Some(total.saturating_sub(before + p.han as u64) as f64 / right_speed * 60.0)
                 }
                 _ => None,
             };
@@ -541,25 +636,26 @@ impl Reader {
                 None => format!("Chapter {}", mins(chapter)),
             };
             let hover = format!(
-                "Time left to the end of the chapter and of the book, at {:.0} characters a minute ({source}).",
-                speed
+                "Time left to the end of the chapter and of the book, at {:.0} characters a minute ({right_source}).",
+                right_speed
             );
             (full, short, hover)
         });
-        let goal = self.stats.goal.map(|g| {
-            let d = self.stats.settings.goal_day(&self.today_now(now));
+        let goal = goal_day.map(|(g, d)| {
             (
                 g.progress(&d),
                 goal_hover(&g, &d, self.stats.settings.goal_listening),
             )
         });
-        Some(Line {
+        let line = Arc::new(Line {
             left,
             left_short,
             left_hover,
             right,
             goal,
-        })
+        });
+        self.stats.line_cache = Some((key, line.clone()));
+        Some(line)
     }
 
     /// Draw the line under the pages; returns the clickable part (the
@@ -627,6 +723,7 @@ impl Reader {
             self.stats.goal_edit = None;
             self.stats.sound.forget_voices();
         }
+        let was_open = self.stats_open;
         let mut open = self.stats_open;
         egui::Popup::menu(&button)
             .id(egui::Id::unique("reader-stats"))
@@ -634,6 +731,9 @@ impl Reader {
             .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
             .show(|ui| self.stats_panel(ui));
         self.stats_open = open;
+        if was_open && !self.stats_open {
+            self.flush_stats_settings(rs::now());
+        }
     }
 
     fn stats_panel(&mut self, ui: &mut egui::Ui) {
@@ -886,11 +986,17 @@ impl Reader {
 
         // Settings.
         ui.separator();
-        let mut set = self.stats.settings.clone();
+        let mut set = self
+            .stats
+            .settings_edit
+            .clone()
+            .unwrap_or_else(|| self.stats.settings.clone());
         let mut goal_edit = self
             .stats
             .goal_edit
             .unwrap_or_else(|| goal.map_or((0, 0), |g| (g.minutes, g.chars)));
+        let mut text_changed = false;
+        let mut text_focused = false;
         egui::CollapsingHeader::new("Settings")
             .id_salt("reader-stats-settings")
             .show(ui, |ui| {
@@ -955,7 +1061,7 @@ impl Reader {
                             );
                         ui.end_row();
                         if set.goal_sound {
-                            self.stats.sound.rows(
+                            (text_changed, text_focused) = self.stats.sound.rows(
                                 ui,
                                 &mut set,
                                 &self.settings.tts.local,
@@ -967,21 +1073,52 @@ impl Reader {
             });
         let goal_now = goal.map_or((0, 0), |g| (g.minutes, g.chars));
         let goal_changed = goal_edit != goal_now;
-        // A goal is set once the drag ends.
+        // A drag or active message edit is committed once it settles, avoiding
+        // full summary rebuilds and synchronous SQLite writes on every tick.
         let dragging = ui.ctx().input(|i| i.pointer.any_down());
         self.stats.goal_edit = (goal_changed && dragging).then_some(goal_edit);
-        if set != self.stats.settings || (goal_changed && !dragging) {
-            let today = self.stats.today;
-            rs::update_meta(|s| {
-                s.settings = set;
-                if goal_changed && !dragging {
-                    s.set_goal(today, goal_edit.0, goal_edit.1);
+        let set_changed = set != self.stats.settings;
+        if text_changed {
+            self.stats.text_edited_at = Some(now);
+        }
+        let only_text_changed = set_changed && {
+            let mut cmp = set.clone();
+            cmp.goal_sound_text
+                .clone_from(&self.stats.settings.goal_sound_text);
+            cmp == self.stats.settings
+        };
+        let text_debouncing = only_text_changed
+            && text_focused
+            && self.stats.text_edited_at.is_some_and(|t| {
+                let left = 0.6 - (now - t);
+                if left > 0.0 {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_secs_f64(left + 0.02));
+                    true
+                } else {
+                    false
                 }
-                self.tracker.settings(s);
             });
-            self.stats.unsaved = true;
-            if self.persist {
-                self.stats_save(now);
+        if set_changed && (dragging || text_debouncing) {
+            self.stats.settings_edit = Some(set);
+        } else {
+            self.stats.settings_edit = None;
+            self.stats.text_edited_at = None;
+            if set_changed || (goal_changed && !dragging) {
+                let today = self.stats.today;
+                rs::update_meta(|s| {
+                    if set_changed {
+                        s.settings = set;
+                    }
+                    if goal_changed && !dragging {
+                        s.set_goal(today, goal_edit.0, goal_edit.1);
+                    }
+                    self.tracker.settings(s);
+                });
+                self.stats.unsaved = true;
+                if self.should_persist() {
+                    self.stats_save(now);
+                }
             }
         }
         if toggle {

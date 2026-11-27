@@ -17,9 +17,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-pub const MAX_SCAN: usize = 16;
+const MAX_SCAN: usize = 16;
 /// Groups kept for one lookup.
-pub const MAX_GROUPS: usize = 32;
+const MAX_GROUPS: usize = 32;
 const CACHE: usize = 64;
 
 /// One dictionary's glossaries for a group.
@@ -36,7 +36,6 @@ pub struct Gloss {
     pub json: Result<String, String>,
     pub def_tags: String,
     pub term_tags: String,
-    pub score: i32,
 }
 
 /// A frequency list's ranks for a group's headword.
@@ -74,7 +73,7 @@ impl Lookup {
 }
 
 /// A reading as grouping compares it: no spaces or apostrophes, lower case.
-pub fn reading_key(r: &str) -> String {
+fn reading_key(r: &str) -> String {
     r.chars()
         .filter(|c| !c.is_whitespace() && !matches!(c, '\'' | '’' | '·' | '-'))
         .flat_map(char::to_lowercase)
@@ -87,7 +86,6 @@ pub struct DictInfo {
     pub id: String,
     pub title: String,
     pub styles: String,
-    pub has_terms: bool,
     pub has_freq: bool,
     pub dir: std::path::PathBuf,
     /// Its entries start collapsed in the popup (the user's choice).
@@ -128,7 +126,6 @@ impl Engine {
                         id: entry.id.clone(),
                         title: s.meta.title.clone(),
                         styles: s.meta.styles.clone(),
-                        has_terms: s.meta.has_terms(),
                         has_freq: s.meta.has_freq(),
                         dir: s.dir.clone(),
                         collapsed: entry.collapsed,
@@ -162,7 +159,8 @@ impl Engine {
         self.cache.clear();
     }
 
-    pub fn is_empty(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
         self.stores.is_empty()
     }
 
@@ -248,15 +246,29 @@ impl Engine {
             });
             members[gi].push((si, t, r.order));
         }
-        // Frequencies.
-        for g in &mut groups {
-            g.freqs = self.freqs(&g.headword, &g.reading);
-        }
+        // Only query the sorting frequency dictionary before truncating to
+        // `MAX_GROUPS`; remaining frequency dictionaries are queried below
+        // only for the surviving groups.
+        let mut sort_badges: Vec<Option<FreqBadge>> = if let Some(fs) = self.freq_sort {
+            groups
+                .iter()
+                .map(|g| {
+                    let hk = xxh64::key(&g.headword);
+                    let folded = crate::script::fold_t2s(&g.headword);
+                    let folded_ref =
+                        (folded != g.headword).then(|| (folded.as_str(), xxh64::key(&folded)));
+                    self.freq_in(fs, &g.headword, hk, folded_ref, &g.reading)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         // Order: longest match, then the chosen list's rank, then the first
         // dictionary that has it, then its best score.
-        let rank = |g: &Group| -> i64 {
-            self.freq_sort
-                .and_then(|fs| g.freqs.iter().find(|b| b.dict == fs))
+        let rank = |i: usize| -> i64 {
+            sort_badges
+                .get(i)
+                .and_then(|b| b.as_ref())
                 .and_then(|b| b.values.iter().map(|v| v.value as i64).min())
                 .unwrap_or(i64::MAX)
         };
@@ -275,35 +287,54 @@ impl Engine {
             (
                 std::cmp::Reverse(groups[i].matched),
                 groups[i].folded,
-                rank(&groups[i]),
+                rank(i),
                 first.0,
                 std::cmp::Reverse(score),
                 first.1,
             )
         });
         order.truncate(MAX_GROUPS);
+        let has_other_freq = self
+            .stores
+            .iter()
+            .enumerate()
+            .any(|(si, s)| s.meta.has_freq() && self.freq_sort != Some(si));
         let mut out = Vec::with_capacity(order.len());
         let mut taken: Vec<Option<Group>> = groups.into_iter().map(Some).collect();
         for i in order {
             let mut g = taken[i].take().unwrap();
+            let mut sort_badge = sort_badges.get_mut(i).and_then(Option::take);
+            if has_other_freq {
+                let hk = xxh64::key(&g.headword);
+                let folded = crate::script::fold_t2s(&g.headword);
+                let folded_ref =
+                    (folded != g.headword).then(|| (folded.as_str(), xxh64::key(&folded)));
+                for si in 0..self.stores.len() {
+                    let badge = if self.freq_sort == Some(si) {
+                        sort_badge.take()
+                    } else {
+                        self.freq_in(si, &g.headword, hk, folded_ref, &g.reading)
+                    };
+                    if let Some(b) = badge {
+                        g.freqs.push(b);
+                    }
+                }
+            } else if let Some(b) = sort_badge {
+                g.freqs.push(b);
+            }
             let mut ms = std::mem::take(&mut members[i]);
             ms.sort_by_key(|m| (m.0, m.2));
             for (si, t, _) in ms {
                 let Some(r) = self.stores[si].record(t) else {
                     continue;
                 };
-                let (def_tags, term_tags, score, slot) = (
-                    r.def_tags.to_owned(),
-                    r.term_tags.to_owned(),
-                    r.score,
-                    r.slot,
-                );
+                let (def_tags, term_tags, slot) =
+                    (r.def_tags.to_owned(), r.term_tags.to_owned(), r.slot);
                 let json = self.stores[si].glossary(slot);
                 let gloss = Gloss {
                     json,
                     def_tags,
                     term_tags,
-                    score,
                 };
                 match g.parts.last_mut() {
                     Some(p) if p.dict == si => p.glossaries.push(gloss),
@@ -318,52 +349,66 @@ impl Engine {
         Lookup { text, groups: out }
     }
 
+    fn freq_in(
+        &self,
+        si: usize,
+        headword: &str,
+        headword_key: u64,
+        folded: Option<(&str, u64)>,
+        reading: &str,
+    ) -> Option<FreqBadge> {
+        let s = &self.stores[si];
+        if !s.meta.has_freq() {
+            return None;
+        }
+        let keep = |v: Vec<Freq>| -> Vec<Freq> {
+            v.into_iter()
+                .filter(|f| f.reading.is_empty() || f.reading == reading)
+                .collect()
+        };
+        // Rank lists: lower is more frequent; occurrence counts: higher.
+        let occurrences = s.meta.frequency_mode.as_deref() == Some("occurrence-based");
+        let best = |v: &[Freq]| -> Option<i64> {
+            let it = v.iter().map(|f| f.value as i64);
+            if occurrences {
+                it.max().map(|x| -x)
+            } else {
+                it.min()
+            }
+        };
+        let mut values = keep(s.freq(headword, headword_key));
+        let mut is_fold = false;
+        if let Some((simp_str, simp_key)) = folded {
+            let simp = keep(s.freq(simp_str, simp_key));
+            let better = match (best(&values), best(&simp)) {
+                (None, Some(_)) => true,
+                (Some(a), Some(b)) => b < a,
+                _ => false,
+            };
+            if better {
+                values = simp;
+                is_fold = true;
+            }
+        }
+        (!values.is_empty()).then_some(FreqBadge {
+            dict: si,
+            values,
+            folded: is_fold,
+        })
+    }
+
     /// A headword's frequencies in every frequency list. A Traditional
     /// headword also gets its Simplified form's, and the more frequent of the
     /// two is shown: lists made from Simplified text rank the rare
     /// Traditional spelling low (時 136,904th in Danmei, 时 near the top).
     pub fn freqs(&self, headword: &str, reading: &str) -> Vec<FreqBadge> {
-        let mut out = Vec::new();
+        let headword_key = xxh64::key(headword);
         let folded = crate::script::fold_t2s(headword);
-        for (si, s) in self.stores.iter().enumerate() {
-            if !s.meta.has_freq() {
-                continue;
-            }
-            let keep = |v: Vec<Freq>| -> Vec<Freq> {
-                v.into_iter()
-                    .filter(|f| f.reading.is_empty() || f.reading == reading)
-                    .collect()
-            };
-            // Rank lists: lower is more frequent; occurrence counts: higher.
-            let occurrences = s.meta.frequency_mode.as_deref() == Some("occurrence-based");
-            let best = |v: &[Freq]| -> Option<i64> {
-                let it = v.iter().map(|f| f.value as i64);
-                if occurrences {
-                    it.max().map(|x| -x)
-                } else {
-                    it.min()
-                }
-            };
-            let mut values = keep(s.freq(headword, xxh64::key(headword)));
-            let mut is_fold = false;
-            if folded != headword {
-                let simp = keep(s.freq(&folded, xxh64::key(&folded)));
-                let better = match (best(&values), best(&simp)) {
-                    (None, Some(_)) => true,
-                    (Some(a), Some(b)) => b < a,
-                    _ => false,
-                };
-                if better {
-                    values = simp;
-                    is_fold = true;
-                }
-            }
-            if !values.is_empty() {
-                out.push(FreqBadge {
-                    dict: si,
-                    values,
-                    folded: is_fold,
-                });
+        let folded_ref = (folded != headword).then(|| (folded.as_str(), xxh64::key(&folded)));
+        let mut out = Vec::new();
+        for si in 0..self.stores.len() {
+            if let Some(badge) = self.freq_in(si, headword, headword_key, folded_ref, reading) {
+                out.push(badge);
             }
         }
         out

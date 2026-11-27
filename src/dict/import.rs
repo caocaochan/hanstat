@@ -9,13 +9,14 @@
 //! appends to the files; the indexes are sorted at the end.
 
 use super::bloom::Bloom;
-use super::format::{self, Meta, SourceZip, Tag, TermRecord, UpdateUrls, put_str};
+use super::format::{self, Meta, SourceZip, TermRecord, UpdateUrls, put_str};
 use super::xxh64;
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 use std::sync::Mutex;
@@ -24,8 +25,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
 /// A bank larger than this (unzipped) is refused, as is a zip whose files
 /// add up to more than [`MAX_TOTAL`]: a guard against zip bombs. The largest
 /// bank seen in real dictionaries is 27 MB.
-pub const MAX_BANK: u64 = 256 << 20;
-pub const MAX_TOTAL: u64 = 16 << 30;
+const MAX_BANK: u64 = 256 << 20;
+const MAX_TOTAL: u64 = 16 << 30;
 
 /// Banks done and to do, for a progress bar.
 #[derive(Default)]
@@ -55,9 +56,6 @@ pub struct Index {
     pub author: Option<String>,
     pub attribution: Option<String>,
     pub description: Option<String>,
-    pub url: Option<String>,
-    pub source_language: Option<String>,
-    pub target_language: Option<String>,
     pub frequency_mode: Option<String>,
 }
 
@@ -109,9 +107,6 @@ impl Index {
             author: s("author"),
             attribution: s("attribution"),
             description: s("description"),
-            url: s("url"),
-            source_language: s("sourceLanguage"),
-            target_language: s("targetLanguage"),
             frequency_mode: s("frequencyMode"),
         })
     }
@@ -141,8 +136,7 @@ struct TermRow<'a> {
     reading: Cow<'a, str>,
     #[serde(borrow)]
     def_tags: Option<Cow<'a, str>>,
-    #[serde(borrow)]
-    rules: Cow<'a, str>,
+    _rules: serde::de::IgnoredAny,
     score: f64,
     #[serde(borrow)]
     gloss: &'a RawValue,
@@ -213,14 +207,14 @@ pub fn parse_freq(data: &str) -> Option<(String, i32, String)> {
 
 /// Glossary hashes already claimed: the first claim gives the slot.
 struct Claims {
-    shards: Vec<Mutex<HashMap<u128, u32>>>,
+    shards: Vec<Mutex<FxHashMap<u128, u32>>>,
     next: AtomicU32,
 }
 
 impl Claims {
     fn new() -> Claims {
         Claims {
-            shards: (0..256).map(|_| Mutex::new(HashMap::new())).collect(),
+            shards: (0..256).map(|_| Mutex::new(FxHashMap::default())).collect(),
             next: AtomicU32::new(0),
         }
     }
@@ -248,7 +242,6 @@ struct BankOut {
     freq: Vec<u8>,
     freq_keys: Vec<(u64, u64)>,
     n_freq: u64,
-    skipped: BTreeMap<String, u64>,
 }
 
 enum Kind {
@@ -319,7 +312,6 @@ fn term_bank(
             expr: &r.expr,
             reading,
             def_tags: r.def_tags.as_deref().unwrap_or(""),
-            rules: &r.rules,
             term_tags: r.term_tags.as_deref().unwrap_or(""),
             score: r.score as i32,
             slot,
@@ -337,11 +329,9 @@ fn meta_bank(name: &str, b: &[u8]) -> Result<BankOut, String> {
     let mut o = BankOut::default();
     for r in &rows {
         if r.mode != "freq" {
-            *o.skipped.entry(r.mode.to_string()).or_default() += 1;
             continue;
         }
         let Some((reading, value, display)) = parse_freq(r.data.get()) else {
-            *o.skipped.entry("freq (unreadable)".into()).or_default() += 1;
             continue;
         };
         o.freq_keys.push((xxh64::key(&r.expr), o.freq.len() as u64));
@@ -422,30 +412,6 @@ fn train_fast_cover(samples: &[&[u8]], threads: usize) -> Option<Vec<u8>> {
     Some(dict)
 }
 
-fn tags(b: &[u8]) -> Vec<Tag> {
-    #[derive(Deserialize)]
-    struct Row(
-        String,
-        #[serde(default)] String,
-        #[serde(default)] f64,
-        #[serde(default)] String,
-        #[serde(default)] f64,
-    );
-    serde_json::from_slice::<Vec<Row>>(b)
-        .map(|rows| {
-            rows.into_iter()
-                .map(|Row(name, category, order, notes, score)| Tag {
-                    name,
-                    category,
-                    order: order as i64,
-                    notes,
-                    score: score as i64,
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -489,9 +455,7 @@ pub fn import(
     }
 
     let mut banks: Vec<(usize, Kind)> = Vec::new();
-    let mut tag_banks = Vec::new();
     let mut media = Vec::new();
-    let mut skipped: BTreeMap<String, u64> = BTreeMap::new();
     let mut total_size = 0u64;
     for i in 0..z.len() {
         let f = z.by_index_raw(i).map_err(|e| e.to_string())?;
@@ -505,12 +469,12 @@ pub fn import(
             banks.push((i, Kind::Term));
         } else if base.starts_with("term_meta_bank_") && base.ends_with(".json") {
             banks.push((i, Kind::Meta));
-        } else if base.starts_with("tag_bank_") && base.ends_with(".json") {
-            tag_banks.push(i);
-        } else if base.starts_with("kanji_bank_") && base.ends_with(".json") {
-            *skipped.entry("kanji banks".into()).or_default() += 1;
-        } else if base.starts_with("kanji_meta_bank_") && base.ends_with(".json") {
-            *skipped.entry("kanji meta banks".into()).or_default() += 1;
+        } else if (base.starts_with("tag_bank_")
+            || base.starts_with("kanji_bank_")
+            || base.starts_with("kanji_meta_bank_"))
+            && base.ends_with(".json")
+        {
+            // Unused Yomitan banks (not media).
         } else if name != "index.json" && name != "styles.css" {
             media.push(i);
         }
@@ -561,9 +525,6 @@ pub fn import(
         author: index.author.clone(),
         attribution: index.attribution.clone(),
         description: index.description.clone(),
-        url: index.url.clone(),
-        source_language: index.source_language.clone(),
-        target_language: index.target_language.clone(),
         frequency_mode: index.frequency_mode.clone(),
         format: index.format,
         styles,
@@ -641,9 +602,6 @@ pub fn import(
             meta.terms += b.n_terms;
             meta.freqs += b.n_freq;
             meta.max_len = meta.max_len.max(b.max_len);
-            for (k, v) in b.skipped {
-                *skipped.entry(k).or_default() += v;
-            }
             progress.done.fetch_add(1, Relaxed);
         }
     });
@@ -665,12 +623,14 @@ pub fn import(
         )
     });
     for (name, k) in [(format::KEYS, &keys), (format::FREQ_IDX, &freq_keys)] {
-        let mut b = Vec::with_capacity(k.len() * 16);
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, open(name)?);
         for (h, o) in k {
-            b.extend_from_slice(&h.to_le_bytes());
-            b.extend_from_slice(&o.to_le_bytes());
+            let mut rec = [0u8; 16];
+            rec[..8].copy_from_slice(&h.to_le_bytes());
+            rec[8..].copy_from_slice(&o.to_le_bytes());
+            w.write_all(&rec).map_err(|e| format!("{name}: {e}"))?;
         }
-        write(&out.join(name), &b)?;
+        w.flush().map_err(|e| format!("{name}: {e}"))?;
     }
     let mut bloom = Bloom::with_keys(keys.len());
     let mut last = None;
@@ -681,24 +641,38 @@ pub fn import(
         }
     }
     write(&out.join(format::BLOOM), &bloom.to_bytes())?;
-    let mut gi = Vec::with_capacity(slots.len() * format::SLOT_BYTES);
-    for (off, len) in &slots {
-        gi.extend_from_slice(&off.to_le_bytes());
-        gi.extend_from_slice(&len.to_le_bytes());
+    if !freq_keys.is_empty() {
+        let mut freq_bloom = Bloom::with_keys(freq_keys.len());
+        let mut last = None;
+        for (h, _) in &freq_keys {
+            if last != Some(*h) {
+                freq_bloom.insert(*h);
+                last = Some(*h);
+            }
+        }
+        write(&out.join(format::FREQ_BLOOM), &freq_bloom.to_bytes())?;
     }
-    write(&out.join(format::GLOSS_IDX), &gi)?;
+    {
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, open(format::GLOSS_IDX)?);
+        for (off, len) in &slots {
+            let mut rec = [0u8; format::SLOT_BYTES];
+            rec[..8].copy_from_slice(&off.to_le_bytes());
+            rec[8..].copy_from_slice(&len.to_le_bytes());
+            w.write_all(&rec)
+                .map_err(|e| format!("{}: {e}", format::GLOSS_IDX))?;
+        }
+        w.flush()
+            .map_err(|e| format!("{}: {e}", format::GLOSS_IDX))?;
+    }
     drop((keys, freq_keys, slots));
 
     let t_index = t0.elapsed();
-    // Tags and media.
-    for i in tag_banks {
-        let (_, b) = read_entry(&mut z, i)?;
-        meta.tags.extend(tags(&b));
-    }
+    // Media.
     if !media.is_empty() {
         let mut bin = std::io::BufWriter::new(open(format::MEDIA)?);
         let mut idx: BTreeMap<String, (u64, u64)> = BTreeMap::new();
         let mut off = 0u64;
+        let mut b = Vec::new();
         for i in media {
             if cancel.load(Relaxed) {
                 return Err("cancelled".into());
@@ -708,7 +682,8 @@ pub fn import(
             if f.size() > MAX_BANK {
                 continue;
             }
-            let mut b = Vec::with_capacity(f.size() as usize);
+            b.clear();
+            b.reserve(f.size() as usize);
             f.read_to_end(&mut b).map_err(|e| format!("{name}: {e}"))?;
             bin.write_all(&b).map_err(|e| e.to_string())?;
             idx.insert(name, (off, b.len() as u64));
@@ -732,16 +707,8 @@ pub fn import(
             t0.elapsed() - t_index
         );
     }
-    meta.skipped = skipped;
-    meta.imported = format::now();
     meta.source = Some(SourceZip {
-        path: zip_path.to_path_buf(),
         size: file_meta.len(),
-        mtime: file_meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_secs()),
     });
     meta.bytes = std::fs::read_dir(out)
         .map(|d| {

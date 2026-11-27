@@ -1,5 +1,20 @@
 # Changelog
 
+## [2026.11.27.04] - 2026-11-27
+
+### Changed
+- **Faster, smoother UI across the Reader, Library, DuChinese and Read aloud.**
+  - Spinners during background work (analysis, downloads, Anki loading and writing-style ratings) now animate at 30 FPS instead of running uncapped without vsync, cutting GPU/CPU usage and avoiding contention with local models.
+  - The Reader no longer shapes the entire Table of Contents on every frame while the **Contents** menu is closed, virtualizes long TOC lists, caches dictionary popup layouts before building HTML, caches dictionary image indexes, synthesizes TXT chapter markup lazily, skips redundant font-atlas rebuilds when fonts haven't changed, and keeps `goal-sound` decoding and dictionary deletion off the UI thread.
+  - **Library › Books**, **Library › Stats**, **Reading path**, **Mark read**, **DuChinese** and **Changelog** now cache per-frame sorting, series grouping, title widths, read-book vocabulary counts, running-total label placement and timezone lookups, decode book and DuChinese covers off the UI thread with bounded texture caches, and run **Save as image…** layout and cover loading in the background.
+  - Marking words known (**A** / **+**) updates your merged known words incrementally instead of rebuilding every word list from scratch.
+  - **Read aloud** and **Export audiobook** skip full-book billing work in Local mode, compute Azure book estimates off the UI thread, virtualize chapter lists, skip empty audio caches when scanning audiobook coverage, cache cloned voice references and server registrations, and move preview/voice-designer audio and file operations off the UI thread.
+  - Startup memory-maps read-only system fonts instead of copying them into heap RAM, and EPUB extraction, segmentation, word discovery, Anki coverage and the Reading path planner do less redundant work and parallelize more passes.
+
+### Fixed
+- **Broken images in the Reader no longer spin at 20 FPS while idle.** Failed images stop requesting repaints, while zoomed images repaint as soon as their sharper background decode finishes.
+- **Subscript (`<sub>`) text in the Reader is now positioned below the baseline**, and errors opening Anki's card browser from the dictionary popup are now shown to the user.
+
 ## [2026.11.27.03] - 2026-11-27
 
 ### Added

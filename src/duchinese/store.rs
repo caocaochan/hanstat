@@ -32,8 +32,6 @@ pub struct Record {
     pub chapters: Vec<ChapterRec>,
     /// Chapters released that the account couldn't read, left out.
     pub locked: u32,
-    /// Seconds since the Unix epoch.
-    pub imported: u64,
     pub checked: u64,
     /// The last update that added chapters: how many, and when.
     pub added: u32,
@@ -204,8 +202,6 @@ impl Catalogue {
 #[serde(default)]
 pub struct Chapters {
     pub fetched: u64,
-    /// Fetched signed in.
-    pub signed_in: bool,
     pub lessons: Vec<Lesson>,
 }
 

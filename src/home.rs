@@ -605,12 +605,11 @@ impl App {
             })
             .collect();
         self.home_view.request(ask, ctx);
-        // Small covers stand in until the large ones are loaded.
+        // Small covers stand in until the large ones are loaded (decoded off the UI thread).
         for b in books.iter().take(1 + SHELF_MAX) {
-            if !self.covers.contains_key(&b.id) {
-                let t = crate::load_cover(ctx, &self.history.cover(&b.id));
-                self.covers.insert(b.id.clone(), t);
-            }
+            let _ = self
+                .covers
+                .get_or_request(ctx, &b.id, self.history.cover(&b.id));
         }
         let cpm = self.cpm();
         let library_size = self.history.entries.len();
@@ -619,7 +618,7 @@ impl App {
         let cover_of = |id: &str| -> Option<&TextureHandle> {
             match view_cover(&view.books, id) {
                 Some(t) => Some(t),
-                None => covers.get(id).and_then(|t| t.as_ref()),
+                None => covers.get(id),
             }
         };
         let books_info = &view.books;
@@ -1296,14 +1295,18 @@ fn year(ui: &mut Ui, sum: &Summary) {
                 ring: palette::good(),
                 focus: Some((first, sum.today + 1)),
             },
-            &|i| {
+            &|i, want_hover| {
                 let d = first + i;
                 let v = sum.days.get(&d)?;
                 let goal = sum.goal_days.contains(&d);
                 Some(charts::CalDay {
                     level: day_level(v),
                     ring: goal,
-                    hover: day_hover(d, v, goal),
+                    hover: if want_hover {
+                        day_hover(d, v, goal)
+                    } else {
+                        String::new()
+                    },
                 })
             },
         );

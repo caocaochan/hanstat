@@ -26,7 +26,6 @@ pub struct Remote {
     pub revision: String,
     /// The zip to download; the dictionary's own `downloadUrl` if absent.
     pub download_url: Option<String>,
-    pub title: Option<String>,
 }
 
 pub fn agent(https_only: bool) -> ureq::Agent {
@@ -62,7 +61,6 @@ pub fn parse_remote(text: &str, https_only: bool) -> Result<Remote, String> {
     Ok(Remote {
         revision,
         download_url,
-        title: v.get("title").and_then(|t| t.as_str()).map(str::to_owned),
     })
 }
 
@@ -173,11 +171,6 @@ pub(crate) mod tests {
         let r = parse_remote(r#"{"title":"CC-CEDICT [2026-11-17]","revision":"2026-11-17","downloadUrl":"https://x.org/d.zip"}"#, true).unwrap();
         assert_eq!(r.revision, "2026-11-17");
         assert_eq!(r.download_url.as_deref(), Some("https://x.org/d.zip"));
-        assert_eq!(
-            r.title.as_deref(),
-            Some("CC-CEDICT [2026-11-17]"),
-            "a new title is fine"
-        );
         // No downloadUrl: the stored one is used.
         assert_eq!(
             parse_remote(r#"{"revision":"2"}"#, true)

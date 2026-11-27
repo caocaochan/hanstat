@@ -98,6 +98,10 @@ impl Canvas {
         let g = self
             .painter
             .layout_no_wrap(s.to_owned(), small(), self.weak);
+        self.x_label_galley(x, g)
+    }
+
+    fn x_label_galley(&self, x: f32, g: std::sync::Arc<egui::Galley>) -> f32 {
         let w = g.size().x;
         let bounds = self.response.rect;
         let left = (x - w / 2.0).clamp(bounds.left(), (bounds.right() - w).max(bounds.left()));
@@ -231,13 +235,10 @@ pub fn columns(
         }
         if let Some(l) = labels.and_then(|l| l.get(i)) {
             let mid = x0 + (slot - gap) / 2.0;
-            let w = c
-                .painter
-                .layout_no_wrap(l.clone(), small(), c.weak)
-                .size()
-                .x;
+            let g = c.painter.layout_no_wrap(l.clone(), small(), c.weak);
+            let w = g.size().x;
             if mid - w / 2.0 > label_end + 4.0 {
-                c.x_label(mid, l);
+                c.x_label_galley(mid, g);
                 label_end = mid + w / 2.0;
             }
         }
@@ -516,8 +517,10 @@ pub struct Calendar<'a> {
 }
 
 /// A year as weeks across (Monday on top), one square a day, in one painter
-/// pass. `day(i)`: the `i`-th day, `None` with nothing in it.
-pub fn calendar(ui: &mut egui::Ui, cal: Calendar<'_>, day: &dyn Fn(i32) -> Option<CalDay>) {
+/// pass. `day(i, want_hover)`: the `i`-th day (`want_hover` is true only for
+/// the hovered cell so callers skip formatting hover text for the other 364),
+/// `None` with nothing in it.
+pub fn calendar(ui: &mut egui::Ui, cal: Calendar<'_>, day: &dyn Fn(i32, bool) -> Option<CalDay>) {
     let Calendar {
         first,
         weekday,
@@ -574,7 +577,8 @@ pub fn calendar(ui: &mut egui::Ui, cal: Calendar<'_>, day: &dyn Fn(i32) -> Optio
     });
     let mut hover_text = None;
     for i in 0..n {
-        let d = day(i);
+        let is_hovered = hovered == Some(i);
+        let d = day(i, is_hovered);
         let r = Rect::from_min_size(pos(i), Vec2::splat(cell));
         let level = d.as_ref().map_or(0, |d| d.level.min(4));
         let dim = focus.is_some_and(|(a, b)| first + i < a || first + i >= b);
@@ -590,7 +594,7 @@ pub fn calendar(ui: &mut egui::Ui, cal: Calendar<'_>, day: &dyn Fn(i32) -> Optio
                 StrokeKind::Inside,
             );
         }
-        if hovered == Some(i) {
+        if is_hovered {
             painter.rect_stroke(
                 r.expand(1.0),
                 2.0,
@@ -744,64 +748,146 @@ pub fn running_total(
     let curve_y = |x: f32| c.y(at(day_at(x)), 0.0, top);
     let font = FontId::proportional(12.0);
     let area = c.plot.shrink2(Vec2::new(2.0, 2.0));
-    let mut taken: Vec<Rect> = Vec::new();
-    let mut placed: Vec<(usize, Pos2, Option<Rect>)> = Vec::new();
-    for (i, n) in r.notes.iter().enumerate() {
-        let x = n.x.clamp(r.first as f64, r.end as f64);
-        let dot = pos2(px(x), c.y(at(x), 0.0, top));
-        let g = c
-            .painter
-            .layout_no_wrap(n.text.clone(), font.clone(), c.text);
-        let size = g.size() + Vec2::new(4.0, 2.0);
-        let mut best = None;
-        // Alternate the preferred side so neighbours spread out.
-        let sides = if i % 2 == 0 {
-            [true, false]
-        } else {
-            [false, true]
-        };
-        'search: for dist in [16.0, 30.0, 46.0, 64.0, 86.0, 112.0, 142.0, 176.0] {
-            for above in sides {
-                for slide in [0.3, 0.0, 0.8] {
-                    let rect = if above {
-                        let right = dot.x - dist * slide + size.x * 0.35;
-                        Rect::from_min_size(pos2(right - size.x, dot.y - dist - size.y), size)
-                    } else {
-                        let left = dot.x + dist * slide - size.x * 0.35;
-                        Rect::from_min_size(pos2(left, dot.y + dist), size)
-                    };
-                    let dx = (area.left() - rect.left()).max(0.0)
-                        + (area.right() - rect.right()).min(0.0);
-                    let rect = rect.translate(Vec2::new(dx, 0.0));
-                    if !area.contains_rect(rect) {
-                        continue;
-                    }
-                    let clear = if above {
-                        rect.bottom() < curve_y(rect.right()) - 4.0
-                    } else {
-                        rect.top() > curve_y(rect.left()) + 4.0
-                    };
-                    let free = !taken.iter().any(|t| t.intersects(rect.expand(3.0)))
-                        && !placed.iter().any(|(_, p, _)| rect.expand(4.0).contains(*p));
-                    if clear && free && !rect.expand(4.0).contains(dot) {
-                        best = Some(rect);
-                        break 'search;
+
+    #[derive(Clone)]
+    struct RunningCache {
+        key: u64,
+        /// `(index, dot_offset_from_plot_min, Option<rect_offset_from_plot_min>)`
+        placed: Vec<(usize, Vec2, Option<Rect>)>,
+        rows: Vec<usize>,
+        n_rows: usize,
+        by_row: Vec<Vec<usize>>,
+    }
+
+    let cache_key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        c.plot.width().to_bits().hash(&mut h);
+        c.plot.height().to_bits().hash(&mut h);
+        r.first.hash(&mut h);
+        r.end.hash(&mut h);
+        top.to_bits().hash(&mut h);
+        r.notes.len().hash(&mut h);
+        for n in r.notes {
+            n.x.to_bits().hash(&mut h);
+            n.text.hash(&mut h);
+            n.span.map(|(a, b)| (a.to_bits(), b.to_bits())).hash(&mut h);
+        }
+        h.finish()
+    };
+    let cache_id = ui.scope_id().with("running_total_cache");
+    let cached: RunningCache = if let Some(hit) = ui
+        .ctx()
+        .data(|d| d.get_temp::<RunningCache>(cache_id))
+        .filter(|hit| hit.key == cache_key)
+    {
+        hit
+    } else {
+        let origin = c.plot.min.to_vec2();
+        let mut taken: Vec<Rect> = Vec::new();
+        let mut placed: Vec<(usize, Vec2, Option<Rect>)> = Vec::with_capacity(r.notes.len());
+        let mut placed_dots: Vec<Pos2> = Vec::with_capacity(r.notes.len());
+        for (i, n) in r.notes.iter().enumerate() {
+            let x = n.x.clamp(r.first as f64, r.end as f64);
+            let dot = pos2(px(x), c.y(at(x), 0.0, top));
+            let g = c
+                .painter
+                .layout_no_wrap(n.text.clone(), font.clone(), c.text);
+            let size = g.size() + Vec2::new(4.0, 2.0);
+            let mut best = None;
+            // Alternate the preferred side so neighbours spread out.
+            let sides = if i % 2 == 0 {
+                [true, false]
+            } else {
+                [false, true]
+            };
+            'search: for dist in [16.0, 30.0, 46.0, 64.0, 86.0, 112.0, 142.0, 176.0] {
+                for above in sides {
+                    for slide in [0.3, 0.0, 0.8] {
+                        let rect = if above {
+                            let right = dot.x - dist * slide + size.x * 0.35;
+                            Rect::from_min_size(pos2(right - size.x, dot.y - dist - size.y), size)
+                        } else {
+                            let left = dot.x + dist * slide - size.x * 0.35;
+                            Rect::from_min_size(pos2(left, dot.y + dist), size)
+                        };
+                        let dx = (area.left() - rect.left()).max(0.0)
+                            + (area.right() - rect.right()).min(0.0);
+                        let rect = rect.translate(Vec2::new(dx, 0.0));
+                        if !area.contains_rect(rect) {
+                            continue;
+                        }
+                        let clear = if above {
+                            rect.bottom() < curve_y(rect.right()) - 4.0
+                        } else {
+                            rect.top() > curve_y(rect.left()) + 4.0
+                        };
+                        let free = !taken.iter().any(|t| t.intersects(rect.expand(3.0)))
+                            && !placed_dots.iter().any(|p| rect.expand(4.0).contains(*p));
+                        if clear && free && !rect.expand(4.0).contains(dot) {
+                            best = Some(rect);
+                            break 'search;
+                        }
                     }
                 }
             }
+            if let Some(rect) = best {
+                taken.push(rect);
+            }
+            placed_dots.push(dot);
+            placed.push((i, dot - c.plot.min, best.map(|rc| rc.translate(-origin))));
         }
-        if let Some(rect) = best {
-            taken.push(rect);
-            let end = pos2(
-                dot.x.clamp(rect.left(), rect.right()),
-                dot.y.clamp(rect.top(), rect.bottom()),
-            );
-            c.painter
-                .line_segment([dot, end], Stroke::new(1.0, c.weak.gamma_multiply(0.8)));
-            c.painter.galley(rect.min + Vec2::new(2.0, 1.0), g, c.text);
+        let spans: Vec<Option<(f64, f64)>> = r.notes.iter().map(|n| n.span).collect();
+        let (rows, n_rows) = span_rows(&spans, 6);
+        let mut by_row: Vec<Vec<usize>> = vec![Vec::new(); n_rows];
+        for i in 0..r.notes.len() {
+            if r.notes[i].span.is_some() {
+                by_row[rows[i]].push(i);
+            }
         }
-        placed.push((i, dot, best));
-    }
+        for row in &mut by_row {
+            row.sort_by(|&a, &b| {
+                r.notes[a]
+                    .span
+                    .unwrap()
+                    .0
+                    .total_cmp(&r.notes[b].span.unwrap().0)
+            });
+        }
+        let entry = RunningCache {
+            key: cache_key,
+            placed,
+            rows,
+            n_rows,
+            by_row,
+        };
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(cache_id, entry.clone()));
+        entry
+    };
+
+    let origin = c.plot.min.to_vec2();
+    let placed: Vec<(usize, Pos2, Option<Rect>)> = cached
+        .placed
+        .iter()
+        .map(|&(i, dot_off, rect_off)| {
+            let dot = c.plot.min + dot_off;
+            let rect = rect_off.map(|rc| rc.translate(origin));
+            if let Some(rect) = rect {
+                let g = c
+                    .painter
+                    .layout_no_wrap(r.notes[i].text.clone(), font.clone(), c.text);
+                let end = pos2(
+                    dot.x.clamp(rect.left(), rect.right()),
+                    dot.y.clamp(rect.top(), rect.bottom()),
+                );
+                c.painter
+                    .line_segment([dot, end], Stroke::new(1.0, c.weak.gamma_multiply(0.8)));
+                c.painter.galley(rect.min + Vec2::new(2.0, 1.0), g, c.text);
+            }
+            (i, dot, rect)
+        })
+        .collect();
     for (_, dot, _) in &placed {
         c.painter.circle(*dot, 3.5, r.color, Stroke::new(1.5, c.bg));
     }
@@ -810,8 +896,8 @@ pub fn running_total(
     // rows of their own.
     const ROW: f32 = 7.0;
     const ROW_GAP: f32 = 3.0;
-    let spans: Vec<Option<(f64, f64)>> = r.notes.iter().map(|n| n.span).collect();
-    let (rows, n_rows) = span_rows(&spans, 6);
+    let rows = &cached.rows;
+    let n_rows = cached.n_rows;
     let strip = (n_rows > 0).then(|| {
         let h = 8.0 + n_rows as f32 * (ROW + ROW_GAP);
         ui.allocate_painter(Vec2::new(c.response.rect.width(), h), egui::Sense::click())
@@ -852,20 +938,7 @@ pub fn running_total(
             c.weak,
         );
         // Neighbours on a row alternate shades.
-        let mut by_row: Vec<Vec<usize>> = vec![Vec::new(); n_rows];
-        for i in 0..r.notes.len() {
-            if r.notes[i].span.is_some() {
-                by_row[rows[i]].push(i);
-            }
-        }
-        for row in &mut by_row {
-            row.sort_by(|&a, &b| {
-                r.notes[a]
-                    .span
-                    .unwrap()
-                    .0
-                    .total_cmp(&r.notes[b].span.unwrap().0)
-            });
+        for row in &cached.by_row {
             for (k, &i) in row.iter().enumerate() {
                 let Some(b) = bar(i, top) else { continue };
                 let shade = if k % 2 == 0 { 0.85 } else { 0.45 };
@@ -1055,7 +1128,7 @@ mod tests {
                         ring: Color32::RED,
                         focus: (wd == 6).then_some((105, 112)),
                     };
-                    calendar(ui, cal, &|i| {
+                    calendar(ui, cal, &|i, _| {
                         (i % 3 == 0).then(|| CalDay {
                             level: (i % 6) as u8,
                             ring: i % 2 == 0,

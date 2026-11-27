@@ -189,20 +189,80 @@ static INTER: &[u8] = include_bytes!("../assets/fonts/Inter-Regular.ttf");
 #[cfg(not(windows))]
 static INTER_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/Inter-SemiBold.ttf");
 
+/// Memory-mapped read-only font file so startup does not copy ~80 MB of
+/// system fonts into heap RAM.
+struct MmapFont(memmap2::Mmap);
+
+impl AsRef<[u8]> for MmapFont {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// True if an SFNT / TTC font blob contains bitmap tables that egui would draw
+/// white (`EBDT`, `CBDT`, `bdat`), meaning we need a mutable copy for
+/// `hide_bitmap_tables`.
+fn has_bitmap_tables(bytes: &[u8]) -> bool {
+    let check_face = |off: usize| -> bool {
+        if off + 12 > bytes.len() {
+            return false;
+        }
+        let n = u16::from_be_bytes([bytes[off + 4], bytes[off + 5]]) as usize;
+        for i in 0..n {
+            let t = off + 12 + i * 16;
+            if t + 4 > bytes.len() {
+                break;
+            }
+            if matches!(&bytes[t..t + 4], b"EBDT" | b"CBDT" | b"bdat") {
+                return true;
+            }
+        }
+        false
+    };
+    if bytes.starts_with(b"ttcf") && bytes.len() >= 12 {
+        let count = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+        for i in 0..count {
+            let p = 12 + i * 4;
+            if p + 4 > bytes.len() {
+                break;
+            }
+            let off =
+                u32::from_be_bytes([bytes[p], bytes[p + 1], bytes[p + 2], bytes[p + 3]]) as usize;
+            if check_face(off) {
+                return true;
+            }
+        }
+        false
+    } else {
+        check_face(0)
+    }
+}
+
+fn load_system_font(path: &Path) -> Option<egui::epaint::text::Blob> {
+    let file = std::fs::File::open(path).ok()?;
+    // SAFETY: system font files are immutable OS assets; if a bitmap table
+    // needs patching we copy into an owned Vec before mutating.
+    let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+    if has_bitmap_tables(&map) {
+        let mut bytes = map.to_vec();
+        reader::fonts::hide_bitmap_tables(&mut bytes);
+        Some(Arc::new(bytes) as egui::epaint::text::Blob)
+    } else {
+        Some(Arc::new(MmapFont(map)) as egui::epaint::text::Blob)
+    }
+}
+
 /// egui ships no CJK glyphs; use the system's fonts as fallbacks, in order.
 /// Characters none of them has still go to eframe's system font provider.
 fn install_fonts(ctx: &egui::Context) {
     let (dir, candidates) = system_fonts();
     let mut fonts = egui::FontDefinitions::default();
-    // Several faces can come from one `.ttc`: read each file once.
+    // Several faces can come from one `.ttc`: map each file once.
     let mut files: HashMap<&str, Option<egui::epaint::text::Blob>> = HashMap::new();
     for &(name, file, index) in candidates {
-        let blob = files.entry(file).or_insert_with(|| {
-            let mut bytes = std::fs::read(dir.join(file)).ok()?;
-            // SimSun-ExtB's embedded bitmaps would be drawn white.
-            reader::fonts::hide_bitmap_tables(&mut bytes);
-            Some(Arc::new(bytes) as egui::epaint::text::Blob)
-        });
+        let blob = files
+            .entry(file)
+            .or_insert_with(|| load_system_font(&dir.join(file)));
         if let Some(blob) = blob {
             let data = egui::FontData::from_blob(blob.clone(), index);
             fonts.font_data.insert(name.to_owned(), Arc::new(data));
@@ -227,11 +287,9 @@ fn install_fonts(ctx: &egui::Context) {
         ("segoe-ui-semibold", "seguisb.ttf", 0, false),
         ("yahei-bold", "msyhbd.ttc", 0, false),
     ] {
-        let Ok(mut bytes) = std::fs::read(dir.join(file)) else {
+        let Some(blob) = load_system_font(&dir.join(file)) else {
             continue;
         };
-        reader::fonts::hide_bitmap_tables(&mut bytes);
-        let blob = Arc::new(bytes) as egui::epaint::text::Blob;
         fonts.font_data.insert(
             name.to_owned(),
             Arc::new(egui::FontData::from_blob(blob, index)),
@@ -611,6 +669,91 @@ struct Job {
     cancel: Arc<AtomicBool>,
 }
 
+/// Async, LRU-bounded book cover thumbnail cache so scrolling never decodes
+/// images synchronously on the UI thread and VRAM stays bounded.
+pub(crate) struct CoverStore {
+    map: HashMap<String, (u64, Option<egui::TextureHandle>)>,
+    pending: HashSet<String>,
+    tx: std::sync::mpsc::Sender<(String, Option<egui::ColorImage>)>,
+    rx: std::sync::mpsc::Receiver<(String, Option<egui::ColorImage>)>,
+    tick: u64,
+}
+
+impl Default for CoverStore {
+    fn default() -> Self {
+        let (tx, rx) = channel();
+        Self {
+            map: HashMap::new(),
+            pending: HashSet::new(),
+            tx,
+            rx,
+            tick: 0,
+        }
+    }
+}
+
+impl CoverStore {
+    const MAX: usize = 400;
+
+    pub(crate) fn poll(&mut self, ctx: &egui::Context) {
+        while let Ok((id, img)) = self.rx.try_recv() {
+            self.pending.remove(&id);
+            self.tick += 1;
+            let tex = img.map(|pixels| {
+                ctx.load_texture(format!("cover {id}"), pixels, egui::TextureOptions::LINEAR)
+            });
+            self.map.insert(id, (self.tick, tex));
+        }
+        if self.map.len() > Self::MAX {
+            let mut order: Vec<(u64, String)> =
+                self.map.iter().map(|(k, (t, _))| (*t, k.clone())).collect();
+            order.sort_unstable();
+            let drop_n = self.map.len().saturating_sub(Self::MAX - 40);
+            for (_, k) in order.into_iter().take(drop_n) {
+                self.map.remove(&k);
+            }
+        }
+    }
+
+    pub(crate) fn get_or_request(
+        &mut self,
+        ctx: &egui::Context,
+        id: &str,
+        path: PathBuf,
+    ) -> Option<&egui::TextureHandle> {
+        if self.map.contains_key(id) {
+            self.tick += 1;
+            let entry = self.map.get_mut(id).unwrap();
+            entry.0 = self.tick;
+            return entry.1.as_ref();
+        }
+        if self.pending.insert(id.to_owned()) {
+            let id_owned = id.to_owned();
+            let tx = self.tx.clone();
+            let ctx = ctx.clone();
+            rayon::spawn(move || {
+                let img = image::open(&path).ok().map(|i| {
+                    let img = i.into_rgba8();
+                    let size = [img.width() as usize, img.height() as usize];
+                    egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw())
+                });
+                let _ = tx.send((id_owned, img));
+                ctx.request_repaint();
+            });
+        }
+        None
+    }
+
+    pub(crate) fn get(&self, id: &str) -> Option<&egui::TextureHandle> {
+        self.map.get(id).and_then(|(_, t)| t.as_ref())
+    }
+
+    pub(crate) fn remove(&mut self, id: &str) {
+        self.map.remove(id);
+        self.pending.remove(id);
+    }
+}
+
 struct App {
     path: Option<PathBuf>,
     /// The segmenter choice.
@@ -695,8 +838,8 @@ struct App {
     /// from (they differ between a new book arriving and its report).
     book_id: Option<String>,
     report_id: Option<String>,
-    /// Cover thumbnails by book id, loaded when first shown (`None`: the book has none).
-    covers: HashMap<String, Option<egui::TextureHandle>>,
+    /// Cover thumbnails by book id, loaded asynchronously when first shown.
+    covers: CoverStore,
     /// The next recording is a fresh analysis: save it even if nothing changed.
     history_touch: bool,
     /// The History view shows the books, the reading path or the library's statistics.
@@ -880,6 +1023,7 @@ impl Inputs {
 }
 
 /// The book the toolbar's 📕 Reader opens ([`App::last_read`]).
+#[derive(Clone)]
 struct LastRead {
     id: String,
     path: PathBuf,
@@ -1015,7 +1159,7 @@ struct Exists {
 }
 
 /// Seconds between checks of [`Exists`].
-const EXISTS_EVERY: f64 = 5.0;
+const EXISTS_EVERY: f64 = 15.0;
 
 impl Exists {
     /// As last checked; a file not checked yet counts as there.
@@ -1028,8 +1172,11 @@ impl Exists {
         self.known.lock().unwrap().insert(p, there);
     }
 
-    /// Check `paths` again in the background, at most every few seconds.
+    /// Check `paths` again in the background, at most every few seconds while focused.
     fn refresh(&mut self, paths: impl FnOnce() -> Vec<PathBuf>, now: f64, ctx: &egui::Context) {
+        if !ctx.input(|i| i.focused) && self.next > 0.0 {
+            return;
+        }
         if now < self.next || self.busy.swap(true, Ordering::Relaxed) {
             return;
         }
@@ -1057,7 +1204,9 @@ impl Exists {
                 c.request_repaint();
             }
         });
-        ctx.request_repaint_after(std::time::Duration::from_secs_f64(EXISTS_EVERY));
+        if ctx.input(|i| i.focused) {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(EXISTS_EVERY));
+        }
     }
 }
 
@@ -1226,6 +1375,9 @@ struct StyleState {
     /// Bumped when a rating arrives.
     version: u64,
     error: Option<String>,
+    /// Cached `StyleScale` for `(version, history_len)` so Overview, Library,
+    /// and Reading Path don't rebuild & sort scores every frame.
+    scale_cache: std::cell::RefCell<Option<(u64, usize, StyleScale)>>,
 }
 
 impl StyleState {
@@ -1736,7 +1888,7 @@ impl Default for App {
             book_id: None,
             report_id: None,
             history_touch: false,
-            covers: HashMap::new(),
+            covers: CoverStore::default(),
             history_tab: HistTab::Books,
             plan: PlanState::default(),
             stats: StatsState::load(),
@@ -2470,7 +2622,7 @@ impl App {
                         reopen = true;
                     }
                     if !a.busy.is_empty() {
-                        ui.spinner();
+                        palette::spinner(ui);
                         ui.label(a.busy);
                     }
                 });
@@ -2825,7 +2977,7 @@ impl App {
         match self.updater.phase() {
             UpdatePhase::Downloading { tag, done, total } => {
                 ui.separator();
-                ui.spinner();
+                palette::spinner(ui);
                 ui.label(format!(
                     "Downloading hanstat {tag} ({:.0} of {:.0} MB)",
                     done as f64 / 1e6,
@@ -2905,7 +3057,7 @@ impl App {
                         UpdatePhase::Idle => {}
                         UpdatePhase::Checking => {
                             ui.horizontal(|ui| {
-                                ui.spinner();
+                                palette::spinner(ui);
                                 ui.label("Checking…");
                             });
                         }
@@ -3032,7 +3184,7 @@ impl App {
             style::Phase::Idle => {}
             style::Phase::Downloading { done, total } => {
                 ui.separator();
-                ui.spinner();
+                palette::spinner(ui);
                 ui.label(format!(
                     "Downloading the writing-style model ({:.0} of {:.0} MB, first use only)",
                     done as f64 / 1e6,
@@ -3056,12 +3208,12 @@ impl App {
             }
             style::Phase::Starting => {
                 ui.separator();
-                ui.spinner();
+                palette::spinner(ui);
                 ui.label("Loading the writing-style model…");
             }
             style::Phase::Rating { title, left } => {
                 ui.separator();
-                ui.spinner();
+                palette::spinner(ui);
                 ui.label(if left > 0 {
                     format!("Rating the writing style of {title} ({left} more to go)")
                 } else {
@@ -3242,7 +3394,16 @@ impl App {
                 .weak()
                 .small(),
             );
-            let dl = style::download_size();
+            let now_t = ui.input(|i| i.time);
+            let dl_id = egui::Id::unique("settings_style_dl_size");
+            let dl = match ui.ctx().data(|d| d.get_temp::<(f64, u64)>(dl_id)) {
+                Some((t, v)) if now_t - t < 2.0 => v,
+                _ => {
+                    let v = style::download_size();
+                    ui.ctx().data_mut(|d| d.insert_temp(dl_id, (now_t, v)));
+                    v
+                }
+            };
             if dl > 0 {
                 ui.label(
                     RichText::new(format!(
@@ -3372,7 +3533,16 @@ impl App {
                     })
                     .clicked();
                 let log = style::Log::path();
-                if log.is_file()
+                let log_id = egui::Id::unique("settings_style_log_exists");
+                let log_exists = match ui.ctx().data(|d| d.get_temp::<(f64, bool)>(log_id)) {
+                    Some((t, v)) if now_t - t < 2.0 => v,
+                    _ => {
+                        let v = log.is_file();
+                        ui.ctx().data_mut(|d| d.insert_temp(log_id, (now_t, v)));
+                        v
+                    }
+                };
+                if log_exists
                     && ui
                         .button("Open the log")
                         .on_hover_text(format!(
@@ -3540,6 +3710,7 @@ impl eframe::App for App {
         self.poll_across(&ctx);
         self.poll_stats(&ctx);
         self.poll_image(&ctx);
+        self.covers.poll(&ctx);
         // Counted only while shown: it reads every book's word data.
         if self.show_history && self.history_tab == HistTab::Stats {
             self.refresh_stats(&ctx);
@@ -3547,15 +3718,31 @@ impl eframe::App for App {
         self.poll_batch(&ctx);
         self.poll_pending_open(&ctx);
         self.poll_moves(&ctx);
-        // Each EPUB's series metadata, read once ([`book_series`]).
-        book_series::want(
-            self.history
-                .entries
-                .iter()
-                .filter(|e| e.stats.format == "EPUB")
-                .map(|e| (e.id.as_str(), e.path.as_path())),
-            &ctx,
-        );
+        // Each EPUB's series metadata, read once ([`book_series`]), only when
+        // the library list changes (and not while the reader fills the window).
+        if self.reader.is_none() {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            self.history.entries.len().hash(&mut h);
+            for e in &self.history.entries {
+                if e.stats.format == "EPUB" {
+                    e.id.hash(&mut h);
+                }
+            }
+            let key = h.finish();
+            let id = egui::Id::unique("book_series_want_key");
+            if ctx.data(|d| d.get_temp::<u64>(id)) != Some(key) {
+                ctx.data_mut(|d| d.insert_temp(id, key));
+                book_series::want(
+                    self.history
+                        .entries
+                        .iter()
+                        .filter(|e| e.stats.format == "EPUB")
+                        .map(|e| (e.id.as_str(), e.path.as_path())),
+                    &ctx,
+                );
+            }
+        }
         self.auto_refresh(&ctx);
         if self.show_history {
             let hist = &self.history;
@@ -3642,7 +3829,6 @@ impl eframe::App for App {
                 ctx.request_repaint();
                 return;
             }
-            let Some(r) = &mut self.reader else { return };
             let finished = r.take_finished().then(|| r.book_id().to_owned());
             // A Library book read to the end: offer Mark read, unless it is.
             if let Some(id) = finished
@@ -3766,7 +3952,7 @@ impl eframe::App for App {
                     {
                         self.show_history = !self.show_history;
                     }
-                    let last = self.last_read();
+                    let last = self.last_read(&ctx);
                     let reader_button = ui.add_enabled(last.is_some(), egui::Button::new(icons::rich(ui, format!("{BOOK_OPEN} Reader"))));
                     if let Some(b) = last {
                         if reader_button
@@ -3907,7 +4093,7 @@ impl eframe::App for App {
                     ui.separator();
                 }
                 if let Some(m) = &self.moves {
-                    ui.spinner();
+                    palette::spinner(ui);
                     ui.label(format!(
                         "Copying books into the Library: {} of {}",
                         (m.done.load(Ordering::Relaxed) + 1).min(m.total),
@@ -3920,7 +4106,7 @@ impl eframe::App for App {
                     ui.separator();
                 }
                 if let Some(job) = &self.job {
-                    ui.spinner();
+                    palette::spinner(ui);
                     let (d, t) = (
                         job.done.load(Ordering::Relaxed),
                         job.total.load(Ordering::Relaxed),
@@ -3950,7 +4136,7 @@ impl eframe::App for App {
                             f.total.load(Ordering::Relaxed),
                         );
                         ui.separator();
-                        ui.spinner();
+                        palette::spinner(ui);
                         ui.label(format!(
                             "Downloading {} ({:.0} of {:.0} MB, first run only)",
                             *f.current.lock().unwrap(),
@@ -4068,7 +4254,7 @@ impl eframe::App for App {
         self.replace_window(&ctx);
         self.read_window(&ctx);
         self.du_windows(&ctx);
-        if let Some(w) = &self.whats_new
+        if let Some(w) = &mut self.whats_new
             && !whats_new::window(&ctx, w)
         {
             self.whats_new = None;
@@ -4177,10 +4363,7 @@ impl App {
         if let Some(since) = recorded.as_deref().and_then(update::parse_version)
             && !sections.is_empty()
         {
-            self.whats_new = Some(whats_new::WhatsNew {
-                since: Some(since),
-                sections,
-            });
+            self.whats_new = Some(whats_new::WhatsNew::new(Some(since), sections));
         }
     }
 
@@ -4411,9 +4594,6 @@ impl App {
                     if ui.button("Reset").clicked() {
                         match reading_stats::reset_all() {
                             Ok(copy) => {
-                                if let Some(r) = &mut self.reader {
-                                    r.stats_reset();
-                                }
                                 let m = match copy {
                                     Some(p) => format!(
                                         "Reading stats reset; the old ones are in {}",
@@ -5139,13 +5319,21 @@ impl App {
     /// The writing-style scale fitted to the rated books of the Library
     /// ([`style_scale`]).
     fn style_scale(&self) -> StyleScale {
+        let key = (self.style.version, self.history.entries.len());
+        if let Some((v, n, s)) = *self.style.scale_cache.borrow()
+            && (v, n) == key
+        {
+            return s;
+        }
         let rated = self.style.store.current();
-        StyleScale::fit(
+        let scale = StyleScale::fit(
             self.history
                 .entries
                 .iter()
                 .filter_map(|e| rated.get(e.id.as_str()).copied()),
-        )
+        );
+        *self.style.scale_cache.borrow_mut() = Some((key.0, key.1, scale));
+        scale
     }
 }
 
@@ -5807,9 +5995,7 @@ impl App {
         let r = self.report.as_ref().unwrap();
         let status = r.anki.as_ref().map(|c| &c.word_status);
         let total = r.words_total.max(1) as f64;
-        let known = &self.known.settings;
-        // Looked up for every row drawn: a set, not the list.
-        let marked: HashSet<&str> = known.marked.iter().map(String::as_str).collect();
+        let marked = &*self.known.marked_set;
         let sort_now = self.word_sort;
         let mut sort = None;
         // (word, mark) from a +/− click or A, applied after the table.
@@ -5817,12 +6003,15 @@ impl App {
         // A on a word known from Anki or a list: why nothing happened.
         let mut note: Option<String> = None;
 
-        // The selection's row in the filtered list.
+        // The selection's row in the filtered list (O(1) fast path via last position).
         let word_of = |p: usize| &r.word_freq[rows[p]].0;
-        let mut pos = self
-            .word_sel
-            .as_ref()
-            .and_then(|sel| (0..rows.len()).find(|&p| word_of(p) == sel));
+        let mut pos = self.word_sel.as_ref().and_then(|sel| {
+            if self.word_sel_pos < rows.len() && word_of(self.word_sel_pos) == sel {
+                Some(self.word_sel_pos)
+            } else {
+                (0..rows.len()).find(|&p| word_of(p) == sel)
+            }
+        });
         let refill = std::mem::take(&mut self.word_sel_refill);
         if pos.is_none() && refill && !rows.is_empty() {
             pos = Some(self.word_sel_pos.min(rows.len() - 1));
@@ -6057,6 +6246,29 @@ impl App {
         if !self.known.settings.set_marked(w, on) {
             return;
         }
+        // Fast path when marking a word known: add the single word in place to
+        // `known.merged` instead of cloning and re-applying all Anki/HSK/read
+        // books from scratch on every `A` press.
+        if on
+            && let Some(m) = &mut self.known.merged
+            && self.known.merged_from.as_ref().is_some_and(|f| {
+                f.match_across_scripts == self.anki.settings.match_across_scripts
+                    && f.anki.as_ref().map(Arc::as_ptr)
+                        == self
+                            .anki
+                            .knowledge
+                            .as_ref()
+                            .filter(|_| self.anki.settings.enabled)
+                            .map(Arc::as_ptr)
+            })
+        {
+            let k = Arc::make_mut(m);
+            k.add_listed(std::iter::once(w), self.known.settings.label());
+            if let Some(f) = &mut self.known.merged_from {
+                f.known = self.known.settings.clone();
+            }
+            Arc::make_mut(&mut self.known.marked_set).insert(w.to_owned());
+        }
         let shown = w;
         let msg = if on {
             format!("Marked {shown} as known")
@@ -6084,9 +6296,28 @@ impl App {
         });
         let r = self.report.as_ref().unwrap();
         let n = r.sections.len();
-        let mut rows: Vec<usize> = (0..n).collect();
         let sort_now = self.section_sort;
-        sort_section_rows(&mut rows, &r.sections, &self.included, sort_now);
+        let rows: Arc<Vec<usize>> = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            self.report_gen.hash(&mut h);
+            self.report_revision.hash(&mut h);
+            self.included.hash(&mut h);
+            (sort_now.0 as u8, sort_now.1).hash(&mut h);
+            let key = h.finish();
+            let id = egui::Id::unique("section_sorted_rows");
+            if let Some((k, cached)) = ui.ctx().data(|d| d.get_temp::<(u64, Arc<Vec<usize>>)>(id))
+                && k == key
+            {
+                cached
+            } else {
+                let mut rows: Vec<usize> = (0..n).collect();
+                sort_section_rows(&mut rows, &r.sections, &self.included, sort_now);
+                let arc = Arc::new(rows);
+                ui.ctx().data_mut(|d| d.insert_temp(id, (key, arc.clone())));
+                arc
+            }
+        };
         let mut sort = None;
         let mut toggles: Vec<usize> = Vec::new();
         let check = CHECK.to_string();
@@ -6235,7 +6466,7 @@ impl App {
         ui.separator();
         let Some(cands) = &self.suggestions else {
             ui.horizontal(|ui| {
-                ui.spinner();
+                palette::spinner(ui);
                 ui.label("Looking for book-specific words…");
             });
             return;
@@ -6297,17 +6528,39 @@ impl App {
         let mut toggles: Vec<String> = Vec::new();
         // (word, mark) from a +/− click, applied after the table.
         let mut mark: Option<(String, bool)> = None;
-        let marked: HashSet<&str> = self
-            .known
-            .settings
-            .marked
-            .iter()
-            .map(String::as_str)
-            .collect();
+        let marked = &*self.known.marked_set;
         let merged = self.known.merged.as_deref();
         let sort_now = self.suggest_sort;
-        let mut rows: Vec<usize> = (0..cands.len()).collect();
-        sort_suggest_rows(&mut rows, cands, &self.selected, merged, sort_now);
+        let rows: Arc<Vec<usize>> = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            cands.as_ptr().hash(&mut h);
+            cands.len().hash(&mut h);
+            self.selected.len().hash(&mut h);
+            // Only matters when sorting by Selected.
+            if sort_now.0 == SuggestCol::Selected {
+                for w in &self.selected {
+                    w.hash(&mut h);
+                }
+            }
+            merged
+                .map_or(0usize, |m| m as *const _ as usize)
+                .hash(&mut h);
+            (sort_now.0 as u8, sort_now.1).hash(&mut h);
+            let key = h.finish();
+            let id = egui::Id::unique("suggest_sorted_rows");
+            if let Some((k, cached)) = ui.ctx().data(|d| d.get_temp::<(u64, Arc<Vec<usize>>)>(id))
+                && k == key
+            {
+                cached
+            } else {
+                let mut rows: Vec<usize> = (0..cands.len()).collect();
+                sort_suggest_rows(&mut rows, cands, &self.selected, merged, sort_now);
+                let arc = Arc::new(rows);
+                ui.ctx().data_mut(|d| d.insert_temp(id, (key, arc.clone())));
+                arc
+            }
+        };
         let mut sort = None;
         let check = CHECK.to_string();
         TableBuilder::new(ui)
@@ -6491,15 +6744,28 @@ impl App {
                 }
                 ui.add_space(12.0);
                 ui.heading("Models");
-                for m in [
+                let now_t = ui.input(|i| i.time);
+                for (mi, m) in [
                     &hanstat::models::LTP,
                     &hanstat::models::CKIP,
-                ] {
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let cid = egui::Id::unique(("notes_model_cached", mi));
+                    let cached = match ui.ctx().data(|d| d.get_temp::<(f64, bool)>(cid)) {
+                        Some((t, v)) if now_t - t < 2.0 => v,
+                        _ => {
+                            let v = m.is_cached();
+                            ui.ctx().data_mut(|d| d.insert_temp(cid, (now_t, v)));
+                            v
+                        }
+                    };
                     ui.horizontal_wrapped(|ui| {
                         ui.label(format!(
                             "• {} — {}",
                             m.title,
-                            if m.is_cached() {
+                            if cached {
                                 "downloaded"
                             } else {
                                 "not downloaded yet"
@@ -6829,20 +7095,40 @@ impl App {
 
     /// The Library book last read in the reader (its place moved last), for
     /// the toolbar's 📕 Reader.
-    fn last_read(&self) -> Option<LastRead> {
+    fn last_read(&self, ctx: &egui::Context) -> Option<LastRead> {
         let entries = &self.history.entries;
-        let id = reading_stats::last_read(|id| {
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            reading_stats::revision().hash(&mut h);
+            entries.len().hash(&mut h);
+            for e in entries {
+                e.id.hash(&mut h);
+            }
+            h.finish()
+        };
+        let id = egui::Id::unique("toolbar_last_read_cache");
+        if let Some((k, cached)) = ctx.data(|d| d.get_temp::<(u64, Option<LastRead>)>(id))
+            && k == key
+        {
+            return cached;
+        }
+        let found = reading_stats::last_read(|id| {
             entries
                 .iter()
                 .any(|e| e.id == id && reader::opens(&e.stats.format))
-        })?;
-        let e = entries.iter().find(|e| e.id == id)?;
-        Some(LastRead {
-            id,
-            path: e.path.clone(),
-            title: e.title.clone(),
-            traditional: e.stats.variant == "Traditional",
         })
+        .and_then(|id| {
+            let e = entries.iter().find(|e| e.id == id)?;
+            Some(LastRead {
+                id,
+                path: e.path.clone(),
+                title: e.title.clone(),
+                traditional: e.stats.variant == "Traditional",
+            })
+        });
+        ctx.data_mut(|d| d.insert_temp(id, (key, found.clone())));
+        found
     }
 
     /// Take a book out of the Library; its cover and word data are deleted
@@ -8022,7 +8308,7 @@ impl App {
     /// The batch's progress, with a button to stop it.
     fn batch_status(&self, ui: &mut egui::Ui) {
         let Some(b) = &self.batch else { return };
-        ui.spinner();
+        palette::spinner(ui);
         let done = b.done.load(Ordering::Relaxed);
         let doing = match b.mode {
             BatchMode::Open => "Analysing",
@@ -8226,7 +8512,30 @@ impl App {
         } else {
             Vec::new()
         };
+        let by_id_map: HashMap<&str, &history::Entry> = self
+            .history
+            .entries
+            .iter()
+            .map(|e| (e.id.as_str(), e))
+            .collect();
         let k = self.known.merged.clone();
+        let all_series: Arc<std::collections::BTreeMap<String, hanstat::series::Meta>> = {
+            let rev = book_series::revision();
+            let id = egui::Id::unique("plan_book_series_all");
+            if let Some((r, cached)) = ctx.data(|d| {
+                d.get_temp::<(
+                    u64,
+                    Arc<std::collections::BTreeMap<String, hanstat::series::Meta>>,
+                )>(id)
+            }) && r == rev
+            {
+                cached
+            } else {
+                let arc = Arc::new(book_series::all());
+                ctx.data_mut(|d| d.insert_temp(id, (rev, arc.clone())));
+                arc
+            }
+        };
         let inputs = PlanInputs {
             lib,
             knowledge: k.as_ref().map_or(0, |k| Arc::as_ptr(k) as usize),
@@ -8248,7 +8557,7 @@ impl App {
                     .filter(|id| self.known.settings.read_book(id).is_none())
                     .filter_map(|id| {
                         let at = reading_stats::left_at(id)?;
-                        let e = self.history.entries.iter().find(|e| e.id == *id)?;
+                        let e = by_id_map.get(id.as_str())?;
                         Some((id.clone(), e.path.clone(), at.spine, at.offset, at.saved))
                     })
                     .collect()
@@ -8260,12 +8569,10 @@ impl App {
             } else {
                 0
             },
-            series: {
-                let all = book_series::all();
-                have.iter()
-                    .filter_map(|id| Some((id.clone(), all.get(id)?.clone())))
-                    .collect()
-            },
+            series: have
+                .iter()
+                .filter_map(|id| Some((id.clone(), all_series.get(id)?.clone())))
+                .collect(),
         };
         if self.plan.inputs.as_ref() != Some(&inputs) {
             // While books are being analysed, only their word data changing:
@@ -8351,7 +8658,7 @@ impl App {
             .unwrap_or_else(|| "nothing marked known".to_owned());
         ui.horizontal_wrapped(|ui| {
             if self.plan.job.is_some() {
-                ui.spinner();
+                palette::spinner(ui);
             }
             ui.label(format!(
                 "{} books · you know {} of their {} distinct words ({source})",
@@ -8602,9 +8909,7 @@ impl App {
                         }
                     });
                     row.col(|ui| {
-                        let tex = covers
-                            .entry(b.id.clone())
-                            .or_insert_with(|| load_cover(ctx, &hist.cover(&b.id)));
+                        let tex = covers.get_or_request(ctx, &b.id, hist.cover(&b.id));
                         let (w, h) = COVER_SIZE;
                         match tex {
                             Some(t) => {
@@ -8613,7 +8918,7 @@ impl App {
                                 ui.allocate_ui(egui::vec2(w, h), |ui| {
                                     ui.centered_and_justified(|ui| {
                                         ui.add(
-                                            egui::Image::new(&*t)
+                                            egui::Image::new(t)
                                                 .fit_to_exact_size(egui::vec2(tw * k, th * k))
                                                 .corner_radius(2.0),
                                         );
@@ -9010,6 +9315,17 @@ fn segmenter_by_label(label: &str) -> SegmenterKind {
     .unwrap_or(SegmenterKind::Auto)
 }
 
+fn status_debug_bytes(s: Status) -> &'static [u8] {
+    match s {
+        Status::NotInAnki => b"NotInAnki",
+        Status::New => b"New",
+        Status::Learning => b"Learning",
+        Status::Listed => b"Listed",
+        Status::Young => b"Young",
+        Status::Mature => b"Mature",
+    }
+}
+
 /// A digest of everything [`BookCoverage::compute`] and a Library row read
 /// from the known words.
 fn knowledge_digest(k: &anki::Knowledge) -> String {
@@ -9021,7 +9337,7 @@ fn knowledge_digest(k: &anki::Knowledge) -> String {
     for (w, s) in words {
         h.update((w.len() as u64).to_le_bytes());
         h.update(w.as_bytes());
-        h.update(format!("{s:?}").as_bytes());
+        h.update(status_debug_bytes(*s));
         h.update([0]);
     }
     let mut chars: Vec<(&char, &Status)> = k.chars.iter().collect();
@@ -9029,7 +9345,7 @@ fn knowledge_digest(k: &anki::Knowledge) -> String {
     h.update((chars.len() as u64).to_le_bytes());
     for (c, s) in chars {
         h.update(u32::from(*c).to_le_bytes());
-        h.update(format!("{s:?}").as_bytes());
+        h.update(status_debug_bytes(*s));
         h.update([0]);
     }
     h.update([u8::from(k.fold), u8::from(k.from_anki)]);
@@ -9051,14 +9367,35 @@ fn title_column_width<'a>(
     n: usize,
 ) -> f32 {
     let font = egui::TextStyle::Body.resolve(ui.style());
-    let p = ui.painter();
-    let longest = titles
-        .map(|t| {
-            p.layout_no_wrap(t.to_owned(), font.clone(), Color32::WHITE)
-                .size()
-                .x
-        })
-        .fold(0.0, f32::max);
+    let list: Vec<&'a str> = titles.collect();
+    let key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        font.size.to_bits().hash(&mut h);
+        list.len().hash(&mut h);
+        for t in &list {
+            t.hash(&mut h);
+        }
+        h.finish()
+    };
+    let cache_id = ui.scope_id().with("title_col_longest");
+    let longest = if let Some((k, w)) = ui.ctx().data(|d| d.get_temp::<(u64, f32)>(cache_id))
+        && k == key
+    {
+        w
+    } else {
+        let p = ui.painter();
+        let w = list
+            .iter()
+            .map(|t| {
+                p.layout_no_wrap((*t).to_owned(), font.clone(), Color32::WHITE)
+                    .size()
+                    .x
+            })
+            .fold(0.0, f32::max);
+        ui.ctx().data_mut(|d| d.insert_temp(cache_id, (key, w)));
+        w
+    };
     let gap = ui.spacing().item_spacing.x;
     // The cover, 6 points, and the spacing either side of them; a little
     // slack so the last letter isn't cut.
@@ -9073,18 +9410,6 @@ const COVER_SIZE: (f32, f32) = (32.0, 44.0);
 const COVER_ROW: f32 = 50.0;
 /// The Library's 📕 Read column.
 const READ_COL: f32 = 76.0;
-
-/// A saved cover thumbnail as a texture; `None` if there is none (or it can't be read).
-fn load_cover(ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
-    let img = image::open(path).ok()?.into_rgba8();
-    let size = [img.width() as usize, img.height() as usize];
-    let pixels = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
-    Some(ctx.load_texture(
-        format!("cover {}", path.display()),
-        pixels,
-        egui::TextureOptions::LINEAR,
-    ))
-}
 
 fn cmp_opt<T: Ord>(a: Option<T>, b: Option<T>, desc: bool) -> std::cmp::Ordering {
     match (a, b) {

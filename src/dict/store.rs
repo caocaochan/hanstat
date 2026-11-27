@@ -3,13 +3,16 @@
 
 use super::bloom::Bloom;
 use super::format::{self, Bytes, Meta, TermRecord, get_str, lower_bound, u32_at, u64_at};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::SystemTime;
 
 pub struct Store {
     pub dir: PathBuf,
     pub meta: Meta,
     bloom: Option<Bloom>,
+    freq_bloom: Option<Bloom>,
     keys: Bytes,
     terms: Bytes,
     gloss_idx: Bytes,
@@ -23,7 +26,6 @@ pub struct Store {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TermRef {
     pub offset: u64,
-    pub slot: u32,
 }
 
 /// A frequency: the reading it is limited to ("" for any), its value (a
@@ -54,10 +56,14 @@ impl Store {
         let bloom = std::fs::read(dir.join(format::BLOOM))
             .ok()
             .and_then(|b| Bloom::from_bytes(&b));
+        let freq_bloom = std::fs::read(dir.join(format::FREQ_BLOOM))
+            .ok()
+            .and_then(|b| Bloom::from_bytes(&b));
         let dec = zstd::bulk::Decompressor::with_dictionary(&zdict).map_err(|e| e.to_string())?;
         Ok(Store {
             dir: dir.to_path_buf(),
             bloom,
+            freq_bloom,
             keys: Bytes::map(&dir.join(format::KEYS))?,
             terms: Bytes::map(&dir.join(format::TERMS))?,
             gloss_idx: Bytes::map(&dir.join(format::GLOSS_IDX))?,
@@ -89,10 +95,7 @@ impl Store {
                 continue;
             };
             if r.expr == expr {
-                out.push(TermRef {
-                    offset: at,
-                    slot: r.slot,
-                });
+                out.push(TermRef { offset: at });
             }
         }
     }
@@ -120,6 +123,13 @@ impl Store {
 
     /// The frequencies of `expr` (`key` its hash).
     pub fn freq(&self, expr: &str, key: u64) -> Vec<Freq> {
+        if self
+            .freq_bloom
+            .as_ref()
+            .is_some_and(|b| !b.may_contain(key))
+        {
+            return Vec::new();
+        }
         let n = self.freq_idx.len() / 16;
         let mut i = lower_bound(&self.freq_idx, key);
         let mut out = Vec::new();
@@ -146,12 +156,63 @@ impl Store {
     }
 }
 
+type MediaIndex = Arc<BTreeMap<String, (u64, u64)>>;
+type MediaCacheEntry = (u64, SystemTime, MediaIndex);
+
+const MAX_MEDIA_CACHE: usize = 64;
+
+fn media_index(dir: &Path) -> Option<MediaIndex> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, MediaCacheEntry>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let idx_path = dir.join(format::MEDIA_IDX);
+    let Ok(meta) = std::fs::metadata(&idx_path) else {
+        cache.lock().unwrap_or_else(|e| e.into_inner()).remove(dir);
+        return None;
+    };
+    let len = meta.len();
+    let modified = meta.modified().ok();
+    if let Some(mtime) = modified {
+        let map = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((cached_len, cached_mtime, idx)) = map.get(dir)
+            && *cached_len == len
+            && *cached_mtime == mtime
+        {
+            return Some(Arc::clone(idx));
+        }
+    }
+    let bytes = match std::fs::read(&idx_path) {
+        Ok(b) => b,
+        Err(_) => {
+            cache.lock().unwrap_or_else(|e| e.into_inner()).remove(dir);
+            return None;
+        }
+    };
+    let parsed: BTreeMap<String, (u64, u64)> = match serde_json::from_slice(&bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            cache.lock().unwrap_or_else(|e| e.into_inner()).remove(dir);
+            return None;
+        }
+    };
+    let idx = Arc::new(parsed);
+    if let Some(mtime) = modified {
+        let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= MAX_MEDIA_CACHE
+            && !map.contains_key(dir)
+            && let Some(evict) = map.keys().next().cloned()
+        {
+            map.remove(&evict);
+        }
+        map.insert(dir.to_path_buf(), (len, mtime, Arc::clone(&idx)));
+    }
+    Some(idx)
+}
+
 /// A dictionary's image by its path in the zip, read from `media.bin` with
 /// no file kept open (so a dictionary can always be deleted or replaced).
 pub fn read_media(dir: &Path, path: &str) -> Option<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
-    let idx: BTreeMap<String, (u64, u64)> =
-        serde_json::from_slice(&std::fs::read(dir.join(format::MEDIA_IDX)).ok()?).ok()?;
+    let idx = media_index(dir)?;
     let path = path.trim_start_matches("./").trim_start_matches('/');
     let &(off, len) = idx.get(path)?;
     let mut f = std::fs::File::open(dir.join(format::MEDIA)).ok()?;

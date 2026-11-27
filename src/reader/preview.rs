@@ -1878,6 +1878,12 @@ fn dictionaries_window() {
     }
     // Danmei deleted: its folder is gone.
     r.dicts.delete(&danmei, &mut r.dict, &settings);
+    let t = Instant::now();
+    while r.dicts.busy() {
+        d.frame(&mut r, vec![]);
+        assert!(t.elapsed().as_secs() < 10);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     assert_eq!(r.dicts.listed().len(), 1);
     assert!(!hanstat::dict::root().join(&danmei).exists());
     r.dicts.open = true;
@@ -1912,6 +1918,12 @@ fn default_dictionary() {
     assert!(listed[0].1.starts_with("CC-CEDICT"), "{listed:?}");
     let settings = r.settings.clone();
     r.dicts.delete(&listed[0].0, &mut r.dict, &settings);
+    let t = Instant::now();
+    while r.dicts.busy() {
+        d.frame(&mut r, vec![]);
+        assert!(t.elapsed().as_secs() < 10);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     r.close(&d.ctx);
     // Opened again: nothing downloaded.
     let mut r = d.open(&book);

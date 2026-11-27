@@ -60,6 +60,7 @@ pub(crate) struct Scene {
 /// changed by `fonts` and `style`; `prepare` runs on the new context
 /// before the page is drawn (to load images). The page is as tall as what
 /// `draw` adds.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lay_out<T>(
     window: &egui::Context,
@@ -69,14 +70,45 @@ pub(crate) fn lay_out<T>(
     fonts: impl FnOnce(&mut egui::FontDefinitions),
     style: impl FnOnce(&mut egui::Style),
     prepare: impl FnOnce(&egui::Context) -> T,
+    draw: impl FnMut(&mut egui::Ui, &T),
+) -> Scene {
+    let defs = window.fonts(|f| f.definitions().clone());
+    let theme = window.theme();
+    let base_style = (*window.global_style()).clone();
+    lay_out_from(
+        defs,
+        theme,
+        base_style,
+        width,
+        pixels_per_point,
+        background,
+        fonts,
+        style,
+        prepare,
+        draw,
+    )
+}
+
+/// Same as [`lay_out`], from a cloned snapshot of window fonts/theme/style so
+/// the entire offscreen layout, cover decoding, and tessellation can run off
+/// the UI thread.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lay_out_from<T>(
+    mut defs: egui::FontDefinitions,
+    theme: egui::Theme,
+    mut s: egui::Style,
+    width: f32,
+    pixels_per_point: f32,
+    background: Color32,
+    fonts: impl FnOnce(&mut egui::FontDefinitions),
+    style: impl FnOnce(&mut egui::Style),
+    prepare: impl FnOnce(&egui::Context) -> T,
     mut draw: impl FnMut(&mut egui::Ui, &T),
 ) -> Scene {
     let ctx = egui::Context::default();
-    let mut defs = window.fonts(|f| f.definitions().clone());
     fonts(&mut defs);
     ctx.set_fonts(defs);
-    ctx.set_theme(window.theme());
-    let mut s = (*window.global_style()).clone();
+    ctx.set_theme(theme);
     style(&mut s);
     ctx.set_global_style(s);
     let data = prepare(&ctx);

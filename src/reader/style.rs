@@ -15,7 +15,7 @@ use super::css::Decl;
 use eframe::egui::Color32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
-pub enum Len {
+pub(super) enum Len {
     #[default]
     Auto,
     /// Multiples of the reader's text size.
@@ -26,20 +26,20 @@ pub enum Len {
 }
 
 impl Len {
-    pub fn resolve(self, base_px: f32, of: f32) -> Option<f32> {
+    pub(super) fn resolve(self, base_px: f32, of: f32) -> Option<f32> {
         match self {
             Len::Auto => None,
             Len::Base(v) => Some(v * base_px),
             Len::Pct(p) => Some(p / 100.0 * of),
         }
     }
-    pub fn px(self, base_px: f32, of: f32) -> f32 {
+    pub(super) fn px(self, base_px: f32, of: f32) -> f32 {
         self.resolve(base_px, of).unwrap_or(0.0)
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Family {
+pub(super) enum Family {
     #[default]
     Default,
     Serif,
@@ -47,7 +47,7 @@ pub enum Family {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Display {
+pub(super) enum Display {
     #[default]
     Inline,
     Block,
@@ -56,7 +56,7 @@ pub enum Display {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Align {
+pub(super) enum Align {
     #[default]
     Start,
     Center,
@@ -65,7 +65,7 @@ pub enum Align {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum WhiteSpace {
+pub(super) enum WhiteSpace {
     #[default]
     Normal,
     NoWrap,
@@ -75,19 +75,19 @@ pub enum WhiteSpace {
 }
 
 impl WhiteSpace {
-    pub fn collapses(self) -> bool {
+    pub(super) fn collapses(self) -> bool {
         matches!(
             self,
             WhiteSpace::Normal | WhiteSpace::NoWrap | WhiteSpace::PreLine
         )
     }
-    pub fn wraps(self) -> bool {
+    pub(super) fn wraps(self) -> bool {
         !matches!(self, WhiteSpace::NoWrap | WhiteSpace::Pre)
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum VAlign {
+pub(super) enum VAlign {
     #[default]
     Baseline,
     Super,
@@ -95,7 +95,7 @@ pub enum VAlign {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Writing {
+pub(super) enum Writing {
     #[default]
     Horizontal,
     VerticalRl,
@@ -103,7 +103,7 @@ pub enum Writing {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum LineStyle {
+pub(super) enum LineStyle {
     #[default]
     None,
     Solid,
@@ -113,20 +113,20 @@ pub enum LineStyle {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
-pub struct Border {
-    pub width: f32,
-    pub style: LineStyle,
-    pub color: Option<Color32>,
+pub(super) struct Border {
+    pub(super) width: f32,
+    pub(super) style: LineStyle,
+    pub(super) color: Option<Color32>,
 }
 
 impl Border {
-    pub fn visible(&self) -> bool {
+    pub(super) fn visible(&self) -> bool {
         self.style != LineStyle::None && self.width > 0.0
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Float {
+pub(super) enum Float {
     #[default]
     None,
     Left,
@@ -134,7 +134,7 @@ pub enum Float {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum ListStyle {
+pub(super) enum ListStyle {
     #[default]
     Disc,
     Decimal,
@@ -142,55 +142,55 @@ pub enum ListStyle {
 }
 
 /// Sides in CSS order: top, right, bottom, left.
-pub type Sides<T> = [T; 4];
+pub(super) type Sides<T> = [T; 4];
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct Style {
+pub(super) struct Style {
     // Inherited.
     /// Font size in base units.
-    pub font: f32,
-    pub family: Family,
-    pub bold: bool,
-    pub italic: bool,
+    pub(super) font: f32,
+    pub(super) family: Family,
+    pub(super) bold: bool,
+    pub(super) italic: bool,
     /// `None`: the theme's text colour.
-    pub color: Option<Color32>,
+    pub(super) color: Option<Color32>,
     /// `None`: normal; else a factor of the font size.
-    pub line_height: Option<f32>,
+    pub(super) line_height: Option<f32>,
     /// A line height given as a length (base units), instead of a factor.
-    pub line_height_abs: Option<f32>,
-    pub align: Align,
-    pub indent: Len,
+    pub(super) line_height_abs: Option<f32>,
+    pub(super) align: Align,
+    pub(super) indent: Len,
     /// Base units.
-    pub letter_spacing: f32,
-    pub white_space: WhiteSpace,
-    pub hidden: bool,
-    pub writing: Writing,
-    pub list_style: ListStyle,
+    pub(super) letter_spacing: f32,
+    pub(super) white_space: WhiteSpace,
+    pub(super) hidden: bool,
+    pub(super) writing: Writing,
+    pub(super) list_style: ListStyle,
     // Not inherited (text-decoration propagates to inline descendants).
-    pub underline: bool,
-    pub strike: bool,
-    pub display: Display,
-    pub margin: Sides<Len>,
-    pub padding: Sides<Len>,
-    pub border: Sides<Border>,
-    pub width: Len,
-    pub height: Len,
-    pub max_width: Len,
-    pub max_height: Len,
-    pub background: Option<Color32>,
-    pub valign: VAlign,
-    pub float: Float,
-    pub break_before: bool,
-    pub break_after: bool,
+    pub(super) underline: bool,
+    pub(super) strike: bool,
+    pub(super) display: Display,
+    pub(super) margin: Sides<Len>,
+    pub(super) padding: Sides<Len>,
+    pub(super) border: Sides<Border>,
+    pub(super) width: Len,
+    pub(super) height: Len,
+    pub(super) max_width: Len,
+    pub(super) max_height: Len,
+    pub(super) background: Option<Color32>,
+    pub(super) valign: VAlign,
+    pub(super) float: Float,
+    pub(super) break_before: bool,
+    pub(super) break_after: bool,
     /// `display: inline-block` (or `inline-flex`, `inline-table`): an inline
     /// box with its own background and border. Laid out as such only in a
     /// dictionary popup; in a book it is plain inline text, as before.
-    pub inline_block: bool,
+    pub(super) inline_block: bool,
     /// `border-radius`, base units.
-    pub radius: f32,
+    pub(super) radius: f32,
     /// `opacity`, multiplied down through the element's descendants (CSS
     /// composites the whole subtree; this fades each part the same).
-    pub opacity: f32,
+    pub(super) opacity: f32,
 }
 
 impl Default for Style {
@@ -234,7 +234,7 @@ impl Default for Style {
 
 impl Style {
     /// The style a child starts from: inherited properties kept, the rest reset.
-    pub fn inherit(&self) -> Style {
+    pub(super) fn inherit(&self) -> Style {
         Style {
             font: self.font,
             family: self.family,
@@ -260,7 +260,7 @@ impl Style {
 
 /// The user-agent sheet: HTML's default presentation, without the body
 /// margin (the reader has its own page margins).
-pub const UA_SHEET: &str = r#"
+pub(super) const UA_SHEET: &str = r#"
 address, article, aside, blockquote, body, center, dd, details, dialog, dir, div, dl, dt,
 fieldset, figcaption, figure, footer, form, h1, h2, h3, h4, h5, h6, header, hgroup, hr,
 html, legend, main, menu, nav, ol, p, pre, section, summary, ul, table, caption, thead,
@@ -297,7 +297,13 @@ td, th { padding: 0.1em 0.3em }
 /// `style` (which starts as the parent's [`Style::inherit`]). `parent` is the
 /// parent's computed style, `root_font` the root element's font size (rem).
 /// `replaced`: an image, whose width and height are not turned for vertical text.
-pub fn apply(style: &mut Style, parent: &Style, root_font: f32, decls: &[&Decl], replaced: bool) {
+pub(super) fn apply(
+    style: &mut Style,
+    parent: &Style,
+    root_font: f32,
+    decls: &[&Decl],
+    replaced: bool,
+) {
     // Writing mode first: it decides how physical sides are turned.
     for d in decls {
         if matches!(
@@ -767,7 +773,7 @@ fn family(v: &str) -> Option<Family> {
         if n.is_empty() {
             continue;
         }
-        if n == "sans-serif" || n == "monospace" || n.starts_with("sans-serif") {
+        if n == "monospace" || n.starts_with("sans-serif") {
             return Some(Family::Sans);
         }
         const SANS: &[&str] = &[
@@ -828,11 +834,11 @@ fn font_size(v: &str, parent: f32, root: f32) -> Option<f32> {
 }
 
 /// The links' colour in [`UA_SHEET`]; drawn in the theme's link colour.
-pub const UA_LINK: Color32 = Color32::from_rgb(0x26, 0x8b, 0xd2);
+pub(super) const UA_LINK: Color32 = Color32::from_rgb(0x26, 0x8b, 0xd2);
 
 /// A CSS length; `em` and `rem` are the element's and the root's font size.
 /// The ink `currentColor` means where a style leaves the colour to the theme.
-pub const THEME_INK: Color32 = Color32::from_rgb(0x1f, 0x3c, 0x46);
+const THEME_INK: Color32 = Color32::from_rgb(0x1f, 0x3c, 0x46);
 
 /// `color-mix(in srgb, <a> N%, <b>)` with `transparent` as one side (what
 /// dictionaries use to tint with the text colour): `<a>` at N% opacity.
@@ -875,7 +881,7 @@ fn color_mix(v: &str, current: Option<Color32>) -> Option<Option<Color32>> {
     )))
 }
 
-pub fn length(v: &str, em: f32, rem: f32) -> Option<Len> {
+fn length(v: &str, em: f32, rem: f32) -> Option<Len> {
     let v = v.trim();
     if v == "auto" {
         return Some(Len::Auto);
@@ -908,7 +914,7 @@ pub fn length(v: &str, em: f32, rem: f32) -> Option<Len> {
 }
 
 /// A colour; `Some(None)` is "the default text colour" (currentColor, black).
-pub fn color(v: &str) -> Option<Option<Color32>> {
+fn color(v: &str) -> Option<Option<Color32>> {
     let v = v.trim();
     if let Some(hex) = v.strip_prefix('#') {
         let h = |s: &str| u8::from_str_radix(s, 16).ok();

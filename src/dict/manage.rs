@@ -24,20 +24,40 @@ pub fn download_path(root: &Path, id: &str) -> PathBuf {
 }
 
 /// The failure points of [`swap`], for tests.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Fail {
-    None,
+enum Fail {
     MoveOld,
     MoveNew,
+}
+
+fn rename_path(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
 }
 
 /// Put `.tmp-<id>` in place as `<id>`. If any step fails, the old folder is
 /// back where it was and the error is returned.
 pub fn swap(root: &Path, id: &str) -> Result<(), String> {
-    swap_with(root, id, Fail::None)
+    swap_impl(root, id, rename_path, rename_path)
 }
 
-pub fn swap_with(root: &Path, id: &str, fail: Fail) -> Result<(), String> {
+#[cfg(test)]
+fn swap_with(root: &Path, id: &str, fail: Fail) -> Result<(), String> {
+    fn fail_rename(_: &Path, _: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::other("test failure"))
+    }
+    match fail {
+        Fail::MoveOld => swap_impl(root, id, fail_rename, rename_path),
+        Fail::MoveNew => swap_impl(root, id, rename_path, fail_rename),
+    }
+}
+
+fn swap_impl(
+    root: &Path,
+    id: &str,
+    move_old: fn(&Path, &Path) -> std::io::Result<()>,
+    move_new: fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), String> {
     let (cur, tmp, old) = (root.join(id), tmp_dir(root, id), old_dir(root, id));
     if !tmp.join(format::META).exists() {
         return Err(format!(
@@ -48,19 +68,9 @@ pub fn swap_with(root: &Path, id: &str, fail: Fail) -> Result<(), String> {
     let _ = std::fs::remove_dir_all(&old);
     let had_old = cur.exists();
     if had_old {
-        let r = if fail == Fail::MoveOld {
-            Err(std::io::Error::other("test failure"))
-        } else {
-            std::fs::rename(&cur, &old)
-        };
-        r.map_err(|e| format!("{}: {e}", cur.display()))?;
+        move_old(&cur, &old).map_err(|e| format!("{}: {e}", cur.display()))?;
     }
-    let r = if fail == Fail::MoveNew {
-        Err(std::io::Error::other("test failure"))
-    } else {
-        std::fs::rename(&tmp, &cur)
-    };
-    if let Err(e) = r {
+    if let Err(e) = move_new(&tmp, &cur) {
         if had_old {
             let _ = std::fs::rename(&old, &cur);
         }

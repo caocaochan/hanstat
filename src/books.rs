@@ -25,11 +25,6 @@ pub fn dir_in(history: &Path) -> PathBuf {
     history.with_file_name("books")
 }
 
-/// The default `books/` folder.
-pub fn dir() -> PathBuf {
-    dir_in(&crate::history::History::path())
-}
-
 /// Book `id`'s folder; `None` for what is not an id, so that nothing else
 /// is ever taken for one.
 fn folder(books: &Path, id: &str) -> Option<PathBuf> {
@@ -73,11 +68,6 @@ pub fn is_own_in(app: &Path, path: &Path) -> bool {
                 == c.as_os_str().to_string_lossy().to_lowercase()
         })
     })
-}
-
-/// [`is_own_in`] hanstat's default folder.
-pub fn is_own(path: &Path) -> bool {
-    is_own_in(&crate::models::app_dir(), path)
 }
 
 /// A book in the Library's folder.

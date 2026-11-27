@@ -14,6 +14,13 @@ use std::sync::{Arc, Mutex};
 
 /// Mono samples from MP3 bytes, and their rate.
 pub fn decode_mp3(bytes: Vec<u8>) -> Result<(Vec<f32>, u32), String> {
+    let mut out = Vec::new();
+    let rate = decode_mp3_into(bytes, &mut out)?;
+    Ok((out, rate))
+}
+
+/// Decode MP3 bytes into `out` (reusing its allocation), returning the sample rate.
+pub(super) fn decode_mp3_into(bytes: Vec<u8>, out: &mut Vec<f32>) -> Result<u32, String> {
     use symphonia::core::codecs::audio::AudioDecoderOptions;
     use symphonia::core::errors::Error;
     use symphonia::core::formats::probe::Hint;
@@ -21,6 +28,7 @@ pub fn decode_mp3(bytes: Vec<u8>) -> Result<(Vec<f32>, u32), String> {
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
 
+    out.clear();
     let mss = MediaSourceStream::new(Box::new(std::io::Cursor::new(bytes)), Default::default());
     let mut hint = Hint::new();
     hint.with_extension("mp3");
@@ -47,7 +55,6 @@ pub fn decode_mp3(bytes: Vec<u8>) -> Result<(Vec<f32>, u32), String> {
         .make_audio_decoder(&params, &AudioDecoderOptions::default())
         .map_err(bad)?;
     let mut rate = params.sample_rate.unwrap_or(24_000);
-    let mut out = Vec::new();
     let mut buf: Vec<f32> = Vec::new();
     while let Some(packet) = format.next_packet().map_err(bad)? {
         if packet.track_id != id {
@@ -71,48 +78,83 @@ pub fn decode_mp3(bytes: Vec<u8>) -> Result<(Vec<f32>, u32), String> {
             );
         }
     }
-    Ok((out, rate))
+    Ok(rate)
 }
 
 /// `input` at `from` Hz as `to` Hz (linear: speech at 24 kHz to a device's
 /// 44.1 or 48 kHz).
 pub fn resample(input: &[f32], from: u32, to: u32) -> Vec<f32> {
+    let mut out = Vec::new();
+    resample_into(input, from, to, &mut out);
+    out
+}
+
+/// Resample `input` from `from` Hz to `to` Hz into `out` (reusing its allocation).
+pub(super) fn resample_into(input: &[f32], from: u32, to: u32, out: &mut Vec<f32>) {
+    out.clear();
     if from == to || input.is_empty() {
-        return input.to_vec();
+        out.extend_from_slice(input);
+        return;
     }
     let n = (input.len() as u64 * to as u64 / from as u64) as usize;
     let step = from as f64 / to as f64;
-    (0..n)
-        .map(|i| {
-            let t = i as f64 * step;
-            let k = t as usize;
-            let f = (t - k as f64) as f32;
-            let a = input[k.min(input.len() - 1)];
-            let b = input[(k + 1).min(input.len() - 1)];
-            a + (b - a) * f
-        })
-        .collect()
+    out.reserve(n);
+    for i in 0..n {
+        let t = i as f64 * step;
+        let k = t as usize;
+        let f = (t - k as f64) as f32;
+        let a = input[k.min(input.len() - 1)];
+        let b = input[(k + 1).min(input.len() - 1)];
+        out.push(a + (b - a) * f);
+    }
+}
+
+/// Owned [`resample`]: returns `input` without copying when `from == to` or empty.
+pub(super) fn resample_owned(input: Vec<f32>, from: u32, to: u32) -> Vec<f32> {
+    if from == to || input.is_empty() {
+        return input;
+    }
+    resample(&input, from, to)
 }
 
 /// Tests run the real device silently.
 #[cfg(test)]
 pub static MUTE: AtomicBool = AtomicBool::new(false);
 
+fn stretch_window(rate: u32) -> usize {
+    (((rate as f32 * 0.025) as usize).max(16)) & !1
+}
+
+fn stretch_noop(len: usize, n: usize, speed: f32) -> bool {
+    (speed - 1.0).abs() < 0.005 || !speed.is_finite() || speed <= 0.0 || len < 2 * n
+}
+
 /// `input` (mono, `rate` Hz) played `speed` times as fast, at the same
 /// pitch: WSOLA (overlap-add of 25 ms Hann windows at half-window steps,
 /// each taken within ±8 ms of where it would be where it best continues the
 /// last one). 1.0 gives the samples unchanged.
+#[cfg(test)]
 pub fn stretch(input: &[f32], rate: u32, speed: f32) -> Vec<f32> {
-    if (speed - 1.0).abs() < 0.005 || !speed.is_finite() || speed <= 0.0 {
+    let n = stretch_window(rate);
+    if stretch_noop(input.len(), n, speed) {
         return input.to_vec();
     }
-    let n = (((rate as f32 * 0.025) as usize).max(16)) & !1;
+    stretch_core(input, rate, speed, n)
+}
+
+/// Owned [`stretch`]: returns `input` without copying when `speed` is ~1.0 or
+/// the clip is too short to stretch.
+pub(super) fn stretch_owned(input: Vec<f32>, rate: u32, speed: f32) -> Vec<f32> {
+    let n = stretch_window(rate);
+    if stretch_noop(input.len(), n, speed) {
+        return input;
+    }
+    stretch_core(&input, rate, speed, n)
+}
+
+fn stretch_core(input: &[f32], rate: u32, speed: f32, n: usize) -> Vec<f32> {
     let hs = n / 2;
     let out_len = (input.len() as f64 / speed as f64).round() as usize;
-    if input.len() < 2 * n {
-        // Too short to stretch: a click or a breath.
-        return input.to_vec();
-    }
     let ha = hs as f64 * speed as f64;
     let delta = (rate as f32 * 0.008) as isize;
     let win: Vec<f32> = (0..n)
@@ -205,6 +247,8 @@ fn voiced(samples: &[f32]) -> Range<usize> {
 
 struct Queue {
     clips: VecDeque<Clip>,
+    /// Finished or cut clips waiting to be dropped off the audio thread.
+    retired: Vec<Clip>,
     paused: bool,
     /// Clips below this id are being cut: faded out, then dropped.
     cut_below: u64,
@@ -220,12 +264,13 @@ struct Queue {
 impl Default for Queue {
     fn default() -> Self {
         Queue {
-            clips: VecDeque::new(),
+            clips: VecDeque::with_capacity(8),
+            retired: Vec::with_capacity(8),
             paused: false,
             cut_below: 0,
             gain: 1.0,
             current: None,
-            finished: Vec::new(),
+            finished: Vec::with_capacity(16),
         }
     }
 }
@@ -238,6 +283,16 @@ impl Queue {
         self.current = None;
         self.finished.clear();
         next
+    }
+
+    fn take_retired(&mut self) -> Vec<Clip> {
+        if self.retired.is_empty() {
+            Vec::new()
+        } else {
+            let mut out = Vec::with_capacity(8);
+            std::mem::swap(&mut self.retired, &mut out);
+            out
+        }
     }
 }
 
@@ -279,9 +334,18 @@ fn fill<T: SizedSample + FromSample<f32>>(
             q.gain = (q.gain + up).min(1.0);
         }
         if cutting && q.gain == 0.0 {
-            // Faded out: what was cut goes, the next clip fades in.
+            // Faded out: what was cut moves to `retired` (dropped off the audio thread).
             let cut = q.cut_below;
-            q.clips.retain(|c| c.id >= cut);
+            let mut i = 0;
+            while i < q.clips.len() {
+                if q.clips[i].id < cut {
+                    if let Some(c) = q.clips.remove(i) {
+                        q.retired.push(c);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
         }
         // Paused and silent: the sound waits where it stopped.
         let s = if q.paused && q.gain == 0.0 {
@@ -302,7 +366,9 @@ fn fill<T: SizedSample + FromSample<f32>>(
                     break s;
                 }
                 let id = c.id;
-                q.clips.pop_front();
+                if let Some(done) = q.clips.pop_front() {
+                    q.retired.push(done);
+                }
                 if id >= cut {
                     q.finished.push(id);
                     ended = true;
@@ -390,12 +456,17 @@ impl Output {
     pub fn push_at(&self, id: u64, samples: Vec<f32>, pos: usize) {
         let voiced = voiced(&samples);
         let pos = pos.min(samples.len());
-        self.queue.lock().unwrap().clips.push_back(Clip {
-            id,
-            samples,
-            pos,
-            voiced,
-        });
+        let retired = {
+            let mut q = self.queue.lock().unwrap();
+            q.clips.push_back(Clip {
+                id,
+                samples,
+                pos,
+                voiced,
+            });
+            q.take_retired()
+        };
+        drop(retired);
     }
 
     /// The clip being heard and how far into it it is (0 to 1).
@@ -410,7 +481,12 @@ impl Output {
 
     /// Stop and forget everything queued: what is heard fades out first.
     pub fn clear(&self) {
-        self.queue.lock().unwrap().cut();
+        let retired = {
+            let mut q = self.queue.lock().unwrap();
+            q.cut();
+            q.take_retired()
+        };
+        drop(retired);
     }
 
     pub fn set_paused(&self, paused: bool) {
@@ -419,12 +495,19 @@ impl Output {
 
     /// Clips queued, the one playing included (not those being cut).
     pub fn queued(&self) -> Vec<u64> {
-        let q = self.queue.lock().unwrap();
-        q.clips
-            .iter()
-            .filter(|c| c.id >= q.cut_below)
-            .map(|c| c.id)
-            .collect()
+        let (ids, retired) = {
+            let mut q = self.queue.lock().unwrap();
+            let ids = q
+                .clips
+                .iter()
+                .filter(|c| c.id >= q.cut_below)
+                .map(|c| c.id)
+                .collect();
+            let retired = q.take_retired();
+            (ids, retired)
+        };
+        drop(retired);
+        ids
     }
 
     /// The clip being heard.
@@ -457,7 +540,20 @@ impl Output {
 
     /// Clips finished since the last call.
     pub fn take_finished(&self) -> Vec<u64> {
-        std::mem::take(&mut self.queue.lock().unwrap().finished)
+        let (finished, retired) = {
+            let mut q = self.queue.lock().unwrap();
+            let finished = if q.finished.is_empty() {
+                Vec::new()
+            } else {
+                let mut next = Vec::with_capacity(16);
+                std::mem::swap(&mut q.finished, &mut next);
+                next
+            };
+            let retired = q.take_retired();
+            (finished, retired)
+        };
+        drop(retired);
+        finished
     }
 
     /// The device went away (unplugged, or changed): open it again.

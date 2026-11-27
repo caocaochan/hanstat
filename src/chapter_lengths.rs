@@ -64,22 +64,34 @@ fn store() -> MutexGuard<'static, Store> {
     s
 }
 
-fn save(s: &Store) {
-    if cfg!(test) {
-        return;
-    }
-    let saved = Saved {
+fn snapshot(s: &Store) -> Saved {
+    Saved {
         reader: READER.to_owned(),
         books: s
             .books
             .iter()
             .map(|(id, l)| (id.clone(), l.to_vec()))
             .collect(),
-    };
-    if let Ok(bytes) = serde_json::to_vec(&saved) {
+    }
+}
+
+fn write_saved(saved: &Saved) {
+    if cfg!(test) {
+        return;
+    }
+    if let Ok(bytes) = serde_json::to_vec(saved) {
         // Errors reach the status bar through `saver::take_error`.
         let _ = hanstat::saver::write(&path(), bytes);
     }
+}
+
+fn save_locked(s: MutexGuard<'static, Store>) {
+    if cfg!(test) {
+        return;
+    }
+    let saved = snapshot(&s);
+    drop(s);
+    write_saved(&saved);
 }
 
 /// The book's chapter lengths, if worked out.
@@ -90,17 +102,19 @@ pub(crate) fn get(id: &str) -> Option<Arc<[usize]>> {
 /// The chapter lengths of `epub` (the book `id`): saved ones, or worked out
 /// now and saved. For a thread that has the book open already.
 pub(crate) fn of_open(id: &str, epub: &reader::epub::Epub) -> Arc<[usize]> {
+    compute_and_store(id, epub, true)
+}
+
+fn compute_and_store(id: &str, epub: &reader::epub::Epub, flush: bool) -> Arc<[usize]> {
     if let Some(l) = get(id) {
         return l;
     }
-    let l: Arc<[usize]> = epub
-        .spine
-        .iter()
-        .map(|href| reader::chapter_text_len(epub, href))
-        .collect();
+    let l: Arc<[usize]> = reader::chapter_text_lens(epub).into();
     let mut s = store();
     s.books.insert(id.to_owned(), l.clone());
-    save(&s);
+    if flush {
+        save_locked(s);
+    }
     l
 }
 
@@ -121,12 +135,18 @@ pub(crate) fn want(id: &str, path: &std::path::Path, ctx: &egui::Context) {
 }
 
 fn run(ctx: egui::Context) {
+    const SAVE_EVERY: usize = 25;
+    let mut unsaved = 0usize;
     loop {
         let Some((id, path)) = ({
             let mut s = store();
             let next = s.todo.pop_front();
             if next.is_none() {
                 s.running = false;
+                if unsaved > 0 {
+                    unsaved = 0;
+                    save_locked(s);
+                }
             }
             next
         }) else {
@@ -134,7 +154,12 @@ fn run(ctx: egui::Context) {
         };
         match reader::epub::Epub::open(&path) {
             Ok(epub) => {
-                of_open(&id, &epub);
+                compute_and_store(&id, &epub, false);
+                unsaved += 1;
+                if unsaved >= SAVE_EVERY {
+                    unsaved = 0;
+                    save_locked(store());
+                }
             }
             Err(_) => {
                 store().failed.insert(id.clone());
@@ -148,10 +173,11 @@ fn run(ctx: egui::Context) {
 /// Forget a book's lengths (it was removed from the Library).
 pub(crate) fn forget(id: &str) {
     let mut s = store();
-    if s.books.remove(id).is_some() {
-        save(&s);
-    }
+    let removed = s.books.remove(id).is_some();
     s.failed.remove(id);
+    if removed {
+        save_locked(s);
+    }
 }
 
 /// How far through the book the place `at` is, 0..=1.

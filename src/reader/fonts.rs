@@ -7,32 +7,33 @@
 //! background. Chosen faces are memory-mapped, not read.
 
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Clone, Debug)]
-pub struct Face {
+struct Face {
     /// `None`: the bundled LXGW WenKai.
-    pub path: Option<PathBuf>,
-    pub index: u32,
-    pub weight: u16,
-    pub italic: bool,
+    path: Option<PathBuf>,
+    index: u32,
+    weight: u16,
+    italic: bool,
 }
 
 #[derive(Clone, Debug)]
-pub struct FamilyInfo {
+pub(super) struct FamilyInfo {
     /// The English (or first) family name: what settings store.
-    pub name: String,
+    pub(super) name: String,
     /// The Chinese name, if the font has one that differs.
-    pub local: Option<String>,
-    pub faces: Vec<Face>,
+    local: Option<String>,
+    faces: Vec<Face>,
 }
 
 impl FamilyInfo {
-    pub fn label(&self) -> String {
+    pub(super) fn label(&self) -> String {
         match &self.local {
             Some(l) => format!("{} · {l}", self.name),
             None => self.name.clone(),
@@ -40,7 +41,7 @@ impl FamilyInfo {
     }
 
     /// The upright face closest to `weight`.
-    pub fn face(&self, weight: u16) -> Option<&Face> {
+    fn face(&self, weight: u16) -> Option<&Face> {
         self.faces
             .iter()
             .filter(|f| !f.italic)
@@ -48,15 +49,15 @@ impl FamilyInfo {
             .or(self.faces.first())
     }
 
-    pub fn has_bold(&self) -> bool {
+    fn has_bold(&self) -> bool {
         self.faces.iter().any(|f| !f.italic && f.weight >= 600)
     }
 }
 
-pub const BUNDLED: &str = "LXGW WenKai";
+const BUNDLED: &str = "LXGW WenKai";
 
 /// The fonts found, once the background scan is done.
-pub fn families() -> Option<Arc<Vec<FamilyInfo>>> {
+pub(super) fn families() -> Option<Arc<Vec<FamilyInfo>>> {
     static SCAN: OnceLock<Mutex<Option<Arc<Vec<FamilyInfo>>>>> = OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
     let slot = SCAN.get_or_init(|| Mutex::new(None));
@@ -70,7 +71,7 @@ pub fn families() -> Option<Arc<Vec<FamilyInfo>>> {
 }
 
 /// Start the scan without waiting for it.
-pub fn prefetch() {
+pub(super) fn prefetch() {
     let _ = families();
 }
 
@@ -431,14 +432,14 @@ static BASE: OnceLock<FontDefinitions> = OnceLock::new();
 
 /// The app's font definitions (system CJK fallbacks), which the reader's
 /// families are added to.
-pub fn set_base(defs: FontDefinitions) {
+pub(crate) fn set_base(defs: FontDefinitions) {
     let _ = BASE.set(defs);
 }
 
 /// Unicode Vertical Presentation Forms checked in each installed font's `cmap`,
 /// so vertical layout uses them only when the chosen primary font has the glyph
 /// (falling back to 90° rotation or optical positioning otherwise).
-pub const VERT_FORMS: &[char] = &[
+const VERT_FORMS: &[char] = &[
     '︐', // U+FE10 vertical comma (，)
     '︑', // U+FE11 vertical ideographic comma (、)
     '︒', // U+FE12 vertical ideographic full stop (。)
@@ -472,11 +473,11 @@ pub const VERT_FORMS: &[char] = &[
 
 /// Bitmask of [`VERT_FORMS`] present in a font face's `cmap`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct VertForms(u32);
+pub(super) struct VertForms(u32);
 
 impl VertForms {
     /// Read vertical-form coverage from raw TTF/OTF/TTC font bytes.
-    pub fn from_font(font: &[u8], index: u32) -> VertForms {
+    pub(super) fn from_font(font: &[u8], index: u32) -> VertForms {
         let face_off = if font.get(0..4) == Some(b"ttcf") {
             let n = be32(font, 8).unwrap_or(0);
             if index >= n {
@@ -511,7 +512,7 @@ impl VertForms {
         VertForms(mask)
     }
 
-    pub fn has(self, ch: char) -> bool {
+    pub(super) fn has(self, ch: char) -> bool {
         VERT_FORMS
             .iter()
             .position(|&c| c == ch)
@@ -519,26 +520,32 @@ impl VertForms {
     }
 }
 
+/// Cached vertical-form coverage for the bundled LXGW WenKai font.
+fn wenkai_vert() -> VertForms {
+    static VERT: OnceLock<VertForms> = OnceLock::new();
+    *VERT.get_or_init(|| VertForms::from_font(crate::png_report::WENKAI, 0))
+}
+
 /// What the reader's text uses: an egui family for each of serif and
 /// sans-serif, regular and bold.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Installed {
-    pub serif: FontFamily,
-    pub serif_bold: FontFamily,
-    pub sans: FontFamily,
-    pub sans_bold: FontFamily,
+pub(super) struct Installed {
+    pub(super) serif: FontFamily,
+    pub(super) serif_bold: FontFamily,
+    pub(super) sans: FontFamily,
+    pub(super) sans_bold: FontFamily,
     /// The family has no bold face: bold is drawn twice, a little apart.
-    pub serif_faux_bold: bool,
-    pub sans_faux_bold: bool,
+    pub(super) serif_faux_bold: bool,
+    pub(super) sans_faux_bold: bool,
     /// Vertical presentation forms present in each primary face.
-    pub serif_vert: VertForms,
-    pub sans_vert: VertForms,
+    pub(super) serif_vert: VertForms,
+    pub(super) sans_vert: VertForms,
     /// The two choices this was made for.
-    pub key: (String, String),
+    pub(super) key: (String, String),
 }
 
 /// Default choices, by what the system has.
-pub fn default_choice(fams: &[FamilyInfo], serif: bool, traditional: bool) -> String {
+pub(super) fn default_choice(fams: &[FamilyInfo], serif: bool, traditional: bool) -> String {
     let wanted: &[&str] = match (serif, traditional) {
         (true, false) => &[
             "Source Han Serif SC",
@@ -639,7 +646,7 @@ fn table_records(font: &[u8]) -> Vec<usize> {
 }
 
 /// Whether any face of `font` has an embedded bitmap table.
-pub fn bitmap_tables(font: &[u8]) -> bool {
+fn bitmap_tables(font: &[u8]) -> bool {
     table_records(font)
         .into_iter()
         .any(|r| BITMAP_TABLES.iter().any(|t| font[r..r + 4] == t[..]))
@@ -652,7 +659,7 @@ pub fn bitmap_tables(font: &[u8]) -> bool {
 /// unknown to egui and it draws the outlines. Lowercasing the last letter
 /// keeps the directory sorted, which table lookups rely on. Fonts without
 /// such tables are left as they are. Returns whether anything changed.
-pub fn hide_bitmap_tables(font: &mut [u8]) -> bool {
+pub(crate) fn hide_bitmap_tables(font: &mut [u8]) -> bool {
     let mut changed = false;
     for r in table_records(font) {
         if BITMAP_TABLES.iter().any(|t| font[r..r + 4] == t[..]) {
@@ -663,23 +670,37 @@ pub fn hide_bitmap_tables(font: &mut [u8]) -> bool {
     changed
 }
 
+fn installed_key() -> egui::Id {
+    egui::Id::unique("reader-fonts-installed")
+}
+
 /// Install `serif` and `sans` (family names; empty: the app's own font) as
-/// new egui families named with `generation`, so text laid out before the
-/// change never mixes with the new fonts. Takes effect at the next pass.
-pub fn install(
+/// new egui families named with a fresh generation, so text laid out before the
+/// change never mixes with the new fonts. Reuses the already-installed families
+/// when reopening a book with unchanged choices, skipping a font-atlas rebuild.
+pub(super) fn install(
     ctx: &egui::Context,
     fams: &[FamilyInfo],
     serif: &str,
     sans: &str,
-    generation: u64,
 ) -> Installed {
+    if let Some(prev) = ctx.data(|d| d.get_temp::<Installed>(installed_key()))
+        && prev.key.0 == serif
+        && prev.key.1 == sans
+        && ctx.fonts(|v| v.definitions().families.contains_key(&prev.serif))
+    {
+        return prev;
+    }
+    static GEN: AtomicU64 = AtomicU64::new(0);
+    let generation = GEN.fetch_add(1, Ordering::Relaxed) + 1;
     let (defs, installed) = definitions(fams, serif, sans, generation);
     ctx.set_fonts(defs);
+    ctx.data_mut(|d| d.insert_temp(installed_key(), installed.clone()));
     installed
 }
 
 /// The app's fonts plus the reader's families (see [`install`]).
-pub fn definitions(
+pub(super) fn definitions(
     fams: &[FamilyInfo],
     serif: &str,
     sans: &str,
@@ -691,7 +712,22 @@ pub fn definitions(
         .get(&FontFamily::Proportional)
         .cloned()
         .unwrap_or_default();
-    let fallback_vert = VertForms::from_font(crate::png_report::WENKAI, 0);
+    let fallback_vert = wenkai_vert();
+    // Share a single mmap when regular/bold or serif/sans come from the same file.
+    let mut mapped: HashMap<PathBuf, egui::epaint::text::Blob> = HashMap::new();
+    let mut load_blob = |face: &Face| -> Option<egui::epaint::text::Blob> {
+        match &face.path {
+            None => Some(Arc::new(crate::png_report::WENKAI) as egui::epaint::text::Blob),
+            Some(p) => {
+                if let Some(b) = mapped.get(p) {
+                    return Some(b.clone());
+                }
+                let b = blob(face)?;
+                mapped.insert(p.clone(), b.clone());
+                Some(b)
+            }
+        }
+    };
     let mut add = |slot: &str, choice: &str| -> (FontFamily, FontFamily, bool, VertForms) {
         let regular_name = format!("rd{generation}-{slot}");
         let bold_name = format!("rd{generation}-{slot}-b");
@@ -702,9 +738,13 @@ pub fn definitions(
         let mut vert = fallback_vert;
         if let Some(fam) = fam {
             if let Some(face) = fam.face(400)
-                && let Some(b) = blob(face)
+                && let Some(b) = load_blob(face)
             {
-                vert = VertForms::from_font(b.as_ref().as_ref(), face.index);
+                vert = if face.path.is_none() {
+                    fallback_vert
+                } else {
+                    VertForms::from_font(b.as_ref().as_ref(), face.index)
+                };
                 let key = format!("{regular_name}-r");
                 defs.font_data
                     .insert(key.clone(), Arc::new(FontData::from_blob(b, face.index)));
@@ -713,7 +753,7 @@ pub fn definitions(
             }
             if fam.has_bold()
                 && let Some(face) = fam.face(700)
-                && let Some(b) = blob(face)
+                && let Some(b) = load_blob(face)
             {
                 let key = format!("{regular_name}-b");
                 defs.font_data

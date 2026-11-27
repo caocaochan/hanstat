@@ -10,6 +10,7 @@ use crate::script;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder};
 use candle_transformers::models::bert::{BertModel, Config};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -83,7 +84,7 @@ impl Ckip {
     fn forward_batch<'a>(
         &self,
         batch: &[&'a str],
-        model_text: &[String],
+        model_text: &[Cow<'a, str>],
     ) -> Result<Vec<Vec<&'a str>>, String> {
         let lens: Vec<usize> = batch.iter().map(|s| s.chars().count()).collect();
         let width = lens.iter().copied().max().unwrap_or(0) + 2;
@@ -146,13 +147,13 @@ impl Ckip {
         let mut seg: Vec<Vec<&'a str>> = vec![Vec::new(); pieces.len()];
         for idx in order.chunks(8) {
             let batch: Vec<&'a str> = idx.iter().map(|&i| pieces[i].1).collect();
-            let model_text: Vec<String> = batch
+            let model_text: Vec<Cow<'a, str>> = batch
                 .iter()
-                .map(|s| {
+                .map(|&s| {
                     if fold_s2t {
-                        script::fold_s2t(s)
+                        Cow::Owned(script::fold_s2t(s))
                     } else {
-                        (*s).to_owned()
+                        Cow::Borrowed(s)
                     }
                 })
                 .collect();

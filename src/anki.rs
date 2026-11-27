@@ -49,15 +49,6 @@ pub enum Status {
 }
 
 impl Status {
-    pub const ALL: [Status; 6] = [
-        Status::Mature,
-        Status::Young,
-        Status::Listed,
-        Status::Learning,
-        Status::New,
-        Status::NotInAnki,
-    ];
-
     pub fn label(self) -> &'static str {
         match self {
             Status::NotInAnki => "Not in Anki",
@@ -109,10 +100,6 @@ impl ByStatus {
             Status::Young => self.young,
             Status::Mature => self.mature,
         }
-    }
-
-    pub fn total(&self) -> u64 {
-        self.mature + self.young + self.listed + self.learning + self.new + self.not_in_anki
     }
 
     /// Mature + young (+ listed).
@@ -971,14 +958,16 @@ impl Collection {
         if !deck_ids.is_empty() && !ords.is_empty() {
             // FSRS stability is `s` in the card's data JSON (Anki 23.10+), present
             // only on cards with an FSRS memory state; `data` is often empty.
-            let mut st = self
-                .conn
-                .prepare(
-                    "SELECT c.nid, n.mid, CASE WHEN c.odid != 0 THEN c.odid ELSE c.did END, c.type, c.queue, c.ivl, \
-                     CASE WHEN json_valid(c.data) THEN json_extract(c.data, '$.s') END \
-                     FROM cards c JOIN notes n ON n.id = c.nid",
-                )
-                .map_err(sql_err)?;
+            let sql = if threshold.is_some() {
+                "SELECT c.nid, n.mid, CASE WHEN c.odid != 0 THEN c.odid ELSE c.did END, c.type, c.queue, c.ivl, \
+                 CASE WHEN json_valid(c.data) THEN json_extract(c.data, '$.s') END \
+                 FROM cards c JOIN notes n ON n.id = c.nid"
+            } else {
+                "SELECT c.nid, n.mid, CASE WHEN c.odid != 0 THEN c.odid ELSE c.did END, c.type, c.queue, c.ivl, \
+                 NULL \
+                 FROM cards c JOIN notes n ON n.id = c.nid"
+            };
+            let mut st = self.conn.prepare(sql).map_err(sql_err)?;
             let rows = st
                 .query_map([], |r| {
                     Ok((
@@ -1098,7 +1087,12 @@ impl Collection {
                     chunk_status.push(*st);
                 }
             }
-            for (toks, st) in segmenter.cut_many(&chunks).into_iter().zip(chunk_status) {
+            use rayon::prelude::*;
+            let segmented: Vec<Vec<Vec<&str>>> = chunks
+                .par_chunks(128)
+                .map(|group| segmenter.cut_many(group))
+                .collect();
+            for (toks, st) in segmented.into_iter().flatten().zip(chunk_status) {
                 toks.into_iter().for_each(|w| add(w, st));
             }
             summary.segmenter = Some(segmenter.kind);
@@ -1227,25 +1221,48 @@ static RE_BRACKET: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[[^\]]*\]").
 static RE_NUM_ENTITY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"&#(?:[xX]([0-9a-fA-F]+)|([0-9]+));").unwrap());
 
+fn replace_if(s: &mut std::borrow::Cow<'_, str>, needle: &str, re: &Regex, rep: &str) {
+    if s.contains(needle) {
+        let next = match re.replace_all(s, rep) {
+            std::borrow::Cow::Owned(r) => Some(r),
+            std::borrow::Cow::Borrowed(_) => None,
+        };
+        if let Some(r) = next {
+            *s = std::borrow::Cow::Owned(r);
+        }
+    }
+}
+
 /// One field's text with HTML, cloze markup, sound tags and bracketed readings
 /// removed, NFC-normalised as book text is.
 pub fn clean_field(field: &str, norm: &mut chars::NormStats) -> String {
-    let s = RE_CLOZE.replace_all(field, "$1");
-    let s = RE_STYLE.replace_all(&s, " ");
-    let s = RE_BLOCK.replace_all(&s, " ");
-    // Inline tags (<b>, <span>) must not split a word.
-    let s = RE_TAG.replace_all(&s, "");
-    let s = RE_BRACKET.replace_all(&s, " ");
-    let s = RE_NUM_ENTITY.replace_all(&s, |c: &regex::Captures| {
-        let n = match (c.get(1), c.get(2)) {
-            (Some(h), _) => u32::from_str_radix(h.as_str(), 16).ok(),
-            (_, Some(d)) => d.as_str().parse().ok(),
-            _ => None,
+    let mut s = std::borrow::Cow::Borrowed(field);
+    replace_if(&mut s, "{{", &RE_CLOZE, "$1");
+    if s.contains('<') {
+        replace_if(&mut s, "<", &RE_STYLE, " ");
+        replace_if(&mut s, "<", &RE_BLOCK, " ");
+        // Inline tags (<b>, <span>) must not split a word.
+        replace_if(&mut s, "<", &RE_TAG, "");
+    }
+    replace_if(&mut s, "[", &RE_BRACKET, " ");
+    if s.contains("&#") {
+        let next = match RE_NUM_ENTITY.replace_all(&s, |c: &regex::Captures| {
+            let n = match (c.get(1), c.get(2)) {
+                (Some(h), _) => u32::from_str_radix(h.as_str(), 16).ok(),
+                (_, Some(d)) => d.as_str().parse().ok(),
+                _ => None,
+            };
+            n.and_then(char::from_u32)
+                .map(String::from)
+                .unwrap_or_default()
+        }) {
+            std::borrow::Cow::Owned(r) => Some(r),
+            std::borrow::Cow::Borrowed(_) => None,
         };
-        n.and_then(char::from_u32)
-            .map(String::from)
-            .unwrap_or_default()
-    });
+        if let Some(r) = next {
+            s = std::borrow::Cow::Owned(r);
+        }
+    }
     chars::normalize(&s, norm)
 }
 
@@ -1289,7 +1306,8 @@ pub fn looks_like_sentence(text: &str) -> bool {
 }
 
 /// The Chinese words in one word-like field (each run of Han characters is one word).
-pub fn field_words(field: &str, norm: &mut chars::NormStats) -> Vec<String> {
+#[cfg(test)]
+fn field_words(field: &str, norm: &mut chars::NormStats) -> Vec<String> {
     han_runs(&clean_field(field, norm))
         .map(str::to_owned)
         .collect()
@@ -1411,10 +1429,16 @@ impl Knowledge {
     }
 
     pub fn word(&self, w: &str) -> Status {
-        self.words
-            .get(&fold(w, self.fold))
-            .copied()
-            .unwrap_or_default()
+        if !self.fold {
+            self.words.get(w).copied().unwrap_or_default()
+        } else {
+            let t = &script::TABLES.t2s;
+            if w.chars().any(|c| t.contains_key(&c)) {
+                self.words.get(&fold(w, true)).copied().unwrap_or_default()
+            } else {
+                self.words.get(w).copied().unwrap_or_default()
+            }
+        }
     }
 
     pub fn char(&self, c: char) -> Status {
@@ -1574,6 +1598,9 @@ impl BookCoverage {
             .filter(|n| n.chars().count() >= 2)
             .map(String::as_str)
             .collect();
+        let ac = (!names.is_empty())
+            .then(|| aho_corasick::AhoCorasick::new(&names).ok())
+            .flatten();
         let mut name_tokens = 0;
         let mut running_words = KnownCount::default();
         for ((w, n), s) in word_freq.iter().zip(&word_status) {
@@ -1581,7 +1608,7 @@ impl BookCoverage {
                 continue;
             }
             let n = *n as u64;
-            if !s.is_known() && names.iter().any(|name| w.contains(name)) {
+            if !s.is_known() && ac.as_ref().is_some_and(|a| a.is_match(w.as_str())) {
                 name_tokens += n;
                 continue;
             }

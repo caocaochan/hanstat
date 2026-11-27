@@ -12,16 +12,16 @@ pub const CHANGELOG: &str = include_str!("../CHANGELOG.md");
 /// One version's notes: `## [2026.11.17.15] - 2026-11-17` and what follows
 /// up to the next `## ` heading.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Section<'a> {
-    pub version: Version,
+pub(crate) struct Section<'a> {
+    pub(crate) version: Version,
     /// The heading after the version, e.g. `2026-11-17` (may be empty).
-    pub date: &'a str,
-    pub body: &'a str,
+    pub(crate) date: &'a str,
+    pub(crate) body: &'a str,
 }
 
 /// The changelog's versions, in its order. Headings whose version doesn't
 /// parse (an `[Unreleased]` section) are skipped with their notes.
-pub fn sections(text: &str) -> Vec<Section<'_>> {
+fn sections(text: &str) -> Vec<Section<'_>> {
     let mut out = Vec::new();
     // (version and date, start of its body) of the heading being read.
     let mut open: Option<(Option<(Version, &str)>, usize)> = None;
@@ -59,7 +59,7 @@ fn heading(h: &str) -> Option<(Version, &str)> {
 }
 
 /// The sections of versions after `after` up to and including `upto`, newest first.
-pub fn between<'a>(secs: &[Section<'a>], after: Version, upto: Version) -> Vec<Section<'a>> {
+fn between<'a>(secs: &[Section<'a>], after: Version, upto: Version) -> Vec<Section<'a>> {
     let mut out: Vec<Section> = secs
         .iter()
         .filter(|s| after < s.version && s.version <= upto)
@@ -87,22 +87,100 @@ pub fn at_start<'a>(
     }
 }
 
+/// Pre-parsed section block so the window does not re-parse all 885+ lines of
+/// `CHANGELOG.md` on every frame.
+enum ParsedBlock {
+    Heading(String),
+    Bullet {
+        level: usize,
+        lead: Option<&'static str>,
+        spans: Vec<(Span, &'static str)>,
+    },
+    Para {
+        level: usize,
+        spans: Vec<(Span, &'static str)>,
+    },
+}
+
+struct ParsedSection {
+    #[cfg(test)]
+    version: Version,
+    version_text: String,
+    date: &'static str,
+    blocks: Vec<ParsedBlock>,
+}
+
+impl ParsedSection {
+    fn parse(s: Section<'static>) -> Self {
+        let blocks = blocks(s.body)
+            .into_iter()
+            .map(|b| match b {
+                Block::Heading(h) => ParsedBlock::Heading(h.to_uppercase()),
+                Block::Bullet { level, text } => {
+                    if level == 0
+                        && let Some((title, rest)) = lead(text)
+                    {
+                        ParsedBlock::Bullet {
+                            level,
+                            lead: Some(title),
+                            spans: if rest.is_empty() {
+                                Vec::new()
+                            } else {
+                                spans(rest)
+                            },
+                        }
+                    } else {
+                        ParsedBlock::Bullet {
+                            level,
+                            lead: None,
+                            spans: spans(text),
+                        }
+                    }
+                }
+                Block::Para { level, text } => ParsedBlock::Para {
+                    level,
+                    spans: spans(text),
+                },
+            })
+            .collect();
+        ParsedSection {
+            #[cfg(test)]
+            version: s.version,
+            version_text: format_version(s.version),
+            date: s.date,
+            blocks,
+        }
+    }
+}
+
 /// The window's state while it is open.
 pub struct WhatsNew {
     /// The version the notes start after; `None` for the whole changelog
     /// (the version menu's **Changelog**).
     pub since: Option<Version>,
-    pub sections: Vec<Section<'static>>,
+    parsed: Vec<ParsedSection>,
+    /// Last measured height of each section at `measured_width` so off-screen
+    /// sections are skipped during scroll without shaping their text.
+    heights: Vec<f32>,
+    measured_width: f32,
 }
 
 impl WhatsNew {
+    pub(crate) fn new(since: Option<Version>, sections: Vec<Section<'static>>) -> Self {
+        let parsed: Vec<ParsedSection> = sections.into_iter().map(ParsedSection::parse).collect();
+        let len = parsed.len();
+        WhatsNew {
+            since,
+            parsed,
+            heights: vec![0.0; len],
+            measured_width: 0.0,
+        }
+    }
+
     /// Every release up to this one, newest first.
     pub fn all() -> Self {
         let current = hanstat::update::current_version();
-        WhatsNew {
-            since: None,
-            sections: between(&sections(CHANGELOG), (0, 0, 0, 0), current),
-        }
+        Self::new(None, between(&sections(CHANGELOG), (0, 0, 0, 0), current))
     }
 }
 
@@ -200,14 +278,14 @@ fn lead(text: &str) -> Option<(&str, &str)> {
 
 /// Body text with more room between lines than egui's default, which is
 /// cramped for paragraphs this long.
-fn inline_job(ui: &egui::Ui, text: &str) -> LayoutJob {
+fn inline_job(ui: &egui::Ui, parts: &[(Span, &str)]) -> LayoutJob {
     let style = ui.style();
     let body = egui::TextStyle::Body.resolve(style);
     let mono = egui::FontId::monospace(body.size * 0.92);
     let line = Some(body.size * 1.5);
     let v = ui.visuals();
     let mut job = LayoutJob::default();
-    for (kind, s) in spans(text) {
+    for &(kind, s) in parts {
         let format = match kind {
             Span::Plain => egui::TextFormat::simple(body.clone(), v.text_color()),
             Span::Bold => egui::TextFormat::simple(body.clone(), v.strong_text_color()),
@@ -230,31 +308,36 @@ fn inline_job(ui: &egui::Ui, text: &str) -> LayoutJob {
 
 /// A section's notes: group headings (Added, Changed, Fixed), entries with
 /// their bold lead as a title, nested bullets and paragraphs.
-fn notes_ui(ui: &mut egui::Ui, body: &str) {
+fn notes_ui(ui: &mut egui::Ui, blocks: &[ParsedBlock]) {
     const INDENT: f32 = 18.0;
     let size = egui::TextStyle::Body.resolve(ui.style()).size;
     let wrapped = |ui: &mut egui::Ui, job: LayoutJob| {
         ui.add(egui::Label::new(job).wrap());
     };
-    for b in blocks(body) {
+    for b in blocks {
         match b {
-            Block::Heading(h) => {
+            ParsedBlock::Heading(h) => {
                 ui.add_space(12.0);
                 ui.label(
-                    RichText::new(h.to_uppercase())
+                    RichText::new(h.as_str())
                         .size(size * 0.85)
                         .extra_letter_spacing(1.5)
                         .weak(),
                 );
                 ui.add_space(2.0);
             }
-            Block::Bullet { level, text } => {
+            ParsedBlock::Bullet {
+                level,
+                lead: title,
+                spans,
+            } => {
+                let level = *level;
                 ui.add_space(if level == 0 { 8.0 } else { 3.0 });
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     ui.add_space(level as f32 * INDENT);
                     let marker = if level == 0 { "•" } else { "◦" };
-                    let first = if level == 0 && lead(text).is_some() {
+                    let first = if title.is_some() {
                         size * 1.12 * 1.3
                     } else {
                         size * 1.5
@@ -265,31 +348,28 @@ fn notes_ui(ui: &mut egui::Ui, body: &str) {
                     );
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
-                        match lead(text).filter(|_| level == 0) {
-                            Some((title, rest)) => {
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(title)
-                                            .size(size * 1.12)
-                                            .color(ui.visuals().strong_text_color()),
-                                    )
-                                    .wrap(),
-                                );
-                                if !rest.is_empty() {
-                                    wrapped(ui, inline_job(ui, rest));
-                                }
-                            }
-                            None => wrapped(ui, inline_job(ui, text)),
+                        if let Some(title) = title {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(*title)
+                                        .size(size * 1.12)
+                                        .color(ui.visuals().strong_text_color()),
+                                )
+                                .wrap(),
+                            );
+                        }
+                        if !spans.is_empty() {
+                            wrapped(ui, inline_job(ui, spans));
                         }
                     });
                 });
             }
-            Block::Para { level, text } => {
+            ParsedBlock::Para { level, spans } => {
                 ui.add_space(6.0);
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
-                    ui.add_space(level as f32 * INDENT);
-                    wrapped(ui, inline_job(ui, text));
+                    ui.add_space(*level as f32 * INDENT);
+                    wrapped(ui, inline_job(ui, spans));
                 });
             }
         }
@@ -300,12 +380,16 @@ fn notes_ui(ui: &mut egui::Ui, body: &str) {
 pub const WINDOW_ID: &str = "whats-new-window";
 
 /// Draw the window; `false` once it is closed.
-pub fn window(ctx: &egui::Context, state: &WhatsNew) -> bool {
+pub fn window(ctx: &egui::Context, state: &mut WhatsNew) -> bool {
     let mut open = true;
     let mut close = false;
     let screen = ctx.content_rect();
     // About 80 Latin characters a line: wider is harder to read.
     let width = (screen.width() - 40.0).clamp(280.0, 580.0);
+    if (state.measured_width - width).abs() > 1.0 {
+        state.heights.fill(0.0);
+        state.measured_width = width;
+    }
     let version = hanstat::update::version_string();
     let title = match state.since {
         Some(_) => format!("What's new in hanstat {version}"),
@@ -336,19 +420,33 @@ pub fn window(ctx: &egui::Context, state: &WhatsNew) -> bool {
                 .max_height((screen.height() * 0.65).max(160.0))
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    for (i, s) in state.sections.iter().enumerate() {
-                        if i > 0 {
-                            ui.add_space(14.0);
-                            ui.separator();
-                            ui.add_space(6.0);
+                    let clip = ui.clip_rect();
+                    for (i, s) in state.parsed.iter().enumerate() {
+                        let y = ui.cursor().top();
+                        let known_h = state.heights[i];
+                        if known_h > 0.0
+                            && (y + known_h < clip.top() - 40.0 || y > clip.bottom() + 40.0)
+                        {
+                            ui.allocate_space(egui::vec2(ui.available_width(), known_h));
+                            continue;
                         }
-                        ui.horizontal(|ui| {
-                            ui.heading(format_version(s.version));
-                            if !s.date.is_empty() {
-                                ui.label(RichText::new(s.date).weak());
+                        let start_y = ui.cursor().top();
+                        ui.vertical(|ui| {
+                            if i > 0 {
+                                ui.add_space(14.0);
+                                ui.separator();
+                                ui.add_space(6.0);
                             }
+                            ui.horizontal(|ui| {
+                                ui.heading(&s.version_text);
+                                if !s.date.is_empty() {
+                                    ui.label(RichText::new(s.date).weak());
+                                }
+                            });
+                            notes_ui(ui, &s.blocks);
                         });
-                        notes_ui(ui, s.body);
+                        let h = (ui.cursor().top() - start_y).max(1.0);
+                        state.heights[i] = h;
                     }
                 });
             ui.separator();
@@ -463,8 +561,8 @@ mod tests {
     #[test]
     fn whole_changelog() {
         let all = WhatsNew::all();
-        assert!(all.sections.len() > 30);
-        assert!(all.sections.windows(2).all(|w| w[0].version > w[1].version));
+        assert!(all.parsed.len() > 30);
+        assert!(all.parsed.windows(2).all(|w| w[0].version > w[1].version));
     }
 
     #[test]

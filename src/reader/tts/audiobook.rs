@@ -154,33 +154,46 @@ impl Book {
         }
         let mut mp3 = HashSet::new();
         let mut opus = HashSet::new();
-        read_cache(&self.dir, &mut mp3, &mut opus);
+        read_cache(&self.dir, &mut mp3, Some(&mut opus));
         // Old Azure caches were shared by all books, with one directory per
         // leading hash byte. Include them without moving files during the scan.
         for entry in fs::read_dir(cache_root()).into_iter().flatten().flatten() {
             if entry.file_name().to_str().is_some_and(super::is_legacy) {
-                read_cache(&entry.path(), &mut mp3, &mut HashSet::new());
+                read_cache(&entry.path(), &mut mp3, None);
             }
         }
+        let mut key_buf = String::new();
         profiles
             .into_values()
             .filter_map(|speech| {
                 let existing = if speech.local.is_some() { &opus } else { &mp3 };
+                if existing.is_empty() {
+                    return None;
+                }
+                let prefix = speech.key_prefix();
+                key_buf.clear();
+                key_buf.push_str(&prefix);
+                let prefix_len = key_buf.len();
+                let mut any = false;
                 let sentences: Vec<_> = self
                     .chapters
                     .iter()
                     .map(|chapter| {
-                        chapter
+                        let count = chapter
                             .sentences
                             .iter()
-                            .filter(|s| existing.contains(&speech.key(&s.text)))
-                            .count()
+                            .filter(|s| {
+                                key_buf.truncate(prefix_len);
+                                key_buf.push_str(&s.text);
+                                existing
+                                    .contains(&hanstat::dict::xxh64::xxh64(key_buf.as_bytes(), 0))
+                            })
+                            .count();
+                        any |= count > 0;
+                        count
                     })
                     .collect();
-                sentences
-                    .iter()
-                    .any(|&n| n > 0)
-                    .then_some(Coverage { speech, sentences })
+                any.then_some(Coverage { speech, sentences })
             })
             .collect()
     }
@@ -288,7 +301,7 @@ fn known_profiles(
     profiles
 }
 
-fn read_cache(dir: &Path, mp3: &mut HashSet<u64>, opus: &mut HashSet<u64>) {
+fn read_cache(dir: &Path, mp3: &mut HashSet<u64>, mut opus: Option<&mut HashSet<u64>>) {
     for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
         let name = entry.file_name();
         let Some((stem, ext)) = name.to_str().and_then(|s| s.rsplit_once('.')) else {
@@ -299,10 +312,16 @@ fn read_cache(dir: &Path, mp3: &mut HashSet<u64>, opus: &mut HashSet<u64>) {
             && entry.file_type().is_ok_and(|ty| ty.is_file())
         {
             match ext {
-                MP3 => mp3.insert(key),
-                OPUS => opus.insert(key),
-                _ => false,
-            };
+                MP3 => {
+                    mp3.insert(key);
+                }
+                OPUS => {
+                    if let Some(set) = opus.as_deref_mut() {
+                        set.insert(key);
+                    }
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -487,7 +506,7 @@ impl Audiobook {
         let Some(form) = &mut self.form else {
             if self.error.is_none() {
                 ui.horizontal(|ui| {
-                    ui.spinner();
+                    crate::palette::spinner(ui);
                     ui.label("Reading chapters and looking for saved audio…");
                 });
             }
@@ -584,14 +603,15 @@ impl Form {
         if std::mem::take(&mut self.reset_scroll) {
             reset_scroll(ui, CHAPTER_SCROLL);
         }
+        let row_h = ui.spacing().interact_size.y;
         egui::ScrollArea::vertical()
             .id_salt(CHAPTER_SCROLL)
             .max_height(chapter_height)
             .min_scrolled_height(chapter_height)
             .auto_shrink([false, true])
-            .show(ui, |ui| {
-                for (chapter, selected) in self.book.chapters.iter().zip(&mut self.selected) {
-                    ui.checkbox(selected, &chapter.title);
+            .show_rows(ui, row_h, self.book.chapters.len(), |ui, range| {
+                for i in range {
+                    ui.checkbox(&mut self.selected[i], &self.book.chapters[i].title);
                 }
             });
         if self.selected.is_empty() {
@@ -714,7 +734,7 @@ impl Form {
                     )
                     .clicked();
                 if self.fetching.is_some() {
-                    ui.spinner();
+                    crate::palette::spinner(ui);
                 }
             });
             if fetch {
@@ -1046,7 +1066,7 @@ impl Job {
                     .text(format!("{done} / {} sentences", p.total)),
             );
         } else {
-            ui.spinner();
+            crate::palette::spinner(ui);
         }
         if ui
             .add_enabled(!cancel.load(Relaxed), egui::Button::new("Cancel export"))

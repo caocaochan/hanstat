@@ -98,10 +98,6 @@ impl Key {
         }
         Key(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
     }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
 /// On disk: every distinct string once, and the sections' maps as indexes into them.
@@ -299,17 +295,20 @@ impl Cache {
             );
             let mut w = BufWriter::new(gz);
             serde_json::to_writer(&mut w, &pack(key, stats)).map_err(std::io::Error::other)?;
-            w.into_inner()
-                .map_err(|e| e.into_error())?
-                .finish()?
-                .sync_all()?;
+            w.into_inner().map_err(|e| e.into_error())?.finish()?;
             std::fs::rename(&tmp, self.path(key))
         })();
         if let Err(e) = written {
             let _ = std::fs::remove_file(&tmp);
             return Err(err(&e));
         }
-        self.trim(MAX_BYTES);
+        static PUTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if PUTS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .is_multiple_of(16)
+        {
+            self.trim(MAX_BYTES);
+        }
         Ok(())
     }
 
@@ -392,7 +391,6 @@ mod tests {
                 })
                 .collect(),
             notes: Vec::new(),
-            decode_errors: 0,
             cover: None,
         }
     }

@@ -175,9 +175,56 @@ pub fn analyze_book_cancellable(
     progress: &(dyn Fn(usize, usize) + Sync),
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<Prepared, String> {
+    analyze_book_impl(
+        book,
+        kind,
+        None,
+        user_words,
+        known_words,
+        cache,
+        progress,
+        cancel,
+    )
+}
+
+pub(crate) fn analyze_book_with_variant(
+    book: &Book,
+    kind: SegmenterKind,
+    variant: Variant,
+    user_words: &[String],
+    known_words: &[String],
+    cache: Option<&Cache>,
+    progress: &(dyn Fn(usize, usize) + Sync),
+) -> Result<Prepared, String> {
+    let never = std::sync::atomic::AtomicBool::new(false);
+    analyze_book_impl(
+        book,
+        kind,
+        Some(variant),
+        user_words,
+        known_words,
+        cache,
+        progress,
+        &never,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn analyze_book_impl(
+    book: &Book,
+    kind: SegmenterKind,
+    variant: Option<Variant>,
+    user_words: &[String],
+    known_words: &[String],
+    cache: Option<&Cache>,
+    progress: &(dyn Fn(usize, usize) + Sync),
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Prepared, String> {
     let cancelled = || cancel.load(std::sync::atomic::Ordering::Relaxed);
-    let (tr, si) = detect_variant(book);
-    let variant = script::classify(tr, si);
+    let variant = variant.unwrap_or_else(|| {
+        let (tr, si) = detect_variant(book);
+        script::classify(tr, si)
+    });
     let mut norm_dummy = NormStats::default();
     let words: Vec<String> = user_words
         .iter()
@@ -224,36 +271,51 @@ pub fn analyze_book_cancellable(
     }
     let seg = Segmenter::new(resolved, &words, variant)?.with_known(&known)?;
     let done = std::sync::atomic::AtomicUsize::new(0);
-    let stats = book
+    let section_results: Vec<(SectionStats, Vec<String>)> = book
         .sections
         .par_iter()
         .map(|s| {
-            s.paragraphs
+            let chunks: Vec<(SectionStats, Vec<String>)> = s
+                .paragraphs
                 .par_chunks(GROUP)
-                .fold(SectionStats::default, |mut acc, group| {
+                .map(|raw| {
                     if cancelled() {
-                        return acc;
+                        return (SectionStats::default(), Vec::new());
                     }
-                    analyze_group(&mut acc, group, &seg);
-                    let d = done.fetch_add(group.len(), std::sync::atomic::Ordering::Relaxed)
-                        + group.len();
+                    let mut acc = SectionStats::default();
+                    let paras: Vec<String> = raw
+                        .iter()
+                        .map(|p| chars::normalize(p, &mut acc.norm))
+                        .collect();
+                    analyze_group(&mut acc, &paras, &seg);
+                    let d =
+                        done.fetch_add(raw.len(), std::sync::atomic::Ordering::Relaxed) + raw.len();
                     progress(d, total);
-                    acc
+                    (acc, paras)
                 })
-                .reduce(SectionStats::default, SectionStats::merge)
+                .collect();
+            let mut iter = chunks.into_iter();
+            let (mut sec_stats, mut sec_paras) = match iter.next() {
+                Some((st, ps)) => (st, ps),
+                None => (SectionStats::default(), Vec::new()),
+            };
+            for (st, mut ps) in iter {
+                sec_stats = sec_stats.merge(st);
+                sec_paras.append(&mut ps);
+            }
+            (sec_stats, sec_paras)
         })
-        .collect::<Vec<SectionStats>>();
+        .collect();
     if cancelled() {
         return Err(CANCELLED.to_owned());
     }
-    let mut stats = stats;
+    let mut stats = Vec::with_capacity(section_results.len());
+    let mut text = Vec::with_capacity(total);
+    for (st, mut ps) in section_results {
+        stats.push(st);
+        text.append(&mut ps);
+    }
     let protected: Vec<String> = words.iter().chain(&known).cloned().collect();
-    let text: Vec<String> = book
-        .sections
-        .par_iter()
-        .flat_map_iter(|s| s.paragraphs.iter())
-        .map(|p| chars::normalize(p, &mut NormStats::default()))
-        .collect();
     resplit_rare(&mut stats, &protected, &text);
     if let (Some(cache), Some(key)) = (cache, &key) {
         // Not being able to save only means analysing again next time.
@@ -292,12 +354,8 @@ fn resplit_rare(stats: &mut [SectionStats], protected: &[String], text: &[String
     });
 }
 
-fn analyze_group(acc: &mut SectionStats, raw: &[String], seg: &Segmenter) {
-    let paras: Vec<String> = raw
-        .iter()
-        .map(|p| chars::normalize(p, &mut acc.norm))
-        .collect();
-    for p in &paras {
+fn analyze_group(acc: &mut SectionStats, paras: &[String], seg: &Segmenter) {
+    for p in paras {
         count_paragraph(acc, p);
     }
     // Chinese words: segment whitespace-free chunks that contain Han, all at once.
@@ -474,8 +532,6 @@ pub struct Report {
     pub char_freq: Vec<(char, u32)>,
     #[serde(skip)]
     pub word_freq: Vec<(String, u32)>,
-    #[serde(skip)]
-    pub foreign_freq: Vec<(String, u32)>,
 }
 
 fn coverage<T>(sorted: &[(T, u32)], total: u64) -> Vec<Coverage> {
@@ -531,27 +587,30 @@ pub fn build_report(book: &Book, prep: &Prepared, included: &[bool], fold: bool)
     let mut rows = Vec::new();
     for (i, (sec, st)) in book.sections.iter().zip(&prep.stats).enumerate() {
         let inc = included[i];
-        let (mut new_han, mut new_words) = (None, None);
-        let han: std::collections::HashSet<char> = st
-            .han
-            .keys()
-            .map(|&c| crate::anki::fold_char(c, fold))
-            .collect();
-        if inc {
-            new_han = Some(han.iter().filter(|c| seen_c.insert(**c)).count());
-            new_words = Some(
-                st.words
-                    .keys()
-                    .filter(|w| seen_w.insert(w.as_str()))
-                    .count(),
-            );
-        }
+        let (unique_han, new_han) = if fold {
+            let han: std::collections::HashSet<char> = st
+                .han
+                .keys()
+                .map(|&c| crate::anki::fold_char(c, true))
+                .collect();
+            let new = inc.then(|| han.iter().filter(|&&c| seen_c.insert(c)).count());
+            (han.len(), new)
+        } else {
+            let new = inc.then(|| st.han.keys().filter(|&&c| seen_c.insert(c)).count());
+            (st.han.len(), new)
+        };
+        let new_words = inc.then(|| {
+            st.words
+                .keys()
+                .filter(|w| seen_w.insert(w.as_str()))
+                .count()
+        });
         rows.push(SectionRow {
             label: sec.label.clone(),
             kind: sec.kind,
             included: inc,
             han: st.class_counts[0],
-            unique_han: han.len(),
+            unique_han,
             new_han,
             words: st.words.values().map(|&v| v as u64).sum(),
             unique_words: st.words.len(),
@@ -568,7 +627,6 @@ pub fn build_report(book: &Book, prep: &Prepared, included: &[bool], fold: bool)
         sorted_freq(&total.han)
     };
     let word_freq = sorted_freq(&total.words);
-    let foreign_freq = sorted_freq(&total.foreign_words);
     let c = &total.class_counts;
     let han_total = c[0];
     let words_total: u64 = word_freq.iter().map(|(_, n)| *n as u64).sum();
@@ -634,8 +692,8 @@ pub fn build_report(book: &Book, prep: &Prepared, included: &[bool], fold: bool)
         } else {
             0.0
         },
-        foreign_words_total: foreign_freq.iter().map(|(_, n)| *n as u64).sum(),
-        foreign_words_unique: foreign_freq.len(),
+        foreign_words_total: total.foreign_words.values().map(|&n| n as u64).sum(),
+        foreign_words_unique: total.foreign_words.len(),
         numbers: total.numbers,
         paragraphs: total.paragraphs,
         sentences: total.sentences,
@@ -659,7 +717,6 @@ pub fn build_report(book: &Book, prep: &Prepared, included: &[bool], fold: bool)
         anki: None,
         char_freq,
         word_freq,
-        foreign_freq,
     }
 }
 

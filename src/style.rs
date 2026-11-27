@@ -69,8 +69,9 @@ pub const MIN_HAN: usize = 2000;
 pub const TYPICAL: f32 = 5.95;
 
 /// What a rating was made with; one made otherwise is out of date.
-pub fn method() -> String {
-    format!("{}/v{VERSION}", STYLE_LLM.id)
+pub fn method() -> &'static str {
+    static METHOD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    METHOD.get_or_init(|| format!("{}/v{VERSION}", STYLE_LLM.id))
 }
 
 /// Whether this platform has a build of llama.cpp's server.
@@ -1012,7 +1013,7 @@ impl Server {
         Ok(Some(Rating {
             score: scores.iter().sum::<f32>() / scores.len() as f32,
             samples: scores,
-            method: method(),
+            method: method().to_owned(),
             rated: crate::history::now(),
         }))
     }
@@ -1482,7 +1483,6 @@ mod tests {
                 },
             ],
             notes: vec![],
-            decode_errors: 0,
             cover: None,
         }
     }

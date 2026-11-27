@@ -10,6 +10,7 @@
 //! book's own frequent tokens (its names: 木柯跑 → 木柯/跑).
 
 use crate::script;
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
@@ -51,16 +52,12 @@ pub fn extra_words() -> &'static HashSet<&'static str> {
 /// Idioms of 4+ characters in Simplified, from `data/chengyu.txt` (examples/headwords.rs).
 pub fn chengyu() -> &'static [&'static str] {
     static LIST: OnceLock<Vec<&'static str>> = OnceLock::new();
-    LIST.get_or_init(|| {
-        list(include_str!("../data/chengyu.txt"))
-            .into_iter()
-            .collect()
-    })
+    LIST.get_or_init(|| chengyu_set().iter().copied().collect())
 }
 
 fn chengyu_set() -> &'static HashSet<&'static str> {
     static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
-    SET.get_or_init(|| chengyu().iter().copied().collect())
+    SET.get_or_init(|| list(include_str!("../data/chengyu.txt")))
 }
 
 /// `w` (Simplified) is in one of the bundled dictionaries.
@@ -157,17 +154,45 @@ fn names<'a>(candidates: &[&'a str], text: &[String]) -> HashSet<&'a str> {
         pats[i] = p;
     }
     let ac = aho_corasick::AhoCorasick::new(&pats).expect("name patterns");
-    let mut f = vec![0u32; pats.len()];
-    // The characters seen just left and right of each pattern.
-    let mut sides = vec![(Side::Unseen, Side::Unseen); pats.len()];
-    for t in text {
-        for m in ac.find_overlapping_iter(t) {
-            let i = m.pattern().as_usize();
-            f[i] += 1;
-            sides[i].0.see(t[..m.start()].chars().next_back());
-            sides[i].1.see(t[m.end()..].chars().next());
-        }
-    }
+    let n_pats = pats.len();
+    // Counts and characters seen just left and right of each pattern.
+    let (f, sides) = text
+        .par_chunks(256)
+        .fold(
+            || {
+                (
+                    vec![0u32; n_pats],
+                    vec![(Side::Unseen, Side::Unseen); n_pats],
+                )
+            },
+            |(mut f, mut sides), chunk| {
+                for t in chunk {
+                    for m in ac.find_overlapping_iter(t) {
+                        let i = m.pattern().as_usize();
+                        f[i] += 1;
+                        sides[i].0.see(t[..m.start()].chars().next_back());
+                        sides[i].1.see(t[m.end()..].chars().next());
+                    }
+                }
+                (f, sides)
+            },
+        )
+        .reduce(
+            || {
+                (
+                    vec![0u32; n_pats],
+                    vec![(Side::Unseen, Side::Unseen); n_pats],
+                )
+            },
+            |(mut f1, mut s1), (f2, s2)| {
+                for i in 0..n_pats {
+                    f1[i] += f2[i];
+                    s1[i].0 = s1[i].0.merge(s2[i].0);
+                    s1[i].1 = s1[i].1.merge(s2[i].1);
+                }
+                (f1, s1)
+            },
+        );
     let count = |p: &str| f[index[p]];
     candidates
         .iter()
@@ -204,6 +229,14 @@ impl Side {
             (Side::Same(a), Some(c)) if a == c => Side::Same(a),
             _ => Side::Mixed,
         };
+    }
+
+    fn merge(self, other: Side) -> Side {
+        match (self, other) {
+            (Side::Unseen, x) | (x, Side::Unseen) => x,
+            (Side::Same(a), Side::Same(b)) if a == b => Side::Same(a),
+            _ => Side::Mixed,
+        }
     }
 }
 

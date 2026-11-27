@@ -23,9 +23,6 @@ pub struct Course {
     pub description: String,
     /// `short_stories`, `courses`, `article_collections`.
     pub group: String,
-    /// `multi_lesson`, `course`, `article_collection`.
-    #[serde(rename = "type")]
-    pub kind: String,
     /// `newbie`, `elementary`, `intermediate`, `upper intermediate`,
     /// `advanced`, `master`.
     #[serde(deserialize_with = "null_default")]
@@ -133,12 +130,9 @@ pub struct Lesson {
     pub title: String,
     pub course_position: Option<u32>,
     pub free: bool,
-    pub locked: bool,
     /// Missing for a chapter the account can't read.
     pub crd_url: Option<String>,
     pub release_at: Option<String>,
-    pub updated_at: Option<String>,
-    pub level: Option<String>,
     pub course: Option<Course>,
 }
 

@@ -6,11 +6,34 @@ mod bundle;
 use super::{FRAME_SAMPLES, Reference, wav_samples};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Clone, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let meta = fs::metadata(path).ok()?;
+    Some(FileStamp {
+        len: meta.len(),
+        modified: meta.modified().ok(),
+    })
+}
+
+type RefCache = Mutex<HashMap<PathBuf, (FileStamp, FileStamp, Arc<Reference>)>>;
+
+fn ref_cache() -> &'static RefCache {
+    static CACHE: OnceLock<RefCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct VoiceInfo {
@@ -199,6 +222,7 @@ impl VoiceStore {
     /// Its sentence clips live elsewhere and can still be cleared there.
     pub fn delete_voice(&self, id: &str) -> Result<(), String> {
         let dir = self.dir(id)?;
+        ref_cache().lock().unwrap().remove(&dir.join("sample.wav"));
         let tmp = temporary(&self.0);
         fs::rename(&dir, &tmp).map_err(|e| format!("Cannot delete this voice: {e}"))?;
         if let Err(e) = fs::remove_dir_all(&tmp) {
@@ -228,8 +252,18 @@ impl VoiceStore {
             .ok_or_else(|| "The kept sample has no audio.".into())
     }
 
-    pub(super) fn reference(&self, id: &str) -> Result<Reference, String> {
+    pub(super) fn reference(&self, id: &str) -> Result<Arc<Reference>, String> {
         let dir = self.dir(id)?;
+        let wav_path = dir.join("sample.wav");
+        let info_path = dir.join("voice.json");
+        let stamps = file_stamp(&wav_path).zip(file_stamp(&info_path));
+        if let Some((ref ws, ref is)) = stamps
+            && let Some((cws, cis, cached)) = ref_cache().lock().unwrap().get(&wav_path)
+            && cws == ws
+            && cis == is
+        {
+            return Ok(Arc::clone(cached));
+        }
         let info = read_info(&dir)?;
         let wav = self.wav(&dir, id)?;
         let samples = wav_samples(&wav)
@@ -238,12 +272,20 @@ impl VoiceStore {
         if info.sample_text.trim().is_empty() {
             return Err("The kept sample has no text.".into());
         }
-        Ok(Reference {
+        let reference = Arc::new(Reference {
             id: id.to_owned(),
             text: info.sample_text,
             wav,
             frames: samples.len().div_ceil(FRAME_SAMPLES),
-        })
+        });
+        if let Some((ws, is)) = stamps {
+            let mut cache = ref_cache().lock().unwrap();
+            if cache.len() >= 32 {
+                cache.clear();
+            }
+            cache.insert(wav_path, (ws, is, Arc::clone(&reference)));
+        }
+        Ok(reference)
     }
 }
 

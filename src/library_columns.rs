@@ -355,7 +355,22 @@ impl Filter {
 
     /// Whether a row with value `v` passes. `today` and `day_of` (Unix time
     /// to day number) are for the date bounds.
+    #[cfg(test)]
     pub(crate) fn passes(&self, v: &Val, today: i32, day_of: &dyn Fn(f64) -> i32) -> bool {
+        let q = matches!(v, Val::Text(_))
+            .then(|| (!self.text.trim().is_empty()).then(|| search::Query::new(&self.text)))
+            .flatten();
+        self.passes_with(v, today, day_of, q.as_ref())
+    }
+
+    /// Same as [`passes`], reusing a pre-parsed `query` for [`Val::Text`] across rows.
+    pub(crate) fn passes_with(
+        &self,
+        v: &Val,
+        today: i32,
+        day_of: &dyn Fn(f64) -> i32,
+        query: Option<&search::Query>,
+    ) -> bool {
         if *v == Val::None {
             return self.blanks;
         }
@@ -365,10 +380,10 @@ impl Filter {
         match v {
             Val::None => unreachable!(),
             Val::Num(x) => self.min.is_none_or(|m| *x >= m) && self.max.is_none_or(|m| *x <= m),
-            Val::Text(s) => {
-                self.text.trim().is_empty()
-                    || search::Query::new(&self.text).matches(std::iter::once(s.as_str()))
-            }
+            Val::Text(s) => match query {
+                Some(q) => q.matches(std::iter::once(s.as_str())),
+                None => true,
+            },
             Val::Choice(s, _) => self.picked.is_empty() || self.picked.contains(s),
             Val::Time(t) => self.day_passes(day_of(*t), today),
             Val::Day(d) => self.day_passes(*d, today),

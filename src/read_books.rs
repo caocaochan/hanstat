@@ -90,6 +90,18 @@ pub(crate) struct ReadDialog {
     reader_days: (i32, i32),
     /// The book's Chinese characters.
     han: u64,
+    /// Cached selection summary for `(percent, min_count)` so we don't re-sort
+    /// 10k-40k words on every frame while the dialog is open.
+    sel_cache: Option<SelCache>,
+}
+
+struct SelCache {
+    rule: (u8, u32),
+    sel_len: usize,
+    often: usize,
+    new_len: usize,
+    new_sample: Vec<(String, u32)>,
+    share: f64,
 }
 
 /// The dates picked in the Mark read window, or what is wrong with them.
@@ -214,6 +226,7 @@ impl App {
             finished: mark.as_ref().and_then(|m| m.finished),
             reader_days,
             han: e.stats.han_total,
+            sel_cache: None,
         });
     }
 
@@ -248,23 +261,45 @@ impl App {
                     ui.label("times.");
                 });
                 ui.add_space(4.0);
-                let sel = known::read_selection(&d.words, d.percent, d.min_count);
-                let often = d.words.iter().filter(|(_, n)| *n >= d.min_count).count();
-                let known = |w: &str| d.before.as_ref().is_some_and(|k| k.word(w).is_known());
-                let new: Vec<&(String, u32)> =
-                    sel.iter().copied().filter(|(w, _)| !known(w)).collect();
-                let share = if d.running == 0 {
-                    0.0
-                } else {
-                    sel.iter().map(|(_, n)| *n as u64).sum::<u64>() as f64 * 100.0
-                        / d.running as f64
-                };
+                let rule_key = (d.percent, d.min_count);
+                if d.sel_cache.as_ref().is_none_or(|c| c.rule != rule_key) {
+                    let sel = known::read_selection(&d.words, d.percent, d.min_count);
+                    let often = d.words.iter().filter(|(_, n)| *n >= d.min_count).count();
+                    let known_fn =
+                        |w: &str| d.before.as_ref().is_some_and(|k| k.word(w).is_known());
+                    let mut new_len = 0usize;
+                    let mut new_sample = Vec::with_capacity(SHOW_NEW);
+                    for &(w, n) in &sel {
+                        if !known_fn(w) {
+                            if new_sample.len() < SHOW_NEW {
+                                new_sample.push((w.clone(), *n));
+                            }
+                            new_len += 1;
+                        }
+                    }
+                    let share = if d.running == 0 {
+                        0.0
+                    } else {
+                        sel.iter().map(|(_, n)| *n as u64).sum::<u64>() as f64 * 100.0
+                            / d.running as f64
+                    };
+                    d.sel_cache = Some(SelCache {
+                        rule: rule_key,
+                        sel_len: sel.len(),
+                        often,
+                        new_len,
+                        new_sample,
+                        share,
+                    });
+                }
+                let sc = d.sel_cache.as_ref().unwrap();
                 ui.label(format!(
-                    "{} of the {} words it uses {}+ times; {} of them not known yet. Together they are {share:.1}% of its running words.",
-                    fmt_int(sel.len() as u64),
-                    fmt_int(often as u64),
+                    "{} of the {} words it uses {}+ times; {} of them not known yet. Together they are {:.1}% of its running words.",
+                    fmt_int(sc.sel_len as u64),
+                    fmt_int(sc.often as u64),
                     d.min_count,
-                    fmt_int(new.len() as u64),
+                    fmt_int(sc.new_len as u64),
+                    sc.share,
                 ));
                 // What marking it adds across the books read (other books
                 // with these words): worked out again when the rule changes.
@@ -288,7 +323,7 @@ impl App {
                                  this many times in all. The reading path's Learn while reading mode counts the same way.";
                     ui.horizontal_wrapped(|ui| {
                         if working {
-                            ui.spinner();
+                            crate::palette::spinner(ui);
                         }
                         match d.across_new {
                             // The last figure, for the rule it was worked out for.
@@ -310,10 +345,11 @@ impl App {
                 if let Some(n) = &d.note {
                     ui.label(icons::rich(ui, RichText::new(format!("{WARNING} {n}")).color(crate::palette::warn())));
                 }
-                if !new.is_empty() {
+                let sc = d.sel_cache.as_ref().unwrap();
+                if sc.new_len > 0 {
                     ui.add_space(4.0);
                     ui.label(
-                        RichText::new(if new.len() > SHOW_NEW {
+                        RichText::new(if sc.new_len > SHOW_NEW {
                             format!("Not known yet, most frequent first (the first {SHOW_NEW}):")
                         } else {
                             "Not known yet, most frequent first:".to_owned()
@@ -325,7 +361,7 @@ impl App {
                         .max_height(120.0)
                         .show(ui, |ui| {
                             ui.horizontal_wrapped(|ui| {
-                                for (w, n) in new.iter().take(SHOW_NEW) {
+                                for (w, n) in &sc.new_sample {
                                     ui.label(w.as_str())
                                         .on_hover_text(format!("{} times", fmt_int(*n as u64)));
                                 }
@@ -373,7 +409,9 @@ impl App {
                     let label = if d.marked.is_some() { "Save".to_owned() } else { format!("{CHECK} Mark read") };
                     if ui.add_enabled(dates.is_ok(), egui::Button::new(icons::rich(ui, label))).clicked()
                     {
+                        let sel = known::read_selection(&d.words, d.percent, d.min_count);
                         let words: Vec<String> = sel.iter().map(|(w, _)| w.clone()).collect();
+                        let added = d.sel_cache.as_ref().map_or(0, |c| c.new_len);
                         act = Some(ReadAct::Mark(ReadBook {
                             id: d.id.clone(),
                             title: d.title.clone(),
@@ -381,7 +419,7 @@ impl App {
                             percent: d.percent,
                             min_count: d.min_count,
                             words,
-                            added: new.len(),
+                            added,
                             started: d.started,
                             finished: d.finished,
                             han: d.han,
@@ -562,10 +600,31 @@ impl App {
             .iter()
             .map(|e| reading_minutes(&e.stats, speeds))
             .sum();
-        let distinct: HashSet<&str> = marks
-            .iter()
-            .flat_map(|m| m.words.iter().map(String::as_str))
-            .collect();
+        let distinct_len: usize = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            marks.len().hash(&mut h);
+            for m in marks {
+                m.id.hash(&mut h);
+                m.read.hash(&mut h);
+                m.words.len().hash(&mut h);
+            }
+            let key = h.finish();
+            let id = egui::Id::unique("read_books_distinct_words");
+            if let Some((k, n)) = ui.ctx().data(|d| d.get_temp::<(u64, usize)>(id))
+                && k == key
+            {
+                n
+            } else {
+                let distinct: HashSet<&str> = marks
+                    .iter()
+                    .flat_map(|m| m.words.iter().map(String::as_str))
+                    .collect();
+                let n = distinct.len();
+                ui.ctx().data_mut(|d| d.insert_temp(id, (key, n)));
+                n
+            }
+        };
         let added: usize = marks.iter().map(|m| m.added).sum();
         let pct = |a: u64, b: u64| {
             if b == 0 {
@@ -596,7 +655,7 @@ impl App {
                 ),
                 Tile::new(
                     "Words from them",
-                    RichText::new(fmt_int(distinct.len() as u64)),
+                    RichText::new(fmt_int(distinct_len as u64)),
                     format!("{} were new when marked", fmt_int(added as u64)),
                 )
                 .hover("Distinct words the books marked read count as known. A word new for two books is counted for each."),

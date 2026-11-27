@@ -276,11 +276,9 @@ impl Known {
     fn add(&mut self, w: u32) {
         self.bits[(w >> 6) as usize] |= 1 << (w & 63);
     }
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.bits.iter().map(|x| x.count_ones() as usize).sum()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.bits.iter().all(|x| *x == 0)
     }
     /// Times word `w` was met in the books read.
     #[inline]
@@ -304,6 +302,7 @@ pub struct LibBook {
     pub id: String,
     pub title: String,
     pub segmenter: String,
+    #[cfg(test)]
     pub variant: String,
     /// The series it belongs to (numbered within the library) and its
     /// volume ([`series::Volume::number`]), if another book of the library
@@ -639,10 +638,29 @@ struct ReadEval {
     so_far: usize,
 }
 
+/// Precomputed per-word invariants for [`Study::Read`].
+struct ReadWord {
+    w: u32,
+    n: u32,
+    in_sel: bool,
+    name: bool,
+    before: f64,
+    here: f64,
+    rest: f64,
+}
+
+/// Precomputed per-book invariants for [`Study::Read`] (`selection` and `occurs`).
+struct BookReadCache {
+    span: u64,
+    from: u64,
+    win: u64,
+    words: Vec<ReadWord>,
+}
+
 /// A partial path in the search.
 #[derive(Clone)]
 struct State {
-    steps: Vec<Step>,
+    order: Vec<usize>,
     known: Known,
     /// Each word's share summed over the books still to come (lookahead only).
     future: Vec<f32>,
@@ -720,6 +738,7 @@ impl Library {
                         id: o.id.clone(),
                         title,
                         segmenter: o.segmenter.clone(),
+                        #[cfg(test)]
                         variant: o.variant.clone(),
                         series: None,
                         offset: 0.0,
@@ -822,6 +841,7 @@ impl Library {
             id: p.id,
             title,
             segmenter: p.segmenter,
+            #[cfg(test)]
             variant: p.variant,
             series: None,
             offset: 0.0,
@@ -1174,7 +1194,8 @@ impl Library {
                 (now, (c, c))
             }
             Study::Read { percent, min_count } => {
-                let e = self.read_eval(book, k, percent, min_count, false);
+                let rc = self.book_read_cache(book, percent, min_count);
+                let e = Self::read_eval_cached(k, min_count, &rc, false);
                 (
                     now,
                     (
@@ -1184,6 +1205,34 @@ impl Library {
                 )
             }
         }
+    }
+
+    /// Cheap step cost for `book` next from `k`, using precomputed `read_cache`
+    /// under [`Study::Read`] without scanning `b.words` twice.
+    fn cheap_cost(
+        &self,
+        book: usize,
+        k: &Known,
+        study: Study,
+        read_cache: Option<&[Option<BookReadCache>]>,
+    ) -> Cost {
+        let b = &self.books[book];
+        if let Study::Read { percent, min_count } = study {
+            let owned;
+            let rc = match read_cache.and_then(|c| c[book].as_ref()) {
+                Some(rc) => rc,
+                None => {
+                    owned = self.book_read_cache(book, percent, min_count);
+                    &owned
+                }
+            };
+            let e = Self::read_eval_cached(k, min_count, rc, false);
+            return (
+                -((e.start - b.offset) * 100.0).round() as i64,
+                e.lookups.round() as i64,
+            );
+        }
+        self.cheap(book, k, study).1
     }
 
     /// The words of `book` that ✔ Mark read takes ([`crate::known::read_selection`]):
@@ -1196,73 +1245,113 @@ impl Library {
         raw[..take].iter().map(|x| x.0).collect()
     }
 
-    /// Learning while reading `book` from `k`: what it teaches and what
-    /// reading it is like (see [`Study::Read`]). `list`: build the list of
-    /// words taught, not only their effect.
-    fn read_eval(
-        &self,
-        book: usize,
-        k: &Known,
-        percent: u8,
-        min_count: u32,
-        list: bool,
-    ) -> ReadEval {
+    /// Precompute per-word `selection` and `occurs` invariants for `book`.
+    fn book_read_cache(&self, book: usize, percent: u8, min_count: u32) -> BookReadCache {
         let b = &self.books[book];
         let sel = self.selection(book, percent, min_count);
         let span = b.span();
         let from = b.reading.map_or(0, |r| r.0.min(span));
         let win = (from + OPENING).min(span);
+        let words = b
+            .words
+            .iter()
+            .zip(&b.name)
+            .enumerate()
+            .map(|(i, (&(w, n), &name))| {
+                let (before, here, rest) = if name {
+                    (0.0, 0.0, 0.0)
+                } else {
+                    let before = if from > 0 { b.occurs(i, 0, from) } else { 0.0 };
+                    let here = b.occurs(i, from, win);
+                    let rest = (n as f64 - before).max(0.0);
+                    (before, here, rest)
+                };
+                ReadWord {
+                    w,
+                    n,
+                    in_sel: sel.contains(&w),
+                    name,
+                    before,
+                    here,
+                    rest,
+                }
+            })
+            .collect();
+        BookReadCache {
+            span,
+            from,
+            win,
+            words,
+        }
+    }
+
+    fn build_read_cache(
+        &self,
+        books: &[usize],
+        params: &Params,
+    ) -> Option<Vec<Option<BookReadCache>>> {
+        let Study::Read { percent, min_count } = params.study else {
+            return None;
+        };
+        let mut cache: Vec<Option<BookReadCache>> = (0..self.books.len()).map(|_| None).collect();
+        let built: Vec<(usize, BookReadCache)> = books
+            .par_iter()
+            .copied()
+            .map(|book| (book, self.book_read_cache(book, percent, min_count)))
+            .collect();
+        for (book, rc) in built {
+            cache[book] = Some(rc);
+        }
+        Some(cache)
+    }
+
+    /// Learning while reading `book` from `k` using precomputed `rc`.
+    fn read_eval_cached(k: &Known, min_count: u32, rc: &BookReadCache, list: bool) -> ReadEval {
         // Running words, names left out unless known, as the Overview counts them.
         let mut total = 0u64;
         let (mut lk_win, mut lk_rest) = (0f64, 0f64);
         let mut learned = Vec::new();
         let mut so_far = 0;
-        for (i, (&(w, n), &name)) in b.words.iter().zip(&b.name).enumerate() {
-            if k.has(w) {
-                total += n as u64;
+        for rw in &rc.words {
+            if k.has(rw.w) {
+                total += rw.n as u64;
                 continue;
             }
             // Met this many times more, it is learned (`None`: not in this book).
-            let e = k.met(w);
-            let after = if sel.contains(&w) || (e > 0 && e + n >= min_count) {
+            let e = k.met(rw.w);
+            let after = if rw.in_sel || (e > 0 && e + rw.n >= min_count) {
                 Some(min_count.saturating_sub(e) as f64)
             } else {
                 None
             };
-            if after.is_some() && (list || from > 0) {
-                learned.push(w);
+            if after.is_some() && list {
+                learned.push(rw.w);
             }
-            if name {
+            if rw.name {
                 continue;
             }
-            total += n as u64;
-            let before = if from > 0 { b.occurs(i, 0, from) } else { 0.0 };
-            let here = b.occurs(i, from, win);
-            let rest = (n as f64 - before).max(0.0);
+            total += rw.n as u64;
             match after {
                 Some(a) => {
-                    let left = (a - before).max(0.0);
-                    lk_win += left.min(here);
-                    lk_rest += left.min(rest);
-                    if from > 0 && before >= a {
+                    let left = (a - rw.before).max(0.0);
+                    lk_win += left.min(rw.here);
+                    lk_rest += left.min(rw.rest);
+                    if rc.from > 0 && rw.before >= a {
                         so_far += 1;
                     }
                 }
                 None => {
-                    lk_win += here;
-                    lk_rest += rest;
+                    lk_win += rw.here;
+                    lk_rest += rw.rest;
                 }
             }
         }
-        if !list {
-            learned.clear();
-        }
         // Running words over the stretches, names left out as in `total`.
         let share = |a: u64, z: u64| {
-            if span == 0 {
+            if rc.span == 0 {
                 0.0
             } else {
-                total as f64 * (z - a) as f64 / span as f64
+                total as f64 * (z - a) as f64 / rc.span as f64
             }
         };
         let pct = |lk: f64, toks: f64| {
@@ -1273,12 +1362,225 @@ impl Library {
             }
         };
         ReadEval {
-            start: pct(lk_win, share(from, win)),
-            over: pct(lk_rest, share(from, span)),
+            start: pct(lk_win, share(rc.from, rc.win)),
+            over: pct(lk_rest, share(rc.from, rc.span)),
             lookups: lk_rest,
             learned,
             so_far,
         }
+    }
+
+    /// Advance `k` and `future` by reading `book` and return only its step cost,
+    /// without constructing a full [`Step`].
+    fn step_cost_only(
+        &self,
+        book: usize,
+        k: &mut Known,
+        future: &mut [f32],
+        params: &Params,
+        read_cache: Option<&[Option<BookReadCache>]>,
+    ) -> Cost {
+        let b = &self.books[book];
+        if let Study::Read { percent, min_count } = params.study {
+            let owned;
+            let rc = match read_cache.and_then(|c| c[book].as_ref()) {
+                Some(rc) => rc,
+                None => {
+                    owned = self.book_read_cache(book, percent, min_count);
+                    &owned
+                }
+            };
+            let mut total = 0u64;
+            let (mut lk_win, mut lk_rest) = (0f64, 0f64);
+            for rw in &rc.words {
+                if k.has(rw.w) {
+                    total += rw.n as u64;
+                    continue;
+                }
+                let e = k.met(rw.w);
+                let after = if rw.in_sel || (e > 0 && e + rw.n >= min_count) {
+                    Some(min_count.saturating_sub(e) as f64)
+                } else {
+                    None
+                };
+                if after.is_some() {
+                    k.add(rw.w);
+                }
+                if rw.name {
+                    continue;
+                }
+                total += rw.n as u64;
+                match after {
+                    Some(a) => {
+                        let left = (a - rw.before).max(0.0);
+                        lk_win += left.min(rw.here);
+                        lk_rest += left.min(rw.rest);
+                    }
+                    None => {
+                        lk_win += rw.here;
+                        lk_rest += rw.rest;
+                    }
+                }
+            }
+            for &(w, n) in &b.raw {
+                k.add_met(w, n);
+            }
+            let toks_win = if rc.span == 0 {
+                0.0
+            } else {
+                total as f64 * (rc.win - rc.from) as f64 / rc.span as f64
+            };
+            let start = if toks_win <= 0.0 {
+                100.0
+            } else {
+                (100.0 * (1.0 - lk_win / toks_win)).clamp(0.0, 100.0)
+            };
+            return (
+                -((start - b.offset) * 100.0).round() as i64,
+                lk_rest.round() as u64 as i64,
+            );
+        }
+
+        let lam = params.lookahead;
+        let use_lookahead = lam > 0.0 && !future.is_empty() && b.denom > 0;
+        let (mut known, mut total) = (0u64, 0u64);
+        let cost = if use_lookahead {
+            let d = b.denom as f32;
+            let mut v: Vec<(f32, u32, u32)> = Vec::new();
+            for (&(w, n), &name) in b.words.iter().zip(&b.name) {
+                if k.has(w) {
+                    known += n as u64;
+                    total += n as u64;
+                } else if !name {
+                    total += n as u64;
+                    let own = n as f32 / d;
+                    let val = own + lam * (future[w as usize] - own).max(0.0);
+                    v.push((val, w, n));
+                }
+            }
+            v.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(b.2.cmp(&a.2)).then(a.1.cmp(&b.1)));
+            let mut studied = 0usize;
+            let mut add = 0u64;
+            match params.study {
+                Study::Target(t) => {
+                    let need = need_tokens((t + b.offset).clamp(0.0, 100.0), known, total);
+                    for &(_, w, n) in &v {
+                        if add >= need {
+                            break;
+                        }
+                        k.add(w);
+                        add += n as u64;
+                        studied += 1;
+                    }
+                }
+                Study::Fixed(n_study) => {
+                    for &(_, w, c) in v.iter().take(n_study) {
+                        k.add(w);
+                        add += c as u64;
+                        studied += 1;
+                    }
+                }
+                Study::Read { .. } => {}
+            }
+            if let Some(m) = params.incidental {
+                for &(_, w, n) in &v {
+                    if n >= m && !k.has(w) {
+                        k.add(w);
+                    }
+                }
+            }
+            match params.study {
+                Study::Target(_) => (studied as i64, studied as i64),
+                Study::Fixed(_) => {
+                    let reading = if total == 0 {
+                        100.0
+                    } else {
+                        (known + add) as f64 * 100.0 / total as f64
+                    };
+                    let c = -((reading - b.offset) * 100.0).round() as i64;
+                    (c, c)
+                }
+                Study::Read { .. } => (0, 0),
+            }
+        } else {
+            for (&(w, n), &name) in b.words.iter().zip(&b.name) {
+                if k.has(w) {
+                    known += n as u64;
+                    total += n as u64;
+                } else if !name {
+                    total += n as u64;
+                }
+            }
+            let mut studied = 0usize;
+            let mut add = 0u64;
+            match params.study {
+                Study::Target(t) => {
+                    let need = need_tokens((t + b.offset).clamp(0.0, 100.0), known, total);
+                    for (&(w, n), &name) in b.words.iter().zip(&b.name) {
+                        if name || k.has(w) {
+                            continue;
+                        }
+                        if add < need {
+                            k.add(w);
+                            add += n as u64;
+                            studied += 1;
+                        } else if let Some(m) = params.incidental {
+                            if n >= m {
+                                k.add(w);
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                Study::Fixed(n_study) => {
+                    for (&(w, c), &name) in b.words.iter().zip(&b.name) {
+                        if name || k.has(w) {
+                            continue;
+                        }
+                        if studied < n_study {
+                            k.add(w);
+                            add += c as u64;
+                            studied += 1;
+                        } else if let Some(m) = params.incidental {
+                            if c >= m {
+                                k.add(w);
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                Study::Read { .. } => {}
+            }
+            match params.study {
+                Study::Target(_) => (studied as i64, studied as i64),
+                Study::Fixed(_) => {
+                    let reading = if total == 0 {
+                        100.0
+                    } else {
+                        (known + add) as f64 * 100.0 / total as f64
+                    };
+                    let c = -((reading - b.offset) * 100.0).round() as i64;
+                    (c, c)
+                }
+                Study::Read { .. } => (0, 0),
+            }
+        };
+        // This book is no longer to come.
+        if !future.is_empty() && b.denom > 0 {
+            let d = b.denom as f32;
+            for (&(w, n), &name) in b.words.iter().zip(&b.name) {
+                if !name {
+                    future[w as usize] -= n as f32 / d;
+                }
+            }
+        }
+        cost
     }
 
     /// The step for `book` from state `k` (and `future`, with lookahead).
@@ -1289,15 +1591,50 @@ impl Library {
         future: &mut [f32],
         params: &Params,
         known0: &Known,
+        read_cache: Option<&[Option<BookReadCache>]>,
     ) -> Step {
         let b = &self.books[book];
-        let s = self.scan(book, k);
-        let reached = s.percent();
-        let now_scan = self.scan(book, known0);
-        let now = now_scan.percent();
-        let gained = now_scan.unknown.iter().filter(|(w, _)| k.has(*w)).count();
+        let (mut now_known, mut now_total, mut gained) = (0u64, 0u64, 0usize);
+        for (&(w, n), &name) in b.words.iter().zip(&b.name) {
+            if known0.has(w) {
+                now_known += n as u64;
+                now_total += n as u64;
+            } else if !name {
+                now_total += n as u64;
+                if k.has(w) {
+                    gained += 1;
+                }
+            }
+        }
+        let now = if now_total == 0 {
+            100.0
+        } else {
+            now_known as f64 * 100.0 / now_total as f64
+        };
         if let Study::Read { percent, min_count } = params.study {
-            let e = self.read_eval(book, k, percent, min_count, true);
+            let (mut rk, mut rt) = (0u64, 0u64);
+            for (&(w, n), &name) in b.words.iter().zip(&b.name) {
+                if k.has(w) {
+                    rk += n as u64;
+                    rt += n as u64;
+                } else if !name {
+                    rt += n as u64;
+                }
+            }
+            let reached = if rt == 0 {
+                100.0
+            } else {
+                rk as f64 * 100.0 / rt as f64
+            };
+            let owned;
+            let rc = match read_cache.and_then(|c| c[book].as_ref()) {
+                Some(rc) => rc,
+                None => {
+                    owned = self.book_read_cache(book, percent, min_count);
+                    &owned
+                }
+            };
+            let e = Self::read_eval_cached(k, min_count, rc, true);
             for &w in &e.learned {
                 k.add(w);
             }
@@ -1305,7 +1642,7 @@ impl Library {
             for &(w, n) in &b.raw {
                 k.add_met(w, n);
             }
-            let span = b.span();
+            let span = rc.span;
             return Step {
                 book,
                 now,
@@ -1326,6 +1663,8 @@ impl Library {
                 learned: e.learned,
             };
         }
+        let s = self.scan(book, k);
+        let reached = s.percent();
         // Value order: this book's share plus the books still to come.
         let mut cand = s.unknown;
         let lam = params.lookahead;
@@ -1429,6 +1768,16 @@ impl Library {
 
     /// The path that reads `order` as given.
     pub fn evaluate(&self, known0: &Known, params: &Params, order: &[usize]) -> Path {
+        self.evaluate_with(known0, params, order, None)
+    }
+
+    fn evaluate_with(
+        &self,
+        known0: &Known,
+        params: &Params,
+        order: &[usize],
+        read_cache: Option<&[Option<BookReadCache>]>,
+    ) -> Path {
         let mut k = known0.clone();
         let mut future = if params.lookahead > 0.0 {
             self.future(order)
@@ -1437,7 +1786,7 @@ impl Library {
         };
         let steps = order
             .iter()
-            .map(|&b| self.step(b, &mut k, &mut future, params, known0))
+            .map(|&b| self.step(b, &mut k, &mut future, params, known0, read_cache))
             .collect();
         Path {
             steps,
@@ -1512,19 +1861,44 @@ impl Library {
         width: usize,
         cancel: &AtomicBool,
     ) -> Option<Path> {
-        let mut found = Vec::new();
+        self.optimise_with_baseline(known0, params, books, width, cancel)
+            .map(|(best, _)| best)
+    }
+
+    /// [`Library::optimise`], also returning the evaluated easiest-now baseline
+    /// path so callers that compare against it don't evaluate it twice.
+    pub fn optimise_with_baseline(
+        &self,
+        known0: &Known,
+        params: &Params,
+        books: &[usize],
+        width: usize,
+        cancel: &AtomicBool,
+    ) -> Option<(Path, Path)> {
+        let read_cache = self.build_read_cache(books, params);
+        let rc = read_cache.as_deref();
         let first = self.first_books(params, books);
+        let mut found: Vec<(Vec<usize>, Key)> = Vec::with_capacity(2);
         if width > 1 {
-            found.push(self.beam(known0, params, books, &first, width, cancel)?);
+            found.push(self.beam(known0, params, books, &first, width, rc, cancel)?);
         }
-        found.push(self.beam(known0, params, books, &first, 1, cancel)?);
-        found.push(self.evaluate(
-            known0,
-            params,
-            &self.started_first(params, &self.easiest_now(known0, books)),
-        ));
+        found.push(self.beam(known0, params, books, &first, 1, rc, cancel)?);
+        let easiest_order = self.started_first(params, &self.easiest_now(known0, books));
+        let naive = self.evaluate_with(known0, params, &easiest_order, rc);
+        let naive_key = naive.key();
         // The first of the best: the beam's when it ties.
-        found.into_iter().min_by_key(|p| p.key())
+        let best_beam = found.into_iter().min_by_key(|(_, k)| *k);
+        let best = match best_beam {
+            Some((order, key)) if key <= naive_key => {
+                if order == easiest_order {
+                    naive.clone()
+                } else {
+                    self.evaluate_with(known0, params, &order, rc)
+                }
+            }
+            _ => naive.clone(),
+        };
+        Some((best, naive))
     }
 
     /// `first`: books read first, in that order, before the search.
@@ -1533,6 +1907,7 @@ impl Library {
     /// (`levels`), and only paths of as many books are compared. A book
     /// leads to the paths one longer; keeping series together, a whole
     /// series ([`Library::blocks`]) leads to the paths as many books longer.
+    #[allow(clippy::too_many_arguments)]
     fn beam(
         &self,
         known0: &Known,
@@ -1540,12 +1915,13 @@ impl Library {
         books: &[usize],
         first: &[usize],
         width: usize,
+        read_cache: Option<&[Option<BookReadCache>]>,
         cancel: &AtomicBool,
-    ) -> Option<Path> {
+    ) -> Option<(Vec<usize>, Key)> {
         let width = width.max(1);
         let words = (self.books.len()).div_ceil(64);
         let mut start = State {
-            steps: Vec::new(),
+            order: Vec::with_capacity(books.len()),
             known: known0.clone(),
             future: if params.lookahead > 0.0 {
                 self.future(books)
@@ -1556,10 +1932,10 @@ impl Library {
             key: EMPTY,
         };
         for &b in first {
-            let st = self.step(b, &mut start.known, &mut start.future, params, known0);
-            start.key = add_cost(start.key, step_cost(params.study, &st));
+            let c = self.step_cost_only(b, &mut start.known, &mut start.future, params, read_cache);
+            start.key = add_cost(start.key, c);
             start.done[b / 64] |= 1 << (b % 64);
-            start.steps.push(st);
+            start.order.push(b);
         }
         let in_done = |d: &[u64], b: usize| d[b / 64] >> (b % 64) & 1 == 1;
         let with = |d: &[u64], bs: &[usize]| {
@@ -1615,7 +1991,7 @@ impl Library {
                 })
                 .map(|(si, b)| {
                     let s = &beam[si];
-                    let (_, c) = self.cheap(b, &s.known, params.study);
+                    let c = self.cheap_cost(b, &s.known, params.study, read_cache);
                     (order_key(params.objective, add_cost(s.key, c)), si, b)
                 })
                 .collect();
@@ -1630,7 +2006,7 @@ impl Library {
                 .collect();
             let next: Vec<State> = picked
                 .par_iter()
-                .map(|&(si, b)| self.advance(&beam[si], &[b], params, known0))
+                .map(|&(si, b)| self.advance(&beam[si], &[b], params, read_cache))
                 .collect();
             levels[at + 1].extend(next);
             if blocks.is_empty() {
@@ -1651,7 +2027,7 @@ impl Library {
                         .map(move |(bi, _)| (si, bi))
                 })
                 .map(|(si, bi)| {
-                    let k = self.advance_key(&beam[si], &blocks[bi], params, known0);
+                    let k = self.advance_key(&beam[si], &blocks[bi], params, read_cache);
                     (order_key(params.objective, k), si, bi)
                 })
                 .collect();
@@ -1672,10 +2048,10 @@ impl Library {
                 .collect();
             let made: Vec<State> = picked
                 .par_iter()
-                .map(|&(si, bi)| self.advance(&beam[si], &blocks[bi], params, known0))
+                .map(|&(si, bi)| self.advance(&beam[si], &blocks[bi], params, read_cache))
                 .collect();
             for s in made {
-                let to = s.steps.len();
+                let to = s.order.len();
                 levels[to].push(s);
                 if levels[to].len() > width * 2 {
                     rank(&mut levels[to]);
@@ -1684,32 +2060,43 @@ impl Library {
         }
         let mut last = std::mem::take(&mut levels[books.len()]);
         rank(&mut last);
-        last.into_iter().next().map(|s| Path {
-            steps: s.steps,
-            params: *params,
-        })
+        last.into_iter()
+            .next()
+            .map(|s| (s.order, order_key(params.objective, s.key)))
     }
 
     /// `s` after reading `next`, in that order.
-    fn advance(&self, s: &State, next: &[usize], params: &Params, known0: &Known) -> State {
+    fn advance(
+        &self,
+        s: &State,
+        next: &[usize],
+        params: &Params,
+        read_cache: Option<&[Option<BookReadCache>]>,
+    ) -> State {
         let mut s = s.clone();
         for &b in next {
-            let st = self.step(b, &mut s.known, &mut s.future, params, known0);
-            s.key = add_cost(s.key, step_cost(params.study, &st));
+            let c = self.step_cost_only(b, &mut s.known, &mut s.future, params, read_cache);
+            s.key = add_cost(s.key, c);
             s.done[b / 64] |= 1 << (b % 64);
-            s.steps.push(st);
+            s.order.push(b);
         }
         s
     }
 
     /// The key of `s` after reading `next` ([`Library::advance`] without
     /// keeping the steps).
-    fn advance_key(&self, s: &State, next: &[usize], params: &Params, known0: &Known) -> Key {
+    fn advance_key(
+        &self,
+        s: &State,
+        next: &[usize],
+        params: &Params,
+        read_cache: Option<&[Option<BookReadCache>]>,
+    ) -> Key {
         let mut known = s.known.clone();
         let mut future = s.future.clone();
         next.iter().fold(s.key, |k, &b| {
-            let st = self.step(b, &mut known, &mut future, params, known0);
-            add_cost(k, step_cost(params.study, &st))
+            let c = self.step_cost_only(b, &mut known, &mut future, params, read_cache);
+            add_cost(k, c)
         })
     }
 }

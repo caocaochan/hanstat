@@ -3,6 +3,7 @@
 use super::html;
 use super::{Book, Section, SectionKind};
 use encoding_rs::Encoding;
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
 
@@ -11,21 +12,25 @@ struct Zip {
     names: Vec<String>,
 }
 
+fn read_entry(ar: &mut zip::ZipArchive<Cursor<Vec<u8>>>, name: &str) -> Option<Vec<u8>> {
+    let mut f = ar.by_name(name).ok()?;
+    let mut v = Vec::with_capacity(f.size() as usize);
+    f.read_to_end(&mut v).ok()?;
+    Some(v)
+}
+
 impl Zip {
     fn read(&mut self, name: &str) -> Option<Vec<u8>> {
-        let real = if self.names.iter().any(|n| n == name) {
-            name.to_owned()
-        } else {
-            // Some EPUBs reference files with the wrong case.
-            self.names
-                .iter()
-                .find(|n| n.eq_ignore_ascii_case(name))?
-                .clone()
-        };
-        let mut f = self.ar.by_name(&real).ok()?;
-        let mut v = Vec::with_capacity(f.size() as usize);
-        f.read_to_end(&mut v).ok()?;
-        Some(v)
+        if let Some(v) = read_entry(&mut self.ar, name) {
+            return Some(v);
+        }
+        // Some EPUBs reference files with the wrong case.
+        let real = self
+            .names
+            .iter()
+            .find(|n| n.eq_ignore_ascii_case(name))?
+            .clone();
+        read_entry(&mut self.ar, &real)
     }
 }
 
@@ -101,7 +106,6 @@ pub fn load(bytes: Vec<u8>) -> Result<Book, String> {
         .collect();
     let mut z = Zip { ar, names };
     let mut notes = Vec::new();
-    let mut decode_errors = 0u64;
 
     check_drm(&mut z)?;
 
@@ -237,9 +241,14 @@ pub fn load(bytes: Vec<u8>) -> Result<Book, String> {
         }
     }
 
-    let mut sections = Vec::new();
+    struct SpineItem {
+        href: String,
+        linear: bool,
+        bytes: Vec<u8>,
+    }
+    let mut spine_items = Vec::new();
     let mut seen = HashSet::new();
-    let (mut dupes, mut nonlinear, mut non_html, mut missing, mut toc_pages) = (0, 0, 0, 0, 0);
+    let (mut dupes, mut non_html, mut missing) = (0, 0, 0);
     for (idref, linear) in &spine {
         let Some(item) = manifest.get(idref) else {
             missing += 1;
@@ -262,48 +271,69 @@ pub fn load(bytes: Vec<u8>) -> Result<Book, String> {
             missing += 1;
             continue;
         };
-        let (src, err) = decode_markup(&b);
-        if err {
-            decode_errors += src.chars().filter(|&c| c == '\u{FFFD}').count() as u64;
-        }
-        let ex = html::extract(&src);
-        let is_nav = nav_href.as_deref() == Some(item.href.as_str());
-        // A hand-made "Contents" page in the spine: most of its paragraphs are TOC labels.
-        let is_toc_page = !is_nav && is_toc_like(&ex.paragraphs, &toc_texts);
+        spine_items.push(SpineItem {
+            href: item.href.clone(),
+            linear: *linear,
+            bytes: b,
+        });
+    }
+
+    let toc_entries: Vec<(&str, usize)> = toc_texts
+        .iter()
+        .map(|t| (t.as_str(), t.chars().count()))
+        .collect();
+    let extracted: Vec<(Section, bool, bool)> = spine_items
+        .into_par_iter()
+        .map(|item| {
+            let (src, _) = decode_markup(&item.bytes);
+            let ex = html::extract(&src);
+            let is_nav = nav_href.as_deref() == Some(item.href.as_str());
+            // A hand-made "Contents" page in the spine: most of its paragraphs are TOC labels.
+            let is_toc_page = !is_nav && is_toc_like(&ex.paragraphs, &toc_texts, &toc_entries);
+            let is_nonlinear = !(is_nav || is_toc_page) && !item.linear;
+            let kind = if is_nav || is_toc_page {
+                SectionKind::Nav
+            } else if !item.linear {
+                SectionKind::NonLinear
+            } else {
+                SectionKind::Body
+            };
+            let label = labels
+                .get(&item.href)
+                .cloned()
+                .or(ex.first_heading)
+                .or(ex.title)
+                .unwrap_or_else(|| {
+                    item.href
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&item.href)
+                        .to_owned()
+                });
+            let label: String = if label.chars().count() > 60 {
+                label.chars().take(59).chain(['…']).collect()
+            } else {
+                label
+            };
+            let sec = Section {
+                label,
+                href: Some(item.href),
+                kind,
+                paragraphs: ex.paragraphs,
+            };
+            (sec, is_toc_page, is_nonlinear)
+        })
+        .collect();
+    let mut sections = Vec::with_capacity(extracted.len());
+    let (mut nonlinear, mut toc_pages) = (0, 0);
+    for (sec, is_toc_page, is_nonlinear) in extracted {
         if is_toc_page {
             toc_pages += 1;
         }
-        let kind = if is_nav || is_toc_page {
-            SectionKind::Nav
-        } else if !linear {
+        if is_nonlinear {
             nonlinear += 1;
-            SectionKind::NonLinear
-        } else {
-            SectionKind::Body
-        };
-        let file_name = item
-            .href
-            .rsplit('/')
-            .next()
-            .unwrap_or(&item.href)
-            .to_owned();
-        let label = labels
-            .get(&item.href)
-            .cloned()
-            .or(ex.first_heading)
-            .or(ex.title)
-            .unwrap_or_else(|| file_name.clone());
-        let label: String = if label.chars().count() > 60 {
-            label.chars().take(59).chain(['…']).collect()
-        } else {
-            label
-        };
-        sections.push(Section {
-            label,
-            href: Some(item.href.clone()),
-            kind,
-            paragraphs: ex.paragraphs,
-        });
+        }
+        sections.push(sec);
     }
 
     let spine_set: HashSet<&str> = sections.iter().filter_map(|s| s.href.as_deref()).collect();
@@ -359,7 +389,6 @@ pub fn load(bytes: Vec<u8>) -> Result<Book, String> {
         format: "EPUB",
         sections,
         notes,
-        decode_errors,
         cover,
     })
 }
@@ -478,21 +507,33 @@ fn page_image(z: &mut Zip, page: &str, picture_only: bool) -> Option<Vec<u8>> {
     z.read(&resolve(dir_of(page), href))
 }
 
-fn is_toc_like(paras: &[String], toc: &HashSet<String>) -> bool {
+fn is_toc_like(paras: &[String], toc: &HashSet<String>, toc_entries: &[(&str, usize)]) -> bool {
     if paras.len() < 5 || toc.len() < 5 || paras.len() > toc.len() * 2 + 10 {
         return false;
     }
-    let hits = paras
-        .iter()
-        .filter(|p| {
-            toc.contains(p.as_str())
-                || toc.iter().any(|t| {
-                    p.chars().count() <= t.chars().count() + 12
-                        && (p.contains(t.as_str()) || t.contains(p.as_str()))
-                })
-        })
-        .count();
-    hits * 10 >= paras.len() * 6
+    let need = (paras.len() * 6).div_ceil(10);
+    let mut hits = 0usize;
+    for (idx, p) in paras.iter().enumerate() {
+        let matched = if toc.contains(p.as_str()) {
+            true
+        } else {
+            let p_len = p.chars().count();
+            toc_entries
+                .iter()
+                .any(|&(t, t_len)| p_len <= t_len + 12 && (p.contains(t) || t.contains(p.as_str())))
+        };
+        if matched {
+            hits += 1;
+            if hits >= need {
+                return true;
+            }
+        }
+        let remaining = paras.len() - idx - 1;
+        if hits + remaining < need {
+            return false;
+        }
+    }
+    hits >= need
 }
 
 /// Refuse DRM-encrypted content (font obfuscation is fine and common).
