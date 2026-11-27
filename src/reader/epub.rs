@@ -46,6 +46,7 @@ pub struct Epub {
     /// Lower-cased name → name in the archive (some books get the case wrong).
     names: HashMap<String, String>,
     pub title: String,
+    pub author: String,
     /// Content documents in reading order (ZIP paths), linear ones only.
     pub spine: Vec<String>,
     pub toc: Vec<TocEntry>,
@@ -78,10 +79,16 @@ impl Epub {
             files: Files::Zip(Mutex::new(zip)),
             names,
             title: String::new(),
+            author: String::new(),
             spine: Vec::new(),
             toc: Vec::new(),
         };
         epub.read_package()?;
+        if epub.title.is_empty()
+            && let Some(stem) = path.file_stem()
+        {
+            epub.title = stem.to_string_lossy().trim().to_owned();
+        }
         Ok(epub)
     }
 
@@ -169,6 +176,7 @@ impl Epub {
             }),
             names,
             title,
+            author: String::new(),
             spine,
             toc,
         }
@@ -204,11 +212,16 @@ impl Epub {
         let base = dir_of(&opf_path);
         self.title = doc
             .descendants()
-            .find(|n| n.tag_name().name() == "title")
+            .find(|n| {
+                n.tag_name().name() == "title"
+                    && n.ancestors().any(|a| a.tag_name().name() == "metadata")
+            })
+            .or_else(|| doc.descendants().find(|n| n.tag_name().name() == "title"))
             .and_then(|n| n.text())
             .unwrap_or("")
             .trim()
             .to_owned();
+        self.author = extract_author(&doc);
         // id → (path, media type, properties)
         let mut manifest: HashMap<&str, (String, &str, &str)> = HashMap::new();
         for n in doc.descendants().filter(|n| n.tag_name().name() == "item") {
@@ -276,6 +289,60 @@ impl Epub {
         self.toc = toc;
         Ok(())
     }
+}
+
+/// Extract the book's author(s) from OPF `<metadata>` `<dc:creator>` elements.
+/// Prefers primary authors (`role="aut"` or unspecified role) over translators
+/// or editors, falling back to any non-empty `<creator>` if none match.
+fn extract_author(doc: &roxmltree::Document<'_>) -> String {
+    let mut refined_roles: HashMap<&str, String> = HashMap::new();
+    for meta in doc.descendants().filter(|n| {
+        n.tag_name().name() == "meta"
+            && n.attribute("property") == Some("role")
+            && n.ancestors().any(|a| a.tag_name().name() == "metadata")
+    }) {
+        if let (Some(refines), Some(role)) = (meta.attribute("refines"), meta.text()) {
+            let id = refines.trim().trim_start_matches('#');
+            let role = role.trim().to_ascii_lowercase();
+            if !id.is_empty() && !role.is_empty() {
+                refined_roles.insert(id, role);
+            }
+        }
+    }
+
+    let mut primary = Vec::new();
+    let mut all = Vec::new();
+    for n in doc.descendants().filter(|n| {
+        n.tag_name().name() == "creator" && n.ancestors().any(|a| a.tag_name().name() == "metadata")
+    }) {
+        let Some(name) = n.text().map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if !all.iter().any(|s: &String| s == name) {
+            all.push(name.to_owned());
+        }
+        let opf_role = n
+            .attributes()
+            .find(|a| a.name() == "role")
+            .map(|a| a.value().trim().to_ascii_lowercase());
+        let role = opf_role.or_else(|| {
+            n.attribute("id")
+                .and_then(|id| refined_roles.get(id))
+                .cloned()
+        });
+        if role.as_deref().is_none_or(|r| r == "aut") && !primary.iter().any(|s: &String| s == name)
+        {
+            primary.push(name.to_owned());
+        }
+    }
+    let chosen = if primary.is_empty() { all } else { primary };
+    if chosen.is_empty() {
+        return String::new();
+    }
+    let cjk = chosen
+        .iter()
+        .any(|s| s.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c)));
+    chosen.join(if cjk { "、" } else { ", " })
 }
 
 /// One chapter of a plain-text book as XHTML: paragraphs indented by two
@@ -526,6 +593,40 @@ mod tests {
         let e = Epub::from_text(b"", "x");
         assert_eq!(e.spine.len(), 1);
         assert!(e.read_text(&e.spine[0]).is_some());
+    }
+
+    #[test]
+    fn extracts_author_from_opf_metadata() {
+        let opf = r##"<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" xmlns:dc="http://purl.org/dc/elements/1.1/" version="3.0">
+  <metadata>
+    <dc:title>活着</dc:title>
+    <dc:creator id="c1">余华</dc:creator>
+    <meta refines="#c1" property="role">aut</meta>
+    <dc:creator id="c2">某译者</dc:creator>
+    <meta refines="#c2" property="role">trl</meta>
+  </metadata>
+</package>"##;
+        let doc = roxmltree::Document::parse_with_options(opf, xml_opts()).unwrap();
+        assert_eq!(extract_author(&doc), "余华");
+
+        let multi = r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <metadata>
+    <dc:creator>鲁迅</dc:creator>
+    <dc:creator>周作人</dc:creator>
+  </metadata>
+</package>"#;
+        let doc = roxmltree::Document::parse_with_options(multi, xml_opts()).unwrap();
+        assert_eq!(extract_author(&doc), "鲁迅、周作人");
+
+        let latin = r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <metadata>
+    <dc:creator>Jane Austen</dc:creator>
+    <dc:creator>Someone Else</dc:creator>
+  </metadata>
+</package>"#;
+        let doc = roxmltree::Document::parse_with_options(latin, xml_opts()).unwrap();
+        assert_eq!(extract_author(&doc), "Jane Austen, Someone Else");
     }
 
     /// A real TXT from `HANSTAT_TEST_TXT`: chapters and their text agree

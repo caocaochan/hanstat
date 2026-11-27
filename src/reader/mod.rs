@@ -18,6 +18,7 @@ mod markup;
 mod popup;
 #[cfg(test)]
 mod preview;
+mod quote;
 mod render;
 mod search;
 mod stats_ui;
@@ -99,6 +100,10 @@ struct Settings {
     line_spacing: f32,
     /// Page margins, as a factor of the default.
     margins: f32,
+    /// Custom page width in points; `None`: automatic for the window and text size.
+    page_width: Option<f32>,
+    /// Custom page height in points; `None`: automatic for the window and text size.
+    page_height: Option<f32>,
     /// Two pages side by side when the window is wide enough.
     spread: bool,
     /// Traditional vertical-rl reading mode on a landscape page.
@@ -135,6 +140,8 @@ struct Settings {
     tts: tts::TtsSettings,
     /// The search sidebar's width.
     search_width: f32,
+    /// Last layout chosen in the quote PNG exporter.
+    quote_layout: quote::QuoteLayout,
 }
 
 impl Default for Settings {
@@ -146,6 +153,8 @@ impl Default for Settings {
             size: 20.0,
             line_spacing: 1.75,
             margins: 1.0,
+            page_width: None,
+            page_height: None,
             spread: true,
             vertical: false,
             autohide_bar: false,
@@ -161,6 +170,7 @@ impl Default for Settings {
             anki: anki::CardSettings::default(),
             tts: tts::TtsSettings::default(),
             search_width: 340.0,
+            quote_layout: quote::QuoteLayout::default(),
         }
     }
 }
@@ -345,6 +355,8 @@ pub struct Reader {
     selection: Option<Range<u32>>,
     /// The click position and its sentence, fixed for the life of the menu.
     text_menu: Option<TextMenu>,
+    /// The "Export quote" PNG dialog, when open.
+    quote_export: Option<quote::QuoteDialog>,
     /// Reading stats: the tracker, the Stats panel and what they show.
     tracker: tracker::Tracker,
     stats_open: bool,
@@ -574,6 +586,7 @@ impl Reader {
             selection_anchor: None,
             selection: None,
             text_menu: None,
+            quote_export: None,
         })
     }
 
@@ -1072,14 +1085,19 @@ impl Reader {
         (total > 0).then(|| (before + here) as f32 / total as f32)
     }
 
+    fn selected_text(&self) -> Option<String> {
+        let (range, ch) = (self.selection.as_ref()?, self.chapter(self.spine)?);
+        Some(
+            ch.chars[range.start as usize..range.end as usize]
+                .iter()
+                .map(|&c| if c == '\0' { '\n' } else { c })
+                .collect(),
+        )
+    }
+
     fn copy_selection(&self, ctx: &egui::Context) {
-        if let (Some(range), Some(ch)) = (&self.selection, self.chapter(self.spine)) {
-            ctx.copy_text(
-                ch.chars[range.start as usize..range.end as usize]
-                    .iter()
-                    .map(|&c| if c == '\0' { '\n' } else { c })
-                    .collect(),
-            );
+        if let Some(text) = self.selected_text() {
+            ctx.copy_text(text);
         }
     }
 
@@ -1090,12 +1108,13 @@ impl Reader {
         change: Option<egui::SetOpenCommand>,
     ) {
         let Some(menu) = self.text_menu else { return };
-        let play = egui::Popup::menu(response)
+        let has_selection = self.selection.is_some();
+        let (play, export_quote) = egui::Popup::menu(response)
             .id(id)
             .open_memory(change)
             .at_position(menu.position)
             .show(|ui| {
-                let copy = ui.add_enabled(self.selection.is_some(), egui::Button::new("Copy"));
+                let copy = ui.add_enabled(has_selection, egui::Button::new("Copy"));
                 let play =
                     ui.add_enabled(menu.target.is_some(), egui::Button::new("Play from here"));
                 #[cfg(test)]
@@ -1109,12 +1128,30 @@ impl Reader {
                 if play.clicked() {
                     ui.close();
                 }
-                play.clicked()
+                let mut export = false;
+                if has_selection {
+                    ui.separator();
+                    let btn =
+                        ui.button(icons::text(ui.ctx(), icons::IMAGE, "Export as PNG…", 14.0));
+                    if btn.clicked() {
+                        export = true;
+                        ui.close();
+                    }
+                }
+                (play.clicked(), export)
             })
-            .is_some_and(|menu| menu.inner);
+            .map_or((false, false), |menu| menu.inner);
         if play && let Some(spot) = menu.target {
             self.peek_keep();
             self.tts.play_from(spot.spine, spot.src, &self.settings.tts);
+        }
+        if export_quote && let Some(text) = self.selected_text() {
+            self.quote_export = Some(quote::QuoteDialog::new(
+                text,
+                self.epub.title.clone(),
+                self.epub.author.clone(),
+                self.settings.quote_layout,
+            ));
         }
     }
 
@@ -1169,7 +1206,8 @@ impl Reader {
             || self.tts.local_window_open()
             || self.tts.design_window_open()
             || self.dicts.open
-            || self.dict.cards.setup_open;
+            || self.dict.cards.setup_open
+            || self.quote_export.is_some();
         // A search result shown isn't reading: its time doesn't count.
         self.stats_frame(&ctx, menus_open);
         // Ctrl+F, wherever the keys are (the search box too).
@@ -1198,7 +1236,9 @@ impl Reader {
                 self.tts.close_local_window();
             }
             self.tts.panel_open = false;
-            if self.dict.cards.setup_open {
+            if self.quote_export.is_some() {
+                self.quote_export = None;
+            } else if self.dict.cards.setup_open {
                 self.dict.cards.setup_open = false;
             } else if self.dicts.open {
                 self.dicts.open = false;
@@ -1320,6 +1360,8 @@ impl Reader {
                 } else {
                     ctx.request_repaint_after(std::time::Duration::from_millis(160));
                 }
+            } else {
+                self.drawn = Some(g);
             }
             let g = self.drawn.unwrap_or(g);
             geom_for_keys = Some(g);
@@ -1624,7 +1666,7 @@ impl Reader {
                     egui::Sense::hover(),
                 )
                 .on_hover_text(format!(
-                    "Page {} of {} in this chapter (pages change with the window, text size and margins)",
+                    "Page {} of {} in this chapter (pages change with the window, page size, text size and margins)",
                     idx + 1,
                     l.pages.len()
                 ));
@@ -1859,6 +1901,36 @@ impl Reader {
         if self.dict.cards.window(&ctx, &mut self.settings.anki) {
             self.dict.sync_cards(&self.settings.anki);
             self.dirty = true;
+        }
+        if let Some(mut dlg) = self.quote_export.take() {
+            let before_layout = dlg.card.layout;
+            let (mut keep_open, save) =
+                dlg.ui(&ctx, th, self.fonts.as_ref(), self.settings.sans_default);
+            if dlg.card.layout != before_layout {
+                self.settings.quote_layout = dlg.card.layout;
+                self.dirty = true;
+            }
+            if save
+                && let Some(path) = rfd::FileDialog::new()
+                    .set_file_name(quote::suggested_filename(&dlg.card.title))
+                    .add_filter("PNG", &["png"])
+                    .save_file()
+            {
+                match quote::export_png(
+                    &ctx,
+                    &dlg.card,
+                    th,
+                    self.fonts.as_ref(),
+                    self.settings.sans_default,
+                    &path,
+                ) {
+                    Ok(()) => keep_open = false,
+                    Err(e) => dlg.error = Some(e),
+                }
+            }
+            if keep_open {
+                self.quote_export = Some(dlg);
+            }
         }
         if self.dirty && !ctx.input(|i| i.pointer.any_down()) {
             self.save();
@@ -2315,6 +2387,7 @@ impl Reader {
                 self.settings.spread,
                 self.settings.autohide_bar,
             );
+            let before_page = (self.settings.page_width, self.settings.page_height);
             ui.set_min_width(300.0);
             let fams = fonts::families();
             egui::Grid::new("reader-settings").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
@@ -2475,6 +2548,32 @@ impl Reader {
                 ui.label("Margins");
                 ui.add(egui::Slider::new(&mut self.settings.margins, 0.4..=2.0).step_by(0.1).fixed_decimals(1));
                 ui.end_row();
+                let area = self.page_area.unwrap_or_else(|| ui.ctx().content_rect());
+                let bounds = page_bounds(&self.settings, area);
+                page_dimension_row(
+                    ui,
+                    "Page width",
+                    &mut self.settings.page_width,
+                    bounds.default_w,
+                    bounds.min_w,
+                    bounds.max_w,
+                    if bounds.spread {
+                        "Width of each page in points (Auto follows the window and text size)"
+                    } else {
+                        "Width of the page in points (Auto follows the window and text size)"
+                    },
+                    "Use the default page width",
+                );
+                page_dimension_row(
+                    ui,
+                    "Page height",
+                    &mut self.settings.page_height,
+                    bounds.default_h,
+                    bounds.min_h,
+                    bounds.max_h,
+                    "Height of the page in points (Auto follows the window and text size)",
+                    "Use the default page height",
+                );
                 ui.label("Text direction");
                 #[cfg(test)]
                 let mut vert_rect = None;
@@ -2535,7 +2634,8 @@ impl Reader {
                 self.settings.vertical,
                 self.settings.spread,
                 self.settings.autohide_bar,
-            ) {
+            ) || before_page != (self.settings.page_width, self.settings.page_height)
+            {
                 changed = true;
             }
         });
@@ -2578,8 +2678,74 @@ fn toc_labels(toc: &[epub::TocEntry]) -> Vec<String> {
         .collect()
 }
 
-/// Where the pages go in `area`.
-fn geometry(settings: &Settings, area: Rect) -> Geometry {
+#[allow(clippy::too_many_arguments)]
+fn page_dimension_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    setting: &mut Option<f32>,
+    default: f32,
+    min: f32,
+    max: f32,
+    hover: &str,
+    reset_hover: &str,
+) {
+    ui.label(label);
+    let lo = min.ceil();
+    let hi = max.floor().max(lo);
+    let mut val = setting.unwrap_or(default).clamp(lo, hi).round();
+    let is_auto = setting.is_none();
+    ui.horizontal(|ui| {
+        let r = ui
+            .add(
+                egui::Slider::new(&mut val, lo..=hi)
+                    .step_by(1.0)
+                    .custom_formatter(move |v, _| {
+                        if is_auto {
+                            "Auto".to_owned()
+                        } else {
+                            format!("{v:.0} pt")
+                        }
+                    })
+                    .custom_parser(|s| {
+                        s.trim()
+                            .strip_suffix("pt")
+                            .unwrap_or(s)
+                            .trim()
+                            .parse::<f64>()
+                            .ok()
+                    }),
+            )
+            .on_hover_text(hover);
+        if r.changed() {
+            *setting = Some(val);
+        }
+        if ui
+            .add_enabled(setting.is_some(), egui::Button::new("Reset"))
+            .on_hover_text(reset_hover)
+            .clicked()
+        {
+            *setting = None;
+        }
+    });
+    ui.end_row();
+}
+
+/// Default and allowable outer page dimensions in `area`.
+struct PageBounds {
+    default_w: f32,
+    default_h: f32,
+    min_w: f32,
+    max_w: f32,
+    min_h: f32,
+    max_h: f32,
+    spread: bool,
+    pad_x: f32,
+    pad_top: f32,
+    pad_bottom: f32,
+    desk: f32,
+}
+
+fn page_bounds(settings: &Settings, area: Rect) -> PageBounds {
     let base = settings.size;
     let pad_x = (base * 2.2 * settings.margins).max(12.0);
     let pad_top = (base * 2.4 * settings.margins).max(24.0);
@@ -2593,55 +2759,100 @@ fn geometry(settings: &Settings, area: Rect) -> Geometry {
         let min_h = (base * 6.0 + 2.0 * pad_v).min(avail_h);
         // Single landscape page: comfortable column height, wider than tall
         // even in narrow or square windows.
-        let page_h = avail_h
+        let default_h = avail_h
             .min(max_col_text + 2.0 * pad_v)
             .min((avail_w / 1.3).max(min_h))
             .max(min_h);
-        let page_w = avail_w
-            .min(page_h * 1.6)
-            .max(page_h.min(avail_w))
+        let default_w = avail_w
+            .min(default_h * 1.6)
+            .max(default_h.min(avail_w))
             .max(160.0);
+        let min_w = (base * 4.0 + 2.0 * pad_x).max(160.0).min(avail_w);
+        return PageBounds {
+            default_w,
+            default_h,
+            min_w,
+            max_w: avail_w.max(min_w),
+            min_h,
+            max_h: avail_h.max(min_h),
+            spread: false,
+            pad_x,
+            pad_top,
+            pad_bottom,
+            desk,
+        };
+    }
+    let max_text = base * 34.0;
+    let min_spread_text = base * 20.0;
+    let avail_h = (area.height() - 2.0 * desk).max(200.0);
+    let spread = settings.spread
+        && area.width() - 3.0 * desk >= 2.0 * (min_spread_text + 2.0 * pad_x)
+        && area.width() > area.height() * 1.15;
+    let avail_page_w = if spread {
+        (area.width() - 3.0 * desk) / 2.0
+    } else {
+        area.width() - 2.0 * desk
+    }
+    .max(160.0);
+    let default_w = avail_page_w.min(max_text + 2.0 * pad_x).max(160.0);
+    let min_w = (base * 4.0 + 2.0 * pad_x).max(160.0).min(avail_page_w);
+    let min_h = (base * 4.0 + pad_top + pad_bottom).max(200.0).min(avail_h);
+    PageBounds {
+        default_w,
+        default_h: avail_h,
+        min_w,
+        max_w: avail_page_w.max(min_w),
+        min_h,
+        max_h: avail_h.max(min_h),
+        spread,
+        pad_x,
+        pad_top,
+        pad_bottom,
+        desk,
+    }
+}
+
+/// Where the pages go in `area`.
+fn geometry(settings: &Settings, area: Rect) -> Geometry {
+    let base = settings.size;
+    let b = page_bounds(settings, area);
+    let page_w = settings
+        .page_width
+        .map_or(b.default_w, |w| w.clamp(b.min_w, b.max_w));
+    let page_h = settings
+        .page_height
+        .map_or(b.default_h, |h| h.clamp(b.min_h, b.max_h));
+    if settings.vertical {
+        let pad_v = b.pad_top.max(b.pad_bottom);
         // Column height a whole number of characters: CJK columns then fill
         // it without stretching, and rows of characters line up.
         let text_h = ((page_h - 2.0 * pad_v) / base).floor().max(4.0) * base;
         let inset_y = (page_h - text_h) / 2.0;
-        let content_w = (page_w - 2.0 * pad_x).max(base * 3.0);
+        let content_w = (page_w - 2.0 * b.pad_x).max(base * 3.0);
         let x0 = area.center().x - page_w / 2.0;
         let y0 = area.center().y - page_h / 2.0;
         let p0 = Rect::from_min_size(pos2(x0, y0), vec2(page_w, page_h));
         return Geometry {
             pages: [p0, p0],
             spread: false,
-            inset: vec2(pad_x, inset_y),
+            inset: vec2(b.pad_x, inset_y),
             content: vec2(content_w, text_h),
         };
     }
-    let max_text = base * 34.0;
-    let min_spread_text = base * 20.0;
-    let h = (area.height() - 2.0 * desk).max(200.0);
-    let spread = settings.spread
-        && area.width() - 3.0 * desk >= 2.0 * (min_spread_text + 2.0 * pad_x)
-        && area.width() > area.height() * 1.15;
-    let page_w = if spread {
-        ((area.width() - 3.0 * desk) / 2.0).min(max_text + 2.0 * pad_x)
-    } else {
-        (area.width() - 2.0 * desk).min(max_text + 2.0 * pad_x)
-    }
-    .max(160.0);
     // Text width a whole number of characters: CJK lines then fill it
     // without stretching, and columns of characters line up.
-    let text_w = ((page_w - 2.0 * pad_x) / base).floor().max(4.0) * base;
+    let text_w = ((page_w - 2.0 * b.pad_x) / base).floor().max(4.0) * base;
     let inset_x = (page_w - text_w) / 2.0;
-    let content = vec2(text_w, (h - pad_top - pad_bottom).max(base * 3.0));
-    let total_w = if spread { 2.0 * page_w } else { page_w };
+    let content = vec2(text_w, (page_h - b.pad_top - b.pad_bottom).max(base * 3.0));
+    let total_w = if b.spread { 2.0 * page_w } else { page_w };
     let x0 = area.center().x - total_w / 2.0;
-    let y0 = area.top() + desk;
-    let p0 = Rect::from_min_size(pos2(x0, y0), vec2(page_w, h));
+    let y0 = (area.center().y - page_h / 2.0).max(area.top() + b.desk);
+    let p0 = Rect::from_min_size(pos2(x0, y0), vec2(page_w, page_h));
     let p1 = p0.translate(vec2(page_w, 0.0));
     Geometry {
         pages: [p0, p1],
-        spread,
-        inset: vec2(inset_x, pad_top),
+        spread: b.spread,
+        inset: vec2(inset_x, b.pad_top),
         content,
     }
 }
@@ -2892,5 +3103,135 @@ mod geometry_tests {
                 "page fits inside area at {w}x{h}: {page:?}"
             );
         }
+    }
+
+    #[test]
+    fn custom_page_width_and_height_horizontal() {
+        let area = Rect::from_min_size(Pos2::ZERO, vec2(1920.0, 1080.0));
+
+        // Single page: default matches the original formula (max_text + 2*pad_x, full height).
+        let mut s = Settings {
+            spread: false,
+            ..Settings::default()
+        };
+        assert_eq!(s.page_width, None);
+        assert_eq!(s.page_height, None);
+        let def = geometry(&s, area);
+        assert!(!def.spread);
+        let expected_w = s.size * 34.0 + 2.0 * (s.size * 2.2 * s.margins);
+        let expected_h = area.height() - 36.0;
+        assert!((def.pages[0].width() - expected_w).abs() < 1e-3);
+        assert!((def.pages[0].height() - expected_h).abs() < 1e-3);
+        assert!((def.pages[0].top() - 18.0).abs() < 1e-3);
+
+        // Wider and shorter than default, centered vertically and horizontally.
+        s.page_width = Some(1200.0);
+        s.page_height = Some(640.0);
+        let custom = geometry(&s, area);
+        assert!((custom.pages[0].width() - 1200.0).abs() < 1e-3);
+        assert!((custom.pages[0].height() - 640.0).abs() < 1e-3);
+        assert!((custom.pages[0].center().x - area.center().x).abs() < 1e-3);
+        assert!((custom.pages[0].center().y - area.center().y).abs() < 1e-3);
+        assert!((custom.content.x % s.size).abs() < 1e-3);
+        assert!(area.contains_rect(custom.pages[0]));
+
+        // Oversized values clamp to the window's available space.
+        s.page_width = Some(5000.0);
+        s.page_height = Some(5000.0);
+        let clamped_hi = geometry(&s, area);
+        assert!((clamped_hi.pages[0].width() - (area.width() - 36.0)).abs() < 1e-3);
+        assert!((clamped_hi.pages[0].height() - expected_h).abs() < 1e-3);
+        assert!(area.contains_rect(clamped_hi.pages[0]));
+
+        // Tiny values clamp to a readable minimum.
+        s.page_width = Some(10.0);
+        s.page_height = Some(10.0);
+        let clamped_lo = geometry(&s, area);
+        let b = page_bounds(&s, area);
+        assert!((clamped_lo.pages[0].width() - b.min_w).abs() < 1e-3);
+        assert!((clamped_lo.pages[0].height() - b.min_h).abs() < 1e-3);
+        assert!(clamped_lo.content.x >= s.size * 4.0);
+        assert!(clamped_lo.content.y >= s.size * 3.0);
+
+        // Spread mode: custom width applies to each page, clamped to half the window.
+        let mut spread_s = Settings {
+            spread: true,
+            page_width: Some(500.0),
+            page_height: Some(700.0),
+            ..Settings::default()
+        };
+        let sp = geometry(&spread_s, area);
+        assert!(sp.spread);
+        assert!((sp.pages[0].width() - 500.0).abs() < 1e-3);
+        assert!((sp.pages[1].width() - 500.0).abs() < 1e-3);
+        assert!((sp.pages[0].height() - 700.0).abs() < 1e-3);
+        assert!((sp.pages[0].right() - sp.pages[1].left()).abs() < 1e-3);
+        assert!(((sp.pages[0].left() + sp.pages[1].right()) / 2.0 - area.center().x).abs() < 1e-3);
+
+        spread_s.page_width = Some(5000.0);
+        let sp_max = geometry(&spread_s, area);
+        assert!((sp_max.pages[0].width() - (area.width() - 54.0) / 2.0).abs() < 1e-3);
+        assert!(area.contains_rect(sp_max.pages[0]));
+        assert!(area.contains_rect(sp_max.pages[1]));
+    }
+
+    #[test]
+    fn custom_page_width_and_height_vertical() {
+        let area = Rect::from_min_size(Pos2::ZERO, vec2(1920.0, 1080.0));
+        let mut s = Settings {
+            vertical: true,
+            ..Settings::default()
+        };
+        let def = geometry(&s, area);
+
+        // Increasing height does not unexpectedly change width.
+        s.page_height = Some(920.0);
+        let taller = geometry(&s, area);
+        assert!((taller.pages[0].height() - 920.0).abs() < 1e-3);
+        assert!((taller.pages[0].width() - def.pages[0].width()).abs() < 1e-3);
+        assert!((taller.content.y % s.size).abs() < 1e-3);
+
+        // Increasing width does not change height.
+        s.page_width = Some(1600.0);
+        let wider = geometry(&s, area);
+        assert!((wider.pages[0].width() - 1600.0).abs() < 1e-3);
+        assert!((wider.pages[0].height() - 920.0).abs() < 1e-3);
+        assert!(area.contains_rect(wider.pages[0]));
+    }
+
+    #[test]
+    fn page_size_settings_serde_defaults_to_none() {
+        let legacy: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.page_width, None);
+        assert_eq!(legacy.page_height, None);
+
+        let custom = Settings {
+            page_width: Some(820.0),
+            page_height: Some(640.0),
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&custom).unwrap();
+        let roundtrip: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.page_width, Some(820.0));
+        assert_eq!(roundtrip.page_height, Some(640.0));
+    }
+
+    #[test]
+    fn page_dimension_row_keeps_none_until_changed() {
+        let ctx = egui::Context::default();
+        let mut width = None;
+        let mut height = Some(1500.0);
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            egui::Grid::new("test-page-dims")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    page_dimension_row(ui, "Page width", &mut width, 768.0, 168.0, 1200.0, "", "");
+                    // Saved value wider than current window stays untouched if user doesn't drag it.
+                    page_dimension_row(ui, "Page height", &mut height, 764.0, 200.0, 764.0, "", "");
+                });
+        });
+        out.textures_delta.clear();
+        assert_eq!(width, None);
+        assert_eq!(height, Some(1500.0));
     }
 }

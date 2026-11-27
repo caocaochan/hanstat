@@ -1,5 +1,11 @@
 # Changelog
 
+## [2026.11.27.06] - 2026-11-27
+
+### Added
+- **Page width and height in the Reader's Aa menu.** The **Aa** panel now includes **Page width** and **Page height** sliders (with **Reset** back to **Auto**). The default **Auto** behaviour is unchanged, adapting automatically to the window, text size and reading direction, while custom widths and heights clamp to the window and work in single-page, two-page spread and vertical modes.
+- **Export selected text as a quote PNG.** Right-clicking selected text in the Reader now offers **Export as PNG…**, opening a live-preview dialog styled in the current Reader theme's colours. Choose between **Square** (1024 × 1024 px), **Horizontal** (1024 × 640 px) and **Vertical** (640 × 1024 px) layouts; the card includes the quote, date, book title (automatically read from the book) and author (read from EPUB `<dc:creator>` metadata, and editable in the dialog).
+
 ## [2026.11.27.05] - 2026-11-27
 
 ### Added
