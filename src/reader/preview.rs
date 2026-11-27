@@ -48,6 +48,7 @@ fn render_pages() {
     if let Some(v) = env("READER_SPREAD") {
         settings.spread = v != "0";
     }
+    settings.vertical = env("READER_VERTICAL").is_some();
     let trad = env("READER_TRAD").is_some();
     let th = &theme::THEMES[theme::index(&env("READER_THEME").unwrap_or_default())];
 
@@ -102,6 +103,7 @@ fn render_pages() {
             rule: th.muted,
             page: th.page,
             dark: th.dark,
+            vertical: settings.vertical,
         };
         let mut info = String::new();
         let scene = crate::raster::lay_out(
@@ -138,12 +140,21 @@ fn render_pages() {
                     let origin = page_rect.min + g.inset;
                     let mut off = origin.to_vec2();
                     if l.pages[idx].center {
-                        off.y += ((g.content.y - l.page_height(idx)) / 2.0).max(0.0);
+                        if l.vertical {
+                            off.x -= ((g.content.x - l.page_height(idx)) / 2.0).max(0.0);
+                        } else {
+                            off.y += ((g.content.y - l.page_height(idx)) / 2.0).max(0.0);
+                        }
                     }
                     let (items, shift) = l.page_items(idx);
                     let off = off + shift;
                     let clip = Rect::from_min_size(origin, g.content).expand(4.0);
-                    let painter = ui.painter_at(clip.expand2(vec2(g.inset.x * 0.5, 0.0)));
+                    let clip_pad = if l.vertical {
+                        vec2(0.0, g.inset.y * 0.4)
+                    } else {
+                        vec2(g.inset.x * 0.5, 0.0)
+                    };
+                    let painter = ui.painter_at(clip.expand2(clip_pad));
                     for i in &items {
                         if let Item::Image { rect, path } = &l.items[*i] {
                             let r = rect.translate(off);
@@ -3712,6 +3723,7 @@ fn reading_han_counts() {
         rule: th.muted,
         page: th.page,
         dark: th.dark,
+        vertical: false,
     };
     let mut mismatched = 0;
     for path in books {
@@ -3837,4 +3849,98 @@ fn reader_autohide_bar() {
     d.idle(&mut r, 30);
     assert!(r.probe.bar.is_some(), "shown once the button is let go");
     unmoved(&r, "after the drag");
+}
+
+/// Switching to vertical mode in the Aa menu turns the page into a single
+/// landscape sheet, flips ←/→ navigation to RTL, and supports vertical
+/// drag-selection.
+#[test]
+#[ignore = "opens the reader with the system fonts and dictionary settings"]
+fn reader_vertical_mode() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut d = Driver::new();
+    let (mut r, _) = selection_book(&mut d, temp.path());
+    let before_geom = r.last_geom.expect("horizontal pages drawn");
+    assert!(before_geom.spread, "starts in horizontal spread");
+
+    let aa = r.probe.aa.expect("Aa drawn");
+    d.click(&mut r, aa.center());
+    assert!(r.settings_open);
+    let vert_btn = r.probe.vertical.expect("Vertical radio drawn");
+    d.snap("vertical-aa");
+    d.click(&mut r, vert_btn.center());
+    d.ready(&mut r);
+    assert!(r.settings.vertical, "vertical mode toggled on");
+    assert!(d.key(&mut r, Key::Escape), "Esc closes Aa panel");
+    d.idle(&mut r, 10);
+
+    let g = r.last_geom.expect("vertical page drawn");
+    assert!(!g.spread, "single landscape page in vertical mode");
+    assert!(
+        g.pages[0].width() > g.pages[0].height(),
+        "page switched to landscape: {:?}",
+        g.pages[0]
+    );
+    d.snap("vertical-page");
+
+    // In vertical-rl, Left turns forward and Right turns back.
+    let p0 = r.page;
+    d.key(&mut r, Key::ArrowLeft);
+    assert!(r.page > p0, "ArrowLeft advances in vertical mode");
+    d.key(&mut r, Key::ArrowRight);
+    assert_eq!(r.page, p0, "ArrowRight goes back in vertical mode");
+
+    // Drag along the first column selects characters.
+    let (idx, off) = r.probe.sides[0];
+    let l = r.layouts.get(&r.spine).unwrap().clone();
+    let a = l.char_rects(idx, 0..1)[0].translate(off).center();
+    let b = l.char_rects(idx, 4..5)[0].translate(off).center();
+    assert!(a.y < b.y, "column runs top to bottom: {a:?} -> {b:?}");
+    d.drag(&mut r, a, b);
+    assert!(r.selection.is_some(), "vertical drag creates a selection");
+}
+
+#[test]
+#[ignore = "opens the reader with the system fonts and dictionary settings"]
+fn reader_vertical_typography() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("vertical_rich.epub");
+    let chapter = r#"<html><meta charset="utf-8"><style>
+        h2 { text-align: center; margin: 1em 0; }
+        p { text-indent: 2em; margin: 0.4em 0; }
+    </style><body>
+        <h2>第一章 《山海经》</h2>
+        <p>他说：“你好，世界！”然后指着「<u>昆仑山</u>」道——这便是传说中的地方……</p>
+        <p>书中记载：<ruby>青鸟<rt>qīngniǎo</rt></ruby>与<ruby>白泽<rt>ㄅㄞˊㄗㄜˊ</rt></ruby>，公元 2026 年仍为世人所称道（见 Vol. 3）。</p>
+        <hr/>
+        <p><strong>加粗文字</strong>与<s>删除线</s>测试。</p>
+    </body></html>"#;
+    write_zip(
+        &path,
+        &[
+            (
+                "META-INF/container.xml",
+                r#"<container><rootfiles><rootfile full-path="book.opf"/></rootfiles></container>"#,
+            ),
+            (
+                "book.opf",
+                r#"<package><metadata><dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">竖排测试</dc:title></metadata><manifest><item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c1"/></spine></package>"#,
+            ),
+            ("c1.xhtml", chapter),
+        ],
+    );
+    let mut d = Driver::new();
+    let mut r = d.open(path.to_str().unwrap());
+    r.settings.vertical = true;
+    d.ready(&mut r);
+    d.idle(&mut r, 10);
+    d.snap("vertical-rich");
+    let l = r.layouts.get(&r.spine).unwrap();
+    assert!(l.vertical);
+    assert!(
+        l.items
+            .iter()
+            .any(|it| matches!(it, Item::Text { angle, .. } if *angle > 0.0)),
+        "expected rotated sideways Latin/ASCII runs"
+    );
 }

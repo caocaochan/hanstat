@@ -88,6 +88,8 @@ struct Settings {
     margins: f32,
     /// Two pages side by side when the window is wide enough.
     spread: bool,
+    /// Traditional vertical-rl reading mode on a landscape page.
+    vertical: bool,
     /// The menu bar shows only with the pointer at the top of the window,
     /// over the pages, which are laid out as if it weren't there.
     autohide_bar: bool,
@@ -132,6 +134,7 @@ impl Default for Settings {
             line_spacing: 1.75,
             margins: 1.0,
             spread: true,
+            vertical: false,
             autohide_bar: false,
             theme: theme::THEMES[0].id.to_owned(),
             popup_theme: popup::SAME_AS_PAGES.to_owned(),
@@ -190,6 +193,8 @@ struct Probe {
     serif_box: Option<Rect>,
     /// The serif list is open: one of its entries and its family.
     serif_item: Option<(Rect, String)>,
+    /// The Vertical radio button, while the panel is open.
+    vertical: Option<Rect>,
     contents: Option<Rect>,
     /// The contents menu is open: its sixth entry.
     toc_item: Option<Rect>,
@@ -1173,11 +1178,18 @@ impl Reader {
                 rule: th.muted,
                 page: th.page,
                 dark: th.dark,
+                vertical: self.settings.vertical,
             };
-            // Not while a slider or the window edge is being dragged.
-            let settled = (now - self.resized_at > 0.15
-                && !text_input_busy
-                && !ctx.input(|i| i.pointer.any_down()))
+            // Not while a slider or the window edge is being dragged (toggling
+            // horizontal/vertical switches immediately).
+            let mode_flipped = self
+                .params
+                .as_ref()
+                .is_some_and(|p| p.vertical != params.vertical);
+            let settled = mode_flipped
+                || (now - self.resized_at > 0.15
+                    && !text_input_busy
+                    && !ctx.input(|i| i.pointer.any_down()))
                 || self.layouts.is_empty();
             if self.params.as_ref() != Some(&params) {
                 if settled {
@@ -1264,7 +1276,11 @@ impl Reader {
                     let origin = g.pages[side].min + g.inset;
                     let mut off = origin.to_vec2();
                     if l.pages[idx].center {
-                        off.y += ((g.content.y - l.page_height(idx)) / 2.0).max(0.0);
+                        if l.vertical {
+                            off.x -= ((g.content.x - l.page_height(idx)) / 2.0).max(0.0);
+                        } else {
+                            off.y += ((g.content.y - l.page_height(idx)) / 2.0).max(0.0);
+                        }
                     }
                     let off = off + l.page_items(idx).1;
                     Some((idx, off, Rect::from_min_size(origin, g.content).expand(4.0)))
@@ -1419,12 +1435,22 @@ impl Reader {
                     continue;
                 };
                 let items = l.page_items(idx).0;
-                let painter = ui.painter_at(clip.expand2(vec2(g.inset.x * 0.5, 0.0)));
+                let clip_pad = if l.vertical {
+                    vec2(0.0, g.inset.y * 0.4)
+                } else {
+                    vec2(g.inset.x * 0.5, 0.0)
+                };
+                let painter = ui.painter_at(clip.expand2(clip_pad));
                 let ppp = ctx.pixels_per_point();
+                let hl_pad = if l.vertical {
+                    vec2(0.0, 1.0)
+                } else {
+                    vec2(1.0, 0.0)
+                };
                 if let Some(r) = &reading {
                     for r in l.char_rects(idx, r.clone()) {
                         painter.rect_filled(
-                            r.translate(off).expand2(vec2(1.0, 0.0)),
+                            r.translate(off).expand2(hl_pad),
                             3.0,
                             th.reading(),
                         );
@@ -1433,7 +1459,7 @@ impl Reader {
                 if let Some((src, n)) = highlight {
                     for r in l.char_rects(idx, src..src + n as u32) {
                         let r = r.translate(off);
-                        painter.rect_filled(r.expand2(vec2(1.0, 0.0)), 3.0, th.highlight());
+                        painter.rect_filled(r.expand2(hl_pad), 3.0, th.highlight());
                         self.dict.anchor = Some(self.dict.anchor.map_or(r, |a| a.union(r)));
                     }
                 }
@@ -1444,7 +1470,7 @@ impl Reader {
                     && *sp == self.spine
                 {
                     for r in l.char_rects(idx, range.clone()) {
-                        painter.rect_filled(r.translate(off).expand2(vec2(1.0, 0.0)), 3.0, th.search_hit());
+                        painter.rect_filled(r.translate(off).expand2(hl_pad), 3.0, th.search_hit());
                     }
                 }
                 if let Some(range) = &self.selection {
@@ -1533,9 +1559,17 @@ impl Reader {
                         g.pages[0].right()
                     };
                     if p.x < left {
-                        self.prev(&g);
+                        if self.settings.vertical {
+                            self.next(&g);
+                        } else {
+                            self.prev(&g);
+                        }
                     } else if p.x > right {
-                        self.next(&g);
+                        if self.settings.vertical {
+                            self.prev(&g);
+                        } else {
+                            self.next(&g);
+                        }
                     }
                 }
             }
@@ -1600,11 +1634,16 @@ impl Reader {
                     self.tts.toggle_pause();
                 }
             }
+            let (fwd_arrow, back_arrow) = if self.settings.vertical {
+                (Key::ArrowLeft, Key::ArrowRight)
+            } else {
+                (Key::ArrowRight, Key::ArrowLeft)
+            };
             let (fwd, back, home, end, esc, wheel) = ctx.input_mut(|i| {
-                let fwd = [Key::ArrowRight, Key::ArrowDown, Key::PageDown, Key::Space]
+                let fwd = [fwd_arrow, Key::ArrowDown, Key::PageDown, Key::Space]
                     .iter()
                     .any(|k| i.consume_key(egui::Modifiers::NONE, *k));
-                let back = [Key::ArrowLeft, Key::ArrowUp, Key::PageUp, Key::Backspace]
+                let back = [back_arrow, Key::ArrowUp, Key::PageUp, Key::Backspace]
                     .iter()
                     .any(|k| i.consume_key(egui::Modifiers::NONE, *k))
                     || i.consume_key(egui::Modifiers::SHIFT, Key::Space);
@@ -1837,17 +1876,26 @@ impl Reader {
                 }
                 ui.separator();
                 let before = self.settings.spread;
-                ui.selectable_value(
-                    &mut self.settings.spread,
-                    true,
-                    RichText::new("Two pages").size(14.0),
-                )
-                .on_hover_text("Two pages side by side, when the window is wide enough");
-                ui.selectable_value(
-                    &mut self.settings.spread,
-                    false,
-                    RichText::new("One page").size(14.0),
-                );
+                ui.add_enabled_ui(!self.settings.vertical, |ui| {
+                    let spread_tip = if self.settings.vertical {
+                        "Vertical mode uses one landscape page"
+                    } else {
+                        "Two pages side by side, when the window is wide enough"
+                    };
+                    ui.selectable_value(
+                        &mut self.settings.spread,
+                        true,
+                        RichText::new("Two pages").size(14.0),
+                    )
+                    .on_hover_text(spread_tip)
+                    .on_disabled_hover_text("Vertical mode uses one landscape page");
+                    ui.selectable_value(
+                        &mut self.settings.spread,
+                        false,
+                        RichText::new("One page").size(14.0),
+                    )
+                    .on_disabled_hover_text("Vertical mode uses one landscape page");
+                });
                 if self.settings.spread != before {
                     self.dirty = true;
                 }
@@ -2076,6 +2124,7 @@ impl Reader {
         self.probe.popup_theme_items.clear();
         self.probe.serif_box = None;
         self.probe.serif_item = None;
+        self.probe.vertical = None;
         let mut open = self.settings_open;
         egui::Popup::menu(&button)
             .id(egui::Id::unique("reader-settings"))
@@ -2210,13 +2259,27 @@ impl Reader {
                 ui.label("Margins");
                 ui.add(egui::Slider::new(&mut self.settings.margins, 0.4..=2.0).step_by(0.1).fixed_decimals(1));
                 ui.end_row();
-                ui.label("Pages");
+                ui.label("Text direction");
+                let mut vert_rect = None;
                 ui.horizontal(|ui| {
-                    ui.radio_value(&mut self.settings.spread, false, "One");
-                    ui.radio_value(&mut self.settings.spread, true, "Two side by side");
+                    ui.radio_value(&mut self.settings.vertical, false, "Horizontal");
+                    let v = ui.radio_value(&mut self.settings.vertical, true, "Vertical");
+                    vert_rect = Some(v.rect);
                 })
                 .response
-                .on_hover_text("Two pages when the window is wide enough");
+                .on_hover_text("Vertical: top to bottom, right to left, on a landscape page");
+                self.probe.vertical = vert_rect;
+                ui.end_row();
+                ui.label("Pages");
+                ui.add_enabled_ui(!self.settings.vertical, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut self.settings.spread, false, "One");
+                        ui.radio_value(&mut self.settings.spread, true, "Two side by side");
+                    })
+                    .response
+                    .on_hover_text("Two pages when the window is wide enough")
+                    .on_disabled_hover_text("Vertical mode uses one landscape page");
+                });
                 ui.end_row();
                 ui.label("Menu bar");
                 ui.checkbox(&mut self.settings.autohide_bar, "Hide until the pointer is at the top")
@@ -2283,6 +2346,37 @@ fn geometry(settings: &Settings, area: Rect) -> Geometry {
     let pad_top = (base * 2.4 * settings.margins).max(24.0);
     let pad_bottom = (base * 2.4 * settings.margins).max(28.0);
     let desk = 18.0;
+    if settings.vertical {
+        let avail_w = (area.width() - 2.0 * desk).max(200.0);
+        let avail_h = (area.height() - 2.0 * desk).max(200.0);
+        let max_col_text = base * 32.0;
+        let pad_v = pad_top.max(pad_bottom);
+        let min_h = (base * 6.0 + 2.0 * pad_v).min(avail_h);
+        // Single landscape page: comfortable column height, wider than tall
+        // even in narrow or square windows.
+        let page_h = avail_h
+            .min(max_col_text + 2.0 * pad_v)
+            .min((avail_w / 1.3).max(min_h))
+            .max(min_h);
+        let page_w = avail_w
+            .min(page_h * 1.6)
+            .max(page_h.min(avail_w))
+            .max(160.0);
+        // Column height a whole number of characters: CJK columns then fill
+        // it without stretching, and rows of characters line up.
+        let text_h = ((page_h - 2.0 * pad_v) / base).floor().max(4.0) * base;
+        let inset_y = (page_h - text_h) / 2.0;
+        let content_w = (page_w - 2.0 * pad_x).max(base * 3.0);
+        let x0 = area.center().x - page_w / 2.0;
+        let y0 = area.center().y - page_h / 2.0;
+        let p0 = Rect::from_min_size(pos2(x0, y0), vec2(page_w, page_h));
+        return Geometry {
+            pages: [p0, p0],
+            spread: false,
+            inset: vec2(pad_x, inset_y),
+            content: vec2(content_w, text_h),
+        };
+    }
     let max_text = base * 34.0;
     let min_spread_text = base * 20.0;
     let h = (area.height() - 2.0 * desk).max(200.0);
@@ -2322,10 +2416,28 @@ fn paint_item(
     ppp: f32,
 ) {
     match item {
-        Item::Text { pos, galley, faux } => {
-            painter.galley(*pos + off, galley.clone(), th.ink);
-            if let Some((g, dx)) = faux {
-                painter.galley(*pos + off + vec2(*dx, 0.0), g.clone(), th.ink);
+        Item::Text {
+            pos,
+            galley,
+            angle,
+            faux,
+        } => {
+            if *angle == 0.0 {
+                painter.galley(*pos + off, galley.clone(), th.ink);
+                if let Some((g, delta)) = faux {
+                    painter.galley(*pos + off + *delta, g.clone(), th.ink);
+                }
+            } else {
+                painter.add(
+                    egui::epaint::TextShape::new(*pos + off, galley.clone(), th.ink)
+                        .with_angle(*angle),
+                );
+                if let Some((g, delta)) = faux {
+                    painter.add(
+                        egui::epaint::TextShape::new(*pos + off + *delta, g.clone(), th.ink)
+                            .with_angle(*angle),
+                    );
+                }
             }
         }
         Item::Image { rect, path } => {
@@ -2509,4 +2621,39 @@ fn apply_theme(ctx: &egui::Context, egui_theme: egui::Theme, i: usize) {
     let mut style = (*ctx.style_of(egui_theme)).clone();
     style.visuals = theme::get(ctx).visuals();
     ctx.set_style_of(egui_theme, style);
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+
+    #[test]
+    fn vertical_geometry_uses_single_landscape_page() {
+        let mut s = Settings::default();
+        let wide = Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0));
+        let horiz = geometry(&s, wide);
+        assert!(horiz.spread, "horizontal uses spread on wide window");
+
+        s.vertical = true;
+        for (w, h) in [(1280.0, 800.0), (1920.0, 1080.0), (800.0, 800.0)] {
+            let area = Rect::from_min_size(Pos2::ZERO, vec2(w, h));
+            let g = geometry(&s, area);
+            assert!(!g.spread, "vertical uses one page at {w}x{h}");
+            let page = g.pages[0];
+            assert!(
+                page.width() > page.height(),
+                "landscape at {w}x{h}: {page:?}"
+            );
+            assert!(
+                (g.content.y % s.size).abs() < 1e-3,
+                "column height snaps to whole chars: {} vs {}",
+                g.content.y,
+                s.size
+            );
+            assert!(
+                area.contains_rect(page),
+                "page fits inside area at {w}x{h}: {page:?}"
+            );
+        }
+    }
 }

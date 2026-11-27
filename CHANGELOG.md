@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.27.00] - 2026-11-27
+
+### Added
+- **Vertical reading mode.** The Reader's **Aa** panel has a **Text direction** setting (**Horizontal** / **Vertical**). Choosing **Vertical** lays the book out in columns running top to bottom and right to left on a single landscape page, with vertical punctuation forms (and rotated Latin letters and numbers), ruby annotations beside the column, and right-to-left page turning (**←** or clicking left of the page goes forward; **→** or clicking right goes back). Text selection, search, read-aloud highlighting and the dictionary popup (placed beside the column) all work in vertical mode, and switching back to **Horizontal** restores your one- or two-page choice.
+
 ## [2026.11.26.06] - 2026-11-26
 
 ### Added

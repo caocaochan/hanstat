@@ -902,26 +902,46 @@ impl Popup {
     ) -> Option<(String, Origin, Rect)> {
         let screen = ctx.content_rect();
         // A fixed height: its entries scroll inside.
-        let max_h = content_h;
-        let below = screen.bottom() - anchor.bottom();
-        let above = anchor.top() - screen.top();
-        let x = anchor.left().clamp(
-            screen.left() + 8.0,
-            (screen.right() - width - 8.0).max(screen.left() + 8.0),
-        );
-        let down = below >= max_h + FRAME_V + 14.0 || below >= above;
-        let room = if down { below } else { above };
-        let max_h = max_h.min(room - 14.0 - FRAME_V).max(100.0);
-        // Placed by its top-left corner always: its height is fixed, so its
-        // top is known now above the word too; egui would place a
-        // bottom-anchored area from last frame's size, a frame off.
-        let pos = if down {
-            pos2(x, anchor.bottom() + 6.0)
+        let side_by_side = level == 0 && params.vertical;
+        let (pos, max_h, down, left_side) = if side_by_side {
+            // Beside the vertical column so the rest of the column stays readable.
+            let right_room = screen.right() - anchor.right();
+            let left_room = anchor.left() - screen.left();
+            let place_left = left_room >= width + 14.0 || left_room >= right_room;
+            let x = if place_left {
+                (anchor.left() - 8.0 - width).max(screen.left() + 8.0)
+            } else {
+                (anchor.right() + 8.0).min((screen.right() - width - 8.0).max(screen.left() + 8.0))
+            };
+            let max_h = content_h.min(screen.height() - 16.0 - FRAME_V).max(100.0);
+            let y = anchor.top().clamp(
+                screen.top() + 8.0,
+                (screen.bottom() - max_h - FRAME_V - 8.0).max(screen.top() + 8.0),
+            );
+            (pos2(x, y), max_h, true, place_left)
         } else {
-            pos2(
-                x,
-                (anchor.top() - 6.0 - max_h - FRAME_V).max(screen.top() + 2.0),
-            )
+            let max_h = content_h;
+            let below = screen.bottom() - anchor.bottom();
+            let above = anchor.top() - screen.top();
+            let x = anchor.left().clamp(
+                screen.left() + 8.0,
+                (screen.right() - width - 8.0).max(screen.left() + 8.0),
+            );
+            let down = below >= max_h + FRAME_V + 14.0 || below >= above;
+            let room = if down { below } else { above };
+            let max_h = max_h.min(room - 14.0 - FRAME_V).max(100.0);
+            // Placed by its top-left corner always: its height is fixed, so its
+            // top is known now above the word too; egui would place a
+            // bottom-anchored area from last frame's size, a frame off.
+            let pos = if down {
+                pos2(x, anchor.bottom() + 6.0)
+            } else {
+                pos2(
+                    x,
+                    (anchor.top() - 6.0 - max_h - FRAME_V).max(screen.top() + 2.0),
+                )
+            };
+            (pos, max_h, down, false)
         };
         let pivot = egui::Align2::LEFT_TOP;
         let inner_w = width - 24.0;
@@ -934,6 +954,7 @@ impl Popup {
         entry_params.content_w = content_w;
         entry_params.page_h = 1.0e6;
         entry_params.line_spacing = 1.2;
+        entry_params.vertical = false;
         // Sans-serif throughout, whatever family a dictionary names.
         entry_params.serif_default = false;
         entry_params.fonts.serif = entry_params.fonts.sans.clone();
@@ -1199,24 +1220,30 @@ impl Popup {
                         }
                     });
                 // The grip in the corner away from the word: dragging it
-                // resizes every popup (down and right, or up and right).
+                // resizes every popup (down and right, up and right, or down
+                // and left when placed left of a vertical column).
                 let r = frame.response.rect;
-                let grip = if down {
+                let grip = if left_side {
+                    Rect::from_min_size(r.left_bottom() + vec2(0.0, -GRIP), vec2(GRIP, GRIP))
+                } else if down {
                     Rect::from_min_size(r.right_bottom() - vec2(GRIP, GRIP), vec2(GRIP, GRIP))
                 } else {
                     Rect::from_min_size(r.right_top() + vec2(-GRIP, 0.0), vec2(GRIP, GRIP))
                 };
                 let g = ui.interact(grip, egui::Id::unique(("dict-grip", level)), Sense::drag());
                 if g.hovered() || g.dragged() {
-                    ui.ctx().set_cursor_icon(if down {
-                        egui::CursorIcon::ResizeNwSe
-                    } else {
+                    ui.ctx().set_cursor_icon(if left_side || !down {
                         egui::CursorIcon::ResizeNeSw
+                    } else {
+                        egui::CursorIcon::ResizeNwSe
                     });
                 }
                 if g.dragged() {
                     let d = g.drag_delta();
-                    resize = Some(vec2(d.x, if down { d.y } else { -d.y }));
+                    resize = Some(vec2(
+                        if left_side { -d.x } else { d.x },
+                        if down { d.y } else { -d.y },
+                    ));
                 }
                 let c = if g.hovered() || g.dragged() {
                     look.subtle
@@ -1226,7 +1253,12 @@ impl Popup {
                 let p = ui.painter();
                 for k in 1..=3 {
                     let o = k as f32 * 3.5;
-                    let (a, b) = if down {
+                    let (a, b) = if left_side {
+                        (
+                            pos2(grip.left() + 2.0, grip.bottom() - 2.0 - o),
+                            pos2(grip.left() + 2.0 + o, grip.bottom() - 2.0),
+                        )
+                    } else if down {
                         (
                             pos2(grip.right() - 2.0, grip.bottom() - 2.0 - o),
                             pos2(grip.right() - 2.0 - o, grip.bottom() - 2.0),

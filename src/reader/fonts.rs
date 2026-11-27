@@ -435,6 +435,90 @@ pub fn set_base(defs: FontDefinitions) {
     let _ = BASE.set(defs);
 }
 
+/// Unicode Vertical Presentation Forms checked in each installed font's `cmap`,
+/// so vertical layout uses them only when the chosen primary font has the glyph
+/// (falling back to 90° rotation or optical positioning otherwise).
+pub const VERT_FORMS: &[char] = &[
+    '︐', // U+FE10 vertical comma (，)
+    '︑', // U+FE11 vertical ideographic comma (、)
+    '︒', // U+FE12 vertical ideographic full stop (。)
+    '︓', // U+FE13 vertical colon (：)
+    '︔', // U+FE14 vertical semicolon (；)
+    '︕', // U+FE15 vertical exclamation mark (！)
+    '︖', // U+FE16 vertical question mark (？)
+    '︙', // U+FE19 vertical horizontal ellipsis (…)
+    '︰', // U+FE30 vertical two dot leader (‥)
+    '︱', // U+FE31 vertical em dash (—)
+    '︲', // U+FE32 vertical en dash (–)
+    '︵', // U+FE35 vertical left parenthesis (（)
+    '︶', // U+FE36 vertical right parenthesis (）)
+    '︷', // U+FE37 vertical left curly bracket (｛)
+    '︸', // U+FE38 vertical right curly bracket (｝)
+    '︹', // U+FE39 vertical left tortoise shell bracket (〔)
+    '︺', // U+FE3A vertical right tortoise shell bracket (〕)
+    '︻', // U+FE3B vertical left black lenticular bracket (【)
+    '︼', // U+FE3C vertical right black lenticular bracket (】)
+    '︽', // U+FE3D vertical left double angle bracket (《)
+    '︾', // U+FE3E vertical right double angle bracket (》)
+    '︿', // U+FE3F vertical left angle bracket (〈)
+    '﹀', // U+FE40 vertical right angle bracket (〉)
+    '﹁', // U+FE41 vertical left corner bracket (「, “)
+    '﹂', // U+FE42 vertical right corner bracket (」, ”)
+    '﹃', // U+FE43 vertical left white corner bracket (『, ‘)
+    '﹄', // U+FE44 vertical right white corner bracket (』, ’)
+    '﹇', // U+FE47 vertical left square bracket (［)
+    '﹈', // U+FE48 vertical right square bracket (］)
+];
+
+/// Bitmask of [`VERT_FORMS`] present in a font face's `cmap`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VertForms(u32);
+
+impl VertForms {
+    /// Read vertical-form coverage from raw TTF/OTF/TTC font bytes.
+    pub fn from_font(font: &[u8], index: u32) -> VertForms {
+        let face_off = if font.get(0..4) == Some(b"ttcf") {
+            let n = be32(font, 8).unwrap_or(0);
+            if index >= n {
+                return VertForms(0);
+            }
+            be32(font, 12 + index as usize * 4).unwrap_or(0) as usize
+        } else {
+            0
+        };
+        let Some(n) = be16(font, face_off + 4) else {
+            return VertForms(0);
+        };
+        let mut cmap = None;
+        for i in 0..n as usize {
+            let r = face_off + 12 + i * 16;
+            if font.get(r..r + 4) == Some(b"cmap") {
+                if let (Some(o), Some(l)) = (be32(font, r + 8), be32(font, r + 12)) {
+                    cmap = font.get(o as usize..o as usize + l as usize);
+                }
+                break;
+            }
+        }
+        let Some(cmap) = cmap else {
+            return VertForms(0);
+        };
+        let mut mask = 0u32;
+        for (i, &ch) in VERT_FORMS.iter().enumerate() {
+            if cmap_has(cmap, ch as u32) {
+                mask |= 1 << i;
+            }
+        }
+        VertForms(mask)
+    }
+
+    pub fn has(self, ch: char) -> bool {
+        VERT_FORMS
+            .iter()
+            .position(|&c| c == ch)
+            .is_some_and(|i| self.0 & (1 << i) != 0)
+    }
+}
+
 /// What the reader's text uses: an egui family for each of serif and
 /// sans-serif, regular and bold.
 #[derive(Clone, Debug, PartialEq)]
@@ -446,6 +530,9 @@ pub struct Installed {
     /// The family has no bold face: bold is drawn twice, a little apart.
     pub serif_faux_bold: bool,
     pub sans_faux_bold: bool,
+    /// Vertical presentation forms present in each primary face.
+    pub serif_vert: VertForms,
+    pub sans_vert: VertForms,
     /// The two choices this was made for.
     pub key: (String, String),
 }
@@ -604,17 +691,20 @@ pub fn definitions(
         .get(&FontFamily::Proportional)
         .cloned()
         .unwrap_or_default();
-    let mut add = |slot: &str, choice: &str| -> (FontFamily, FontFamily, bool) {
+    let fallback_vert = VertForms::from_font(crate::png_report::WENKAI, 0);
+    let mut add = |slot: &str, choice: &str| -> (FontFamily, FontFamily, bool, VertForms) {
         let regular_name = format!("rd{generation}-{slot}");
         let bold_name = format!("rd{generation}-{slot}-b");
         let fam = fams.iter().find(|f| f.name.eq_ignore_ascii_case(choice));
         let mut reg_list = Vec::new();
         let mut bold_list = Vec::new();
         let mut faux = true;
+        let mut vert = fallback_vert;
         if let Some(fam) = fam {
             if let Some(face) = fam.face(400)
                 && let Some(b) = blob(face)
             {
+                vert = VertForms::from_font(b.as_ref().as_ref(), face.index);
                 let key = format!("{regular_name}-r");
                 defs.font_data
                     .insert(key.clone(), Arc::new(FontData::from_blob(b, face.index)));
@@ -639,10 +729,10 @@ pub fn definitions(
         let b = FontFamily::Name(bold_name.into());
         defs.families.insert(r.clone(), reg_list);
         defs.families.insert(b.clone(), bold_list);
-        (r, b, faux)
+        (r, b, faux, vert)
     };
-    let (serif_f, serif_b, serif_faux) = add("serif", serif);
-    let (sans_f, sans_b, sans_faux) = add("sans", sans);
+    let (serif_f, serif_b, serif_faux, serif_vert) = add("serif", serif);
+    let (sans_f, sans_b, sans_faux, sans_vert) = add("sans", sans);
     let installed = Installed {
         serif: serif_f,
         serif_bold: serif_b,
@@ -650,6 +740,8 @@ pub fn definitions(
         sans_bold: sans_b,
         serif_faux_bold: serif_faux,
         sans_faux_bold: sans_faux,
+        serif_vert,
+        sans_vert,
         key: (serif.to_owned(), sans.to_owned()),
     };
     (defs, installed)
