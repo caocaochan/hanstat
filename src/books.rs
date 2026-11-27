@@ -10,7 +10,7 @@
 //! only added and deleted; nothing but the folders is needed to find one.
 
 use sha2::{Digest, Sha256};
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -185,6 +185,71 @@ pub fn import(books: &Path, path: &Path, expect: Option<&str>) -> Result<Importe
     }
 }
 
+/// Read an EPUB's `<dc:title>` metadata quickly (ZIP directory, `container.xml`
+/// and the package document, without reading chapters or images), matching
+/// [`crate::extract::epub::load`]. Returns `None` for TXT files, unreadable
+/// files, or EPUBs without a non-empty title element.
+pub fn title(path: &Path) -> Option<String> {
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut magic = [0u8; 4];
+    if f.read_exact(&mut magic).is_err() || &magic != b"PK\x03\x04" {
+        return None;
+    }
+    f.rewind().ok()?;
+    let mut ar = zip::ZipArchive::new(BufReader::new(f)).ok()?;
+    let names: Vec<String> = ar
+        .file_names()
+        .filter_map(|n| n.ok().map(|n| n.into_owned()))
+        .collect();
+    let mut read = |name: &str| -> Option<Vec<u8>> {
+        let real = if names.iter().any(|n| n == name) {
+            name.to_owned()
+        } else {
+            names.iter().find(|n| n.eq_ignore_ascii_case(name))?.clone()
+        };
+        let mut entry = ar.by_name(&real).ok()?;
+        let mut v = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut v).ok()?;
+        Some(v)
+    };
+    fn xml_opts<'a>() -> roxmltree::ParsingOptions<'a> {
+        roxmltree::ParsingOptions {
+            allow_dtd: true,
+            ..Default::default()
+        }
+    }
+    let opf_path = read("META-INF/container.xml")
+        .and_then(|b| {
+            let (s, _) = crate::extract::epub::decode_markup(&b);
+            let doc = roxmltree::Document::parse_with_options(&s, xml_opts()).ok()?;
+            doc.descendants()
+                .filter(|n| n.tag_name().name() == "rootfile")
+                .find(|n| {
+                    n.attribute("media-type")
+                        .is_none_or(|m| m == "application/oebps-package+xml")
+                })?
+                .attribute("full-path")
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            names
+                .iter()
+                .find(|n| n.to_ascii_lowercase().ends_with(".opf"))
+                .cloned()
+        })?;
+    let opf_bytes = read(&opf_path)?;
+    let (opf_src, _) = crate::extract::epub::decode_markup(&opf_bytes);
+    let opf = roxmltree::Document::parse_with_options(&opf_src, xml_opts()).ok()?;
+    opf.descendants()
+        .find(|n| {
+            n.tag_name().name() == "title"
+                && n.ancestors().any(|a| a.tag_name().name() == "metadata")
+        })
+        .and_then(|n| n.text())
+        .map(|t| t.trim().to_owned())
+        .filter(|t| !t.is_empty())
+}
+
 /// Delete copies left half-written (hanstat was closed while copying) more
 /// than an hour ago.
 pub fn clean_incoming(books: &Path) {
@@ -299,5 +364,57 @@ mod tests {
             ));
             assert!(!is_own_in(app, Path::new(r"D:\Books\a.epub")));
         }
+    }
+
+    #[test]
+    fn reads_epub_title_and_returns_none_for_txt() {
+        let d = scratch("title");
+        let txt = d.join("三体.txt");
+        std::fs::write(&txt, "正文").unwrap();
+        assert_eq!(title(&txt), None);
+
+        let epub = d.join("renamed.epub");
+        {
+            let f = std::fs::File::create(&epub).unwrap();
+            let mut z = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default();
+            z.start_file("META-INF/container.xml", opts).unwrap();
+            z.write_all(
+                br#"<?xml version="1.0"?>
+                <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+                  <rootfiles>
+                    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+                  </rootfiles>
+                </container>"#,
+            )
+            .unwrap();
+            z.start_file("OEBPS/content.opf", opts).unwrap();
+            z.write_all(
+                r#"<?xml version="1.0" encoding="utf-8"?>
+                <package xmlns="http://www.idpf.org/2007/opf">
+                  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+                    <dc:title>  三体  </dc:title>
+                  </metadata>
+                </package>"#
+                    .as_bytes(),
+            )
+            .unwrap();
+            z.finish().unwrap();
+        }
+        assert_eq!(title(&epub).as_deref(), Some("三体"));
+
+        // Fallback to *.opf when container.xml is absent; blank title returns None.
+        let blank = d.join("blank.epub");
+        {
+            let f = std::fs::File::create(&blank).unwrap();
+            let mut z = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default();
+            z.start_file("book.opf", opts).unwrap();
+            z.write_all(br#"<package><metadata><dc:title>   </dc:title></metadata></package>"#)
+                .unwrap();
+            z.finish().unwrap();
+        }
+        assert_eq!(title(&blank), None);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.27.03] - 2026-11-27
+
+### Added
+- **Prompt before replacing a book with the same title.** Opening or dragging in a file whose title matches a different book already in the Library now asks whether to **Replace** it, **Keep both** or **Cancel** (**Skip** when opening several files at once, with an option to apply the choice to the remaining matches). Replacing updates the Library copy, cover and statistics once the new file finishes analysing, while keeping your reading stats, where you left off, read status, custom columns and reading-path placement.
+
 ## [2026.11.27.02] - 2026-11-27
 
 ### Added

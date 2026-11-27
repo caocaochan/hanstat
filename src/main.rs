@@ -170,7 +170,7 @@ fn main() -> eframe::Result {
             match paths.len() {
                 0 => {}
                 // As before: a history view asked for stays up.
-                1 => app.start(paths.pop().unwrap(), cc.egui_ctx.clone()),
+                1 if history_tab.is_some() => app.start(paths.pop().unwrap(), cc.egui_ctx.clone()),
                 _ => app.open_files(paths, &cc.egui_ctx),
             }
             Ok(Box::new(app))
@@ -386,6 +386,8 @@ struct Loaded {
     path: PathBuf,
     /// Why it could not be copied.
     copy_error: Option<String>,
+    /// Existing Library book ids to replace once this book is recorded.
+    replace: Vec<String>,
 }
 
 struct BuiltReport {
@@ -731,6 +733,9 @@ struct App {
     settings_window: bool,
     /// The "Reset all reading stats" confirmation is open.
     reset_stats: bool,
+    /// Files being checked for Library title matches, or waiting for the user
+    /// to decide whether to replace matching books.
+    pending_open: Option<PendingOpen>,
     /// Sort column and direction (descending) of the Characters, Words,
     /// Sections and Suggested words tables.
     char_sort: (CharCol, bool),
@@ -791,10 +796,11 @@ enum Win {
     WhatsNew,
     DuChinese,
     DuSignIn,
+    Replace,
 }
 
 impl Win {
-    const ALL: [Win; 8] = [
+    const ALL: [Win; 9] = [
         Win::Anki,
         Win::Known,
         Win::Forced,
@@ -803,6 +809,7 @@ impl Win {
         Win::WhatsNew,
         Win::DuChinese,
         Win::DuSignIn,
+        Win::Replace,
     ];
 
     /// Its layer: the id given to its `egui::Window`.
@@ -816,6 +823,7 @@ impl Win {
             Win::WhatsNew => whats_new::WINDOW_ID,
             Win::DuChinese => "duchinese-window",
             Win::DuSignIn => "duchinese-sign-in",
+            Win::Replace => "replace-book-dialog",
         });
         egui::LayerId::new(egui::Order::Middle, id)
     }
@@ -1324,7 +1332,7 @@ struct Batch {
     cancel: Arc<AtomicBool>,
     failed: Vec<String>,
     /// Opened (analysed and shown) once the others are done, unless stopped.
-    then_open: Option<PathBuf>,
+    then_open: Option<OpenFile>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1348,16 +1356,171 @@ struct BatchItem {
     /// A Library row of which only the known words changed: updated from its
     /// saved word data ([`coverage_only`]), or analysed again if that can't be.
     refresh: Option<Box<history::Entry>>,
+    /// Existing Library book ids to replace once this book is recorded.
+    replace: Vec<String>,
 }
 
 enum BatchMsg {
-    /// With whether its word data changed.
-    Book(Box<history::Entry>, bool),
+    /// With whether its word data changed, and any Library book ids to replace.
+    Book(Box<history::Entry>, bool, Vec<String>),
     /// Label, file, error.
     Failed(String, PathBuf, String),
     /// A book analysed but not copied into the Library's folder: why.
     CopyFailed(String),
     Finished,
+}
+
+/// A book already in the Library whose title matches a file being opened.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExistingBook {
+    id: String,
+    title: String,
+    format: String,
+    han_total: u64,
+    analysed: u64,
+    file_name: String,
+}
+
+/// A file being opened whose title matches one or more books already in the
+/// Library (different file contents).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TitleConflict {
+    path: PathBuf,
+    title: String,
+    existing: Vec<ExistingBook>,
+}
+
+/// One file ready to be opened/analysed, optionally replacing Library book(s).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OpenFile {
+    path: PathBuf,
+    replace: Vec<String>,
+}
+
+/// Result of inspecting one file before opening.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CheckedFile {
+    Ready(PathBuf),
+    Conflict(TitleConflict),
+}
+
+enum QueuedFile {
+    Ready(OpenFile),
+    Conflict(TitleConflict),
+}
+
+#[derive(Clone, Copy)]
+enum ReplaceChoice {
+    Replace,
+    KeepBoth,
+    Skip,
+}
+
+/// Files being checked for Library title matches, or waiting for the user's
+/// replace/keep/skip decision in the dialog.
+struct PendingOpen {
+    /// Background thread inspecting titles (and SHA-256 on title hits).
+    checking: Option<Receiver<Vec<CheckedFile>>>,
+    /// Items in the order they were opened/dropped; `None` entries were skipped.
+    items: Vec<Option<QueuedFile>>,
+    /// Index in `items` of the conflict currently shown in the dialog.
+    current: Option<usize>,
+    /// Total number of conflicts in this open operation.
+    total_conflicts: usize,
+    /// Number of conflicts already decided.
+    decided_conflicts: usize,
+    /// Checkbox: apply the chosen action to every remaining conflict.
+    apply_all: bool,
+}
+
+impl PendingOpen {
+    fn checking(rx: Receiver<Vec<CheckedFile>>) -> Self {
+        Self {
+            checking: Some(rx),
+            items: Vec::new(),
+            current: None,
+            total_conflicts: 0,
+            decided_conflicts: 0,
+            apply_all: false,
+        }
+    }
+
+    fn from_checked(checked: Vec<CheckedFile>) -> Self {
+        let mut items = Vec::with_capacity(checked.len());
+        let mut total_conflicts = 0;
+        let mut current = None;
+        for c in checked {
+            match c {
+                CheckedFile::Ready(path) => items.push(Some(QueuedFile::Ready(OpenFile {
+                    path,
+                    replace: Vec::new(),
+                }))),
+                CheckedFile::Conflict(conflict) => {
+                    if current.is_none() {
+                        current = Some(items.len());
+                    }
+                    total_conflicts += 1;
+                    items.push(Some(QueuedFile::Conflict(conflict)));
+                }
+            }
+        }
+        Self {
+            checking: None,
+            items,
+            current,
+            total_conflicts,
+            decided_conflicts: 0,
+            apply_all: false,
+        }
+    }
+
+    fn apply_choice(&mut self, choice: ReplaceChoice) -> Option<Vec<OpenFile>> {
+        let idx = self.current?;
+        let apply_all = self.apply_all;
+        let resolve = |slot: &mut Option<QueuedFile>| {
+            let Some(QueuedFile::Conflict(c)) = slot.take() else {
+                return false;
+            };
+            *slot = match choice {
+                ReplaceChoice::Replace => Some(QueuedFile::Ready(OpenFile {
+                    path: c.path,
+                    replace: c.existing.into_iter().map(|e| e.id).collect(),
+                })),
+                ReplaceChoice::KeepBoth => Some(QueuedFile::Ready(OpenFile {
+                    path: c.path,
+                    replace: Vec::new(),
+                })),
+                ReplaceChoice::Skip => None,
+            };
+            true
+        };
+        if resolve(&mut self.items[idx]) {
+            self.decided_conflicts += 1;
+        }
+        if apply_all {
+            for slot in &mut self.items[idx + 1..] {
+                if matches!(slot, Some(QueuedFile::Conflict(_))) && resolve(slot) {
+                    self.decided_conflicts += 1;
+                }
+            }
+        }
+        self.current = self.items[idx + 1..]
+            .iter()
+            .position(|slot| matches!(slot, Some(QueuedFile::Conflict(_))))
+            .map(|off| idx + 1 + off);
+        if self.current.is_some() {
+            return None;
+        }
+        Some(
+            self.items
+                .drain(..)
+                .filter_map(|slot| match slot {
+                    Some(QueuedFile::Ready(f)) => Some(f),
+                    _ => None,
+                })
+                .collect(),
+        )
+    }
 }
 
 /// What a click in the reading path asks for.
@@ -1593,6 +1756,7 @@ impl Default for App {
             removed: None,
             settings_window: false,
             reset_stats: false,
+            pending_open: None,
             char_sort: (CharCol::Rank, false),
             word_sort: (WordCol::Rank, false),
             section_sort: (SectionCol::Index, false),
@@ -1633,6 +1797,10 @@ fn cumulative(counts: impl Iterator<Item = u32>, total: u64) -> Vec<f64> {
 
 impl App {
     fn start(&mut self, path: PathBuf, ctx: egui::Context) {
+        self.start_replacing(path, Vec::new(), ctx);
+    }
+
+    fn start_replacing(&mut self, path: PathBuf, replace: Vec<String>, ctx: egui::Context) {
         // An analysis still running (another book, or other options) stops.
         if let Some(j) = self.job.take() {
             j.cancel.store(true, Ordering::Relaxed);
@@ -1750,6 +1918,7 @@ impl App {
                     file_id,
                     path,
                     copy_error,
+                    replace,
                 })
             })();
             let _ = tx.send(JobMsg::Done(res));
@@ -1775,6 +1944,10 @@ impl App {
     }
 
     fn open(&mut self, path: PathBuf, ctx: &egui::Context) {
+        self.open_replacing(path, Vec::new(), ctx);
+    }
+
+    fn open_replacing(&mut self, path: PathBuf, replace: Vec<String>, ctx: &egui::Context) {
         self.show_history = false;
         self.home = false;
         self.book = None;
@@ -1789,7 +1962,7 @@ impl App {
         self.suggestions = None;
         self.selected.clear();
         self.encoding = EncodingChoice::Auto;
-        self.start(path, ctx.clone());
+        self.start_replacing(path, replace, ctx.clone());
     }
 
     /// Re-run with the same file (e.g. different segmenter/dictionary/encoding).
@@ -3287,6 +3460,11 @@ impl App {
                         Some(e) => self.set_error("copy", e),
                         None => self.clear_error("copy"),
                     }
+                    if let Some(new_id) = self.book_id.clone()
+                        && !l.replace.is_empty()
+                    {
+                        self.replace_library_books(&l.replace, &new_id, ctx);
+                    }
                     self.history_touch = true;
                     if self.included == l.included
                         && l.built.report.chars_folded == self.fold_chars()
@@ -3367,6 +3545,7 @@ impl eframe::App for App {
             self.refresh_stats(&ctx);
         }
         self.poll_batch(&ctx);
+        self.poll_pending_open(&ctx);
         self.poll_moves(&ctx);
         // Each EPUB's series metadata, read once ([`book_series`]).
         book_series::want(
@@ -3886,6 +4065,7 @@ impl eframe::App for App {
         if self.reset_stats {
             self.reset_stats_window(&ctx);
         }
+        self.replace_window(&ctx);
         self.read_window(&ctx);
         self.du_windows(&ctx);
         if let Some(w) = &self.whats_new
@@ -4125,6 +4305,10 @@ impl App {
             Win::WhatsNew => self.whats_new.is_some(),
             Win::DuChinese => self.du.open,
             Win::DuSignIn => self.du.signing_in(),
+            Win::Replace => self
+                .pending_open
+                .as_ref()
+                .is_some_and(|p| p.current.is_some()),
         }
     }
 
@@ -4145,6 +4329,7 @@ impl App {
             Some(Win::WhatsNew) => self.whats_new = None,
             Some(Win::DuChinese) => self.du.open = false,
             Some(Win::DuSignIn) => self.du.close_sign_in(),
+            Some(Win::Replace) => self.pending_open = None,
             None => {}
         }
     }
@@ -4772,6 +4957,52 @@ fn file_stem(p: &Path) -> String {
     p.file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+/// Normalised key for comparing book titles (trimmed, NFC, case-folded).
+fn title_key(title: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    title.trim().nfc().collect::<String>().to_lowercase()
+}
+
+/// Inspect `files` against the Library's existing entries. A file conflicts
+/// when it exists on disk, its title matches an entry already in the Library,
+/// and its SHA-256 is not already in the Library (i.e. it is a different file
+/// with the same title).
+fn check_open_files(files: Vec<PathBuf>, library: &[ExistingBook]) -> Vec<CheckedFile> {
+    let mut by_title: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut known_ids: HashSet<&str> = HashSet::with_capacity(library.len());
+    for (i, e) in library.iter().enumerate() {
+        known_ids.insert(e.id.as_str());
+        let k = title_key(&e.title);
+        if !k.is_empty() {
+            by_title.entry(k).or_default().push(i);
+        }
+    }
+    files
+        .into_iter()
+        .map(|path| {
+            if !path.is_file() {
+                return CheckedFile::Ready(path);
+            }
+            let title = books::title(&path).unwrap_or_else(|| file_stem(&path));
+            let key = title_key(&title);
+            let Some(matches) = (!key.is_empty()).then(|| by_title.get(&key)).flatten() else {
+                return CheckedFile::Ready(path);
+            };
+            if history::file_id(&path)
+                .ok()
+                .is_some_and(|id| known_ids.contains(id.as_str()))
+            {
+                return CheckedFile::Ready(path);
+            }
+            CheckedFile::Conflict(TitleConflict {
+                path,
+                title,
+                existing: matches.iter().map(|&i| library[i].clone()).collect(),
+            })
+        })
+        .collect()
 }
 
 fn save(name: &str, ext: &str, content: String) -> Option<String> {
@@ -6965,13 +7196,227 @@ impl App {
         }
     }
 
-    /// Open `files`: one is opened as usual; of several, all but the last
-    /// are analysed in the background and recorded in the History, then the
-    /// last is opened, so the book shown is the last one analysed.
-    fn open_files(&mut self, mut files: Vec<PathBuf>, ctx: &egui::Context) {
+    /// Open `files`: check first whether any file shares a title with a
+    /// different book already in the Library, prompting to replace it if so.
+    /// Once confirmed, one file is opened as usual; of several, all but the
+    /// last are analysed in the background and recorded in the History, then
+    /// the last is opened, so the book shown is the last one analysed.
+    fn open_files(&mut self, files: Vec<PathBuf>, ctx: &egui::Context) {
+        if files.is_empty() {
+            return;
+        }
+        if self.pending_open.is_some() {
+            self.toast = Some((
+                "Finish answering the replace prompt first.".into(),
+                ctx.input(|i| i.time) + 4.0,
+            ));
+            return;
+        }
+        if files.len() > 1
+            && self
+                .batch
+                .as_ref()
+                .is_some_and(|b| b.mode != BatchMode::Auto)
+        {
+            self.toast = Some((
+                "Still analysing the books opened before: open these once it has finished.".into(),
+                ctx.input(|i| i.time) + 4.0,
+            ));
+            return;
+        }
+        if self.history.entries.is_empty() {
+            let ready = files
+                .into_iter()
+                .map(|path| OpenFile {
+                    path,
+                    replace: Vec::new(),
+                })
+                .collect();
+            self.open_confirmed(ready, ctx);
+            return;
+        }
+        let library: Vec<ExistingBook> = self
+            .history
+            .entries
+            .iter()
+            .map(|e| ExistingBook {
+                id: e.id.clone(),
+                title: e.title.clone(),
+                format: e.stats.format.clone(),
+                han_total: e.stats.han_total,
+                analysed: e.analysed,
+                file_name: file_name(&e.path),
+            })
+            .collect();
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let checked = check_open_files(files, &library);
+            let _ = tx.send(checked);
+            ctx.request_repaint();
+        });
+        self.pending_open = Some(PendingOpen::checking(rx));
+    }
+
+    fn poll_pending_open(&mut self, ctx: &egui::Context) {
+        let checked = {
+            let Some(p) = &mut self.pending_open else {
+                return;
+            };
+            let Some(rx) = &p.checking else { return };
+            match rx.try_recv() {
+                Ok(checked) => Some(checked),
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    self.pending_open = None;
+                    return;
+                }
+            }
+        };
+        let Some(checked) = checked else { return };
+        let pending = PendingOpen::from_checked(checked);
+        if pending.current.is_none() {
+            let ready = pending
+                .items
+                .into_iter()
+                .filter_map(|slot| match slot {
+                    Some(QueuedFile::Ready(f)) => Some(f),
+                    _ => None,
+                })
+                .collect();
+            self.pending_open = None;
+            self.open_confirmed(ready, ctx);
+        } else {
+            self.pending_open = Some(pending);
+        }
+    }
+
+    /// Ask whether a file with the same title as a Library book should replace it.
+    fn replace_window(&mut self, ctx: &egui::Context) {
+        let Some(p) = &mut self.pending_open else {
+            return;
+        };
+        let Some(idx) = p.current else { return };
+        let Some(QueuedFile::Conflict(conflict)) = p.items.get(idx).and_then(|s| s.as_ref()) else {
+            return;
+        };
+        let conflict = conflict.clone();
+        let total_conflicts = p.total_conflicts;
+        let decided = p.decided_conflicts;
+        let remaining = total_conflicts.saturating_sub(decided);
+        let has_other_files = p
+            .items
+            .iter()
+            .enumerate()
+            .any(|(i, slot)| i != idx && slot.is_some());
+        let mut open = true;
+        let mut choice: Option<ReplaceChoice> = None;
+        egui::Window::new("Already in the Library")
+            .id(egui::Id::unique("replace-book-dialog"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_max_width(440.0);
+                let heading = if total_conflicts > 1 {
+                    format!(
+                        "“{}” is already in the Library ({} of {}). Replace it with this file?",
+                        conflict.title,
+                        decided + 1,
+                        total_conflicts
+                    )
+                } else if conflict.existing.len() > 1 {
+                    format!(
+                        "“{}” is already in the Library ({} copies). Replace them with this file?",
+                        conflict.title,
+                        conflict.existing.len()
+                    )
+                } else {
+                    format!(
+                        "“{}” is already in the Library. Replace it with this file?",
+                        conflict.title
+                    )
+                };
+                ui.label(heading);
+                ui.add_space(4.0);
+                let now = history::now();
+                for e in conflict.existing.iter().take(2) {
+                    ui.label(
+                        RichText::new(format!(
+                            "In Library: {}, {} characters, added {}",
+                            e.format,
+                            fmt_int(e.han_total),
+                            history::age(e.analysed, now),
+                        ))
+                        .weak(),
+                    )
+                    .on_hover_text(&e.file_name);
+                }
+                if conflict.existing.len() > 2 {
+                    ui.label(
+                        RichText::new(format!(
+                            "…and {} more in the Library",
+                            conflict.existing.len() - 2
+                        ))
+                        .weak(),
+                    );
+                }
+                ui.label(
+                    RichText::new(format!("New file: {}", file_name(&conflict.path))).weak(),
+                )
+                .on_hover_text(conflict.path.display().to_string());
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Replacing updates the Library copy and statistics, while keeping your reading stats, \
+                         where you left off, read status and custom columns.",
+                    )
+                    .weak()
+                    .small(),
+                );
+                if remaining > 1 {
+                    ui.add_space(4.0);
+                    let others = remaining - 1;
+                    ui.checkbox(
+                        &mut p.apply_all,
+                        format!(
+                            "Do the same for the other {} matching {}",
+                            others,
+                            if others == 1 { "book" } else { "books" }
+                        ),
+                    );
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Replace").clicked() {
+                        choice = Some(ReplaceChoice::Replace);
+                    }
+                    if ui.button("Keep both").clicked() {
+                        choice = Some(ReplaceChoice::KeepBoth);
+                    }
+                    let skip_label = if has_other_files { "Skip" } else { "Cancel" };
+                    if ui.button(skip_label).clicked() {
+                        choice = Some(ReplaceChoice::Skip);
+                    }
+                });
+            });
+        if !open {
+            self.pending_open = None;
+            return;
+        }
+        if let Some(choice) = choice
+            && let Some(ready) = p.apply_choice(choice)
+        {
+            self.pending_open = None;
+            self.open_confirmed(ready, ctx);
+        }
+    }
+
+    fn open_confirmed(&mut self, mut files: Vec<OpenFile>, ctx: &egui::Context) {
         let Some(last) = files.pop() else { return };
         if files.is_empty() {
-            self.open(last, ctx);
+            self.open_replacing(last.path, last.replace, ctx);
             return;
         }
         if self
@@ -6987,10 +7432,110 @@ impl App {
         }
         let todo = files
             .into_iter()
-            .map(|p| self.batch_item(file_name(&p), p, self.segmenter))
+            .map(|f| {
+                let mut item = self.batch_item(file_name(&f.path), f.path, self.segmenter);
+                item.replace = f.replace;
+                item
+            })
             .collect();
         self.home = false;
         self.start_batch(todo, Some(last), BatchMode::Open, ctx);
+    }
+
+    /// Replace Library book(s) `old_ids` with `new_id` (a newly analysed file of
+    /// the same title): carry over the user's custom columns, reading stats,
+    /// reader place, read mark and reading-path placement, and remove the old
+    /// Library row(s) and their stored copies, covers and word data.
+    fn replace_library_books(&mut self, old_ids: &[String], new_id: &str, ctx: &egui::Context) {
+        let old_ids: Vec<String> = old_ids
+            .iter()
+            .filter(|id| id.as_str() != new_id && self.history.entries.iter().any(|e| e.id == **id))
+            .cloned()
+            .collect();
+        if old_ids.is_empty() {
+            return;
+        }
+        let mut moved_cols = false;
+        let mut cols_changed = false;
+        for old in &old_ids {
+            if !moved_cols && self.columns.cols.rekey(old, new_id) {
+                moved_cols = true;
+                cols_changed = true;
+            } else if self.columns.cols.forget(old) {
+                cols_changed = true;
+            }
+        }
+        if cols_changed {
+            self.columns.save();
+        }
+        if let Some(old) = old_ids.iter().find(|old| {
+            reading_stats::with(|s| {
+                s.books.contains_key(old.as_str()) || s.places.contains_key(old.as_str())
+            })
+        }) {
+            reading_stats::rekey(old, new_id, |s| s);
+            if let Err(e) = reading_stats::save() {
+                self.set_error("reading stats", e);
+            }
+        }
+        let old_set: HashSet<String> = old_ids.iter().cloned().collect();
+        let new_s = new_id.to_owned();
+        self.edit_known(ctx, move |k| {
+            let mut moved = k.read.iter().any(|b| b.id == new_s);
+            let mut changed = false;
+            k.read.retain_mut(|b| {
+                if !old_set.contains(&b.id) {
+                    return true;
+                }
+                changed = true;
+                if !moved {
+                    b.id.clone_from(&new_s);
+                    moved = true;
+                    true
+                } else {
+                    false
+                }
+            });
+            changed
+        });
+        let st = &mut self.plan.settings;
+        let mut plan_changed = false;
+        let rekey_vec = |ids: &mut Vec<String>, changed: &mut bool| {
+            let mut seen_new = ids.iter().any(|id| id == new_id);
+            ids.retain_mut(|id| {
+                if !old_ids.iter().any(|o| o == id) {
+                    return true;
+                }
+                *changed = true;
+                if !seen_new {
+                    *id = new_id.to_owned();
+                    seen_new = true;
+                    true
+                } else {
+                    false
+                }
+            });
+        };
+        rekey_vec(&mut st.left_out, &mut plan_changed);
+        for manual in st.manual.values_mut() {
+            rekey_vec(manual, &mut plan_changed);
+        }
+        if plan_changed && let Err(e) = st.save() {
+            self.history_error = Some(e);
+        }
+        for old in &old_ids {
+            self.finish_profile_for(old);
+            if let Err(e) = self.history.remove(old) {
+                self.history_error = Some(e);
+            }
+            self.covers.remove(old);
+            self.home_view.forget(old);
+            chapter_lengths::forget(old);
+            book_series::forget(old);
+            self.exists.set(self.history.profile(old), false);
+        }
+        self.home_view.forget(new_id);
+        self.profiles_version += 1;
     }
 
     /// A book for a batch, with the sections saved for it in the Library.
@@ -7008,6 +7553,7 @@ impl App {
             kind,
             sections,
             refresh: None,
+            replace: Vec::new(),
         }
     }
 
@@ -7020,6 +7566,7 @@ impl App {
             kind: segmenter_by_label(&e.stats.segmenter),
             sections: e.sections.clone(),
             refresh: None,
+            replace: Vec::new(),
         }
     }
 
@@ -7218,7 +7765,7 @@ impl App {
     fn start_batch(
         &mut self,
         todo: Vec<BatchItem>,
-        then_open: Option<PathBuf>,
+        then_open: Option<OpenFile>,
         mode: BatchMode,
         ctx: &egui::Context,
     ) {
@@ -7267,6 +7814,7 @@ impl App {
                     kind,
                     sections,
                     refresh,
+                    replace,
                 } = item;
                 *cur2.lock().unwrap() = label.clone();
                 ctx.request_repaint();
@@ -7286,7 +7834,7 @@ impl App {
                         thread_inputs.as_ref(),
                     )
                 }) {
-                    let _ = tx.send(BatchMsg::Book(Box::new(e), false));
+                    let _ = tx.send(BatchMsg::Book(Box::new(e), false, Vec::new()));
                     d2.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
@@ -7374,7 +7922,7 @@ impl App {
                     ))
                 });
                 let _ = tx.send(match res {
-                    Ok((e, changed)) => BatchMsg::Book(Box::new(e), changed),
+                    Ok((e, changed)) => BatchMsg::Book(Box::new(e), changed, replace),
                     Err(e) => BatchMsg::Failed(label, path, e),
                 });
                 d2.fetch_add(1, Ordering::Relaxed);
@@ -7400,25 +7948,15 @@ impl App {
         let Some(b) = &mut self.batch else {
             return;
         };
+        let mode = b.mode;
         let mut finished = false;
         let mut copy_failed = None;
+        let mut books_done: Vec<(Box<history::Entry>, bool, Vec<String>)> = Vec::new();
         while let Ok(m) = b.rx.try_recv() {
             match m {
-                BatchMsg::Book(e, changed) => {
-                    self.exists.set(self.history.profile(&e.id), true);
-                    let res = match b.mode {
-                        BatchMode::Open => self.history.record(*e, true),
-                        BatchMode::Refresh | BatchMode::Auto => self.history.refresh(*e),
-                    };
-                    if let Err(e) = res {
-                        self.history_error = Some(e);
-                    }
-                    if changed {
-                        self.profiles_version += 1;
-                    }
-                }
+                BatchMsg::Book(e, changed, replace) => books_done.push((e, changed, replace)),
                 BatchMsg::Failed(label, path, e) => {
-                    if b.mode == BatchMode::Auto
+                    if mode == BatchMode::Auto
                         && let Some(d) = self
                             .history
                             .entries
@@ -7435,6 +7973,22 @@ impl App {
                 BatchMsg::Finished => finished = true,
             }
         }
+        for (e, changed, replace) in books_done {
+            self.exists.set(self.history.profile(&e.id), true);
+            if mode == BatchMode::Open && !replace.is_empty() {
+                self.replace_library_books(&replace, &e.id, ctx);
+            }
+            let res = match mode {
+                BatchMode::Open => self.history.record(*e, true),
+                BatchMode::Refresh | BatchMode::Auto => self.history.refresh(*e),
+            };
+            if let Err(e) = res {
+                self.history_error = Some(e);
+            }
+            if changed {
+                self.profiles_version += 1;
+            }
+        }
         if let Some(e) = copy_failed {
             self.set_error("copy", e);
         }
@@ -7448,10 +8002,10 @@ impl App {
             // Stopped by the user: not again until something changes.
             self.auto.paused = b.inputs.clone();
         }
-        if let Some(p) = b.then_open
+        if let Some(f) = b.then_open
             && !stopped
         {
-            self.open(p, ctx);
+            self.open_replacing(f.path, f.replace, ctx);
         }
         // After opening, which clears the error line.
         if !b.failed.is_empty() {
@@ -8893,5 +9447,189 @@ mod sort_tests {
         assert_eq!(ui.word_sort, (WordCol::Length, true));
         assert_eq!(ui.section_sort, (SectionCol::Index, false));
         assert_eq!(ui.suggest_sort, (SuggestCol::Note, false));
+    }
+
+    #[test]
+    fn check_open_files_detects_title_conflicts_only_for_different_files() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("hanstat-replace-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let orig_txt = dir.join("三体.txt");
+        std::fs::write(&orig_txt, "旧版本正文").unwrap();
+        let orig_id = history::file_id(&orig_txt).unwrap();
+
+        let updated_dir = dir.join("updated");
+        std::fs::create_dir_all(&updated_dir).unwrap();
+        let updated_txt = updated_dir.join("三体.txt");
+        std::fs::write(&updated_txt, "新版本正文").unwrap();
+
+        let new_txt = dir.join("流浪地球.txt");
+        std::fs::write(&new_txt, "新书").unwrap();
+
+        // An EPUB with a different filename whose <dc:title> matches "三体".
+        let epub = dir.join("three-body-fixed.epub");
+        {
+            let f = std::fs::File::create(&epub).unwrap();
+            let mut z = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default();
+            z.start_file("META-INF/container.xml", opts).unwrap();
+            z.write_all(
+                br#"<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+                    <rootfiles><rootfile full-path="content.opf"/></rootfiles>
+                </container>"#,
+            )
+            .unwrap();
+            z.start_file("content.opf", opts).unwrap();
+            z.write_all(
+                r#"<package><metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+                    <dc:title>三体</dc:title>
+                </metadata></package>"#
+                    .as_bytes(),
+            )
+            .unwrap();
+            z.finish().unwrap();
+        }
+
+        let missing = dir.join("missing.txt");
+
+        let library = vec![ExistingBook {
+            id: orig_id,
+            title: "三体".into(),
+            format: "TXT".into(),
+            han_total: 5,
+            analysed: 100,
+            file_name: "三体.txt".into(),
+        }];
+
+        let checked = check_open_files(
+            vec![
+                orig_txt.clone(),
+                updated_txt.clone(),
+                new_txt.clone(),
+                epub.clone(),
+                missing.clone(),
+            ],
+            &library,
+        );
+
+        // Identical file (same SHA-256): no conflict.
+        assert_eq!(checked[0], CheckedFile::Ready(orig_txt));
+        // Different TXT with the same title: conflict.
+        assert!(matches!(
+            &checked[1],
+            CheckedFile::Conflict(c) if c.path == updated_txt && c.title == "三体" && c.existing.len() == 1
+        ));
+        // Different title: no conflict.
+        assert_eq!(checked[2], CheckedFile::Ready(new_txt));
+        // EPUB with different filename but matching metadata title: conflict.
+        assert!(matches!(
+            &checked[3],
+            CheckedFile::Conflict(c) if c.path == epub && c.title == "三体" && c.existing.len() == 1
+        ));
+        // Non-existent path: falls through to normal open error.
+        assert_eq!(checked[4], CheckedFile::Ready(missing));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_open_applies_choices_and_preserves_order() {
+        let existing = |id: &str, title: &str| ExistingBook {
+            id: id.into(),
+            title: title.into(),
+            format: "EPUB".into(),
+            han_total: 100,
+            analysed: 1,
+            file_name: format!("{title}.epub"),
+        };
+        let checked = vec![
+            CheckedFile::Ready(PathBuf::from("a.epub")),
+            CheckedFile::Conflict(TitleConflict {
+                path: PathBuf::from("b.epub"),
+                title: "B".into(),
+                existing: vec![existing("old-b", "B")],
+            }),
+            CheckedFile::Ready(PathBuf::from("c.epub")),
+            CheckedFile::Conflict(TitleConflict {
+                path: PathBuf::from("d.epub"),
+                title: "D".into(),
+                existing: vec![existing("old-d1", "D"), existing("old-d2", "D")],
+            }),
+        ];
+
+        // Individual decisions: Replace first, KeepBoth second.
+        let mut p = PendingOpen::from_checked(checked.clone());
+        assert_eq!(p.total_conflicts, 2);
+        assert_eq!(p.current, Some(1));
+        assert!(p.apply_choice(ReplaceChoice::Replace).is_none());
+        assert_eq!(p.current, Some(3));
+        let ready = p.apply_choice(ReplaceChoice::KeepBoth).unwrap();
+        assert_eq!(
+            ready,
+            vec![
+                OpenFile {
+                    path: PathBuf::from("a.epub"),
+                    replace: vec![]
+                },
+                OpenFile {
+                    path: PathBuf::from("b.epub"),
+                    replace: vec!["old-b".into()]
+                },
+                OpenFile {
+                    path: PathBuf::from("c.epub"),
+                    replace: vec![]
+                },
+                OpenFile {
+                    path: PathBuf::from("d.epub"),
+                    replace: vec![]
+                },
+            ]
+        );
+
+        // Apply-all Skip: keeps only non-conflicting files in original order.
+        let mut p = PendingOpen::from_checked(checked.clone());
+        p.apply_all = true;
+        let ready = p.apply_choice(ReplaceChoice::Skip).unwrap();
+        assert_eq!(
+            ready,
+            vec![
+                OpenFile {
+                    path: PathBuf::from("a.epub"),
+                    replace: vec![]
+                },
+                OpenFile {
+                    path: PathBuf::from("c.epub"),
+                    replace: vec![]
+                },
+            ]
+        );
+
+        // Apply-all Replace: replaces every conflicting book with all matching ids.
+        let mut p = PendingOpen::from_checked(checked);
+        p.apply_all = true;
+        let ready = p.apply_choice(ReplaceChoice::Replace).unwrap();
+        assert_eq!(
+            ready,
+            vec![
+                OpenFile {
+                    path: PathBuf::from("a.epub"),
+                    replace: vec![]
+                },
+                OpenFile {
+                    path: PathBuf::from("b.epub"),
+                    replace: vec!["old-b".into()]
+                },
+                OpenFile {
+                    path: PathBuf::from("c.epub"),
+                    replace: vec![]
+                },
+                OpenFile {
+                    path: PathBuf::from("d.epub"),
+                    replace: vec!["old-d1".into(), "old-d2".into()],
+                },
+            ]
+        );
     }
 }
