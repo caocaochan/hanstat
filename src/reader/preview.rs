@@ -3909,9 +3909,9 @@ fn reader_vertical_typography() {
         h2 { text-align: center; margin: 1em 0; }
         p { text-indent: 2em; margin: 0.4em 0; }
     </style><body>
-        <h2>第一章 《山海经》</h2>
-        <p>他说：“你好，世界！”然后指着「<u>昆仑山</u>」道——这便是传说中的地方……</p>
-        <p>书中记载：<ruby>青鸟<rt>qīngniǎo</rt></ruby>与<ruby>白泽<rt>ㄅㄞˊㄗㄜˊ</rt></ruby>，公元 2026 年仍为世人所称道（见 Vol. 3）。</p>
+        <h2>CHAPTER 1 《山海经》</h2>
+        <p>1989年，他说：“你好，世界！”然后指着「<u>昆仑山</u>」道——这便是传说中的地方……</p>
+        <p>书中记载：<ruby>青鸟<rt>qīngniǎo</rt></ruby>与<ruby>白泽<rt>ㄅㄞˊㄗㄜˊ</rt></ruby>，约有105个故事，公元 2026 年仍为世人所称道（见 Silent Vortex）。</p>
         <hr/>
         <p><strong>加粗文字</strong>与<s>删除线</s>测试。</p>
     </body></html>"#;
@@ -3937,10 +3937,11 @@ fn reader_vertical_typography() {
     d.snap("vertical-rich");
     let l = r.layouts.get(&r.spine).unwrap();
     assert!(l.vertical);
-    assert!(
-        l.items
-            .iter()
-            .any(|it| matches!(it, Item::Text { angle, .. } if *angle > 0.0)),
-        "expected rotated sideways Latin/ASCII runs"
-    );
+    // Digits and Latin letters in body text are stacked upright (angle == 0).
+    let body_upright = l
+        .items
+        .iter()
+        .filter(|it| matches!(it, Item::Text { angle, .. } if *angle == 0.0))
+        .count();
+    assert!(body_upright > 20, "expected upright stacked glyphs");
 }

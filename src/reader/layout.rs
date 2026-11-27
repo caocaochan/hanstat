@@ -627,18 +627,18 @@ fn vert_form(c: char) -> Option<(char, bool)> {
         '』' | '’' => ('﹄', true),
         '《' => ('︽', true),
         '》' => ('︾', true),
-        '〈' => ('︿', true),
-        '〉' => ('﹀', true),
-        '（' => ('︵', true),
-        '）' => ('︶', true),
+        '〈' | '<' => ('︿', true),
+        '〉' | '>' => ('﹀', true),
+        '（' | '(' => ('︵', true),
+        '）' | ')' => ('︶', true),
         '【' => ('︻', true),
         '】' => ('︼', true),
         '〔' => ('︹', true),
         '〕' => ('︺', true),
-        '｛' => ('︷', true),
-        '｝' => ('︸', true),
-        '［' => ('﹇', true),
-        '］' => ('﹈', true),
+        '｛' | '{' => ('︷', true),
+        '｝' | '}' => ('︸', true),
+        '［' | '[' => ('﹇', true),
+        '］' | ']' => ('﹈', true),
         '—' => ('︱', true),
         '–' => ('︲', true),
         '…' => ('︙', true),
@@ -679,17 +679,15 @@ fn vert_glyph(c: char, has_vert: impl Fn(char) -> bool) -> VertGlyph {
             dy: 0.0,
         };
     }
-    if matches!(c, '～' | '〜' | '─' | '―' | '━' | 'ー') {
+    if matches!(c, '～' | '〜' | '─' | '―' | '━' | 'ー' | '-') {
         return VertGlyph::Sideways(c);
     }
-    if is_upright_vertical(c) {
-        VertGlyph::Upright {
-            ch: c,
-            dx: 0.0,
-            dy: 0.0,
-        }
-    } else {
-        VertGlyph::Sideways(c)
+    // Everything else — Hanzi, digits, Latin letters and symbols — stacks
+    // upright (`text-orientation: upright`).
+    VertGlyph::Upright {
+        ch: c,
+        dx: 0.0,
+        dy: 0.0,
     }
 }
 
@@ -1477,6 +1475,7 @@ impl Flow<'_, '_> {
                         let (w, vert) = if vertical {
                             let vg = vert_glyph(c, |vc| self.has_vert(s, vc));
                             let adv = match vg {
+                                VertGlyph::Upright { ch: ' ', .. } => fp * 0.5 + ls,
                                 VertGlyph::Upright { .. } => fp + ls,
                                 VertGlyph::Sideways(gc) => *widths
                                     .entry((gc, *style))
@@ -2761,8 +2760,32 @@ mod tests {
                 dy: 0.0
             }
         );
-        assert_eq!(vert_glyph('A', all), VertGlyph::Sideways('A'));
+        assert_eq!(
+            vert_glyph('A', all),
+            VertGlyph::Upright {
+                ch: 'A',
+                dx: 0.0,
+                dy: 0.0
+            }
+        );
+        assert_eq!(
+            vert_glyph('9', all),
+            VertGlyph::Upright {
+                ch: '9',
+                dx: 0.0,
+                dy: 0.0
+            }
+        );
         assert_eq!(vert_glyph('～', all), VertGlyph::Sideways('～'));
+        assert_eq!(vert_glyph('-', all), VertGlyph::Sideways('-'));
+        assert_eq!(
+            vert_glyph('(', all),
+            VertGlyph::Upright {
+                ch: '︵',
+                dx: 0.0,
+                dy: 0.0
+            }
+        );
         assert_eq!(
             vert_glyph('字', all),
             VertGlyph::Upright {

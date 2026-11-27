@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.27.01] - 2026-11-27
+
+### Changed
+- **Upright numbers and Latin letters in vertical mode.** Digits and Latin letters now stack upright top to bottom along the column instead of rotating sideways, with half-em word spaces and vertical forms for ASCII brackets.
+
 ## [2026.11.27.00] - 2026-11-27
 
 ### Added
