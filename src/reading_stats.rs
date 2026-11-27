@@ -214,6 +214,9 @@ pub struct ReadingStats {
     /// Where each book was left, by the same id; kept when a book's stats
     /// are removed.
     pub places: BTreeMap<String, LeftAt>,
+    /// Books hidden from Home's recently read list; kept with their place and
+    /// stats until opened again in the reader.
+    pub hidden_recent: BTreeSet<String>,
 }
 
 impl ReadingStats {
@@ -540,6 +543,37 @@ pub fn remove_book(id: &str) {
     s.removed.insert(id.to_owned());
 }
 
+/// Remove all reading data for book `id`: its reading stats, where it was
+/// left, and any hidden-from-recently-read mark. [`save`] persists it.
+pub fn reset_book(id: &str) {
+    let mut s = store();
+    s.stats.books.remove(id);
+    s.dirty.remove(id);
+    s.removed.insert(id.to_owned());
+    s.stats.places.remove(id);
+    s.places_dirty.remove(id);
+    s.places_removed.insert(id.to_owned());
+    if s.stats.hidden_recent.remove(id) {
+        s.meta_dirty = true;
+    }
+    s.revision += 1;
+}
+
+/// Hide book `id` from Home's recently read list without deleting its saved
+/// place or reading stats. Opening it in the reader brings it back.
+pub fn hide_recent(id: &str) {
+    let mut s = store();
+    if s.stats.hidden_recent.insert(id.to_owned()) {
+        s.meta_dirty = true;
+        s.revision += 1;
+    }
+}
+
+/// Whether book `id` is hidden from Home's recently read list.
+pub fn is_hidden_recent(id: &str) -> bool {
+    store().stats.hidden_recent.contains(id)
+}
+
 /// Remove every book's reading stats: time, characters, days, sessions and
 /// the first-read and finished dates. Where each book was left, the goals
 /// and the settings stay. The saved database is copied first, and nothing
@@ -605,6 +639,10 @@ pub fn rekey(old: &str, new: &str, spine: impl Fn(u32) -> u32) {
         s.places_removed.remove(new);
         s.places_dirty.insert(new.to_owned());
     }
+    if s.stats.hidden_recent.remove(old) {
+        s.stats.hidden_recent.insert(new.to_owned());
+        s.meta_dirty = true;
+    }
     s.revision += 1;
 }
 
@@ -615,11 +653,11 @@ pub fn left_at(id: &str) -> Option<LeftAt> {
 
 /// The book among those `keep` accepts whose place moved last: the one last read.
 pub fn last_read(keep: impl Fn(&str) -> bool) -> Option<String> {
-    store()
-        .stats
+    let s = store();
+    s.stats
         .places
         .iter()
-        .filter(|(id, _)| keep(id))
+        .filter(|(id, _)| !s.stats.hidden_recent.contains(*id) && keep(id))
         .max_by_key(|(_, p)| p.saved)
         .map(|(id, _)| id.clone())
 }
@@ -632,13 +670,20 @@ pub fn set_left_at(id: &str, spine: usize, offset: usize) {
         offset: offset as u64,
         saved: now() as u64,
     };
-    if s.stats
-        .places
-        .get(id)
-        .is_none_or(|p| (p.spine, p.offset) != (at.spine, at.offset))
+    let unhid = s.stats.hidden_recent.remove(id);
+    if unhid {
+        s.meta_dirty = true;
+    }
+    if unhid
+        || s.stats
+            .places
+            .get(id)
+            .is_none_or(|p| (p.spine, p.offset) != (at.spine, at.offset))
     {
         s.stats.places.insert(id.to_owned(), at);
         s.places_dirty.insert(id.to_owned());
+        s.places_removed.remove(id);
+        s.revision += 1;
     }
 }
 
@@ -690,8 +735,13 @@ pub fn save() -> Result<(), String> {
             .filter_map(|id| s.stats.books.get(&id).cloned().map(|b| (id, b)))
             .collect(),
         removed: std::mem::take(&mut s.removed).into_iter().collect(),
-        meta: std::mem::take(&mut s.meta_dirty)
-            .then(|| (s.stats.settings.clone(), s.stats.goals.clone())),
+        meta: std::mem::take(&mut s.meta_dirty).then(|| {
+            (
+                s.stats.settings.clone(),
+                s.stats.goals.clone(),
+                s.stats.hidden_recent.clone(),
+            )
+        }),
         places: std::mem::take(&mut s.places_dirty)
             .into_iter()
             .filter_map(|id| s.stats.places.get(&id).map(|p| (id, *p)))
@@ -718,6 +768,7 @@ pub fn flush() {
 mod db {
     use super::{BookStats, Day, Goal, LeftAt, ReadingStats, Session, TrackerSettings};
     use rusqlite::{Connection, params};
+    use std::collections::BTreeSet;
     use std::path::Path;
 
     /// `PRAGMA user_version`: a database from a newer build isn't touched.
@@ -726,7 +777,7 @@ mod db {
     pub struct Batch {
         pub books: Vec<(String, BookStats)>,
         pub removed: Vec<String>,
-        pub meta: Option<(TrackerSettings, Vec<Goal>)>,
+        pub meta: Option<(TrackerSettings, Vec<Goal>, BTreeSet<String>)>,
         pub places: Vec<(String, LeftAt)>,
         pub places_removed: Vec<String>,
     }
@@ -795,6 +846,21 @@ mod db {
             .map_err(e)?
         {
             s.settings = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+        }
+        if let Some(json) = c
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'hidden_recent'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(e),
+            })
+            .map_err(e)?
+        {
+            s.hidden_recent = serde_json::from_str(&json).map_err(|e| e.to_string())?;
         }
         let mut q = c
             .prepare("SELECT from_day, minutes, chars FROM goals ORDER BY from_day")
@@ -966,12 +1032,21 @@ mod db {
                 params![id, p.spine, p.offset as i64, p.saved as i64],
             )?;
         }
-        if let Some((settings, goals)) = &b.meta {
+        if let Some((settings, goals, hidden_recent)) = &b.meta {
             let json = serde_json::to_string(settings).unwrap_or_default();
             t.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES ('settings', ?1)",
                 [json],
             )?;
+            if hidden_recent.is_empty() {
+                t.execute("DELETE FROM meta WHERE key = 'hidden_recent'", [])?;
+            } else {
+                let json = serde_json::to_string(hidden_recent).unwrap_or_default();
+                t.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES ('hidden_recent', ?1)",
+                    [json],
+                )?;
+            }
             t.execute("DELETE FROM goals", [])?;
             for g in goals {
                 t.execute(
@@ -1504,6 +1579,7 @@ mod tests {
                 saved: 1_790_100_001,
             },
         );
+        s.hidden_recent.insert("C:\\书\\b.epub".into());
         s
     }
 
@@ -1511,7 +1587,7 @@ mod tests {
         db::Batch {
             books: s.books.clone().into_iter().collect(),
             removed: vec![],
-            meta: Some((s.settings.clone(), s.goals.clone())),
+            meta: Some((s.settings.clone(), s.goals.clone(), s.hidden_recent.clone())),
             places: s.places.clone().into_iter().collect(),
             places_removed: vec![],
         }
@@ -1707,5 +1783,58 @@ mod tests {
             serde_json::from_str(r#"{"books":{"x":{"days":{"3":{"read_secs":5}}}}}"#).unwrap();
         assert_eq!(old.settings, TrackerSettings::default());
         assert_eq!(old.books["x"].days[&3].read_secs, 5.0);
+        assert!(old.hidden_recent.is_empty());
+    }
+
+    #[test]
+    fn hide_recent_and_reset_book_behave_as_expected() {
+        let a = "home-menu-test-a";
+        let b = "home-menu-test-b";
+        edit(|s| {
+            let mut bs = BookStats {
+                title: "Book A".into(),
+                ..Default::default()
+            };
+            bs.days.insert(20_000, day(10.0, 2000));
+            s.books.insert(a.into(), bs);
+            s.places.insert(
+                a.into(),
+                LeftAt {
+                    spine: 4,
+                    offset: 120,
+                    saved: 200,
+                },
+            );
+            s.places.insert(
+                b.into(),
+                LeftAt {
+                    spine: 1,
+                    offset: 10,
+                    saved: 100,
+                },
+            );
+            s.hidden_recent.remove(a);
+            s.hidden_recent.remove(b);
+        });
+        assert_eq!(last_read(|id| id == a || id == b).as_deref(), Some(a));
+        // Hiding A keeps its place and stats, but skips it in last_read.
+        hide_recent(a);
+        assert!(is_hidden_recent(a));
+        assert_eq!(left_at(a).map(|p| (p.spine, p.offset)), Some((4, 120)));
+        assert!(with(|s| s.books.contains_key(a)));
+        assert_eq!(last_read(|id| id == a || id == b).as_deref(), Some(b));
+        // Opening/saving A's place unhides it, even at the same spine/offset.
+        set_left_at(a, 4, 120);
+        assert!(!is_hidden_recent(a));
+        assert_eq!(last_read(|id| id == a || id == b).as_deref(), Some(a));
+        // Resetting A wipes both its reading stats and its saved place.
+        hide_recent(a);
+        reset_book(a);
+        assert!(!is_hidden_recent(a));
+        assert_eq!(left_at(a), None);
+        assert!(!with(|s| s.books.contains_key(a)));
+        assert_eq!(last_read(|id| id == a || id == b).as_deref(), Some(b));
+        // Clean up shared test store entries.
+        reset_book(b);
     }
 }

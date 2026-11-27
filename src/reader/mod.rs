@@ -183,6 +183,18 @@ impl Settings {
     }
 }
 
+/// Drop any legacy saved place for `book_id` in `reader.json` (used when
+/// resetting a book's reading data so it doesn't fall back to an old place).
+pub(crate) fn forget_position(book_id: &str) {
+    if cfg!(test) {
+        return;
+    }
+    let mut settings = Settings::load();
+    if settings.positions.remove(book_id).is_some() {
+        let _ = settings.save();
+    }
+}
+
 /// Widgets of the settings panel as drawn in the last frame.
 #[cfg(test)]
 #[derive(Default)]
@@ -499,6 +511,7 @@ impl Reader {
             tracker::Tracker::new(&book_id, &epub.title, s, crate::reading_stats::now())
         });
         let search = search::Search::new(chapters.clone(), ctx, settings.search_width);
+        let dirty = migrated || crate::reading_stats::is_hidden_recent(&book_id);
         let chapter_names = chapter_labels(&epub, &toc_labels);
         Ok(Reader {
             search,
@@ -540,7 +553,7 @@ impl Reader {
             resized_at: 0.0,
             last_geom: None,
             drawn: None,
-            dirty: migrated,
+            dirty,
             #[cfg(test)]
             persist: true,
             toc_labels,

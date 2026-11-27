@@ -9,7 +9,8 @@
 //! background thread the first time Home shows a book.
 
 use crate::icons::{
-    self, BOOKS, CARDS, CARET_RIGHT, CONFETTI, FIRE, FOLDER_OPEN, LIST_CHECKS, PLAY,
+    self, ARROW_COUNTER_CLOCKWISE, BOOK_OPEN, BOOKS, CARDS, CARET_RIGHT, CHECK, CHECK_CIRCLE,
+    CONFETTI, DOTS_THREE, EYE_SLASH, FIRE, FOLDER_OPEN, LIST_CHECKS, PLAY, TRASH,
 };
 use crate::library_reading::{calendar_shades, day_hover, day_level};
 use crate::reader::{self, stats_mins as mins};
@@ -79,6 +80,19 @@ pub(crate) struct HomeView {
     known: Option<(usize, u64, u64)>,
     /// The daily goal being edited (minutes, characters).
     goal_edit: Option<(u32, u64)>,
+    /// The "Reset reading data" confirmation window, for one book.
+    reset_confirm: Option<ResetConfirm>,
+}
+
+/// Book details kept while confirming "Reset reading data".
+#[derive(Clone)]
+struct ResetConfirm {
+    id: String,
+    title: String,
+    read_secs: f64,
+    read_chars: u64,
+    listen_secs: f64,
+    finished: bool,
 }
 
 /// A book's details for Home.
@@ -118,12 +132,20 @@ struct Shown {
     /// Where the reader left it; `None`: never opened in the reader.
     at: Option<LeftAt>,
     finished: bool,
+    /// Whether the book has any reading stats (time, characters, or finished).
+    has_stats: bool,
+    /// Whether the book is marked read in Known words.
+    marked_read: bool,
 }
 
 /// What a click on Home asks for, done once the page is drawn.
 enum Act {
     Read(usize),
     Overview(usize),
+    MarkRead(usize),
+    RemoveRecent(usize),
+    ResetReading(usize),
+    Delete(usize),
     Library(HistTab),
     Open,
     Anki,
@@ -708,10 +730,12 @@ impl App {
                 });
             });
         self.home_act_books(act, &books, ctx);
+        self.home_reset_window(ctx);
     }
 
-    /// The books Home shows: those read in the reader, the one moved in
-    /// last first; or, with none, the book analysed last.
+    /// The books Home shows: those read in the reader (not hidden from
+    /// recently read), the one moved in last first; or, with none, the book
+    /// analysed last.
     fn home_books(&self, sum: &Summary) -> Vec<Shown> {
         let finished: HashSet<&str> = sum
             .books
@@ -719,6 +743,7 @@ impl App {
             .filter(|(_, b)| b.finished.is_some())
             .map(|(id, _)| id.as_str())
             .collect();
+        let has_stats: HashSet<&str> = sum.books.iter().map(|(id, _)| id.as_str()).collect();
         let shown = |e: &history::Entry, at: Option<LeftAt>| Shown {
             id: e.id.clone(),
             title: e.title.clone(),
@@ -728,14 +753,18 @@ impl App {
             han_total: e.stats.han_total,
             at,
             finished: finished.contains(e.id.as_str()),
+            has_stats: has_stats.contains(e.id.as_str()),
+            marked_read: self.known.settings.read_book(&e.id).is_some(),
         };
-        let mut read: Vec<Shown> = self
-            .history
-            .entries
-            .iter()
-            .filter(|e| reader::opens(&e.stats.format))
-            .filter_map(|e| rs::left_at(&e.id).map(|at| shown(e, Some(at))))
-            .collect();
+        let mut read: Vec<Shown> = rs::with(|s| {
+            self.history
+                .entries
+                .iter()
+                .filter(|e| reader::opens(&e.stats.format))
+                .filter(|e| !s.hidden_recent.contains(&e.id))
+                .filter_map(|e| s.places.get(&e.id).copied().map(|at| shown(e, Some(at))))
+                .collect()
+        });
         read.sort_by_key(|b| std::cmp::Reverse(b.at.map_or(0, |a| a.saved)));
         if read.is_empty()
             && let Some(e) = self.history.entries.iter().max_by_key(|e| e.analysed)
@@ -784,7 +813,128 @@ impl App {
                     self.open(b.path.clone(), ctx);
                 }
             }
+            Some(Act::MarkRead(i)) => {
+                let Some(b) = books.get(i) else { return };
+                self.open_read_dialog(&b.id);
+            }
+            Some(Act::RemoveRecent(i)) => {
+                let Some(b) = books.get(i) else { return };
+                rs::hide_recent(&b.id);
+                if let Err(e) = rs::save() {
+                    self.set_error("reading stats", e);
+                }
+                let time = ctx.input(|inp| inp.time);
+                self.toast = Some((
+                    format!("Removed “{}” from recently read", b.title),
+                    time + 4.0,
+                ));
+            }
+            Some(Act::ResetReading(i)) => {
+                let Some(b) = books.get(i) else { return };
+                let (read_secs, read_chars, listen_secs, finished) = rs::with(|s| {
+                    s.books.get(&b.id).map_or((0.0, 0, 0.0, false), |bs| {
+                        let t = bs.totals();
+                        (
+                            t.read_secs,
+                            t.read_chars,
+                            t.listen_secs,
+                            bs.finished.is_some(),
+                        )
+                    })
+                });
+                self.home_view.reset_confirm = Some(ResetConfirm {
+                    id: b.id.clone(),
+                    title: b.title.clone(),
+                    read_secs,
+                    read_chars,
+                    listen_secs,
+                    finished,
+                });
+            }
+            Some(Act::Delete(i)) => {
+                let Some(b) = books.get(i) else { return };
+                self.remove_book(&b.id, ctx.input(|inp| inp.time));
+            }
             other => self.home_act(other, ctx),
+        }
+    }
+
+    fn home_reset_window(&mut self, ctx: &egui::Context) {
+        let Some(target) = self.home_view.reset_confirm.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut close = false;
+        let has_timed = target.read_secs >= 1.0
+            || target.read_chars > 0
+            || target.listen_secs >= 1.0
+            || target.finished;
+        egui::Window::new("Reset reading data")
+            .id(egui::Id::unique("home_reset_reading"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                if has_timed {
+                    let mut parts = Vec::new();
+                    if target.read_secs >= 1.0 || target.read_chars > 0 {
+                        parts.push(format!(
+                            "{} and {} characters read",
+                            mins(target.read_secs),
+                            fmt_int(target.read_chars)
+                        ));
+                    }
+                    if target.listen_secs >= 1.0 {
+                        parts.push(format!("{} listened", mins(target.listen_secs)));
+                    }
+                    let stats_note = if parts.is_empty() {
+                        "its finished status".to_owned()
+                    } else {
+                        parts.join(", ")
+                    };
+                    ui.label(format!(
+                        "Reset all reading data for “{}”? This removes {} and resets your saved page to the start. This can't be undone.",
+                        target.title, stats_note
+                    ));
+                } else {
+                    ui.label(format!(
+                        "Reset reading progress for “{}”? Your saved page will be reset to the start and it will be taken off Recently read.",
+                        target.title
+                    ));
+                }
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("The book stays in your Library.")
+                        .weak()
+                        .small(),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(RichText::new("Reset").color(palette::error()))
+                        .clicked()
+                    {
+                        rs::reset_book(&target.id);
+                        if let Err(e) = rs::save() {
+                            self.set_error("reading stats", e);
+                        }
+                        reader::forget_position(&target.id);
+                        let time = ctx.input(|inp| inp.time);
+                        self.toast = Some((
+                            format!("Reset reading data for “{}”", target.title),
+                            time + 4.0,
+                        ));
+                        close = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if close || !open {
+            self.home_view.reset_confirm = None;
         }
     }
 
@@ -804,7 +954,15 @@ impl App {
                     self.set_error("reading stats", e);
                 }
             }
-            Some(Act::Read(_) | Act::Overview(_)) | None => {}
+            Some(
+                Act::Read(_)
+                | Act::Overview(_)
+                | Act::MarkRead(_)
+                | Act::RemoveRecent(_)
+                | Act::ResetReading(_)
+                | Act::Delete(_),
+            )
+            | None => {}
         }
     }
 }
@@ -861,31 +1019,172 @@ fn header(ui: &mut Ui, library_size: usize, act: &mut Option<Act>) {
     });
 }
 
+/// The `…` button at the top-right corner of a book cover, shown while the
+/// cover is hovered or its menu is open. Returns whether the button itself
+/// was clicked this frame.
+#[allow(clippy::too_many_arguments)]
+fn cover_menu_button(
+    ui: &mut Ui,
+    drawn: Rect,
+    id: egui::Id,
+    index: usize,
+    b: &Shown,
+    size: f32,
+    inset: f32,
+    show: bool,
+    act: &mut Option<Act>,
+) -> bool {
+    let popup_id = id.with("menu");
+    if !show {
+        return false;
+    }
+    let btn_rect = Rect::from_min_size(
+        pos2(drawn.max.x - inset - size, drawn.min.y + inset),
+        Vec2::splat(size),
+    );
+    let btn = ui
+        .interact(btn_rect, id.with("more"), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let menu_open = egui::Popup::is_id_open(ui.ctx(), popup_id);
+    let c = palette::cat();
+    let dark = palette::dark();
+    let fill = if menu_open || btn.hovered() {
+        c.surface1.gamma_multiply(0.96)
+    } else {
+        c.base.gamma_multiply(0.90)
+    };
+    let stroke = Stroke::new(
+        1.0,
+        if dark {
+            Color32::from_white_alpha(28)
+        } else {
+            Color32::from_black_alpha(32)
+        },
+    );
+    let radius = size / 2.0;
+    ui.painter().rect_filled(btn_rect, radius, fill);
+    ui.painter()
+        .rect_stroke(btn_rect, radius, stroke, StrokeKind::Inside);
+    icons::paint(
+        ui.painter(),
+        btn_rect.center(),
+        DOTS_THREE,
+        size * 0.62,
+        true,
+        c.text,
+    );
+    if !menu_open {
+        btn.clone().on_hover_text("More options");
+    }
+    egui::Popup::menu(&btn).id(popup_id).show(|ui| {
+        ui.set_min_width(200.0);
+        if ui
+            .button(icons::rich(ui, format!("{BOOK_OPEN}  Overview")))
+            .on_hover_text("The book's figures and words")
+            .clicked()
+        {
+            *act = Some(Act::Overview(index));
+            ui.close();
+        }
+        let (mark_icon, mark_label, mark_tip) = if b.marked_read {
+            (
+                CHECK_CIRCLE,
+                "Edit read mark…",
+                "Change how many of its words count as known, or unmark it",
+            )
+        } else {
+            (
+                CHECK,
+                "Mark read…",
+                "Count its most frequent words as known and take it off the reading path",
+            )
+        };
+        if ui
+            .button(icons::rich(ui, format!("{mark_icon}  {mark_label}")))
+            .on_hover_text(mark_tip)
+            .clicked()
+        {
+            *act = Some(Act::MarkRead(index));
+            ui.close();
+        }
+        if b.at.is_some() || b.has_stats {
+            ui.separator();
+        }
+        if b.at.is_some()
+            && ui
+                .button(icons::rich(
+                    ui,
+                    format!("{EYE_SLASH}  Remove from recently read"),
+                ))
+                .on_hover_text(
+                    "Take it off Home without losing your place or reading stats; \
+                     opening it in the reader brings it back",
+                )
+                .clicked()
+        {
+            *act = Some(Act::RemoveRecent(index));
+            ui.close();
+        }
+        if (b.at.is_some() || b.has_stats)
+            && ui
+                .button(icons::rich(
+                    ui,
+                    format!("{ARROW_COUNTER_CLOCKWISE}  Reset reading data…"),
+                ))
+                .on_hover_text(
+                    "Reset your saved page and remove all reading time and characters \
+                     recorded for this book",
+                )
+                .clicked()
+        {
+            *act = Some(Act::ResetReading(index));
+            ui.close();
+        }
+        ui.separator();
+        if ui
+            .button(icons::rich(
+                ui,
+                RichText::new(format!("{TRASH}  Delete from Library")).color(palette::error()),
+            ))
+            .on_hover_text(
+                "Remove from the Library, with hanstat's copy of the book \
+                 (the original file is not touched); can be undone for a few seconds",
+            )
+            .clicked()
+        {
+            *act = Some(Act::Delete(index));
+            ui.close();
+        }
+    });
+    btn.clicked()
+}
+
 /// The hero's cover: a click reads the book (EPUB) or opens its Overview.
 fn hero_cover(ui: &mut Ui, b: &Shown, tex: Option<&TextureHandle>, act: &mut Option<Act>) -> Rect {
-    let (rect, resp) = ui.allocate_exact_size(HERO_COVER, Sense::click());
+    let id = egui::Id::unique(("home hero", &b.id));
+    let popup_id = id.with("menu");
+    let menu_was_open = egui::Popup::is_id_open(ui.ctx(), popup_id);
+    let (rect, _) = ui.allocate_exact_size(HERO_COVER, Sense::hover());
+    let resp = ui.interact(rect, id, Sense::click());
     let hovered = ui.rect_contains_pointer(rect);
+    let active = hovered || menu_was_open;
     let lift = ui
         .ctx()
-        .animate_bool_with_time(resp.id.with("lift"), hovered, 0.15);
-    paint_cover(
-        ui,
-        rect.translate(vec2(0.0, -3.0 * lift)),
-        tex,
-        &b.title,
-        &b.id,
-        lift,
-    );
+        .animate_bool_with_time(id.with("lift"), active, 0.15);
+    let drawn = rect.translate(vec2(0.0, -3.0 * lift));
+    paint_cover(ui, drawn, tex, &b.title, &b.id, lift);
+    let menu_clicked = cover_menu_button(ui, drawn, id, 0, b, 28.0, 8.0, active, act);
+    let menu_open = egui::Popup::is_id_open(ui.ctx(), popup_id);
     let tip = if b.readable {
         "Read it"
     } else {
         "Its Overview"
     };
-    if resp
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(tip)
-        .clicked()
-    {
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if !menu_open && !menu_was_open {
+        resp.clone().on_hover_text(tip);
+    }
+    if resp.clicked() && !menu_clicked && !menu_was_open {
         *act = Some(if b.readable {
             Act::Read(0)
         } else {
@@ -1161,22 +1460,21 @@ fn shelf_row<'a>(
         let x = area.min.x + k as f32 * (SHELF_COVER.x + SHELF_GAP);
         let rect = Rect::from_min_size(pos2(x, area.min.y + 6.0), SHELF_COVER);
         let id = egui::Id::unique(("home shelf", &b.id));
+        let popup_id = id.with("menu");
+        let menu_was_open = egui::Popup::is_id_open(ui.ctx(), popup_id);
         let resp = ui.interact(rect, id, Sense::click());
         let hovered = ui.rect_contains_pointer(rect);
+        let active = hovered || menu_was_open;
         let lift = ui
             .ctx()
-            .animate_bool_with_time(id.with("lift"), hovered, 0.15);
+            .animate_bool_with_time(id.with("lift"), active, 0.15);
         let drawn = rect.translate(vec2(0.0, -4.0 * lift));
         paint_cover(ui, drawn, cover_of(&b.id), &b.title, &b.id, lift);
-        if resp
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text(format!("Read {}", b.title))
-            .clicked()
-        {
-            *act = Some(Act::Read(i));
-        }
+        let menu_clicked = cover_menu_button(ui, drawn, id, i, b, 26.0, 6.0, active, act);
+        let menu_open = egui::Popup::is_id_open(ui.ctx(), popup_id);
         // The Overview, on the cover while it is pointed at.
-        if hovered {
+        let mut overview_clicked = false;
+        if hovered && !menu_open {
             let pill = Rect::from_center_size(
                 pos2(drawn.center().x, drawn.max.y - 22.0),
                 vec2(84.0, 24.0),
@@ -1197,8 +1495,16 @@ fn shelf_row<'a>(
                 .on_hover_text("The book's figures and words")
                 .clicked()
             {
+                overview_clicked = true;
                 *act = Some(Act::Overview(i));
             }
+        }
+        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        if !menu_open && !menu_was_open {
+            resp.clone().on_hover_text(format!("Read {}", b.title));
+        }
+        if resp.clicked() && !menu_clicked && !overview_clicked && !menu_was_open {
+            *act = Some(Act::Read(i));
         }
         // How far, under the cover; then the title, two lines at most.
         let by = rect.max.y + 12.0;
@@ -1732,5 +2038,127 @@ mod tests {
             )),
             "{t}"
         );
+    }
+
+    #[test]
+    fn cover_menu_opens_on_hover_click_without_triggering_read() {
+        let ctx = egui::Context::default();
+        let b = Shown {
+            id: "book-1".to_owned(),
+            title: "Test Book".to_owned(),
+            path: PathBuf::from("test.epub"),
+            readable: true,
+            traditional: false,
+            han_total: 10_000,
+            at: Some(LeftAt {
+                spine: 1,
+                offset: 50,
+                saved: 100,
+            }),
+            finished: false,
+            has_stats: true,
+            marked_read: false,
+        };
+        let mut cover_rect = Rect::NOTHING;
+        let run = |events: Vec<egui::Event>, cover_rect: &mut Rect| -> (Option<Act>, bool) {
+            let mut act = None;
+            let mut menu_open = false;
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    *cover_rect = hero_cover(ui, &b, None, &mut act);
+                    let id = egui::Id::unique(("home hero", &b.id));
+                    menu_open = egui::Popup::is_id_open(ui.ctx(), id.with("menu"));
+                });
+            });
+            out.textures_delta.clear();
+            (act, menu_open)
+        };
+        // Frame 1: lay out cover, pointer absent.
+        let (act, open) = run(vec![], &mut cover_rect);
+        assert!(act.is_none() && !open);
+
+        // Top-right button center on the hero cover (size 28, inset 8, lifted up to 3px).
+        let btn_pos = pos2(cover_rect.max.x - 8.0 - 14.0, cover_rect.min.y + 8.0 + 14.0);
+        // Hover over the cover so the `…` button appears.
+        let (act, open) = run(vec![egui::Event::PointerMoved(btn_pos)], &mut cover_rect);
+        assert!(act.is_none() && !open);
+
+        // Click the `…` button: opens menu and must NOT trigger Read.
+        let (act, open) = run(
+            vec![
+                egui::Event::PointerMoved(btn_pos),
+                egui::Event::PointerButton {
+                    pos: btn_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: btn_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            &mut cover_rect,
+        );
+        assert!(act.is_none(), "clicking ... must not trigger cover click");
+        assert!(open, "clicking ... must open the cover menu");
+
+        // Moving pointer away from the cover keeps the menu open.
+        let away = pos2(cover_rect.max.x + 120.0, cover_rect.max.y + 120.0);
+        let (act, open) = run(vec![egui::Event::PointerMoved(away)], &mut cover_rect);
+        assert!(act.is_none());
+        assert!(open, "menu must stay open when pointer leaves cover");
+
+        // Clicking on the cover center while menu is open closes the menu without reading.
+        let center = cover_rect.center();
+        let (act, open) = run(
+            vec![
+                egui::Event::PointerMoved(center),
+                egui::Event::PointerButton {
+                    pos: center,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: center,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            &mut cover_rect,
+        );
+        assert!(act.is_none(), "dismissing menu on cover must not open book");
+        assert!(!open, "clicking outside menu must close it");
+
+        // Clicking the cover center now (with menu closed) reads the book.
+        let (act, open) = run(
+            vec![
+                egui::Event::PointerMoved(center),
+                egui::Event::PointerButton {
+                    pos: center,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: center,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            &mut cover_rect,
+        );
+        assert!(matches!(act, Some(Act::Read(0))));
+        assert!(!open);
     }
 }

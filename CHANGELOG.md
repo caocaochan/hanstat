@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.27.05] - 2026-11-27
+
+### Added
+- **Book cover menu on Home.** Hovering over a book cover on Home (both the **Continue reading** hero cover and every **Recently read** cover) shows a **…** button in its top-right corner with quick actions: open its **Overview**, **Mark read…** (or edit its read mark), **Remove from recently read** (hides it from Home while keeping your saved place and reading stats; opening it again in the Reader brings it back), **Reset reading data…** (clears its reading time, characters and saved page after confirmation), or **Delete from Library** (with the status bar's Undo).
+
 ## [2026.11.27.04] - 2026-11-27
 
 ### Changed

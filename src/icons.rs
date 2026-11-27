@@ -53,8 +53,10 @@ glyphs! {
     COLUMNS = '\u{e546}', "columns";
     CONFETTI = '\u{e81a}', "confetti";
     DOTS_SIX_VERTICAL = '\u{eae2}', "dots-six-vertical";
+    DOTS_THREE = '\u{e1fe}', "dots-three";
     DOWNLOAD = '\u{e20c}', "download-simple";
     EXPORT = '\u{eaf0}', "export";
+    EYE_SLASH = '\u{e224}', "eye-slash";
     FIRE = '\u{e242}', "fire";
     FLOPPY_DISK = '\u{e248}', "floppy-disk";
     FOLDER_OPEN = '\u{e256}', "folder-open";
