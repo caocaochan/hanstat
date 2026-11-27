@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.27.02] - 2026-11-27
+
+### Added
+- **Every column sorts in Characters, Words, Sections and Suggested words.** **Characters** and **Words** now also sort by **Count**, **%**, **Cumulative %**, and (for Characters) **Code point**. **Sections** now sorts by every column — included (**✓**), **#**, **Section**, **Kind**, **Chars**, **Unique**, **New**, **Words**, **Unique w.** and **New w.** — keeping excluded sections (`–`) at the bottom when sorting by **New** or **New w.** **Suggested words** now sorts by every column — ticked (**✓**), **Word**, **Status**, **Occurrences**, **Wrong**, **Dependency**, **Boundary freedom** and **Note** — and your sort choices are remembered between runs.
+
 ## [2026.11.27.01] - 2026-11-27
 
 ### Changed

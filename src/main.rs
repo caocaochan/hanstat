@@ -152,6 +152,8 @@ fn main() -> eframe::Result {
             }
             app.char_sort = ui.char_sort;
             app.word_sort = ui.word_sort;
+            app.section_sort = ui.section_sort;
+            app.suggest_sort = ui.suggest_sort;
             app.shortcuts = Shortcuts::from_saved(&app.settings.shortcuts);
             app.models = fetch_models(&cc.egui_ctx);
             app.updater.start(&cc.egui_ctx);
@@ -729,10 +731,13 @@ struct App {
     settings_window: bool,
     /// The "Reset all reading stats" confirmation is open.
     reset_stats: bool,
-    /// Sort column and direction (descending) of the Characters and Words tables.
+    /// Sort column and direction (descending) of the Characters, Words,
+    /// Sections and Suggested words tables.
     char_sort: (CharCol, bool),
     word_sort: (WordCol, bool),
-    /// The rows of those tables (filtered and sorted) and what they were made from.
+    section_sort: (SectionCol, bool),
+    suggest_sort: (SuggestCol, bool),
+    /// The rows of the Characters and Words tables (filtered and sorted) and what they were made from.
     char_rows: Option<(RowsKey<CharCol>, Arc<Vec<usize>>)>,
     word_rows: Option<(RowsKey<WordCol>, Arc<Vec<usize>>)>,
     /// Bumped whenever the report or its known-word statuses change.
@@ -890,7 +895,11 @@ const UNDO_SECS: f64 = 10.0;
 enum CharCol {
     Rank,
     Char,
+    Count,
+    Percent,
+    Cumulative,
     Status,
+    CodePoint,
 }
 
 /// Columns of the Words table that sort.
@@ -898,13 +907,44 @@ enum CharCol {
 enum WordCol {
     Rank,
     Word,
+    Count,
+    Percent,
+    Cumulative,
     Status,
     Length,
 }
 
+/// Columns of the Sections table that sort.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+enum SectionCol {
+    Included,
+    Index,
+    Label,
+    Kind,
+    Chars,
+    UniqueChars,
+    NewChars,
+    Words,
+    UniqueWords,
+    NewWords,
+}
+
+/// Columns of the Suggested words table that sort.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+enum SuggestCol {
+    Selected,
+    Word,
+    Status,
+    Occurrences,
+    Wrong,
+    Dependency,
+    BoundaryFreedom,
+    Note,
+}
+
 /// A table header: its title, the column it sorts by with whether that
 /// starts largest first (`None`: it doesn't sort), and its hover text.
-type SortHead<C> = (&'static str, Option<(C, bool)>, &'static str);
+type SortHead<'a, C> = (&'a str, Option<(C, bool)>, &'a str);
 
 /// What the rows of the Characters or Words table were made from.
 #[derive(Clone, PartialEq)]
@@ -928,6 +968,8 @@ struct UiState {
     library_hide_read: bool,
     char_sort: (CharCol, bool),
     word_sort: (WordCol, bool),
+    section_sort: (SectionCol, bool),
+    suggest_sort: (SuggestCol, bool),
     /// See [`App::window_size`].
     window_size: Option<[f32; 2]>,
     window_maximized: bool,
@@ -942,6 +984,8 @@ impl Default for UiState {
             library_hide_read: false,
             char_sort: (CharCol::Rank, false),
             word_sort: (WordCol::Rank, false),
+            section_sort: (SectionCol::Index, false),
+            suggest_sort: (SuggestCol::Note, false),
             window_size: None,
             window_maximized: false,
         }
@@ -1551,6 +1595,8 @@ impl Default for App {
             reset_stats: false,
             char_sort: (CharCol::Rank, false),
             word_sort: (WordCol::Rank, false),
+            section_sort: (SectionCol::Index, false),
+            suggest_sort: (SuggestCol::Note, false),
             char_rows: None,
             word_rows: None,
             report_gen: 0,
@@ -3276,6 +3322,8 @@ impl eframe::App for App {
                 library_hide_read: false,
                 char_sort: self.char_sort,
                 word_sort: self.word_sort,
+                section_sort: self.section_sort,
+                suggest_sort: self.suggest_sort,
                 window_size: self.window_size.map(<[f32; 2]>::from),
                 window_maximized: self.window_maximized,
             },
@@ -5321,16 +5369,13 @@ impl App {
             .filter(|&i| f.is_empty() || f.contains(&fold(r.char_freq[i].0)))
             .filter(|&i| status.is_none_or(|s| key.known.matches(s[i])))
             .collect();
-        let (col, desc) = key.sort;
-        // Ties stay in frequency order.
-        rows.sort_by(|&a, &b| {
-            let o = match col {
-                CharCol::Rank => a.cmp(&b),
-                CharCol::Char => r.char_freq[a].0.cmp(&r.char_freq[b].0),
-                CharCol::Status => status.map_or(std::cmp::Ordering::Equal, |s| s[a].cmp(&s[b])),
-            };
-            (if desc { o.reverse() } else { o }).then(a.cmp(&b))
-        });
+        sort_char_rows(
+            &mut rows,
+            &r.char_freq,
+            &self.char_cum,
+            status.map(Vec::as_slice),
+            key.sort,
+        );
         let rows = Arc::new(rows);
         self.char_rows = Some((key, rows.clone()));
         rows
@@ -5372,26 +5417,42 @@ impl App {
             .column(Column::exact(70.0))
             .column(Column::exact(100.0))
             .column(Column::exact(90.0))
-            .column(Column::exact(110.0))
+            .column(Column::exact(130.0))
             .column(Column::exact(if status.is_some() { 100.0 } else { 0.0 }))
             .column(Column::remainder())
             .header(24.0, |mut h| {
-                let heads: [SortHead<CharCol>; 7] = [
+                let heads: [SortHead<'_, CharCol>; 7] = [
                     (
                         "Rank",
                         Some((CharCol::Rank, false)),
                         "By frequency, most frequent first",
                     ),
                     ("Char", Some((CharCol::Char, false)), "By code point"),
-                    ("Count", None, ""),
-                    ("%", None, ""),
-                    ("Cumulative %", None, ""),
+                    (
+                        "Count",
+                        Some((CharCol::Count, true)),
+                        "By occurrences, most frequent first",
+                    ),
+                    (
+                        "%",
+                        Some((CharCol::Percent, true)),
+                        "Share of all Chinese characters",
+                    ),
+                    (
+                        "Cumulative %",
+                        Some((CharCol::Cumulative, true)),
+                        "Cumulative share of Chinese characters",
+                    ),
                     (
                         if status.is_some() { "Status" } else { "" },
                         status.map(|_| (CharCol::Status, false)),
                         "Least known first, then by frequency",
                     ),
-                    ("Code point", None, ""),
+                    (
+                        "Code point",
+                        Some((CharCol::CodePoint, false)),
+                        "By Unicode code point",
+                    ),
                 ];
                 for (t, c, hover) in heads {
                     h.col(|ui| match c {
@@ -5463,28 +5524,13 @@ impl App {
             })
             .filter(|&i| status.is_none_or(|s| key.known.matches(s[i])))
             .collect();
-        let (col, desc) = key.sort;
-        let word = |i: usize| r.word_freq[i].0.as_str();
-        match col {
-            // Each length counted once, not at every comparison.
-            WordCol::Length => {
-                rows.sort_by_cached_key(|&i| {
-                    let n = r.word_freq[i].0.chars().count();
-                    (if desc { usize::MAX - n } else { n }, i)
-                });
-            }
-            _ => rows.sort_by(|&a, &b| {
-                let o = match col {
-                    WordCol::Word => word(a).cmp(word(b)),
-                    WordCol::Status => {
-                        status.map_or(std::cmp::Ordering::Equal, |s| s[a].cmp(&s[b]))
-                    }
-                    _ => a.cmp(&b),
-                };
-                // Ties stay in frequency order.
-                (if desc { o.reverse() } else { o }).then(a.cmp(&b))
-            }),
-        }
+        sort_word_rows(
+            &mut rows,
+            &r.word_freq,
+            &self.word_cum,
+            status.map(Vec::as_slice),
+            key.sort,
+        );
         let rows = Arc::new(rows);
         self.word_rows = Some((key, rows.clone()));
         rows
@@ -5640,7 +5686,7 @@ impl App {
             )
             .column(Column::exact(100.0))
             .column(Column::exact(90.0))
-            .column(Column::exact(110.0))
+            .column(Column::exact(130.0))
             .column(Column::exact(if status.is_some() { 100.0 } else { 0.0 }))
             .column(Column::remainder());
         if moved && let Some(p) = pos {
@@ -5648,7 +5694,7 @@ impl App {
         }
         table
             .header(24.0, |mut h| {
-                let heads: [SortHead<WordCol>; 8] = [
+                let heads: [SortHead<'_, WordCol>; 8] = [
                     (
                         "Rank",
                         Some((WordCol::Rank, false)),
@@ -5660,9 +5706,21 @@ impl App {
                         Some((WordCol::Word, false)),
                         "Alphabetically, by code point",
                     ),
-                    ("Count", None, ""),
-                    ("%", None, ""),
-                    ("Cumulative %", None, ""),
+                    (
+                        "Count",
+                        Some((WordCol::Count, true)),
+                        "By occurrences, most frequent first",
+                    ),
+                    (
+                        "%",
+                        Some((WordCol::Percent, true)),
+                        "Share of all running words",
+                    ),
+                    (
+                        "Cumulative %",
+                        Some((WordCol::Cumulative, true)),
+                        "Cumulative share of running words",
+                    ),
                     (
                         if status.is_some() { "Status" } else { "" },
                         status.map(|_| (WordCol::Status, false)),
@@ -5795,43 +5853,96 @@ impl App {
         });
         let r = self.report.as_ref().unwrap();
         let n = r.sections.len();
+        let mut rows: Vec<usize> = (0..n).collect();
+        let sort_now = self.section_sort;
+        sort_section_rows(&mut rows, &r.sections, &self.included, sort_now);
+        let mut sort = None;
         let mut toggles: Vec<usize> = Vec::new();
+        let check = CHECK.to_string();
         TableBuilder::new(ui)
             // Cells otherwise inherit the top-down layout: text sits at the row top.
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .striped(true)
-            .column(Column::exact(28.0))
-            .column(Column::exact(44.0))
+            .column(Column::exact(42.0))
+            .column(Column::exact(48.0))
             .column(
                 Column::initial(300.0)
                     .at_least(120.0)
                     .resizable(true)
                     .clip(true),
             )
+            .column(Column::exact(84.0))
+            .column(Column::exact(84.0))
+            .column(Column::exact(88.0))
             .column(Column::exact(80.0))
-            .columns(Column::exact(80.0), 6)
+            .column(Column::exact(84.0))
+            .column(Column::exact(104.0))
+            .column(Column::exact(92.0))
             .header(24.0, |mut h| {
-                let heads = [
-                    "",
-                    "#",
-                    "Section",
-                    "Kind",
-                    "Chars",
-                    "Unique",
-                    "New",
-                    "Words",
-                    "Unique w.",
-                    "New w.",
+                let heads: [SortHead<'_, SectionCol>; 10] = [
+                    (
+                        &check,
+                        Some((SectionCol::Included, true)),
+                        "Whether the section is included",
+                    ),
+                    (
+                        "#",
+                        Some((SectionCol::Index, false)),
+                        "Reading order in the book",
+                    ),
+                    (
+                        "Section",
+                        Some((SectionCol::Label, false)),
+                        "Alphabetically by section title",
+                    ),
+                    ("Kind", Some((SectionCol::Kind, false)), "By section kind"),
+                    (
+                        "Chars",
+                        Some((SectionCol::Chars, true)),
+                        "Chinese characters in the section",
+                    ),
+                    (
+                        "Unique",
+                        Some((SectionCol::UniqueChars, true)),
+                        "Unique Chinese characters in the section",
+                    ),
+                    (
+                        "New",
+                        Some((SectionCol::NewChars, true)),
+                        "Chinese characters first met in this section",
+                    ),
+                    (
+                        "Words",
+                        Some((SectionCol::Words, true)),
+                        "Chinese words in the section",
+                    ),
+                    (
+                        "Unique w.",
+                        Some((SectionCol::UniqueWords, true)),
+                        "Unique Chinese words in the section",
+                    ),
+                    (
+                        "New w.",
+                        Some((SectionCol::NewWords, true)),
+                        "Chinese words first met in this section",
+                    ),
                 ];
-                for t in heads {
-                    h.col(|ui| {
-                        ui.strong(t);
+                for (t, c, hover) in heads {
+                    h.col(|ui| match c {
+                        Some((c, first_desc)) => {
+                            if let Some(s) = sort_header(ui, t, hover, c, sort_now, first_desc) {
+                                sort = Some(s);
+                            }
+                        }
+                        None => {
+                            ui.strong(t);
+                        }
                     });
                 }
             })
             .body(|body| {
-                body.rows(24.0, n, |mut row| {
-                    let i = row.index();
+                body.rows(24.0, rows.len(), |mut row| {
+                    let i = rows[row.index()];
                     let s = &r.sections[i];
                     row.col(|ui| {
                         let mut v = self.included[i];
@@ -5876,6 +5987,9 @@ impl App {
                     }
                 });
             });
+        if let Some(s) = sort {
+            self.section_sort = s;
+        }
         for i in toggles {
             self.included[i] = !self.included[i];
             changed = true;
@@ -5960,45 +6074,87 @@ impl App {
             .map(String::as_str)
             .collect();
         let merged = self.known.merged.as_deref();
+        let sort_now = self.suggest_sort;
+        let mut rows: Vec<usize> = (0..cands.len()).collect();
+        sort_suggest_rows(&mut rows, cands, &self.selected, merged, sort_now);
+        let mut sort = None;
+        let check = CHECK.to_string();
         TableBuilder::new(ui)
             // Cells otherwise inherit the top-down layout: text sits at the row top.
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .striped(true)
-            .column(Column::exact(28.0))
+            .column(Column::exact(42.0))
             .column(Column::exact(30.0))
             .column(Column::exact(150.0))
             .column(Column::exact(if merged.is_some() { 100.0 } else { 0.0 }))
-            .column(Column::exact(100.0))
+            .column(Column::exact(115.0))
             .column(Column::exact(110.0))
-            .column(Column::exact(100.0))
-            .column(Column::exact(110.0))
+            .column(Column::exact(115.0))
+            .column(Column::exact(155.0))
             .column(Column::remainder())
             .header(24.0, |mut h| {
-                for (t, tip) in [
-                    ("", ""),
-                    ("", ""),
-                    ("Word", ""),
+                let heads: [SortHead<'_, SuggestCol>; 9] = [
+                    (
+                        &check,
+                        Some((SuggestCol::Selected, true)),
+                        "Ticked to apply as a forced word",
+                    ),
+                    ("", None, ""),
+                    (
+                        "Word",
+                        Some((SuggestCol::Word, false)),
+                        "Alphabetically, by code point",
+                    ),
                     (
                         if merged.is_some() { "Status" } else { "" },
-                        "Whether you know the word (Anki, the levels and word lists ticked, or marked with +)",
+                        merged.map(|_| (SuggestCol::Status, false)),
+                        "Whether you know the word (Anki, the levels and word lists ticked, or marked with +). Least known first.",
                     ),
-                    SUGGEST_COLUMNS[0],
-                    SUGGEST_COLUMNS[1],
-                    SUGGEST_COLUMNS[2],
-                    SUGGEST_COLUMNS[3],
-                    ("", ""),
-                ] {
-                    h.col(|ui| {
-                        let r = ui.strong(t);
-                        if !tip.is_empty() {
-                            r.on_hover_text(tip);
+                    (
+                        SUGGEST_COLUMNS[0].0,
+                        Some((SuggestCol::Occurrences, true)),
+                        SUGGEST_COLUMNS[0].1,
+                    ),
+                    (
+                        SUGGEST_COLUMNS[1].0,
+                        Some((SuggestCol::Wrong, true)),
+                        SUGGEST_COLUMNS[1].1,
+                    ),
+                    (
+                        SUGGEST_COLUMNS[2].0,
+                        Some((SuggestCol::Dependency, true)),
+                        SUGGEST_COLUMNS[2].1,
+                    ),
+                    (
+                        SUGGEST_COLUMNS[3].0,
+                        Some((SuggestCol::BoundaryFreedom, true)),
+                        SUGGEST_COLUMNS[3].1,
+                    ),
+                    (
+                        "Note",
+                        Some((SuggestCol::Note, false)),
+                        "Recommended first, then other candidates, always split, and general words",
+                    ),
+                ];
+                for (t, c, tip) in heads {
+                    h.col(|ui| match c {
+                        Some((c, first_desc)) => {
+                            if let Some(s) = sort_header(ui, t, tip, c, sort_now, first_desc) {
+                                sort = Some(s);
+                            }
+                        }
+                        None => {
+                            let r = ui.strong(t);
+                            if !tip.is_empty() {
+                                r.on_hover_text(tip);
+                            }
                         }
                     });
                 }
             })
             .body(|body| {
-                body.rows(26.0, cands.len(), |mut row| {
-                    let c = &cands[row.index()];
+                body.rows(26.0, rows.len(), |mut row| {
+                    let c = &cands[rows[row.index()]];
                     row.col(|ui| {
                         let mut v = self.selected.contains(&c.word);
                         if ui.checkbox(&mut v, "").changed() {
@@ -6063,6 +6219,9 @@ impl App {
                     });
                 });
             });
+        if let Some(s) = sort {
+            self.suggest_sort = s;
+        }
         for w in toggles {
             if !self.selected.remove(&w) {
                 self.selected.insert(w);
@@ -8371,4 +8530,368 @@ fn load_cover(ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
         pixels,
         egui::TextureOptions::LINEAR,
     ))
+}
+
+fn cmp_opt<T: Ord>(a: Option<T>, b: Option<T>, desc: bool) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            if desc {
+                b.cmp(&a)
+            } else {
+                a.cmp(&b)
+            }
+        }
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn section_kind_rank(k: SectionKind) -> u8 {
+    match k {
+        SectionKind::FrontMatter => 0,
+        SectionKind::NonLinear => 1,
+        SectionKind::Nav => 2,
+        SectionKind::Body => 3,
+    }
+}
+
+fn suggest_note_rank(c: &Candidate) -> u8 {
+    if c.recommended {
+        0
+    } else if c.in_dictionary {
+        3
+    } else if c.split_occurrences() == c.occurrences {
+        2
+    } else {
+        1
+    }
+}
+
+fn sort_char_rows(
+    rows: &mut [usize],
+    freq: &[(char, u32)],
+    cum: &[f64],
+    status: Option<&[Status]>,
+    (col, desc): (CharCol, bool),
+) {
+    // Ties stay in frequency order.
+    rows.sort_by(|&a, &b| {
+        let o = match col {
+            CharCol::Rank => a.cmp(&b),
+            CharCol::Char | CharCol::CodePoint => freq[a].0.cmp(&freq[b].0),
+            CharCol::Count | CharCol::Percent => freq[a].1.cmp(&freq[b].1),
+            CharCol::Cumulative => cum[a].total_cmp(&cum[b]),
+            CharCol::Status => status.map_or(std::cmp::Ordering::Equal, |s| s[a].cmp(&s[b])),
+        };
+        (if desc { o.reverse() } else { o }).then(a.cmp(&b))
+    });
+}
+
+fn sort_word_rows(
+    rows: &mut [usize],
+    freq: &[(String, u32)],
+    cum: &[f64],
+    status: Option<&[Status]>,
+    (col, desc): (WordCol, bool),
+) {
+    match col {
+        // Each length counted once, not at every comparison.
+        WordCol::Length => {
+            rows.sort_by_cached_key(|&i| {
+                let n = freq[i].0.chars().count();
+                (if desc { usize::MAX - n } else { n }, i)
+            });
+        }
+        _ => rows.sort_by(|&a, &b| {
+            let o = match col {
+                WordCol::Rank => a.cmp(&b),
+                WordCol::Word => freq[a].0.cmp(&freq[b].0),
+                WordCol::Count | WordCol::Percent => freq[a].1.cmp(&freq[b].1),
+                WordCol::Cumulative => cum[a].total_cmp(&cum[b]),
+                WordCol::Status => status.map_or(std::cmp::Ordering::Equal, |s| s[a].cmp(&s[b])),
+                WordCol::Length => unreachable!(),
+            };
+            // Ties stay in frequency order.
+            (if desc { o.reverse() } else { o }).then(a.cmp(&b))
+        }),
+    }
+}
+
+fn sort_section_rows(
+    rows: &mut [usize],
+    sections: &[analyze::SectionRow],
+    included: &[bool],
+    (col, desc): (SectionCol, bool),
+) {
+    match col {
+        SectionCol::Label => {
+            let keys: Vec<String> = sections.iter().map(|s| s.label.to_lowercase()).collect();
+            rows.sort_by(|&a, &b| {
+                let o = keys[a]
+                    .cmp(&keys[b])
+                    .then_with(|| sections[a].label.cmp(&sections[b].label));
+                (if desc { o.reverse() } else { o }).then(a.cmp(&b))
+            });
+        }
+        _ => rows.sort_by(|&a, &b| {
+            let (sa, sb) = (&sections[a], &sections[b]);
+            let o = match col {
+                SectionCol::Included => included[a].cmp(&included[b]),
+                SectionCol::Index => a.cmp(&b),
+                SectionCol::Label => unreachable!(),
+                SectionCol::Kind => section_kind_rank(sa.kind).cmp(&section_kind_rank(sb.kind)),
+                SectionCol::Chars => sa.han.cmp(&sb.han),
+                SectionCol::UniqueChars => sa.unique_han.cmp(&sb.unique_han),
+                SectionCol::NewChars => {
+                    return cmp_opt(sa.new_han, sb.new_han, desc).then(a.cmp(&b));
+                }
+                SectionCol::Words => sa.words.cmp(&sb.words),
+                SectionCol::UniqueWords => sa.unique_words.cmp(&sb.unique_words),
+                SectionCol::NewWords => {
+                    return cmp_opt(sa.new_words, sb.new_words, desc).then(a.cmp(&b));
+                }
+            };
+            (if desc { o.reverse() } else { o }).then(a.cmp(&b))
+        }),
+    }
+}
+
+fn sort_suggest_rows(
+    rows: &mut [usize],
+    cands: &[Candidate],
+    selected: &HashSet<String>,
+    merged: Option<&anki::Knowledge>,
+    (col, desc): (SuggestCol, bool),
+) {
+    rows.sort_by(|&a, &b| {
+        let (ca, cb) = (&cands[a], &cands[b]);
+        let o = match col {
+            SuggestCol::Selected => selected
+                .contains(&ca.word)
+                .cmp(&selected.contains(&cb.word)),
+            SuggestCol::Word => ca.word.cmp(&cb.word),
+            SuggestCol::Status => merged.map_or(std::cmp::Ordering::Equal, |k| {
+                k.word(&ca.word).cmp(&k.word(&cb.word))
+            }),
+            SuggestCol::Occurrences => ca.occurrences.cmp(&cb.occurrences),
+            SuggestCol::Wrong => {
+                let ratio =
+                    |c: &Candidate| c.split_occurrences() as f64 / c.occurrences.max(1) as f64;
+                ca.split_occurrences()
+                    .cmp(&cb.split_occurrences())
+                    .then_with(|| ratio(ca).total_cmp(&ratio(cb)))
+            }
+            SuggestCol::Dependency => ca.dependency.total_cmp(&cb.dependency),
+            SuggestCol::BoundaryFreedom => ca
+                .left_entropy
+                .min(ca.right_entropy)
+                .total_cmp(&cb.left_entropy.min(cb.right_entropy)),
+            SuggestCol::Note => suggest_note_rank(ca).cmp(&suggest_note_rank(cb)),
+        };
+        (if desc { o.reverse() } else { o }).then(a.cmp(&b))
+    });
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::*;
+
+    #[test]
+    fn char_table_sorts_all_columns() {
+        let freq = [('的', 100), ('一', 50), ('了', 50), ('不', 10)];
+        let cum = [47.62, 71.43, 95.24, 100.0];
+        let status = [
+            Status::Mature,
+            Status::NotInAnki,
+            Status::Learning,
+            Status::Young,
+        ];
+        let run = |col, desc| {
+            let mut rows = vec![0, 1, 2, 3];
+            sort_char_rows(&mut rows, &freq, &cum, Some(&status), (col, desc));
+            rows
+        };
+
+        assert_eq!(run(CharCol::Rank, false), vec![0, 1, 2, 3]);
+        assert_eq!(run(CharCol::Rank, true), vec![3, 2, 1, 0]);
+        // Code point order: 一 (4E00) < 不 (4E0D) < 了 (4E86) < 的 (7684)
+        assert_eq!(run(CharCol::Char, false), vec![1, 3, 2, 0]);
+        assert_eq!(run(CharCol::CodePoint, false), vec![1, 3, 2, 0]);
+        assert_eq!(run(CharCol::CodePoint, true), vec![0, 2, 3, 1]);
+        // Count & Percent preserve frequency tie-order (1 before 2)
+        assert_eq!(run(CharCol::Count, true), vec![0, 1, 2, 3]);
+        assert_eq!(run(CharCol::Count, false), vec![3, 1, 2, 0]);
+        assert_eq!(run(CharCol::Percent, true), vec![0, 1, 2, 3]);
+        assert_eq!(run(CharCol::Percent, false), vec![3, 1, 2, 0]);
+        // Cumulative %
+        assert_eq!(run(CharCol::Cumulative, true), vec![3, 2, 1, 0]);
+        assert_eq!(run(CharCol::Cumulative, false), vec![0, 1, 2, 3]);
+        // Status: NotInAnki < Learning < Young < Mature
+        assert_eq!(run(CharCol::Status, false), vec![1, 2, 3, 0]);
+        assert_eq!(run(CharCol::Status, true), vec![0, 3, 2, 1]);
+    }
+
+    #[test]
+    fn word_table_sorts_all_columns() {
+        let freq = [
+            ("我们".to_owned(), 80),
+            ("一".to_owned(), 40),
+            ("不知道".to_owned(), 40),
+            ("可以".to_owned(), 10),
+        ];
+        let cum = [47.06, 70.59, 94.12, 100.0];
+        let status = [
+            Status::Young,
+            Status::Mature,
+            Status::NotInAnki,
+            Status::Listed,
+        ];
+        let run = |col, desc| {
+            let mut rows = vec![0, 1, 2, 3];
+            sort_word_rows(&mut rows, &freq, &cum, Some(&status), (col, desc));
+            rows
+        };
+
+        assert_eq!(run(WordCol::Rank, false), vec![0, 1, 2, 3]);
+        assert_eq!(run(WordCol::Word, false), vec![1, 2, 3, 0]);
+        assert_eq!(run(WordCol::Count, true), vec![0, 1, 2, 3]);
+        assert_eq!(run(WordCol::Count, false), vec![3, 1, 2, 0]);
+        assert_eq!(run(WordCol::Percent, false), vec![3, 1, 2, 0]);
+        assert_eq!(run(WordCol::Cumulative, true), vec![3, 2, 1, 0]);
+        assert_eq!(run(WordCol::Status, false), vec![2, 3, 0, 1]);
+        assert_eq!(run(WordCol::Length, true), vec![2, 0, 3, 1]);
+        assert_eq!(run(WordCol::Length, false), vec![1, 0, 3, 2]);
+    }
+
+    #[test]
+    fn section_table_sorts_all_columns_and_keeps_none_last() {
+        let sections = [
+            analyze::SectionRow {
+                label: "Chapter 2".into(),
+                kind: SectionKind::Body,
+                included: true,
+                han: 500,
+                unique_han: 200,
+                new_han: Some(50),
+                words: 300,
+                unique_words: 150,
+                new_words: Some(40),
+            },
+            analyze::SectionRow {
+                label: "Contents".into(),
+                kind: SectionKind::Nav,
+                included: false,
+                han: 40,
+                unique_han: 30,
+                new_han: None,
+                words: 20,
+                unique_words: 15,
+                new_words: None,
+            },
+            analyze::SectionRow {
+                label: "chapter 1".into(),
+                kind: SectionKind::FrontMatter,
+                included: true,
+                han: 800,
+                unique_han: 350,
+                new_han: Some(350),
+                words: 450,
+                unique_words: 220,
+                new_words: Some(220),
+            },
+        ];
+        let included = [true, false, true];
+        let run = |col, desc| {
+            let mut rows = vec![0, 1, 2];
+            sort_section_rows(&mut rows, &sections, &included, (col, desc));
+            rows
+        };
+
+        assert_eq!(run(SectionCol::Included, true), vec![0, 2, 1]);
+        assert_eq!(run(SectionCol::Included, false), vec![1, 0, 2]);
+        assert_eq!(run(SectionCol::Index, false), vec![0, 1, 2]);
+        assert_eq!(run(SectionCol::Index, true), vec![2, 1, 0]);
+        // Case-insensitive: chapter 1 < Chapter 2 < Contents
+        assert_eq!(run(SectionCol::Label, false), vec![2, 0, 1]);
+        assert_eq!(run(SectionCol::Label, true), vec![1, 0, 2]);
+        // Kind: FrontMatter (0) < Nav (2) < Body (3)
+        assert_eq!(run(SectionCol::Kind, false), vec![2, 1, 0]);
+        assert_eq!(run(SectionCol::Chars, true), vec![2, 0, 1]);
+        assert_eq!(run(SectionCol::UniqueChars, false), vec![1, 0, 2]);
+        // Excluded section (None) stays last in both asc and desc
+        assert_eq!(run(SectionCol::NewChars, true), vec![2, 0, 1]);
+        assert_eq!(run(SectionCol::NewChars, false), vec![0, 2, 1]);
+        assert_eq!(run(SectionCol::Words, true), vec![2, 0, 1]);
+        assert_eq!(run(SectionCol::UniqueWords, false), vec![1, 0, 2]);
+        assert_eq!(run(SectionCol::NewWords, true), vec![2, 0, 1]);
+        assert_eq!(run(SectionCol::NewWords, false), vec![0, 2, 1]);
+    }
+
+    #[test]
+    fn suggest_table_sorts_all_columns() {
+        let cand = |word: &str,
+                    occ: u32,
+                    kept: u32,
+                    dep: f64,
+                    hl: f64,
+                    hr: f64,
+                    in_dict: bool,
+                    rec: bool| Candidate {
+            word: word.to_owned(),
+            occurrences: occ,
+            kept_whole: kept,
+            cohesion: 10.0,
+            dependency: dep,
+            left_entropy: hl,
+            right_entropy: hr,
+            in_dictionary: in_dict,
+            recommended: rec,
+        };
+        let cands = [
+            cand("林婉儿", 30, 5, 0.95, 2.5, 1.8, false, true), // recommended, wrong 25, bf 1.8
+            cand("张小凡", 40, 40 - 10, 0.70, 3.0, 2.2, false, false), // plain, wrong 10 (25%), bf 2.2
+            cand("青云门", 10, 0, 0.85, 1.1, 2.9, false, false), // always split, wrong 10 (100%), bf 1.1
+            cand("不知道", 50, 20, 0.60, 4.0, 3.5, true, false), // general word, wrong 30, bf 3.5
+        ];
+        let selected: HashSet<String> = ["林婉儿".to_owned(), "青云门".to_owned()].into();
+        let mut knowledge = anki::Knowledge::empty(false);
+        knowledge.words.insert("不知道".to_owned(), Status::Mature);
+        knowledge
+            .words
+            .insert("张小凡".to_owned(), Status::Learning);
+
+        let run = |col, desc| {
+            let mut rows = vec![0, 1, 2, 3];
+            sort_suggest_rows(&mut rows, &cands, &selected, Some(&knowledge), (col, desc));
+            rows
+        };
+
+        assert_eq!(run(SuggestCol::Selected, true), vec![0, 2, 1, 3]);
+        assert_eq!(run(SuggestCol::Selected, false), vec![1, 3, 0, 2]);
+        // Code point order: 不 (4E0D) < 张 (5F20) < 林 (6797) < 青 (9752)
+        assert_eq!(run(SuggestCol::Word, false), vec![3, 1, 0, 2]);
+        // Status: NotInAnki (0, 2) < Learning (1) < Mature (3)
+        assert_eq!(run(SuggestCol::Status, false), vec![0, 2, 1, 3]);
+        assert_eq!(run(SuggestCol::Status, true), vec![3, 1, 0, 2]);
+        assert_eq!(run(SuggestCol::Occurrences, true), vec![3, 1, 0, 2]);
+        // Wrong: 30 (3) > 25 (0) > 10 @100% (2) > 10 @25% (1)
+        assert_eq!(run(SuggestCol::Wrong, true), vec![3, 0, 2, 1]);
+        assert_eq!(run(SuggestCol::Dependency, true), vec![0, 2, 1, 3]);
+        // Boundary freedom: 3.5 (3) > 2.2 (1) > 1.8 (0) > 1.1 (2)
+        assert_eq!(run(SuggestCol::BoundaryFreedom, true), vec![3, 1, 0, 2]);
+        // Note: recommended (0) < plain (1) < always split (2) < general word (3)
+        assert_eq!(run(SuggestCol::Note, false), vec![0, 1, 2, 3]);
+        assert_eq!(run(SuggestCol::Note, true), vec![3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn ui_state_deserializes_without_new_sort_fields() {
+        let old = r#"{"char_sort":["Rank",false],"word_sort":["Length",true]}"#;
+        let ui: UiState = serde_json::from_str(old).unwrap();
+        assert_eq!(ui.char_sort, (CharCol::Rank, false));
+        assert_eq!(ui.word_sort, (WordCol::Length, true));
+        assert_eq!(ui.section_sort, (SectionCol::Index, false));
+        assert_eq!(ui.suggest_sort, (SuggestCol::Note, false));
+    }
 }
