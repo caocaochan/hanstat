@@ -198,14 +198,17 @@ impl QuoteDialog {
         let mut open = true;
         let mut save = false;
         let mut close_clicked = false;
-        egui::Window::new("Export quote")
+        let bounds = crate::palette::popup_bounds(ctx);
+        let max_inner = crate::palette::popup_max_inner(ctx, bounds);
+        crate::palette::popup_window(ctx, "Export quote")
             .id(egui::Id::unique("reader-quote-export"))
             .open(&mut open)
             .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .default_width(470.0_f32.min(max_inner.x))
+            .default_height((max_inner.y * 0.88).min(640.0))
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(bounds.center())
             .show(ctx, |ui| {
-                ui.set_min_width(440.0);
                 // Layout switcher.
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Layout").color(reader_th.subtle));
@@ -281,46 +284,63 @@ impl QuoteDialog {
                     egui::Popup::menu(&button)
                         .id(egui::Id::unique("reader-quote-theme-list"))
                         .show(|ui| {
+                            let max = crate::palette::dropdown_max_size(ui.ctx(), 72.0);
                             let col_w = super::THEME_COLUMN;
                             let w = 2.0 * col_w + ui.spacing().item_spacing.x;
-                            let same = ui
-                                .allocate_ui(vec2(w, 30.0), |ui| {
-                                    theme::swatch_as(
-                                        ui,
-                                        reader_th,
-                                        "Same as pages",
-                                        current_override.is_none(),
-                                    )
-                                })
-                                .inner;
-                            if same.clicked() {
-                                self.theme_id = None;
-                                ui.close();
-                            }
-                            ui.horizontal_top(|ui| {
-                                for dark in [false, true] {
-                                    ui.vertical(|ui| {
-                                        ui.set_width(col_w);
-                                        ui.label(
-                                            RichText::new(if dark { "Dark" } else { "Light" })
-                                                .size(12.0)
-                                                .color(reader_th.muted),
-                                        );
-                                        for (i, t) in theme::THEMES
-                                            .iter()
-                                            .enumerate()
-                                            .filter(|(_, t)| t.dark == dark)
-                                        {
-                                            let r =
-                                                theme::swatch(ui, t, Some(i) == current_override);
-                                            if r.clicked() {
-                                                self.theme_id = Some(t.id.to_owned());
-                                                ui.close();
-                                            }
+                            crate::palette::resizable_scroll_popup(
+                                ui,
+                                "reader-quote-theme-list-box",
+                                vec2(w + 12.0, 490.0),
+                                vec2(220.0, 140.0),
+                                max,
+                                |ui| {
+                                    let same = ui
+                                        .allocate_ui(vec2(w, 30.0), |ui| {
+                                            theme::swatch_as(
+                                                ui,
+                                                reader_th,
+                                                "Same as pages",
+                                                current_override.is_none(),
+                                            )
+                                        })
+                                        .inner;
+                                    if same.clicked() {
+                                        self.theme_id = None;
+                                        ui.close();
+                                    }
+                                    ui.horizontal_top(|ui| {
+                                        for dark in [false, true] {
+                                            ui.vertical(|ui| {
+                                                ui.set_width(col_w);
+                                                ui.label(
+                                                    RichText::new(if dark {
+                                                        "Dark"
+                                                    } else {
+                                                        "Light"
+                                                    })
+                                                    .size(12.0)
+                                                    .color(reader_th.muted),
+                                                );
+                                                for (i, t) in theme::THEMES
+                                                    .iter()
+                                                    .enumerate()
+                                                    .filter(|(_, t)| t.dark == dark)
+                                                {
+                                                    let r = theme::swatch(
+                                                        ui,
+                                                        t,
+                                                        Some(i) == current_override,
+                                                    );
+                                                    if r.clicked() {
+                                                        self.theme_id = Some(t.id.to_owned());
+                                                        ui.close();
+                                                    }
+                                                }
+                                            });
                                         }
                                     });
-                                }
-                            });
+                                },
+                            );
                         });
                 });
                 ui.add_space(6.0);

@@ -415,12 +415,13 @@ impl Manager {
         );
         let mut open = self.open;
         let mut action: Option<Action> = None;
-        egui::Window::new("Dictionaries")
+        let bounds = crate::palette::popup_bounds(ctx);
+        let max_inner = crate::palette::popup_max_inner(ctx, bounds);
+        crate::palette::popup_window(ctx, "Dictionaries")
             .open(&mut open)
             .collapsible(false)
-            .resizable(true)
-            .default_width(760.0)
-            .max_height(ctx.content_rect().height() * 0.85)
+            .default_width(760.0_f32.min(max_inner.x))
+            .default_height((max_inner.y * 0.85).min(620.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if ui
@@ -453,12 +454,11 @@ impl Manager {
                         .color(crate::reader::theme::get(ui.ctx()).subtle),
                     );
                 }
-                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                    egui::Grid::new("dict-rows")
-                        .num_columns(9)
-                        .spacing([10.0, 6.0])
-                        .striped(true)
-                        .show(ui, |ui| {
+                egui::Grid::new("dict-rows")
+                    .num_columns(9)
+                    .spacing([10.0, 6.0])
+                    .striped(true)
+                    .show(ui, |ui| {
                             let n = self.rows.len();
                             if n > 0 {
                                 let head = |ui: &mut egui::Ui, t: &str| {
@@ -599,7 +599,6 @@ impl Manager {
                                 ui.end_row();
                             }
                         });
-                });
                 // Jobs.
                 for j in &self.jobs.list {
                     ui.horizontal(|ui| {

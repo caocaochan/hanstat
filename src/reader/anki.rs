@@ -981,12 +981,13 @@ impl Cards {
         let mut open = self.setup_open;
         let mut refresh = false;
         let mut model_changed = false;
-        egui::Window::new("Anki cards")
+        let bounds = crate::palette::popup_bounds(ctx);
+        let max_inner = crate::palette::popup_max_inner(ctx, bounds);
+        crate::palette::popup_window(ctx, "Anki cards")
             .open(&mut open)
             .collapsible(false)
-            .resizable(true)
-            .default_width(620.0)
-            .max_height(ctx.content_rect().height() * 0.9)
+            .default_width(620.0_f32.min(max_inner.x))
+            .default_height((max_inner.y * 0.85).min(640.0))
             .show(ctx, |ui| {
                 ui.label(
                     RichText::new(
@@ -1057,27 +1058,25 @@ impl Cards {
                 if s.model.is_empty() {
                     ui.label(RichText::new("Choose a note type.").color(faint));
                 }
-                egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, true]).show(ui, |ui| {
-                    egui::Grid::new("anki-fields").num_columns(3).spacing([10.0, 4.0]).striped(true).show(ui, |ui| {
-                        for (i, (name, t)) in s.fields.iter_mut().enumerate() {
-                            let l = ui.label(name.as_str());
-                            if i == 0 {
-                                l.on_hover_text("The first field: what Anki compares to find duplicates");
-                            }
-                            ui.add_sized([340.0, ui.spacing().interact_size.y], egui::TextEdit::singleline(t));
-                            ui.menu_button("+", |ui| {
-                                for (m, what) in MARKERS {
-                                    if ui.button(*m).on_hover_text(*what).clicked() {
-                                        t.push_str(m);
-                                        ui.close();
-                                    }
-                                }
-                            })
-                            .response
-                            .on_hover_text("Insert a marker");
-                            ui.end_row();
+                egui::Grid::new("anki-fields").num_columns(3).spacing([10.0, 4.0]).striped(true).show(ui, |ui| {
+                    for (i, (name, t)) in s.fields.iter_mut().enumerate() {
+                        let l = ui.label(name.as_str());
+                        if i == 0 {
+                            l.on_hover_text("The first field: what Anki compares to find duplicates");
                         }
-                    });
+                        ui.add_sized([340.0, ui.spacing().interact_size.y], egui::TextEdit::singleline(t));
+                        ui.menu_button("+", |ui| {
+                            for (m, what) in MARKERS {
+                                if ui.button(*m).on_hover_text(*what).clicked() {
+                                    t.push_str(m);
+                                    ui.close();
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text("Insert a marker");
+                        ui.end_row();
+                    }
                 });
                 if !s.fields.is_empty() && s.fields[0].1.trim().is_empty() {
                     ui.label(RichText::new("The first field needs a template: Anki won't add a note with it empty.").color(red));

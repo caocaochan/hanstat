@@ -729,7 +729,17 @@ impl Reader {
             .id(egui::Id::unique("reader-stats"))
             .open_bool(&mut open)
             .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
-            .show(|ui| self.stats_panel(ui));
+            .show(|ui| {
+                let max = crate::palette::dropdown_max_size(ui.ctx(), 72.0);
+                crate::palette::resizable_scroll_popup(
+                    ui,
+                    "reader-stats-box",
+                    egui::vec2(420.0, 440.0),
+                    egui::vec2(260.0, 160.0),
+                    max,
+                    |ui| self.stats_panel(ui),
+                );
+            });
         self.stats_open = open;
         if was_open && !self.stats_open {
             self.flush_stats_settings(rs::now());
@@ -747,8 +757,6 @@ impl Reader {
             let (sum, book) = rs::with(|s| (s.summary(today), s.books.get(&id).cloned()));
             self.stats.summary = Some((rev, sum, book));
         }
-        ui.set_min_width(380.0);
-        ui.set_max_width(440.0);
         let (r_open, l_open) = self.tracker.open_secs(now);
         let open = Day {
             read_secs: r_open,

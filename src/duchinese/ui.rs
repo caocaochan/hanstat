@@ -1104,11 +1104,13 @@ impl App {
             }
         }
         let row_count = self.du.frozen.as_ref().map_or(0, |f| f.indices.len());
-        egui::Window::new("DuChinese")
+        let bounds = palette::popup_bounds(ctx);
+        let max_inner = palette::popup_max_inner(ctx, bounds);
+        palette::popup_window(ctx, "DuChinese")
             .id(egui::Id::unique("duchinese-window"))
             .open(&mut open)
-            .default_size([760.0, 620.0])
-            .min_width(560.0)
+            .default_size([760.0_f32.min(max_inner.x), 620.0_f32.min(max_inner.y)])
+            .min_size([280.0_f32.min(max_inner.x), 200.0_f32.min(max_inner.y)])
             .show(ctx, |ui| {
                 // Account.
                 ui.horizontal_wrapped(|ui| {
@@ -1220,7 +1222,7 @@ impl App {
                 let row_h = 56.0;
                 let list = egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
-                    .max_height(ui.available_height() - 40.0)
+                    .max_height((ui.available_height() - 40.0).max(100.0))
                     .show_rows(ui, row_h, row_count, |ui, range| {
                         for i in range {
                             let cat_idx = self.du.frozen.as_ref().unwrap().indices[i];
@@ -1454,12 +1456,12 @@ impl App {
         let Some(s) = &mut self.du.sign_in else {
             return;
         };
-        egui::Window::new("Sign in to DuChinese")
+        let max_inner = palette::popup_max_inner(ctx, palette::popup_bounds(ctx));
+        palette::popup_window(ctx, "Sign in to DuChinese")
             .id(egui::Id::unique("duchinese-sign-in"))
             .open(&mut open)
             .collapsible(false)
-            .resizable(false)
-            .default_width(360.0)
+            .default_width(360.0_f32.min(max_inner.x))
             .show(ctx, |ui| {
                 ui.add_enabled_ui(!s.busy, |ui| {
                     ui.add(egui::TextEdit::singleline(&mut s.email).hint_text("Email").desired_width(f32::INFINITY));

@@ -1276,10 +1276,14 @@ impl Tts {
             .open_bool(&mut open)
             .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
             .show(|ui| {
-                ui.set_min_width(380.0);
-                ui.set_max_width(440.0);
-                let max_h = ui.ctx().content_rect().height() - 120.0;
-                egui::ScrollArea::vertical().max_height(max_h.max(200.0)).show(ui, |ui| {
+                let max = crate::palette::dropdown_max_size(ui.ctx(), 72.0);
+                crate::palette::resizable_scroll_popup(
+                    ui,
+                    "reader-tts-box",
+                    egui::vec2(420.0, (max.y * 0.85).min(560.0)),
+                    egui::vec2(260.0, 160.0),
+                    max,
+                    |ui| {
                 // Playback.
                 ui.horizontal(|ui| {
                     match self.state() {
@@ -1415,7 +1419,8 @@ impl Tts {
                 if self.ahead_of_time(ui, s, spine, ready) {
                     close = true;
                 }
-                });
+                    },
+                );
             });
         if close || (!design_was_open && self.design_window_open()) {
             open = false;

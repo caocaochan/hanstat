@@ -2034,7 +2034,7 @@ impl Reader {
             self.save();
         }
         if let Some(e) = self.error.take() {
-            egui::Window::new("Reader")
+            crate::palette::popup_window(&ctx, "Reader")
                 .collapsible(false)
                 .show(&ctx, |ui| ui.label(e));
         }
@@ -2369,60 +2369,75 @@ impl Reader {
                 }
                 let text = ui.visuals().text_color();
                 let muted = theme::get(ui.ctx()).muted;
-                let max_h = ui.ctx().content_rect().height() * 0.7;
+                let max = crate::palette::dropdown_max_size(ui.ctx(), 72.0);
+                let def_w =
+                    (cache.names_col + cache.numbers_col + 56.0).clamp(200.0_f32.min(max.x), max.x);
+                let def_h =
+                    (ui.ctx().content_rect().height() * 0.7).clamp(120.0_f32.min(max.y), max.y);
+                let min_s = vec2(200.0_f32.min(max.x), 120.0_f32.min(max.y));
                 let row_h = (ui.fonts_mut(|f| f.row_height(&font))
                     + 2.0 * ui.spacing().button_padding.y)
                     .max(ui.spacing().interact_size.y);
-                let mut scroll_area = egui::ScrollArea::vertical().max_height(max_h);
-                if scroll && let Some(cur) = current {
-                    let spacing = ui.spacing().item_spacing.y;
-                    let stride = row_h + spacing;
-                    let content_h = (toc.len() as f32 * stride - spacing).max(0.0);
-                    let visible_h = max_h.min(content_h);
-                    let target_y = (cur as f32 * stride + row_h * 0.5 - visible_h * 0.5)
-                        .clamp(0.0, (content_h - visible_h).max(0.0));
-                    scroll_area = scroll_area.vertical_scroll_offset(target_y);
-                }
-                scroll_area.show_rows(ui, row_h, toc.len(), |ui, rows| {
-                    for i in rows {
-                        let e = &toc[i];
-                        let ind = indent(e);
-                        let (num_str, num_w) = if cache.has_lengths {
-                            (cache.numbers[i].as_str(), cache.number_w[i])
-                        } else {
-                            ("…", cache.ellipsis_w)
-                        };
-                        let mut job = egui::text::LayoutJob::default();
-                        job.append(
-                            &labels[i],
-                            ind,
-                            egui::TextFormat::simple(font.clone(), text),
-                        );
-                        // Gap to the numbers' column, numbers right-aligned in it.
-                        let gap = (cache.names_col - ind - cache.name_w[i]).max(0.0)
-                            + 28.0
-                            + (cache.numbers_col - num_w);
-                        job.append(
-                            num_str,
-                            gap,
-                            egui::TextFormat {
-                                valign: egui::Align::Center,
-                                ..egui::TextFormat::simple(small.clone(), muted)
-                            },
-                        );
-                        let r = ui
-                            .selectable_label(current == Some(i), job)
-                            .on_hover_text("Its length: Chinese characters, letters and digits");
-                        #[cfg(test)]
-                        if i == 5 {
-                            toc_item = Some(r.rect);
+                egui::Resize::default()
+                    .id_salt("reader-contents-resize")
+                    .default_size(vec2(def_w, def_h))
+                    .min_size(min_s)
+                    .max_size(max)
+                    .show(ui, |ui| {
+                        let visible_max_h = ui.available_height();
+                        let mut scroll_area = egui::ScrollArea::both()
+                            .id_salt("reader-contents-scroll")
+                            .auto_shrink([false, true]);
+                        if scroll && let Some(cur) = current {
+                            let spacing = ui.spacing().item_spacing.y;
+                            let stride = row_h + spacing;
+                            let content_h = (toc.len() as f32 * stride - spacing).max(0.0);
+                            let visible_h = visible_max_h.min(content_h);
+                            let target_y = (cur as f32 * stride + row_h * 0.5 - visible_h * 0.5)
+                                .clamp(0.0, (content_h - visible_h).max(0.0));
+                            scroll_area = scroll_area.vertical_scroll_offset(target_y);
                         }
-                        if r.clicked() {
-                            go = Some(i);
-                            ui.close();
-                        }
-                    }
-                });
+                        scroll_area.show_rows(ui, row_h, toc.len(), |ui, rows| {
+                            for i in rows {
+                                let e = &toc[i];
+                                let ind = indent(e);
+                                let (num_str, num_w) = if cache.has_lengths {
+                                    (cache.numbers[i].as_str(), cache.number_w[i])
+                                } else {
+                                    ("…", cache.ellipsis_w)
+                                };
+                                let mut job = egui::text::LayoutJob::default();
+                                job.append(
+                                    &labels[i],
+                                    ind,
+                                    egui::TextFormat::simple(font.clone(), text),
+                                );
+                                // Gap to the numbers' column, numbers right-aligned in it.
+                                let gap = (cache.names_col - ind - cache.name_w[i]).max(0.0)
+                                    + 28.0
+                                    + (cache.numbers_col - num_w);
+                                job.append(
+                                    num_str,
+                                    gap,
+                                    egui::TextFormat {
+                                        valign: egui::Align::Center,
+                                        ..egui::TextFormat::simple(small.clone(), muted)
+                                    },
+                                );
+                                let r = ui.selectable_label(current == Some(i), job).on_hover_text(
+                                    "Its length: Chinese characters, letters and digits",
+                                );
+                                #[cfg(test)]
+                                if i == 5 {
+                                    toc_item = Some(r.rect);
+                                }
+                                if r.clicked() {
+                                    go = Some(i);
+                                    ui.close();
+                                }
+                            }
+                        });
+                    });
             },
         );
         #[cfg(test)]
@@ -2472,6 +2487,14 @@ impl Reader {
             .open_bool(&mut open)
             .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
             .show(|ui| {
+            let max = crate::palette::dropdown_max_size(ui.ctx(), 72.0);
+            crate::palette::resizable_scroll_popup(
+                ui,
+                "reader-settings-box",
+                vec2(400.0, 440.0),
+                vec2(260.0, 160.0),
+                max,
+                |ui| {
             let before = (
                 self.settings.theme.clone(),
                 self.settings.popup_theme.clone(),
@@ -2486,7 +2509,6 @@ impl Reader {
                 self.settings.autohide_bar,
             );
             let before_page = (self.settings.page_width, self.settings.page_height);
-            ui.set_min_width(300.0);
             let fams = fonts::families();
             egui::Grid::new("reader-settings").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                 ui.label("Theme");
@@ -2502,14 +2524,25 @@ impl Reader {
                 egui::Popup::menu(&button)
                     .id(egui::Id::unique("reader-theme-list"))
                     .show(|ui| {
-                        #[cfg(test)]
-                        {
-                            chosen = theme_columns(ui, Some(current), &mut items);
-                        }
-                        #[cfg(not(test))]
-                        {
-                            chosen = theme_columns(ui, Some(current));
-                        }
+                        let max = crate::palette::dropdown_max_size(ui.ctx(), 72.0);
+                        let w = 2.0 * THEME_COLUMN + ui.spacing().item_spacing.x + 12.0;
+                        crate::palette::resizable_scroll_popup(
+                            ui,
+                            "reader-theme-list-box",
+                            vec2(w, 460.0),
+                            vec2(220.0, 140.0),
+                            max,
+                            |ui| {
+                                #[cfg(test)]
+                                {
+                                    chosen = theme_columns(ui, Some(current), &mut items);
+                                }
+                                #[cfg(not(test))]
+                                {
+                                    chosen = theme_columns(ui, Some(current));
+                                }
+                            },
+                        );
                     });
                 #[cfg(test)]
                 {
@@ -2541,28 +2574,38 @@ impl Reader {
                 egui::Popup::menu(&button)
                     .id(egui::Id::unique("reader-popup-theme-list"))
                     .show(|ui| {
-                        // As wide as the two columns below it, in the pages' colours.
+                        let max = crate::palette::dropdown_max_size(ui.ctx(), 72.0);
                         let w = 2.0 * THEME_COLUMN + ui.spacing().item_spacing.x;
-                        let r = ui
-                            .allocate_ui(vec2(w, 30.0), |ui| {
-                                theme::swatch_as(ui, &theme::THEMES[pages], "Same as pages", current.is_none())
-                            })
-                            .inner;
-                        if r.clicked() {
-                            chosen = Some(popup::SAME_AS_PAGES);
-                            ui.close();
-                        }
-                        #[cfg(test)]
-                        {
-                            same = Some(r.rect);
-                            if let Some(i) = theme_columns(ui, current, &mut items) {
-                                chosen = Some(theme::THEMES[i].id);
-                            }
-                        }
-                        #[cfg(not(test))]
-                        if let Some(i) = theme_columns(ui, current) {
-                            chosen = Some(theme::THEMES[i].id);
-                        }
+                        crate::palette::resizable_scroll_popup(
+                            ui,
+                            "reader-popup-theme-list-box",
+                            vec2(w + 12.0, 490.0),
+                            vec2(220.0, 140.0),
+                            max,
+                            |ui| {
+                                // As wide as the two columns below it, in the pages' colours.
+                                let r = ui
+                                    .allocate_ui(vec2(w, 30.0), |ui| {
+                                        theme::swatch_as(ui, &theme::THEMES[pages], "Same as pages", current.is_none())
+                                    })
+                                    .inner;
+                                if r.clicked() {
+                                    chosen = Some(popup::SAME_AS_PAGES);
+                                    ui.close();
+                                }
+                                #[cfg(test)]
+                                {
+                                    same = Some(r.rect);
+                                    if let Some(i) = theme_columns(ui, current, &mut items) {
+                                        chosen = Some(theme::THEMES[i].id);
+                                    }
+                                }
+                                #[cfg(not(test))]
+                                if let Some(i) = theme_columns(ui, current) {
+                                    chosen = Some(theme::THEMES[i].id);
+                                }
+                            },
+                        );
                     });
                 #[cfg(test)]
                 {
@@ -2736,6 +2779,8 @@ impl Reader {
             {
                 changed = true;
             }
+                },
+            );
         });
         self.settings_open = open;
         if changed {

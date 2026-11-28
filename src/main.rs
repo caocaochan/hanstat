@@ -2566,11 +2566,16 @@ impl App {
         let mut open = self.anki.window;
         let mut changed = false;
         let mut reopen = false;
+        let bounds = palette::popup_bounds(ctx);
+        let max_inner = palette::popup_max_inner(ctx, bounds);
         egui::Window::new("Anki")
             .id(egui::Id::unique("anki-window"))
             .open(&mut open)
-            .default_size([780.0, 680.0])
-            .min_height(420.0)
+            .resizable(true)
+            .constrain_to(bounds)
+            .default_size([780.0_f32.min(max_inner.x), 680.0_f32.min(max_inner.y)])
+            .min_size([280.0_f32.min(max_inner.x), 220.0_f32.min(max_inner.y)])
+            .max_size(max_inner)
             .vscroll(false)
             .show(ctx, |ui| {
                 let a = &mut self.anki;
@@ -2637,8 +2642,14 @@ impl App {
                 let Some(info) = a.info.clone() else { return };
                 // Options and results are pinned to the bottom; the deck and
                 // field lists get whatever height is left and scroll inside it.
+                let bottom_max = (ui.available_height() * 0.45).max(80.0);
                 egui::Panel::bottom("anki-bottom")
                     .frame(egui::Frame::NONE.inner_margin(egui::Margin { top: 6, ..Default::default() }))
+                    .show(ui, |ui| {
+                egui::ScrollArea::both()
+                    .id_salt("anki-bottom-scroll")
+                    .max_height(bottom_max)
+                    .auto_shrink([false, true])
                     .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     changed |= ui
@@ -2735,13 +2746,14 @@ impl App {
                     .small(),
                 );
                     });
+                    });
                 egui::CentralPanel::no_frame().show(ui, |ui| {
                 ui.separator();
                 ui.columns(2, |cols| {
                     let ui = &mut cols[0];
                     ui.strong("Decks");
                     ui.label(RichText::new("A deck includes its subdecks.").weak());
-                    egui::ScrollArea::vertical()
+                    egui::ScrollArea::both()
                         .id_salt("anki-decks")
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
@@ -2768,7 +2780,7 @@ impl App {
                         ui.checkbox(&mut a.show_unused_types, "show unused");
                     });
                     ui.label(RichText::new("Tick the fields that hold the word (not sentences).").weak());
-                    egui::ScrollArea::vertical()
+                    egui::ScrollArea::both()
                         .id_salt("anki-types")
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
@@ -2957,10 +2969,11 @@ impl App {
 
     fn forced_window(&mut self, ctx: &egui::Context) {
         let mut open = self.forced_window;
-        egui::Window::new("Forced words")
+        let max_w = palette::popup_max_inner(ctx, palette::popup_bounds(ctx)).x;
+        palette::popup_window(ctx, "Forced words")
             .id(egui::Id::unique("forced-window"))
             .open(&mut open)
-            .default_width(420.0)
+            .default_width(420.0_f32.min(max_w))
             .show(ctx, |ui| {
                 ui.label(
                     "Each forced word always counts as one word, in every book of this language: use it for a name the \
@@ -3244,20 +3257,13 @@ impl App {
     /// The Settings window, opened with ⚙ at the right of the status bar.
     fn settings_window(&mut self, ctx: &egui::Context) {
         let mut open = self.settings_window;
-        egui::Window::new("Settings")
+        let max_inner = palette::popup_max_inner(ctx, palette::popup_bounds(ctx));
+        palette::popup_window(ctx, "Settings")
             .id(egui::Id::unique("settings-window"))
             .open(&mut open)
-            .default_width(460.0)
-            .resizable(false)
+            .default_width(480.0_f32.min(max_inner.x))
+            .default_height((max_inner.y * 0.85).min(640.0))
             .show(ctx, |ui| {
-            // Taller than the screen once Keyboard shortcuts is open: the
-            // whole body scrolls (title bar and margins stay outside).
-            let max_h = (ctx.content_rect().height() - 80.0).max(200.0);
-            egui::ScrollArea::vertical()
-                .id_salt("settings-scroll")
-                .max_height(max_h)
-                .show(ui, |ui| {
-            ui.set_max_width(460.0);
             ui.strong("Counting");
             if ui
                 .checkbox(
@@ -3562,7 +3568,6 @@ impl App {
             if let Some(e) = &self.style.error {
                 ui.colored_label(palette::warn(), e);
             }
-                });
         });
         self.settings_window &= open;
     }
@@ -4317,13 +4322,20 @@ impl App {
             self.window_placed = true;
             self.window_settle_until = now + 1.5;
             let chrome = (outer.size() - inner.size()).max(egui::Vec2::ZERO);
-            let fits = (monitor - chrome).max(egui::vec2(200.0, 200.0));
-            let size = self
-                .window_size
-                .unwrap_or(monitor * 0.75 - chrome)
-                .min(fits);
+            // Leave room for the Windows taskbar so an unmaximised window does
+            // not open behind it.
+            let work = egui::vec2(
+                monitor.x,
+                if cfg!(windows) {
+                    (monitor.y - 48.0).max(200.0)
+                } else {
+                    monitor.y
+                },
+            );
+            let fits = (work - chrome).max(egui::vec2(200.0, 200.0));
+            let size = self.window_size.unwrap_or(work * 0.75 - chrome).min(fits);
             // Centred on the primary monitor, where eframe opened it (origin 0, 0).
-            let pos = ((monitor - size - chrome) * 0.5).max(egui::Vec2::ZERO);
+            let pos = ((work - size - chrome) * 0.5).max(egui::Vec2::ZERO);
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos.to_pos2()));
             // Restoring it later gives that size, centred.
@@ -4565,13 +4577,15 @@ impl App {
         });
         let mut open = true;
         let mut close = false;
-        egui::Window::new("Reset all reading stats")
+        let bounds = palette::popup_bounds(ctx);
+        let max_inner = palette::popup_max_inner(ctx, bounds);
+        palette::popup_window(ctx, "Reset all reading stats")
             .collapsible(false)
-            .resizable(false)
             .open(&mut open)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_width(420.0_f32.min(max_inner.x))
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(bounds.center())
             .show(ctx, |ui| {
-                ui.set_max_width(420.0);
                 ui.label(format!(
                     "Remove the reading stats of all {} {}: {} and {} characters, read or listened to, \
                      with every day, session and streak, and the speed measured in the reader.",
@@ -4735,10 +4749,12 @@ impl App {
     fn known_window(&mut self, ctx: &egui::Context) {
         let mut open = self.known.window;
         let mut changed = false;
-        egui::Window::new("Known words: HSK, TOCFL & word lists")
+        let max_inner = palette::popup_max_inner(ctx, palette::popup_bounds(ctx));
+        palette::popup_window(ctx, "Known words: HSK, TOCFL & word lists")
             .id(egui::Id::unique("known-window"))
             .open(&mut open)
-            .default_width(560.0)
+            .default_width(560.0_f32.min(max_inner.x))
+            .default_height((max_inner.y * 0.85).min(680.0))
             .show(ctx, |ui| {
                 let k = &mut self.known;
                 let bands = &known::BANDS;
@@ -5421,7 +5437,10 @@ impl App {
         let mut save_image = false;
         let mut read_book = false;
         let mut export_audiobook = false;
-        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+        egui::ScrollArea::both()
+            .id_salt("overview-scroll")
+            .auto_shrink(false)
+            .show(ui, |ui| {
             // The title, wrapped clear of the image button at the right.
             ui.horizontal_top(|ui| {
                 let w = (ui.available_width() - 160.0).max(120.0);
@@ -5643,6 +5662,8 @@ impl App {
                 ui.add_space(10.0);
             }
 
+            let cols_w = ui.available_width().max(760.0);
+            ui.allocate_ui(egui::vec2(cols_w, 0.0), |ui| {
             ui.columns(2, |cols| {
                 let ui = &mut cols[0];
                 section_card(ui, "Composition", |ui| {
@@ -5726,6 +5747,7 @@ impl App {
                 }
                 });
             });
+            });
         });
         let ctx = ui.ctx().clone();
         if save_image {
@@ -5803,7 +5825,7 @@ impl App {
     fn char_table(&mut self, ui: &mut egui::Ui) {
         {
             let r = self.report.as_ref().unwrap();
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Filter:");
                 let f = ui.add(
                     egui::TextEdit::singleline(&mut self.char_filter)
@@ -5828,92 +5850,99 @@ impl App {
         let total = r.han_total.max(1) as f64;
         let sort_now = self.char_sort;
         let mut sort = None;
-        TableBuilder::new(ui)
-            // Cells otherwise inherit the top-down layout: text sits at the row top.
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .striped(true)
-            .column(Column::exact(70.0))
-            .column(Column::exact(70.0))
-            .column(Column::exact(100.0))
-            .column(Column::exact(90.0))
-            .column(Column::exact(130.0))
-            .column(Column::exact(if status.is_some() { 100.0 } else { 0.0 }))
-            .column(Column::remainder())
-            .header(24.0, |mut h| {
-                let heads: [SortHead<'_, CharCol>; 7] = [
-                    (
-                        "Rank",
-                        Some((CharCol::Rank, false)),
-                        "By frequency, most frequent first",
-                    ),
-                    ("Char", Some((CharCol::Char, false)), "By code point"),
-                    (
-                        "Count",
-                        Some((CharCol::Count, true)),
-                        "By occurrences, most frequent first",
-                    ),
-                    (
-                        "%",
-                        Some((CharCol::Percent, true)),
-                        "Share of all Chinese characters",
-                    ),
-                    (
-                        "Cumulative %",
-                        Some((CharCol::Cumulative, true)),
-                        "Cumulative share of Chinese characters",
-                    ),
-                    (
-                        if status.is_some() { "Status" } else { "" },
-                        status.map(|_| (CharCol::Status, false)),
-                        "Least known first, then by frequency",
-                    ),
-                    (
-                        "Code point",
-                        Some((CharCol::CodePoint, false)),
-                        "By Unicode code point",
-                    ),
-                ];
-                for (t, c, hover) in heads {
-                    h.col(|ui| match c {
-                        Some((c, first_desc)) => {
-                            if let Some(s) = sort_header(ui, t, hover, c, sort_now, first_desc) {
-                                sort = Some(s);
-                            }
+        egui::ScrollArea::horizontal()
+            .id_salt("char-table-hscroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                TableBuilder::new(ui)
+                    // Cells otherwise inherit the top-down layout: text sits at the row top.
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .striped(true)
+                    .column(Column::exact(70.0))
+                    .column(Column::exact(70.0))
+                    .column(Column::exact(100.0))
+                    .column(Column::exact(90.0))
+                    .column(Column::exact(130.0))
+                    .column(Column::exact(if status.is_some() { 100.0 } else { 0.0 }))
+                    .column(Column::remainder().at_least(100.0))
+                    .header(24.0, |mut h| {
+                        let heads: [SortHead<'_, CharCol>; 7] = [
+                            (
+                                "Rank",
+                                Some((CharCol::Rank, false)),
+                                "By frequency, most frequent first",
+                            ),
+                            ("Char", Some((CharCol::Char, false)), "By code point"),
+                            (
+                                "Count",
+                                Some((CharCol::Count, true)),
+                                "By occurrences, most frequent first",
+                            ),
+                            (
+                                "%",
+                                Some((CharCol::Percent, true)),
+                                "Share of all Chinese characters",
+                            ),
+                            (
+                                "Cumulative %",
+                                Some((CharCol::Cumulative, true)),
+                                "Cumulative share of Chinese characters",
+                            ),
+                            (
+                                if status.is_some() { "Status" } else { "" },
+                                status.map(|_| (CharCol::Status, false)),
+                                "Least known first, then by frequency",
+                            ),
+                            (
+                                "Code point",
+                                Some((CharCol::CodePoint, false)),
+                                "By Unicode code point",
+                            ),
+                        ];
+                        for (t, c, hover) in heads {
+                            h.col(|ui| match c {
+                                Some((c, first_desc)) => {
+                                    if let Some(s) =
+                                        sort_header(ui, t, hover, c, sort_now, first_desc)
+                                    {
+                                        sort = Some(s);
+                                    }
+                                }
+                                None => {
+                                    ui.strong(t);
+                                }
+                            });
                         }
-                        None => {
-                            ui.strong(t);
-                        }
+                    })
+                    .body(|body| {
+                        body.rows(26.0, rows.len(), |mut row| {
+                            let i = rows[row.index()];
+                            let (c, n) = r.char_freq[i];
+                            row.col(|ui| {
+                                ui.label((i + 1).to_string());
+                            });
+                            row.col(|ui| {
+                                ui.label(RichText::new(c.to_string()).size(20.0));
+                            });
+                            row.col(|ui| {
+                                ui.label(fmt_int(n as u64));
+                            });
+                            row.col(|ui| {
+                                ui.label(format!("{:.3}", n as f64 * 100.0 / total));
+                            });
+                            row.col(|ui| {
+                                ui.label(format!("{:.2}", self.char_cum[i]));
+                            });
+                            row.col(|ui| {
+                                if let Some(s) = status {
+                                    ui.label(status_text(s[i]));
+                                }
+                            });
+                            row.col(|ui| {
+                                ui.monospace(format!("U+{:04X}", c as u32));
+                            });
+                        });
                     });
-                }
-            })
-            .body(|body| {
-                body.rows(26.0, rows.len(), |mut row| {
-                    let i = rows[row.index()];
-                    let (c, n) = r.char_freq[i];
-                    row.col(|ui| {
-                        ui.label((i + 1).to_string());
-                    });
-                    row.col(|ui| {
-                        ui.label(RichText::new(c.to_string()).size(20.0));
-                    });
-                    row.col(|ui| {
-                        ui.label(fmt_int(n as u64));
-                    });
-                    row.col(|ui| {
-                        ui.label(format!("{:.3}", n as f64 * 100.0 / total));
-                    });
-                    row.col(|ui| {
-                        ui.label(format!("{:.2}", self.char_cum[i]));
-                    });
-                    row.col(|ui| {
-                        if let Some(s) = status {
-                            ui.label(status_text(s[i]));
-                        }
-                    });
-                    row.col(|ui| {
-                        ui.monospace(format!("U+{:04X}", c as u32));
-                    });
-                });
             });
         if let Some(s) = sort {
             self.char_sort = s;
@@ -5960,7 +5989,7 @@ impl App {
         const ROW_H: f32 = 26.0;
         {
             let r = self.report.as_ref().unwrap();
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Filter:");
                 let f = ui.add(
                     egui::TextEdit::singleline(&mut self.word_filter)
@@ -6090,92 +6119,98 @@ impl App {
         // Clicking a row also selects it (below).
         let mut clicked: Option<usize> = None;
 
-        let mut table = TableBuilder::new(ui)
-            // Cells otherwise inherit the top-down layout: text sits at the row top.
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .striped(true)
-            .sense(egui::Sense::click())
-            .column(Column::exact(70.0))
-            .column(Column::exact(30.0))
-            // Long words are cut off at its edge; drag it wider to see them.
-            .column(
-                Column::initial(200.0)
-                    .at_least(100.0)
-                    .resizable(true)
-                    .clip(true),
-            )
-            .column(Column::exact(100.0))
-            .column(Column::exact(90.0))
-            .column(Column::exact(130.0))
-            .column(Column::exact(if status.is_some() { 100.0 } else { 0.0 }))
-            .column(Column::remainder());
-        if moved && let Some(p) = pos {
-            table = table.scroll_to_row(p, None);
-        }
-        table
-            .header(24.0, |mut h| {
-                let heads: [SortHead<'_, WordCol>; 8] = [
-                    (
-                        "Rank",
-                        Some((WordCol::Rank, false)),
-                        "By frequency, most frequent first",
-                    ),
-                    ("", None, ""),
-                    (
-                        "Word",
-                        Some((WordCol::Word, false)),
-                        "Alphabetically, by code point",
-                    ),
-                    (
-                        "Count",
-                        Some((WordCol::Count, true)),
-                        "By occurrences, most frequent first",
-                    ),
-                    (
-                        "%",
-                        Some((WordCol::Percent, true)),
-                        "Share of all running words",
-                    ),
-                    (
-                        "Cumulative %",
-                        Some((WordCol::Cumulative, true)),
-                        "Cumulative share of running words",
-                    ),
-                    (
-                        if status.is_some() { "Status" } else { "" },
-                        status.map(|_| (WordCol::Status, false)),
-                        "Least known first, then by frequency",
-                    ),
-                    (
-                        "Length",
-                        Some((WordCol::Length, true)),
-                        "Longest first, then by frequency",
-                    ),
-                ];
-                for (t, c, hover) in heads {
-                    h.col(|ui| match c {
-                        Some((c, first_desc)) => {
-                            if let Some(s) = sort_header(ui, t, hover, c, sort_now, first_desc) {
-                                sort = Some(s);
-                            }
-                        }
-                        None => {
-                            ui.strong(t);
-                        }
-                    });
+        egui::ScrollArea::horizontal()
+            .id_salt("word-table-hscroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let mut table = TableBuilder::new(ui)
+                    // Cells otherwise inherit the top-down layout: text sits at the row top.
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .striped(true)
+                    .sense(egui::Sense::click())
+                    .column(Column::exact(70.0))
+                    .column(Column::exact(30.0))
+                    // Long words are cut off at its edge; drag it wider to see them.
+                    .column(
+                        Column::initial(200.0)
+                            .at_least(100.0)
+                            .resizable(true)
+                            .clip(true),
+                    )
+                    .column(Column::exact(100.0))
+                    .column(Column::exact(90.0))
+                    .column(Column::exact(130.0))
+                    .column(Column::exact(if status.is_some() { 100.0 } else { 0.0 }))
+                    .column(Column::remainder().at_least(80.0));
+                if moved && let Some(p) = pos {
+                    table = table.scroll_to_row(p, None);
                 }
-            })
-            .body(|body| {
-                body.rows(ROW_H, rows.len(), |mut row| {
-                    let i = rows[row.index()];
-                    let (w, n) = &r.word_freq[i];
-                    row.set_selected(pos == Some(row.index()));
-                    row.col(|ui| {
-                        ui.label((i + 1).to_string());
-                    });
-                    row.col(|ui| {
-                        let is_known = status.is_some_and(|s| s[i].is_known());
-                        if marked.contains(w.as_str()) {
+                table
+                    .header(24.0, |mut h| {
+                        let heads: [SortHead<'_, WordCol>; 8] = [
+                            (
+                                "Rank",
+                                Some((WordCol::Rank, false)),
+                                "By frequency, most frequent first",
+                            ),
+                            ("", None, ""),
+                            (
+                                "Word",
+                                Some((WordCol::Word, false)),
+                                "Alphabetically, by code point",
+                            ),
+                            (
+                                "Count",
+                                Some((WordCol::Count, true)),
+                                "By occurrences, most frequent first",
+                            ),
+                            (
+                                "%",
+                                Some((WordCol::Percent, true)),
+                                "Share of all running words",
+                            ),
+                            (
+                                "Cumulative %",
+                                Some((WordCol::Cumulative, true)),
+                                "Cumulative share of running words",
+                            ),
+                            (
+                                if status.is_some() { "Status" } else { "" },
+                                status.map(|_| (WordCol::Status, false)),
+                                "Least known first, then by frequency",
+                            ),
+                            (
+                                "Length",
+                                Some((WordCol::Length, true)),
+                                "Longest first, then by frequency",
+                            ),
+                        ];
+                        for (t, c, hover) in heads {
+                            h.col(|ui| match c {
+                                Some((c, first_desc)) => {
+                                    if let Some(s) =
+                                        sort_header(ui, t, hover, c, sort_now, first_desc)
+                                    {
+                                        sort = Some(s);
+                                    }
+                                }
+                                None => {
+                                    ui.strong(t);
+                                }
+                            });
+                        }
+                    })
+                    .body(|body| {
+                        body.rows(ROW_H, rows.len(), |mut row| {
+                            let i = rows[row.index()];
+                            let (w, n) = &r.word_freq[i];
+                            row.set_selected(pos == Some(row.index()));
+                            row.col(|ui| {
+                                ui.label((i + 1).to_string());
+                            });
+                            row.col(|ui| {
+                                let is_known = status.is_some_and(|s| s[i].is_known());
+                                if marked.contains(w.as_str()) {
                             if ui
                                 .small_button("−")
                                 .on_hover_text("You marked this word known. Click to unmark it.")
@@ -6193,31 +6228,32 @@ impl App {
                         {
                             toggle = Some((w.clone(), true));
                         }
+                            });
+                            row.col(|ui| {
+                                ui.label(RichText::new(w).size(18.0));
+                            });
+                            row.col(|ui| {
+                                ui.label(fmt_int(*n as u64));
+                            });
+                            row.col(|ui| {
+                                ui.label(format!("{:.3}", *n as f64 * 100.0 / total));
+                            });
+                            row.col(|ui| {
+                                ui.label(format!("{:.2}", self.word_cum[i]));
+                            });
+                            row.col(|ui| {
+                                if let Some(s) = status {
+                                    ui.label(status_text(s[i]));
+                                }
+                            });
+                            row.col(|ui| {
+                                ui.label(w.chars().count().to_string());
+                            });
+                            if row.response().clicked() {
+                                clicked = Some(row.index());
+                            }
+                        });
                     });
-                    row.col(|ui| {
-                        ui.label(RichText::new(w).size(18.0));
-                    });
-                    row.col(|ui| {
-                        ui.label(fmt_int(*n as u64));
-                    });
-                    row.col(|ui| {
-                        ui.label(format!("{:.3}", *n as f64 * 100.0 / total));
-                    });
-                    row.col(|ui| {
-                        ui.label(format!("{:.2}", self.word_cum[i]));
-                    });
-                    row.col(|ui| {
-                        if let Some(s) = status {
-                            ui.label(status_text(s[i]));
-                        }
-                    });
-                    row.col(|ui| {
-                        ui.label(w.chars().count().to_string());
-                    });
-                    if row.response().clicked() {
-                        clicked = Some(row.index());
-                    }
-                });
             });
         if clicked.is_some() {
             pos = clicked;
@@ -6281,7 +6317,7 @@ impl App {
 
     fn sections(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Untick sections to exclude them (cover, copyright, TOC, ads…).");
             if ui.button("Include all").clicked() {
                 self.included.iter_mut().for_each(|x| *x = true);
@@ -6321,133 +6357,140 @@ impl App {
         let mut sort = None;
         let mut toggles: Vec<usize> = Vec::new();
         let check = CHECK.to_string();
-        TableBuilder::new(ui)
-            // Cells otherwise inherit the top-down layout: text sits at the row top.
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .striped(true)
-            .column(Column::exact(42.0))
-            .column(Column::exact(48.0))
-            .column(
-                Column::initial(300.0)
-                    .at_least(120.0)
-                    .resizable(true)
-                    .clip(true),
-            )
-            .column(Column::exact(84.0))
-            .column(Column::exact(84.0))
-            .column(Column::exact(88.0))
-            .column(Column::exact(80.0))
-            .column(Column::exact(84.0))
-            .column(Column::exact(104.0))
-            .column(Column::exact(92.0))
-            .header(24.0, |mut h| {
-                let heads: [SortHead<'_, SectionCol>; 10] = [
-                    (
-                        &check,
-                        Some((SectionCol::Included, true)),
-                        "Whether the section is included",
-                    ),
-                    (
-                        "#",
-                        Some((SectionCol::Index, false)),
-                        "Reading order in the book",
-                    ),
-                    (
-                        "Section",
-                        Some((SectionCol::Label, false)),
-                        "Alphabetically by section title",
-                    ),
-                    ("Kind", Some((SectionCol::Kind, false)), "By section kind"),
-                    (
-                        "Chars",
-                        Some((SectionCol::Chars, true)),
-                        "Chinese characters in the section",
-                    ),
-                    (
-                        "Unique",
-                        Some((SectionCol::UniqueChars, true)),
-                        "Unique Chinese characters in the section",
-                    ),
-                    (
-                        "New",
-                        Some((SectionCol::NewChars, true)),
-                        "Chinese characters first met in this section",
-                    ),
-                    (
-                        "Words",
-                        Some((SectionCol::Words, true)),
-                        "Chinese words in the section",
-                    ),
-                    (
-                        "Unique w.",
-                        Some((SectionCol::UniqueWords, true)),
-                        "Unique Chinese words in the section",
-                    ),
-                    (
-                        "New w.",
-                        Some((SectionCol::NewWords, true)),
-                        "Chinese words first met in this section",
-                    ),
-                ];
-                for (t, c, hover) in heads {
-                    h.col(|ui| match c {
-                        Some((c, first_desc)) => {
-                            if let Some(s) = sort_header(ui, t, hover, c, sort_now, first_desc) {
-                                sort = Some(s);
+        egui::ScrollArea::horizontal()
+            .id_salt("sections-table-hscroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                TableBuilder::new(ui)
+                    // Cells otherwise inherit the top-down layout: text sits at the row top.
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .striped(true)
+                    .column(Column::exact(42.0))
+                    .column(Column::exact(48.0))
+                    .column(
+                        Column::initial(300.0)
+                            .at_least(120.0)
+                            .resizable(true)
+                            .clip(true),
+                    )
+                    .column(Column::exact(84.0))
+                    .column(Column::exact(84.0))
+                    .column(Column::exact(88.0))
+                    .column(Column::exact(80.0))
+                    .column(Column::exact(84.0))
+                    .column(Column::exact(104.0))
+                    .column(Column::exact(92.0))
+                    .header(24.0, |mut h| {
+                        let heads: [SortHead<'_, SectionCol>; 10] = [
+                            (
+                                &check,
+                                Some((SectionCol::Included, true)),
+                                "Whether the section is included",
+                            ),
+                            (
+                                "#",
+                                Some((SectionCol::Index, false)),
+                                "Reading order in the book",
+                            ),
+                            (
+                                "Section",
+                                Some((SectionCol::Label, false)),
+                                "Alphabetically by section title",
+                            ),
+                            ("Kind", Some((SectionCol::Kind, false)), "By section kind"),
+                            (
+                                "Chars",
+                                Some((SectionCol::Chars, true)),
+                                "Chinese characters in the section",
+                            ),
+                            (
+                                "Unique",
+                                Some((SectionCol::UniqueChars, true)),
+                                "Unique Chinese characters in the section",
+                            ),
+                            (
+                                "New",
+                                Some((SectionCol::NewChars, true)),
+                                "Chinese characters first met in this section",
+                            ),
+                            (
+                                "Words",
+                                Some((SectionCol::Words, true)),
+                                "Chinese words in the section",
+                            ),
+                            (
+                                "Unique w.",
+                                Some((SectionCol::UniqueWords, true)),
+                                "Unique Chinese words in the section",
+                            ),
+                            (
+                                "New w.",
+                                Some((SectionCol::NewWords, true)),
+                                "Chinese words first met in this section",
+                            ),
+                        ];
+                        for (t, c, hover) in heads {
+                            h.col(|ui| match c {
+                                Some((c, first_desc)) => {
+                                    if let Some(s) =
+                                        sort_header(ui, t, hover, c, sort_now, first_desc)
+                                    {
+                                        sort = Some(s);
+                                    }
+                                }
+                                None => {
+                                    ui.strong(t);
+                                }
+                            });
+                        }
+                    })
+                    .body(|body| {
+                        body.rows(24.0, rows.len(), |mut row| {
+                            let i = rows[row.index()];
+                            let s = &r.sections[i];
+                            row.col(|ui| {
+                                let mut v = self.included[i];
+                                if ui.checkbox(&mut v, "").changed() {
+                                    toggles.push(i);
+                                }
+                            });
+                            row.col(|ui| {
+                                ui.label(i.to_string());
+                            });
+                            row.col(|ui| {
+                                let t = RichText::new(&s.label);
+                                ui.label(if self.included[i] {
+                                    t
+                                } else {
+                                    t.weak().strikethrough()
+                                });
+                            });
+                            row.col(|ui| {
+                                ui.label(match s.kind {
+                                    SectionKind::Body => "",
+                                    SectionKind::Nav => "TOC",
+                                    SectionKind::NonLinear => "non-linear",
+                                    SectionKind::FrontMatter => "front",
+                                });
+                            });
+                            let dash = |o: Option<usize>| {
+                                o.map(|v| fmt_int(v as u64)).unwrap_or_else(|| "–".into())
+                            };
+                            let values = [
+                                fmt_int(s.han),
+                                fmt_int(s.unique_han as u64),
+                                dash(s.new_han),
+                                fmt_int(s.words),
+                                fmt_int(s.unique_words as u64),
+                                dash(s.new_words),
+                            ];
+                            for v in values {
+                                row.col(|ui| {
+                                    ui.label(v);
+                                });
                             }
-                        }
-                        None => {
-                            ui.strong(t);
-                        }
-                    });
-                }
-            })
-            .body(|body| {
-                body.rows(24.0, rows.len(), |mut row| {
-                    let i = rows[row.index()];
-                    let s = &r.sections[i];
-                    row.col(|ui| {
-                        let mut v = self.included[i];
-                        if ui.checkbox(&mut v, "").changed() {
-                            toggles.push(i);
-                        }
-                    });
-                    row.col(|ui| {
-                        ui.label(i.to_string());
-                    });
-                    row.col(|ui| {
-                        let t = RichText::new(&s.label);
-                        ui.label(if self.included[i] {
-                            t
-                        } else {
-                            t.weak().strikethrough()
                         });
                     });
-                    row.col(|ui| {
-                        ui.label(match s.kind {
-                            SectionKind::Body => "",
-                            SectionKind::Nav => "TOC",
-                            SectionKind::NonLinear => "non-linear",
-                            SectionKind::FrontMatter => "front",
-                        });
-                    });
-                    let dash = |o: Option<usize>| {
-                        o.map(|v| fmt_int(v as u64)).unwrap_or_else(|| "–".into())
-                    };
-                    let values = [
-                        fmt_int(s.han),
-                        fmt_int(s.unique_han as u64),
-                        dash(s.new_han),
-                        fmt_int(s.words),
-                        fmt_int(s.unique_words as u64),
-                        dash(s.new_words),
-                    ];
-                    for v in values {
-                        row.col(|ui| {
-                            ui.label(v);
-                        });
-                    }
-                });
             });
         if let Some(s) = sort {
             self.section_sort = s;
@@ -6482,7 +6525,7 @@ impl App {
         ui.add_space(4.0);
         let n_sel = self.selected.len();
         let mut apply = false;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
                     n_sel > 0 && self.job.is_none(),
@@ -6563,6 +6606,10 @@ impl App {
         };
         let mut sort = None;
         let check = CHECK.to_string();
+        egui::ScrollArea::horizontal()
+            .id_salt("suggest-table-hscroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
         TableBuilder::new(ui)
             // Cells otherwise inherit the top-down layout: text sits at the row top.
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
@@ -6575,7 +6622,7 @@ impl App {
             .column(Column::exact(110.0))
             .column(Column::exact(115.0))
             .column(Column::exact(155.0))
-            .column(Column::remainder())
+            .column(Column::remainder().at_least(120.0))
             .header(24.0, |mut h| {
                 let heads: [SortHead<'_, SuggestCol>; 9] = [
                     (
@@ -6703,6 +6750,7 @@ impl App {
                     });
                 });
             });
+            });
         if let Some(s) = sort {
             self.suggest_sort = s;
         }
@@ -6723,7 +6771,8 @@ impl App {
         let r = self.report.as_ref().unwrap();
         let from_cache = self.prep.as_ref().is_some_and(|p| p.cached);
         let mut clear_cache = false;
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::both()
+            .id_salt("notes-scroll")
             .auto_shrink(false)
             .show(ui, |ui| {
                 ui.heading("About this file");
@@ -6792,7 +6841,7 @@ impl App {
                             "• This book was analysed just now; its counts are saved for the next time it is opened."
                         });
                         ui.label("• A saved analysis is used only if the text, the segmenter and its model, the forced and known words and hanstat's analysis code are all unchanged. Including or excluding sections, Anki and vocabulary levels never need a new analysis.");
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             let (n, bytes) = self.cache_usage;
                             ui.label(format!(
                                 "• {} saved ({:.1} MB of at most {:.0} MB; the ones unused the longest are deleted first)",
@@ -7227,10 +7276,18 @@ fn info_button(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) -> egui::
         .on_hover_text("Click for an explanation");
     egui::Popup::from_toggle_button_response(&r)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-        .width(440.0)
         .show(|ui| {
-            ui.set_max_width(440.0);
-            content(ui);
+            let max = palette::dropdown_max_size(ui.ctx(), 60.0);
+            palette::resizable_scroll_popup(
+                ui,
+                r.id,
+                egui::vec2(440.0, max.y * 0.55),
+                egui::vec2(220.0, 80.0),
+                max,
+                |ui| {
+                    content(ui);
+                },
+            );
         });
     r
 }
@@ -7597,14 +7654,16 @@ impl App {
             .any(|(i, slot)| i != idx && slot.is_some());
         let mut open = true;
         let mut choice: Option<ReplaceChoice> = None;
-        egui::Window::new("Already in the Library")
+        let bounds = palette::popup_bounds(ctx);
+        let max_inner = palette::popup_max_inner(ctx, bounds);
+        palette::popup_window(ctx, "Already in the Library")
             .id(egui::Id::unique("replace-book-dialog"))
             .collapsible(false)
-            .resizable(false)
             .open(&mut open)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_width(440.0_f32.min(max_inner.x))
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(bounds.center())
             .show(ctx, |ui| {
-                ui.set_max_width(440.0);
                 let heading = if total_conflicts > 1 {
                     format!(
                         "“{}” is already in the Library ({} of {}). Replace it with this file?",

@@ -1,5 +1,13 @@
 # Changelog
 
+## [2026.11.28.06] - 2026-11-28
+
+Thank you to **✨ nebula ✨** and **Lotus | 荷园** for reporting these bugs and layout issues!
+
+### Fixed
+- **All popups and dialogs are scrollable, resizable and stay clear of the taskbar.** Every floating window, modal and dropdown panel across the app and Reader (**Anki cards**, **Dictionaries**, **Settings**, **Anki**, **Known words**, **Forced words**, **Library columns**, **Mark read**, **DuChinese**, **Sign in to DuChinese**, **What's new**, **Export quote**, **Export audiobook**, **Generate locally**, **Design a voice**, **Aa**, **Stats**, **Read aloud**, **Contents**, theme pickers, info popups and confirmation dialogs) can now be resized freely, scrolls both vertically and horizontally when its contents don't fit, and stays constrained within the viewport so it never runs off-screen or behind the taskbar. On Windows, unmaximised startup placement also leaves room for the taskbar.
+- **Horizontal scrolling in all book overview tabs.** The book tab bar (**Overview**, **Characters**, **Words**, **Sections**, **Suggested words**, **Notes & method**) and the contents and tables inside all six tabs now scroll horizontally when the window is narrower than their content, and their filter/action bars wrap instead of clipping.
+
 ## [2026.11.28.05] - 2026-11-28
 
 ### Added

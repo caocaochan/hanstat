@@ -837,7 +837,7 @@ impl Popup {
         self.renderer.set_look(&look);
         self.renderer.images.next_frame();
         self.renderer.images.poll(ctx);
-        let screen = ctx.content_rect();
+        let screen = crate::palette::popup_bounds(ctx);
         let size = (params.base * 0.8).max(13.0);
         // The entries' area: as dragged, or the default; within the window.
         let want = self.size.unwrap_or(vec2(
@@ -918,7 +918,7 @@ impl Popup {
         key_held: bool,
         look: &Look,
     ) -> Option<(String, Origin, Rect)> {
-        let screen = ctx.content_rect();
+        let screen = crate::palette::popup_bounds(ctx);
         // A fixed height: its entries scroll inside.
         let side_by_side = level == 0 && params.vertical;
         let (pos, max_h, down, left_side) = if side_by_side {
@@ -1036,7 +1036,7 @@ impl Popup {
             .fade_in(false)
             .fixed_pos(pos)
             .pivot(pivot)
-            .constrain(true)
+            .constrain_to(screen)
             .show(ctx, |ui| {
                 *ui.visuals_mut() = look.visuals();
                 let frame = egui::Frame::new()
@@ -1062,7 +1062,7 @@ impl Popup {
                         // Above its word, a popup takes all the room there: its
                         // bottom stays by the word whatever its entries' height
                         // (egui places it from last frame's size).
-                        let mut scroll_area = egui::ScrollArea::vertical()
+                        let mut scroll_area = egui::ScrollArea::both()
                             .id_salt(("dict-scroll", level))
                             .max_height(max_h)
                             .min_scrolled_height(max_h)
@@ -1322,7 +1322,7 @@ impl Popup {
             });
         if let Some(d) = resize {
             let cur = vec2(inner_w + (level as f32 * 24.0).min(width * 0.3), max_h);
-            let screen = ctx.content_rect();
+            let screen = crate::palette::popup_bounds(ctx);
             self.size = Some(vec2(
                 (cur.x + d.x).clamp(216.0, (screen.width() - 48.0).max(216.0)),
                 (cur.y + d.y).clamp(100.0, (screen.height() * 0.9).max(100.0)),

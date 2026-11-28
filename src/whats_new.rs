@@ -383,28 +383,25 @@ pub const WINDOW_ID: &str = "whats-new-window";
 pub fn window(ctx: &egui::Context, state: &mut WhatsNew) -> bool {
     let mut open = true;
     let mut close = false;
-    let screen = ctx.content_rect();
+    let bounds = crate::palette::popup_bounds(ctx);
+    let max_inner = crate::palette::popup_max_inner(ctx, bounds);
     // About 80 Latin characters a line: wider is harder to read.
-    let width = (screen.width() - 40.0).clamp(280.0, 580.0);
-    if (state.measured_width - width).abs() > 1.0 {
-        state.heights.fill(0.0);
-        state.measured_width = width;
-    }
+    let default_w =
+        (max_inner.x - 16.0).clamp(240.0_f32.min(max_inner.x), 580.0_f32.min(max_inner.x));
+    let default_h = (max_inner.y * 0.78).clamp(180.0_f32.min(max_inner.y), max_inner.y);
     let version = hanstat::update::version_string();
     let title = match state.since {
         Some(_) => format!("What's new in hanstat {version}"),
         None => "hanstat changelog".to_owned(),
     };
-    egui::Window::new(title)
+    crate::palette::popup_window(ctx, title)
         .id(egui::Id::unique(WINDOW_ID))
         .open(&mut open)
         .collapsible(false)
-        .resizable(false)
-        .default_width(width)
+        .default_size(egui::vec2(default_w, default_h))
         .pivot(egui::Align2::CENTER_CENTER)
-        .default_pos(screen.center())
+        .default_pos(bounds.center())
         .show(ctx, |ui| {
-            ui.set_width(width);
             let intro = match state.since {
                 Some(v) => format!(
                     "Changes since {}, the version you used last.",
@@ -414,12 +411,18 @@ pub fn window(ctx: &egui::Context, state: &mut WhatsNew) -> bool {
             };
             ui.label(RichText::new(intro).weak());
             ui.separator();
+            let list_h = (ui.available_height() - 40.0).max(120.0);
             egui::ScrollArea::vertical()
                 // Each list starts at its top.
                 .id_salt(("whats-new", state.since))
-                .max_height((screen.height() * 0.65).max(160.0))
+                .max_height(list_h)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
+                    let avail_w = ui.available_width();
+                    if (state.measured_width - avail_w).abs() > 1.0 {
+                        state.heights.fill(0.0);
+                        state.measured_width = avail_w;
+                    }
                     let clip = ui.clip_rect();
                     for (i, s) in state.parsed.iter().enumerate() {
                         let y = ui.cursor().top();

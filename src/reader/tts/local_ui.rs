@@ -656,30 +656,29 @@ impl Tts {
         }
         self.count_chapters();
         let mut open = true;
-        egui::Window::new("Generate locally")
+        let bounds = crate::palette::popup_bounds(ctx);
+        let max_inner = crate::palette::popup_max_inner(ctx, bounds);
+        crate::palette::popup_window(ctx, "Generate locally")
             .id(egui::Id::unique("reader-tts-local-window"))
             .open(&mut open)
             .collapsible(false)
-            .resizable(true)
-            .default_width(560.0)
-            .default_height(ctx.content_rect().height() * 0.8)
+            .default_width(560.0_f32.min(max_inner.x))
+            .default_height((max_inner.y * 0.85).min(ctx.content_rect().height() * 0.8))
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.label(
-                        RichText::new(
-                            "Make chapters' audio with Qwen3-TTS on this computer's GPU. \
-                             Reading aloud then plays it without waiting.",
-                        )
-                        .weak(),
-                    );
-                    self.download_row(ui, &s.local);
-                    ui.separator();
-                    self.local_controls(ui, s, spine, true);
-                    ui.separator();
-                    self.chapter_list(ui, spine);
-                    ui.separator();
-                    self.generate_row(ui, s);
-                });
+                ui.label(
+                    RichText::new(
+                        "Make chapters' audio with Qwen3-TTS on this computer's GPU. \
+                         Reading aloud then plays it without waiting.",
+                    )
+                    .weak(),
+                );
+                self.download_row(ui, &s.local);
+                ui.separator();
+                self.local_controls(ui, s, spine, true);
+                ui.separator();
+                self.chapter_list(ui, spine);
+                ui.separator();
+                self.generate_row(ui, s);
             });
         if !open {
             self.local.window_open = false;

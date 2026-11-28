@@ -394,7 +394,99 @@ pub(crate) fn tab(ui: &mut Ui, selected: bool, name: &str, size: f32) -> Respons
     resp
 }
 
+/// Safe viewport rect for floating popups and dialogs so they stay clear of
+/// the window edges (and therefore the OS taskbar when maximised/full-height).
+pub(crate) fn popup_bounds(ctx: &egui::Context) -> egui::Rect {
+    let s = ctx.content_rect();
+    let pad_x = 8.0_f32.min((s.width() - 120.0).max(0.0) * 0.5);
+    let pad_y = 8.0_f32.min((s.height() - 120.0).max(0.0) * 0.5);
+    egui::Rect::from_min_max(
+        egui::pos2(s.left() + pad_x, s.top() + pad_y),
+        egui::pos2(s.right() - pad_x, s.bottom() - pad_y),
+    )
+}
+
+/// Maximum inner content size for an [`egui::Window`] whose outer frame (title
+/// bar, margins and border) must stay inside `bounds`.
+pub(crate) fn popup_max_inner(ctx: &egui::Context, bounds: egui::Rect) -> egui::Vec2 {
+    let sp = &ctx.style_of(ctx.theme()).spacing;
+    let margin = sp.window_margin.sum();
+    // Title bar height + separator + frame stroke + small safety buffer.
+    let chrome_w = margin.x + 12.0;
+    let chrome_h = margin.y + sp.interact_size.y + 2.0 * sp.button_padding.y + 24.0;
+    vec2(
+        (bounds.width() - chrome_w).max(120.0),
+        (bounds.height() - chrome_h).max(100.0),
+    )
+}
+
+/// A floating popup window that is always resizable, scrollable in both
+/// directions when its contents don't fit, and constrained inside the app
+/// viewport so it never runs off-screen or behind the OS taskbar.
+pub(crate) fn popup_window<'open>(
+    ctx: &egui::Context,
+    title: impl Into<egui::WidgetText>,
+) -> egui::Window<'open> {
+    let bounds = popup_bounds(ctx);
+    let max_inner = popup_max_inner(ctx, bounds);
+    let min_inner = vec2(220.0_f32.min(max_inner.x), 90.0_f32.min(max_inner.y));
+    egui::Window::new(title)
+        .resizable(true)
+        .scroll(true)
+        .constrain_to(bounds)
+        .min_size(min_inner)
+        .max_size(max_inner)
+}
+
+/// Maximum inner size for a dropdown [`egui::Popup`] anchored inside `ctx`.
+/// Reserves space for the bar/trigger button and popup margins so it stays
+/// clear of the bottom of the window (and the OS taskbar).
+pub(crate) fn dropdown_max_size(ctx: &egui::Context, top_reserve: f32) -> egui::Vec2 {
+    let bounds = popup_bounds(ctx);
+    let sp = &ctx.style_of(ctx.theme()).spacing;
+    let margin = sp.menu_margin.sum();
+    vec2(
+        (bounds.width() - margin.x - 16.0).max(160.0),
+        (bounds.height() - margin.y - top_reserve).max(120.0),
+    )
+}
+
+/// Make a dropdown or modal popup body resizable and scrollable in both
+/// directions while staying within `max_size`.
+pub(crate) fn resizable_scroll_popup<R>(
+    ui: &mut Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    default_size: egui::Vec2,
+    min_size: egui::Vec2,
+    max_size: egui::Vec2,
+    body: impl FnOnce(&mut Ui) -> R,
+) -> R {
+    let max_s = vec2(max_size.x.max(120.0), max_size.y.max(100.0));
+    let min_s = vec2(min_size.x.min(max_s.x), min_size.y.min(max_s.y));
+    let def_s = vec2(
+        default_size.x.clamp(min_s.x, max_s.x),
+        default_size.y.clamp(min_s.y, max_s.y),
+    );
+    let scroll_id = ui.make_persistent_id((&id, "scroll"));
+    let mut inner = None;
+    egui::Resize::default()
+        .id_salt((id, "resize"))
+        .default_size(def_s)
+        .min_size(min_s)
+        .max_size(max_s)
+        .show(ui, |ui| {
+            egui::ScrollArea::both()
+                .id_salt(scroll_id)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    inner = Some(body(ui));
+                });
+        });
+    inner.expect("Resize body always runs")
+}
+
 /// A row of tabs over a hairline; sets `current` to the one clicked.
+/// Scrolls horizontally when the window is too narrow for every tab to fit.
 pub(crate) fn tabs<T: Copy + PartialEq>(
     ui: &mut Ui,
     current: &mut T,
@@ -402,18 +494,23 @@ pub(crate) fn tabs<T: Copy + PartialEq>(
     size: f32,
     mut hover: impl FnMut(T, Response),
 ) {
-    let r = ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 2.0;
-        for (t, name) in items {
-            let resp = tab(ui, *current == t, name, size);
-            if resp.clicked() {
-                *current = t;
-            }
-            hover(t, resp);
-        }
-    });
-    let y = r.response.rect.bottom();
     let x = ui.max_rect().x_range();
+    let r = egui::ScrollArea::horizontal()
+        .id_salt("palette-tabs-scroll")
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                for (t, name) in items {
+                    let resp = tab(ui, *current == t, name, size);
+                    if resp.clicked() {
+                        *current = t;
+                    }
+                    hover(t, resp);
+                }
+            })
+        });
+    let y = r.inner_rect.bottom();
     ui.painter()
         .hline(x, y - 0.5, Stroke::new(1.0, cat().surface0));
 }
@@ -481,5 +578,143 @@ mod tests {
                 assert!(contrast(c, bg) >= 4.5, "{c:?} on {bg:?}");
             }
         }
+    }
+
+    #[test]
+    fn popup_window_stays_inside_viewport_with_oversized_content() {
+        let ctx = egui::Context::default();
+        install(&ctx);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(640.0, 420.0));
+        let id = egui::Id::unique("test-oversized-popup");
+        for _ in 0..3 {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..egui::RawInput::default()
+                },
+                |ui| {
+                    popup_window(ui.ctx(), "Oversized")
+                        .id(id)
+                        .collapsible(false)
+                        .default_width(600.0)
+                        .show(ui.ctx(), |ui| {
+                            for i in 0..60 {
+                                ui.label(format!("Row {i}: {}", "wide content ".repeat(12)));
+                            }
+                        });
+                },
+            );
+            out.textures_delta.clear();
+        }
+        let rect = egui::AreaState::load(&ctx, id).unwrap().rect();
+        assert!(
+            rect.left() >= screen.left() && rect.right() <= screen.right(),
+            "popup horizontally escaped viewport: {rect:?} vs {screen:?}"
+        );
+        assert!(
+            rect.top() >= screen.top() && rect.bottom() <= screen.bottom(),
+            "popup vertically escaped viewport: {rect:?} vs {screen:?}"
+        );
+    }
+
+    #[test]
+    fn resizable_scroll_popup_stays_inside_viewport() {
+        let ctx = egui::Context::default();
+        install(&ctx);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(500.0, 360.0));
+        let mut drawn_rect = egui::Rect::NOTHING;
+        for _ in 0..3 {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..egui::RawInput::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let max = dropdown_max_size(ui.ctx(), 72.0);
+                        drawn_rect = ui
+                            .scope(|ui| {
+                                resizable_scroll_popup(
+                                    ui,
+                                    "test-dropdown",
+                                    vec2(420.0, 460.0),
+                                    vec2(220.0, 120.0),
+                                    max,
+                                    |ui| {
+                                        ui.allocate_space(vec2(900.0, 1200.0));
+                                    },
+                                );
+                            })
+                            .response
+                            .rect;
+                    });
+                },
+            );
+            out.textures_delta.clear();
+        }
+        assert!(
+            drawn_rect.width() <= screen.width() && drawn_rect.height() <= screen.height(),
+            "dropdown popup overflowed viewport: {drawn_rect:?} vs {screen:?}"
+        );
+    }
+
+    #[test]
+    fn tabs_scroll_horizontally_when_narrow() {
+        let ctx = egui::Context::default();
+        install(&ctx);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(320.0, 200.0));
+        let items = [
+            (0u8, "Overview"),
+            (1, "Characters"),
+            (2, "Words"),
+            (3, "Sections"),
+            (4, "Suggested words"),
+            (5, "Notes & method"),
+        ];
+        let mut cur = 0u8;
+        let mut last_tab_before = egui::Rect::NOTHING;
+        let mut last_tab_after = egui::Rect::NOTHING;
+        for step in 0..5 {
+            let mut events = Vec::new();
+            if step == 2 {
+                events.push(egui::Event::PointerMoved(egui::pos2(80.0, 20.0)));
+                events.push(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(-180.0, 0.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                    source: egui::MouseWheelSource::Unknown,
+                });
+            }
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..egui::RawInput::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        tabs(ui, &mut cur, items, 15.0, |t, r| {
+                            if t == 5 {
+                                if step == 1 {
+                                    last_tab_before = r.rect;
+                                } else if step == 4 {
+                                    last_tab_after = r.rect;
+                                }
+                            }
+                        });
+                    });
+                },
+            );
+            out.textures_delta.clear();
+        }
+        assert!(
+            last_tab_before.right() > screen.right(),
+            "expected 6 tabs to exceed narrow 320px viewport: {last_tab_before:?}"
+        );
+        assert!(
+            last_tab_after.left() < last_tab_before.left() - 10.0,
+            "expected horizontal scroll to move rightmost tab into view: before={last_tab_before:?}, after={last_tab_after:?}"
+        );
     }
 }

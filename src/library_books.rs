@@ -872,17 +872,27 @@ impl App {
                     egui::Popup::from_toggle_button_response(&r)
                         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                         .show(|ui| {
-                            let choices = if kind == FilterKind::Choice {
-                                data.choices(*c)
-                            } else {
-                                Vec::new()
-                            };
-                            let sp = if kind == FilterKind::Range {
-                                span(&data, *c)
-                            } else {
-                                (0.0, 0.0)
-                            };
-                            changed = filter_editor(ui, *c, kind, &mut nf, &choices, sp);
+                            let max = palette::dropdown_max_size(ui.ctx(), 60.0);
+                            palette::resizable_scroll_popup(
+                                ui,
+                                ("lib-filter-chip", *c),
+                                egui::vec2(260.0, 260.0),
+                                egui::vec2(180.0, 90.0),
+                                max,
+                                |ui| {
+                                    let choices = if kind == FilterKind::Choice {
+                                        data.choices(*c)
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    let sp = if kind == FilterKind::Range {
+                                        span(&data, *c)
+                                    } else {
+                                        (0.0, 0.0)
+                                    };
+                                    changed = filter_editor(ui, *c, kind, &mut nf, &choices, sp);
+                                },
+                            );
                         });
                     if changed {
                         acts.push(Act::Filter(*c, nf));
@@ -999,9 +1009,19 @@ impl App {
                             egui::Popup::from_toggle_button_response(&r)
                                 .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                                 .show(|ui| {
-                                    ui.strong(&name);
-                                    let choices = if kind == FilterKind::Choice { data.choices(c) } else { Vec::new() };
-                                    changed = filter_editor(ui, c, kind, &mut nf, &choices, span(&data, c));
+                                    let max = palette::dropdown_max_size(ui.ctx(), 60.0);
+                                    palette::resizable_scroll_popup(
+                                        ui,
+                                        ("lib-filter-col", c),
+                                        egui::vec2(260.0, 260.0),
+                                        egui::vec2(180.0, 90.0),
+                                        max,
+                                        |ui| {
+                                            ui.strong(&name);
+                                            let choices = if kind == FilterKind::Choice { data.choices(c) } else { Vec::new() };
+                                            changed = filter_editor(ui, c, kind, &mut nf, &choices, span(&data, c));
+                                        },
+                                    );
                                 });
                             if changed {
                                 acts.push(Act::Filter(c, nf));
@@ -1125,11 +1145,12 @@ impl App {
         let mut open = true;
         let mut changed = false;
         let st = &mut self.columns;
-        egui::Window::new("Library columns")
+        let max_inner = palette::popup_max_inner(ctx, palette::popup_bounds(ctx));
+        palette::popup_window(ctx, "Library columns")
             .open(&mut open)
-            .resizable(false)
             .collapsible(false)
-            .default_width(380.0)
+            .default_width(380.0_f32.min(max_inner.x))
+            .default_height((max_inner.y * 0.8).min(520.0))
             .show(ctx, |ui| {
                 ui.label(icons::rich(ui, RichText::new(format!("Book and {BOOK_OPEN} Read are always first; {CHECK} Read and {X} always last.")).weak()));
                 ui.add_space(4.0);

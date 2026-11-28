@@ -237,14 +237,13 @@ impl App {
         };
         let mut open = true;
         let mut act: Option<ReadAct> = None;
-        egui::Window::new(format!("Mark read: {}", d.title))
+        let max_inner = crate::palette::popup_max_inner(ctx, crate::palette::popup_bounds(ctx));
+        crate::palette::popup_window(ctx, format!("Mark read: {}", d.title))
             .id(egui::Id::unique("read_dialog"))
             .open(&mut open)
             .collapsible(false)
-            .resizable(false)
-            .default_width(520.0)
+            .default_width(520.0_f32.min(max_inner.x))
             .show(ctx, |ui| {
-                ui.set_max_width(520.0);
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Count as known the");
                     ui.add(

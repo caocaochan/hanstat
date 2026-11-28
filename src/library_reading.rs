@@ -694,10 +694,13 @@ impl App {
             return;
         };
         let mut close = false;
-        egui::Window::new("Remove reading stats")
+        let bounds = palette::popup_bounds(ctx);
+        let max_inner = palette::popup_max_inner(ctx, bounds);
+        palette::popup_window(ctx, "Remove reading stats")
             .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_width(400.0_f32.min(max_inner.x))
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(bounds.center())
             .show(ctx, |ui| {
                 ui.label(format!(
                     "Remove the time and characters read in “{title}”? This can't be undone."

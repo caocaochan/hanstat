@@ -398,23 +398,43 @@ impl Audiobook {
 
     pub fn show(&mut self, ctx: &egui::Context) -> Action {
         self.poll();
+        let bounds = crate::palette::popup_bounds(ctx);
+        let max_size = egui::vec2(
+            (bounds.width() - 18.0).max(200.0),
+            (bounds.height() - 18.0).max(120.0),
+        );
+        let loaded = self.form.is_some();
+        let default_w = 490.0_f32.clamp(240.0_f32.min(max_size.x), max_size.x);
+        let default_h = if loaded {
+            max_size.y
+        } else {
+            100.0_f32.min(max_size.y)
+        };
+        let min_size = egui::vec2(240.0_f32.min(max_size.x), 80.0_f32.min(max_size.y));
         let response = egui::Modal::new(egui::Id::unique("export-audiobook")).show(ctx, |ui| {
-            let available = ctx.content_rect().size();
-            ui.set_width((available.x - 30.0).clamp(240.0, 490.0));
-            ui.heading("Export audiobook");
-            let body_height = (available.y - 70.0).max(1.0);
-            if self.form.as_ref().is_some_and(|form| form.reset_scroll) {
-                reset_scroll(ui, BODY_SCROLL);
-            }
-            // An Area starts layout with its previous size. Give the scroll
-            // area room to grow past the loading message's height.
-            egui::ScrollArea::vertical()
-                .id_salt(BODY_SCROLL)
-                .max_height(body_height)
-                .min_scrolled_height(body_height)
-                .auto_shrink([false, true])
-                .show(ui, |ui| self.content(ui))
-                .inner
+            let mut action = Action::Keep;
+            egui::Resize::default()
+                .id_salt(("export-audiobook-resize", loaded))
+                .default_size(egui::vec2(default_w, default_h))
+                .min_size(min_size)
+                .max_size(max_size)
+                .show(ui, |ui| {
+                    ui.heading("Export audiobook");
+                    let body_height = (ui.available_height() - 4.0).max(1.0);
+                    if self.form.as_ref().is_some_and(|form| form.reset_scroll) {
+                        reset_scroll(ui, BODY_SCROLL);
+                    }
+                    // An Area starts layout with its previous size. Give the scroll
+                    // area room to grow past the loading message's height.
+                    action = egui::ScrollArea::both()
+                        .id_salt(BODY_SCROLL)
+                        .max_height(body_height)
+                        .min_scrolled_height(if loaded { body_height } else { 0.0 })
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| self.content(ui))
+                        .inner;
+                });
+            action
         });
         if matches!(response.inner, Action::Keep) && self.job.is_none() && response.should_close() {
             Action::Close
@@ -599,7 +619,12 @@ impl Form {
                 self.selected.fill(false);
             }
         });
-        let chapter_height = (ui.ctx().content_rect().height() * 0.30).clamp(55.0, 245.0);
+        let modal_h = ui
+            .ctx()
+            .content_rect()
+            .height()
+            .min(ui.available_height() + 90.0);
+        let chapter_height = (modal_h * 0.30).clamp(55.0, 245.0);
         if std::mem::take(&mut self.reset_scroll) {
             reset_scroll(ui, CHAPTER_SCROLL);
         }

@@ -339,22 +339,22 @@ impl Tts {
             return;
         }
         let mut open = true;
-        egui::Window::new("Design a voice")
+        let max_inner = crate::palette::popup_max_inner(ctx, crate::palette::popup_bounds(ctx));
+        crate::palette::popup_window(ctx, "Design a voice")
             .id(egui::Id::unique("reader-tts-designer"))
             .open(&mut open)
             .collapsible(false)
-            .default_width(460.0)
+            .default_width(460.0_f32.min(max_inner.x))
+            .default_height((max_inner.y * 0.85).min(560.0))
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    self.design_download_row(ui);
-                    ui.separator();
-                    self.make_sample_form(ui, spine);
-                    ui.separator();
-                    self.kept_voices(ui);
-                    if let Some(e) = &self.local.designer.error {
-                        ui.colored_label(RED, e);
-                    }
-                });
+                self.design_download_row(ui);
+                ui.separator();
+                self.make_sample_form(ui, spine);
+                ui.separator();
+                self.kept_voices(ui);
+                if let Some(e) = &self.local.designer.error {
+                    ui.colored_label(RED, e);
+                }
             });
         if !open {
             self.close_design_window();

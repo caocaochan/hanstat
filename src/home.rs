@@ -869,14 +869,16 @@ impl App {
             || target.read_chars > 0
             || target.listen_secs >= 1.0
             || target.finished;
-        egui::Window::new("Reset reading data")
+        let bounds = palette::popup_bounds(ctx);
+        let max_inner = palette::popup_max_inner(ctx, bounds);
+        palette::popup_window(ctx, "Reset reading data")
             .id(egui::Id::unique("home_reset_reading"))
             .collapsible(false)
-            .resizable(false)
             .open(&mut open)
-            .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .default_width(420.0_f32.min(max_inner.x))
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(bounds.center())
             .show(ctx, |ui| {
-                ui.set_max_width(420.0);
                 if has_timed {
                     let mut parts = Vec::new();
                     if target.read_secs >= 1.0 || target.read_chars > 0 {
