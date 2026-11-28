@@ -66,6 +66,7 @@ pub struct EstimateInputs {
 pub struct Make {
     pub traditional: bool,
     pub translations: bool,
+    pub audio: bool,
     pub folder: PathBuf,
 }
 
@@ -87,6 +88,9 @@ pub enum Task {
         before: Record,
         lessons: Vec<Lesson>,
     },
+    /// Download native chapter audio for an already-imported book (without
+    /// rebuilding its EPUB).
+    DownloadAudio(Record),
     SignIn {
         email: String,
         password: String,
@@ -134,6 +138,11 @@ pub enum Event {
         record: Record,
         id: String,
         before: Option<Record>,
+    },
+    /// Native audio downloaded for an imported book's chapters: `(lesson_id, audio_hash)`.
+    AudioDownloaded {
+        course: u64,
+        chapters: Vec<(String, String)>,
     },
     /// A check of every book asked for is over.
     Checked,
@@ -218,6 +227,25 @@ impl Shared {
     fn cached_crd(&self, l: &Lesson) -> Option<Crd> {
         let b = store::read_cached(&store::crd_path(&self.root, &l.id, l.crd_hash()))?;
         Crd::parse(&b).ok()
+    }
+
+    /// A chapter's native MP3 audio: kept in the cache if present, or fetched.
+    /// Returns its hash (`None` if the lesson has no audio URL).
+    fn audio(&self, l: &Lesson) -> Result<Option<String>, Error> {
+        let Some(url) = l.audio_url.as_deref().filter(|u| !u.is_empty()) else {
+            return Ok(None);
+        };
+        let hash = l.audio_hash();
+        if hash.is_empty() {
+            return Ok(None);
+        }
+        let path = store::audio_path(&self.root, &l.id, hash);
+        if path.is_file() {
+            return Ok(Some(hash.to_owned()));
+        }
+        let bytes = self.client.file(url)?;
+        store::write_cached(&path, &bytes).map_err(Error::Other)?;
+        Ok(Some(hash.to_owned()))
     }
 
     fn cover(&self, c: &Course) -> Option<Vec<u8>> {
@@ -489,6 +517,7 @@ fn run(s: &Shared, task: Task) {
             let make = Make {
                 traditional: before.traditional,
                 translations: before.translations,
+                audio: before.audio,
                 folder: before.path.parent().map(PathBuf::from).unwrap_or_default(),
             };
             match build(s, &before.course, &lessons, &make, Some(&before)) {
@@ -498,6 +527,12 @@ fn run(s: &Shared, task: Task) {
                     before: Some(before),
                 }),
                 Err(e) => s.failed(Some(id), e),
+            }
+        }
+        Task::DownloadAudio(record) => {
+            let id = record.course.id;
+            if let Err(e) = download_audio(s, record) {
+                s.failed(Some(id), e);
             }
         }
         Task::SignIn { email, password } => {
@@ -614,8 +649,9 @@ fn catalogue(s: &Shared, force: bool) {
     });
 }
 
-/// Fetch the texts of `lessons` that are readable, saying how far it got.
-fn fetch_texts(s: &Shared, course: u64, lessons: &[Lesson]) -> Result<(), Error> {
+/// Fetch the texts (and, if `audio`, native audio) of `lessons` that are
+/// readable, saying how far it got.
+fn fetch_chapters(s: &Shared, course: u64, lessons: &[Lesson], audio: bool) -> Result<(), Error> {
     let want: Vec<&Lesson> = lessons.iter().filter(|l| l.readable()).collect();
     for (i, l) in want.iter().enumerate() {
         s.send(Event::Progress {
@@ -624,6 +660,9 @@ fn fetch_texts(s: &Shared, course: u64, lessons: &[Lesson]) -> Result<(), Error>
             total: want.len(),
         });
         s.crd(l)?;
+        if audio {
+            s.audio(l)?;
+        }
     }
     Ok(())
 }
@@ -641,7 +680,7 @@ fn import(s: &Shared, c: Course, make: Make) -> Result<(), Error> {
             c.title
         )));
     }
-    fetch_texts(s, c.id, &lessons)?;
+    fetch_chapters(s, c.id, &lessons, make.audio)?;
     let course = lessons
         .iter()
         .find_map(|l| l.course.clone())
@@ -652,6 +691,56 @@ fn import(s: &Shared, c: Course, make: Make) -> Result<(), Error> {
         record,
         id,
         before: None,
+    });
+    Ok(())
+}
+
+fn download_audio(s: &Shared, record: Record) -> Result<(), Error> {
+    let course = record.course.id;
+    s.send(Event::Progress {
+        course,
+        done: 0,
+        total: 0,
+    });
+    let lessons = s.lessons(&record.course)?;
+    let by_id: BTreeMap<&str, &Lesson> = lessons
+        .iter()
+        .filter(|l| l.readable())
+        .map(|l| (l.id.as_str(), l))
+        .collect();
+    let targets: Vec<&Lesson> = record
+        .chapters
+        .iter()
+        .filter_map(|c| by_id.get(c.lesson.as_str()).copied())
+        .collect();
+    if targets.is_empty() {
+        return Err(Error::Other(format!(
+            "No chapter of {} can be downloaded right now",
+            record.course.title
+        )));
+    }
+    let mut downloaded = Vec::new();
+    for (i, l) in targets.iter().enumerate() {
+        s.send(Event::Progress {
+            course,
+            done: i,
+            total: targets.len(),
+        });
+        // Keep the `.crd` cached too, so playback has `syllable_times`.
+        s.crd(l)?;
+        if let Some(hash) = s.audio(l)? {
+            downloaded.push((l.id.clone(), hash));
+        }
+    }
+    if downloaded.is_empty() {
+        return Err(Error::Other(format!(
+            "{} has no audio available on DuChinese",
+            record.course.title
+        )));
+    }
+    s.send(Event::AudioDownloaded {
+        course,
+        chapters: downloaded,
     });
     Ok(())
 }
@@ -689,13 +778,53 @@ fn check(s: &Shared, before: Record, revisions: bool) -> Result<(), Error> {
         .unwrap_or_else(|| before.course.clone());
     let (added, revised) = changes(&before, &lessons);
     if added == 0 && (revised == 0 || !revisions) {
+        if before.audio {
+            // Download any missing or re-recorded audio without rebuilding the EPUB.
+            let by_id: BTreeMap<&str, &Lesson> = lessons
+                .iter()
+                .filter(|l| l.readable() && l.has_audio())
+                .map(|l| (l.id.as_str(), l))
+                .collect();
+            let mut need: Vec<&Lesson> = Vec::new();
+            for ch in &before.chapters {
+                if let Some(&l) = by_id.get(ch.lesson.as_str()) {
+                    let hash = l.audio_hash();
+                    let changed = revisions && ch.audio != hash;
+                    let missing = ch.audio.is_empty()
+                        || !store::audio_path(&s.root, &ch.lesson, &ch.audio).is_file();
+                    if changed || missing {
+                        need.push(l);
+                    }
+                }
+            }
+            if !need.is_empty() {
+                let mut downloaded = Vec::new();
+                for (i, l) in need.iter().enumerate() {
+                    s.send(Event::Progress {
+                        course: before.course.id,
+                        done: i,
+                        total: need.len(),
+                    });
+                    let _ = s.crd(l);
+                    if let Some(hash) = s.audio(l)? {
+                        downloaded.push((l.id.clone(), hash));
+                    }
+                }
+                if !downloaded.is_empty() {
+                    s.send(Event::AudioDownloaded {
+                        course: before.course.id,
+                        chapters: downloaded,
+                    });
+                }
+            }
+        }
         s.send(Event::Unchanged {
             course,
             checked: hanstat::history::now(),
         });
         return Ok(());
     }
-    fetch_texts(s, before.course.id, &lessons)?;
+    fetch_chapters(s, before.course.id, &lessons, before.audio)?;
     let mut before = before;
     before.course = course;
     s.send(Event::Fetched {
@@ -737,13 +866,28 @@ fn build(
         texts.push(super::data::text(&crd, make.traditional));
     }
     // Chapters already in the book stay, even if DuChinese dropped them.
-    let mut chapters: Vec<(String, Text, String, String, String)> = Vec::new();
+    // (lesson, text, label, crd_hash, audio_hash, release_at)
+    let mut chapters: Vec<(String, Text, String, String, String, String)> = Vec::new();
     for (i, (l, t)) in readable.iter().zip(&texts).enumerate() {
+        let audio = if make.audio && l.has_audio() {
+            let h = l.audio_hash();
+            if !h.is_empty() && store::audio_path(&s.root, &l.id, h).is_file() {
+                h.to_owned()
+            } else {
+                String::new()
+            }
+        } else {
+            before
+                .and_then(|b| b.chapters.iter().find(|c| c.lesson == l.id))
+                .map(|c| c.audio.clone())
+                .unwrap_or_default()
+        };
         chapters.push((
             l.id.clone(),
             t.clone(),
             label(i + 1, t, l, course),
             l.crd_hash().to_owned(),
+            audio,
             l.release_at.clone().unwrap_or_default(),
         ));
     }
@@ -764,6 +908,7 @@ fn build(
                     super::data::text(&crd, make.traditional),
                     old.label.clone(),
                     old.crd.clone(),
+                    old.audio.clone(),
                     old.release.clone(),
                 ),
             );
@@ -778,7 +923,7 @@ fn build(
     let cover = s.cover(course);
     let newest = chapters
         .iter()
-        .map(|c| c.4.as_str())
+        .map(|c| c.5.as_str())
         .max()
         .unwrap_or("")
         .to_owned();
@@ -831,13 +976,15 @@ fn build(
         path,
         traditional: make.traditional,
         translations: make.translations,
+        audio: make.audio,
         chapters: chapters
             .into_iter()
             .map(|c| ChapterRec {
                 lesson: c.0,
                 label: c.2,
                 crd: c.3,
-                release: c.4,
+                audio: c.4,
+                release: c.5,
             })
             .collect(),
         locked,
@@ -1095,6 +1242,7 @@ mod tests {
         let make = Make {
             traditional: false,
             translations: true,
+            audio: false,
             folder: dir.path().to_path_buf(),
         };
         w.push(Task::Import(peach.clone(), make.clone()));

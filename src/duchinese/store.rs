@@ -1,7 +1,7 @@
 //! What is kept on disk: the imported stories ([`Records`], `duchinese.json`
 //! in the app folder: worth keeping) and a cache of what was fetched (the
-//! catalogue, chapter lists, chapter texts, covers and fit estimates, in
-//! `duchinese/` in the cache folder: fetched again if lost).
+//! catalogue, chapter lists, chapter texts, chapter audio, covers and fit
+//! estimates, in `duchinese/` in the cache folder: fetched again if lost).
 
 use super::data::{Course, Lesson};
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,9 @@ pub struct ChapterRec {
     pub label: String,
     /// The text's hash ([`Lesson::crd_hash`]): it changes when DuChinese edits it.
     pub crd: String,
+    /// The audio file's hash ([`Lesson::audio_hash`]), empty if not downloaded.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub audio: String,
     pub release: String,
 }
 
@@ -29,6 +32,8 @@ pub struct Record {
     pub path: PathBuf,
     pub traditional: bool,
     pub translations: bool,
+    /// Download and keep DuChinese's native chapter audio for this book.
+    pub audio: bool,
     pub chapters: Vec<ChapterRec>,
     /// Chapters released that the account couldn't read, left out.
     pub locked: u32,
@@ -89,6 +94,14 @@ impl Record {
         } else {
             format!("{have} chapter{}", if have == 1 { "" } else { "s" })
         }
+    }
+
+    /// Chapters of this book whose native audio is downloaded on disk.
+    pub fn audio_count(&self, root: &Path) -> usize {
+        self.chapters
+            .iter()
+            .filter(|c| !c.audio.is_empty() && audio_path(root, &c.lesson, &c.audio).is_file())
+            .count()
     }
 }
 
@@ -224,16 +237,58 @@ impl Chapters {
     }
 }
 
+fn clean_segment(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(80)
+        .collect()
+}
+
 /// A chapter's text file, by lesson and text hash (a new hash: a new file).
 pub fn crd_path(root: &Path, lesson: &str, hash: &str) -> PathBuf {
-    let clean = |s: &str| -> String {
-        s.chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-            .take(80)
-            .collect()
-    };
-    root.join("crd")
-        .join(format!("{}-{}.json", clean(lesson), clean(hash)))
+    root.join("crd").join(format!(
+        "{}-{}.json",
+        clean_segment(lesson),
+        clean_segment(hash)
+    ))
+}
+
+/// A chapter's native MP3 audio file, by lesson and audio hash.
+pub fn audio_path(root: &Path, lesson: &str, hash: &str) -> PathBuf {
+    root.join("audio").join(format!(
+        "{}-{}.mp3",
+        clean_segment(lesson),
+        clean_segment(hash)
+    ))
+}
+
+/// Find the newest cached file for `lesson` in `dir` (`{lesson}-*.{ext}`).
+/// Used as a fallback when a DuChinese EPUB is opened without a matching
+/// `duchinese.json` record (e.g. after the EPUB was moved).
+pub fn find_lesson_file(dir: &Path, lesson: &str, ext: &str) -> Option<PathBuf> {
+    let prefix = format!("{}-", clean_segment(lesson));
+    let suffix = format!(".{ext}");
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(s) = name.to_str() else { continue };
+        if !s.starts_with(&prefix) || !s.ends_with(&suffix) {
+            continue;
+        }
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
+            best = Some((mtime, path));
+        }
+    }
+    best.map(|(_, p)| p)
 }
 
 pub fn read_cached(path: &Path) -> Option<Vec<u8>> {
@@ -370,5 +425,23 @@ mod tests {
         assert_eq!(back.books, vec![a.clone()]);
         assert!(back.by_path(&dir.path().join("x.epub")).is_some());
         assert_eq!(back.get(5).unwrap().chapters.len(), 2);
+    }
+
+    #[test]
+    fn audio_paths_and_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut r = rec((2, 0), 2, 0, "2026-01-01");
+        r.chapters[0].audio = "aaa111".into();
+        r.chapters[1].audio = "bbb222".into();
+        assert_eq!(r.audio_count(root), 0);
+        let p0 = audio_path(root, "0", "aaa111");
+        write_cached(&p0, b"mp3-0").unwrap();
+        assert_eq!(r.audio_count(root), 1);
+        let p1 = audio_path(root, "1", "bbb222");
+        write_cached(&p1, b"mp3-1").unwrap();
+        assert_eq!(r.audio_count(root), 2);
+        assert_eq!(find_lesson_file(&root.join("audio"), "0", "mp3"), Some(p0));
+        assert_eq!(find_lesson_file(&root.join("audio"), "99", "mp3"), None);
     }
 }

@@ -12,7 +12,9 @@
 
 use super::audio::{self, Output};
 use super::azure::{Azure, Fail};
+use super::duchinese::{DecodedChapter, DuBook, TimedSentence, align_chapter};
 use super::{Speech, clip_path, local, opus, saved_clip, sentence_at};
+use crate::duchinese::data::Crd;
 use crate::reader::tree::Chapter;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
@@ -518,6 +520,8 @@ pub enum Cmd {
     /// The playback speed (1.0: as made).
     Playback(f32),
     Speech(Speech),
+    /// Whether to use downloaded DuChinese chapter audio when present.
+    PreferDu(bool),
     Client(Option<Arc<Azure>>),
     Availability(Availability),
     Pregenerate(Vec<usize>, Arc<Batch>),
@@ -549,6 +553,8 @@ pub struct Now {
     pub at: Option<(usize, Range<u32>)>,
     pub error: Option<String>,
     pub needs_setup: bool,
+    /// True while the active sentence is played from downloaded DuChinese audio.
+    pub using_duchinese: bool,
     /// While the sentence is being heard: when its voice started and ends.
     pub clock: Option<Clock>,
 }
@@ -575,7 +581,14 @@ pub struct Engine {
 
 impl Engine {
     /// `dir`: the book's folder of saved audio.
-    pub fn start(chapters: Chapters, dir: PathBuf, speech: Speech, repaint: Repaint) -> Engine {
+    pub fn start(
+        chapters: Chapters,
+        dir: PathBuf,
+        speech: Speech,
+        du: Option<Arc<DuBook>>,
+        prefer_du: bool,
+        repaint: Repaint,
+    ) -> Engine {
         let (tx, rx) = channel();
         let now = Arc::new(Mutex::new(Now::default()));
         {
@@ -583,7 +596,7 @@ impl Engine {
             let _ = std::thread::Builder::new()
                 .name("tts-player".into())
                 .spawn(move || {
-                    let mut p = Player::new(chapters, dir, speech, now, repaint);
+                    let mut p = Player::new(chapters, dir, speech, du, prefer_du, now, repaint);
                     p.run(rx);
                 });
         }
@@ -672,6 +685,13 @@ struct Player {
     needs_setup: bool,
     sentences: HashMap<usize, Arc<Vec<Range<u32>>>>,
     paras: HashMap<usize, Arc<Vec<usize>>>,
+    /// Native DuChinese chapter audio resolver (for DuChinese EPUBs).
+    du: Option<Arc<DuBook>>,
+    prefer_du: bool,
+    /// Aligned DuChinese sentence timing per spine (`None`: unavailable/invalid).
+    du_aligned: HashMap<usize, Option<Arc<Vec<TimedSentence>>>>,
+    /// Most recently decoded DuChinese chapter MP3 and its sentence cuts.
+    du_decoded: Option<(usize, Arc<DecodedChapter>)>,
     /// Stopped: the device closes at this time, once the sound faded out.
     closing: Option<Instant>,
     /// The clip heard and its clock.
@@ -708,6 +728,8 @@ impl Player {
         chapters: Chapters,
         dir: PathBuf,
         speech: Speech,
+        du: Option<Arc<DuBook>>,
+        prefer_du: bool,
         now: Arc<Mutex<Now>>,
         repaint: Repaint,
     ) -> Player {
@@ -732,11 +754,60 @@ impl Player {
             needs_setup: false,
             sentences: HashMap::new(),
             paras: HashMap::new(),
+            du,
+            prefer_du,
+            du_aligned: HashMap::new(),
+            du_decoded: None,
             closing: None,
             clock: None,
             playback: 1.0,
             resume_at: None,
         }
+    }
+
+    /// DuChinese synced sentences for chapter `spine`, if enabled and both the
+    /// `.crd` and `.mp3` are cached on disk and align with the chapter's text.
+    fn du_sentences(&mut self, spine: usize) -> Option<Arc<Vec<TimedSentence>>> {
+        if !self.prefer_du {
+            return None;
+        }
+        if let Some(cached) = self.du_aligned.get(&spine) {
+            return cached.clone();
+        }
+        let du = self.du.as_ref()?.clone();
+        let ch = self.chapter(spine)?;
+        let aligned = du
+            .chapter_files(spine)
+            .and_then(|(crd_path, _)| std::fs::read(crd_path).ok())
+            .and_then(|bytes| Crd::parse(&bytes).ok())
+            .and_then(|crd| align_chapter(&ch, &crd, du.traditional))
+            .map(Arc::new);
+        if self.du_aligned.len() > 8 {
+            self.du_aligned.clear();
+        }
+        self.du_aligned.insert(spine, aligned.clone());
+        aligned
+    }
+
+    /// Decoded DuChinese PCM for chapter `spine`, decoding once per chapter.
+    fn du_chapter(
+        &mut self,
+        spine: usize,
+        timed: &[TimedSentence],
+    ) -> Result<Arc<DecodedChapter>, String> {
+        if let Some((s, dec)) = &self.du_decoded
+            && *s == spine
+        {
+            return Ok(dec.clone());
+        }
+        let (_, audio_path) = self
+            .du
+            .as_ref()
+            .and_then(|d| d.chapter_files(spine))
+            .ok_or_else(|| "DuChinese audio file is missing".to_owned())?;
+        let dec = Arc::new(DecodedChapter::load(&audio_path, timed)?);
+        self.du_decoded = Some((spine, dec.clone()));
+        Ok(dec)
     }
 
     fn chapter(&self, spine: usize) -> Option<Arc<Chapter>> {
@@ -753,7 +824,11 @@ impl Player {
             return Some(s.clone());
         }
         let ch = self.chapter(spine)?;
-        let s = Arc::new(super::sentences_of(&ch));
+        let s = if let Some(timed) = self.du_sentences(spine) {
+            Arc::new(timed.iter().map(|t| t.range.clone()).collect())
+        } else {
+            Arc::new(super::sentences_of(&ch))
+        };
         // Keep a few chapters.
         if self.sentences.len() > 8 {
             self.sentences.clear();
@@ -882,16 +957,18 @@ impl Player {
                 if !self.open_output() {
                     return;
                 }
-                let o = self.output.as_ref().unwrap();
-                o.clear();
+                self.output.as_ref().unwrap().clear();
                 // A short heading alone can finish before the following
-                // cloned sentence is ready. Buffer a few seconds first.
-                self.buffering = self
-                    .speech
-                    .local
-                    .as_ref()
-                    .is_some_and(|s| s.designed.is_some());
-                o.set_paused(self.buffering);
+                // cloned sentence is ready. Buffer a few seconds first
+                // (not needed when playing local DuChinese chapter audio).
+                let using_du = self.du_sentences(spine).is_some();
+                self.buffering = !using_du
+                    && self
+                        .speech
+                        .local
+                        .as_ref()
+                        .is_some_and(|s| s.designed.is_some());
+                self.output.as_ref().unwrap().set_paused(self.buffering);
                 self.queued.clear();
                 self.asked = None;
                 let Some(s) = self.sentences(spine) else {
@@ -943,9 +1020,11 @@ impl Player {
             Cmd::Speech(s) => {
                 if s != self.speech {
                     self.speech = s;
-                    // Heard from the current sentence again in the new voice.
+                    // Heard from the current sentence again in the new voice
+                    // (unless the current chapter is playing DuChinese audio).
                     if matches!(self.state, State::Loading | State::Playing | State::Paused)
                         && let Some((spine, idx)) = self.heard.or(self.cursor)
+                        && self.du_sentences(spine).is_none()
                         && let Some(s) = self.sentences(spine)
                         && let Some(r) = s.get(idx)
                     {
@@ -954,6 +1033,31 @@ impl Player {
                             spine,
                             src: r.start,
                         });
+                        if paused {
+                            self.command(Cmd::Pause);
+                        }
+                    }
+                }
+            }
+            Cmd::PreferDu(prefer) => {
+                if prefer != self.prefer_du {
+                    let restart =
+                        matches!(self.state, State::Loading | State::Playing | State::Paused)
+                            .then(|| {
+                                let (spine, idx) = self.heard.or(self.cursor)?;
+                                let r = self.sentences(spine)?.get(idx)?.clone();
+                                Some((spine, r.start, self.state == State::Paused))
+                            })
+                            .flatten();
+                    self.prefer_du = prefer;
+                    self.sentences.clear();
+                    self.paras.clear();
+                    self.du_aligned.clear();
+                    if !prefer {
+                        self.du_decoded = None;
+                    }
+                    if let Some((spine, src, paused)) = restart {
+                        self.command(Cmd::Play { spine, src });
                         if paused {
                             self.command(Cmd::Pause);
                         }
@@ -1164,6 +1268,49 @@ impl Player {
                 // Nothing playing: the sentence waited for is shown.
                 self.heard = Some(at);
             }
+            if let Some(timed) = self.du_sentences(at.0) {
+                if out.ahead() >= QUEUED_SECONDS || out.queued().len() >= 3 {
+                    return;
+                }
+                match self.du_chapter(at.0, &timed) {
+                    Ok(dec) => {
+                        let samples = dec.slice(at.1);
+                        let rate = dec.rate;
+                        let id = self.next_id;
+                        self.next_id += 1;
+                        let samples = audio::stretch_owned(samples, rate, self.playback);
+                        let samples = audio::resample_owned(samples, rate, out.rate);
+                        let start = match self.resume_at.take() {
+                            Some((a, frac)) if a == at => (samples.len() as f32 * frac) as usize,
+                            _ => 0,
+                        };
+                        out.push_at(id, samples, start);
+                        self.queued.insert(
+                            id,
+                            Queued {
+                                spine: at.0,
+                                idx: at.1,
+                            },
+                        );
+                        self.cursor = Some((at.0, at.1 + 1));
+                        continue;
+                    }
+                    Err(_) => {
+                        // Missing or unreadable MP3: fall back to TTS for this chapter.
+                        let src = timed.get(at.1).map(|t| t.range.start).unwrap_or(0);
+                        self.du_aligned.insert(at.0, None);
+                        self.sentences.remove(&at.0);
+                        self.paras.remove(&at.0);
+                        if self.du_decoded.as_ref().is_some_and(|(s, _)| *s == at.0) {
+                            self.du_decoded = None;
+                        }
+                        if let Some(s) = self.sentences(at.0) {
+                            self.cursor = Some((at.0, sentence_at(&s, src)));
+                        }
+                        continue;
+                    }
+                }
+            }
             if self.availability == Availability::Ready && !self.pool.workers.is_empty() {
                 self.ask(at);
             }
@@ -1373,6 +1520,15 @@ impl Player {
     }
 
     fn publish(&mut self) {
+        let using_duchinese = self.state != State::Stopped
+            && self.heard.or(self.cursor).is_some_and(|(spine, _)| {
+                self.prefer_du
+                    && self
+                        .du_aligned
+                        .get(&spine)
+                        .and_then(|v| v.as_ref())
+                        .is_some()
+            });
         let at = self.heard.and_then(|(spine, idx)| {
             self.sentences
                 .get(&spine)
@@ -1388,6 +1544,7 @@ impl Player {
             },
             error: self.error.clone(),
             needs_setup: self.needs_setup && self.state == State::Stopped,
+            using_duchinese,
             clock: self
                 .clock
                 .filter(|_| self.state == State::Playing)

@@ -514,6 +514,9 @@ impl Reader {
                 .map_err(|e| e.to_string())?;
         }
         let toc_labels = toc_labels(&epub.toc);
+        let du_audio = epub
+            .duchinese
+            .then(|| tts::duchinese::DuBook::open(path, &epub.spine, traditional));
         let tts = tts::Tts::new(
             chapters.clone(),
             chapter_labels(&epub, &toc_labels),
@@ -521,7 +524,8 @@ impl Reader {
             &epub.title,
             &book_id,
             ctx,
-        );
+        )
+        .with_duchinese(du_audio);
         let mut dict = popup::Popup::new(ctx, settings.freq_sort.clone(), dictionary);
         dict.cards.book = Arc::from(epub.title.as_str());
         let migrated = settings.anki.add_sentence_audio();

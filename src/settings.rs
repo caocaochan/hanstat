@@ -44,6 +44,9 @@ pub struct DuChinese {
     pub traditional: bool,
     /// Each paragraph followed by DuChinese's English translation of it.
     pub translations: bool,
+    /// Download DuChinese's native narration for each chapter; the reader
+    /// plays it synced to the text instead of TTS.
+    pub audio: bool,
     /// Check imported stories for new chapters and add them on their own.
     pub auto_update: bool,
 }
@@ -54,6 +57,7 @@ impl Default for DuChinese {
             folder: None,
             traditional: false,
             translations: false,
+            audio: true,
             auto_update: true,
         }
     }

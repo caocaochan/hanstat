@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.28.05] - 2026-11-28
+
+### Added
+- **DuChinese native audio download and text-synced playback.** The DuChinese window now has an **Audio** option (on by default for new imports) and an **Audio** button on already-imported stories to download DuChinese's native chapter narration alongside each chapter's text. In the Reader, **Read aloud** automatically plays the downloaded DuChinese audio synced to the text using DuChinese's timing data — with sentence highlighting, click-to-jump, playback speed control, pause-on-popup, and automatic page turns, without needing an Azure key or local TTS voice. Chapters without downloaded audio fall back to TTS, and you can switch back to Azure or local TTS anytime via **Use DuChinese audio** in the **Read aloud** panel.
+
 ## [2026.11.28.04] - 2026-11-28
 
 ### Fixed

@@ -447,7 +447,14 @@ fn reader_plays_the_cached_sentence_before_requesting_setup() {
     let sentences = crate::reader::tts::sentences(&chapter.chars);
     let chapters = Arc::new(Mutex::new(vec![Some(Arc::new(chapter))]));
     MUTE.store(true, Relaxed);
-    let engine = Engine::start(chapters, temp.path().to_owned(), speech, Arc::new(|| {}));
+    let engine = Engine::start(
+        chapters,
+        temp.path().to_owned(),
+        speech,
+        None,
+        false,
+        Arc::new(|| {}),
+    );
     engine.send(Cmd::Availability(Availability::Setup(
         "Set up the voice.".into(),
     )));

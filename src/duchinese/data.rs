@@ -132,6 +132,8 @@ pub struct Lesson {
     pub free: bool,
     /// Missing for a chapter the account can't read.
     pub crd_url: Option<String>,
+    /// Native narration MP3 on `static.duchinese.net`, if the account can read it.
+    pub audio_url: Option<String>,
     pub release_at: Option<String>,
     pub course: Option<Course>,
 }
@@ -147,6 +149,16 @@ impl Lesson {
     pub fn crd_hash(&self) -> &str {
         self.crd_url.as_deref().map_or("", crd_hash)
     }
+
+    /// Native audio is linked for this chapter.
+    pub fn has_audio(&self) -> bool {
+        self.audio_url.as_deref().is_some_and(|u| !u.is_empty())
+    }
+
+    /// The hash that names its audio file (it changes when re-recorded), or `""`.
+    pub fn audio_hash(&self) -> &str {
+        self.audio_url.as_deref().map_or("", audio_hash)
+    }
 }
 
 /// `https://static.duchinese.net/documents/1442/5b4b…bed9.crd?17937` → `5b4b…bed9`.
@@ -154,6 +166,13 @@ pub fn crd_hash(url: &str) -> &str {
     let path = url.split(['?', '#']).next().unwrap_or("");
     let name = path.rsplit('/').next().unwrap_or("");
     name.strip_suffix(".crd").unwrap_or(name)
+}
+
+/// `https://static.duchinese.net/documents/1442/9f7d…6853.mp3?16366` → `9f7d…6853`.
+pub fn audio_hash(url: &str) -> &str {
+    let path = url.split(['?', '#']).next().unwrap_or("");
+    let name = path.rsplit('/').next().unwrap_or("");
+    name.rsplit_once('.').map_or(name, |(stem, _)| stem)
 }
 
 /// Lessons in reading order: by `course_position`, the order served otherwise.
@@ -169,6 +188,10 @@ pub struct Crd {
     #[serde(deserialize_with = "string_or_number")]
     pub version: String,
     pub words: Vec<Word>,
+    /// Start time (in seconds) of each spoken syllable (counting whitespace-separated
+    /// tokens in each word's `pinyin`), with an optional final end timestamp.
+    #[serde(deserialize_with = "times")]
+    pub syllable_times: Vec<f64>,
     /// Where each sentence after the first begins, as an index into `words`.
     #[serde(deserialize_with = "indices")]
     pub sentence_indices: Vec<usize>,
@@ -183,6 +206,8 @@ pub struct Word {
     #[serde(deserialize_with = "string_or_number")]
     pub hanzi: String,
     pub tc_hanzi: Option<String>,
+    #[serde(deserialize_with = "string_or_number")]
+    pub pinyin: String,
 }
 
 impl Crd {
@@ -293,6 +318,140 @@ pub fn text(crd: &Crd, traditional: bool) -> Text {
     }
 }
 
+/// Per-block character timestamps extracted from a `.crd` file, in the exact
+/// block order produced by [`text`] (heading if present, then paragraphs).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ChapterTiming {
+    /// True when the `.crd`'s first line became the EPUB's `<h2>` heading.
+    /// When false, the EPUB's `<h2>` is a synthetic label not present in audio.
+    pub has_heading: bool,
+    /// `(text, char_times)` for each spoken block (heading if `has_heading`,
+    /// followed by each paragraph). `char_times.len() == text.chars().count()`.
+    pub blocks: Vec<(String, Vec<Option<f64>>)>,
+    /// End timestamp of the final spoken syllable, if provided.
+    pub end_time: Option<f64>,
+}
+
+/// Extract per-character syllable start times from `crd`, matching the exact
+/// text transformation of [`text`]. Returns `None` if `crd.syllable_times` is
+/// missing or inconsistent with the words' pinyin syllable count.
+pub fn timing(crd: &Crd, traditional: bool) -> Option<ChapterTiming> {
+    let total_syllables: usize = crd
+        .words
+        .iter()
+        .map(|w| w.pinyin.split_whitespace().count())
+        .sum();
+    if total_syllables == 0 || crd.syllable_times.is_empty() {
+        return None;
+    }
+    let n_times = crd.syllable_times.len();
+    // DuChinese serves `total_syllables + 1` (start of each syllable plus end
+    // of the last), or occasionally `total_syllables`. Reject mismatched arrays
+    // (more than 5% off) rather than producing drifting highlights.
+    let excess = if n_times < total_syllables {
+        total_syllables - n_times
+    } else {
+        n_times.saturating_sub(total_syllables + 1)
+    };
+    if excess * 20 > total_syllables {
+        return None;
+    }
+    let time_at = |syl: usize| -> Option<f64> {
+        let idx = if n_times >= total_syllables {
+            syl.min(n_times - 1)
+        } else {
+            (syl * (n_times - 1)) / total_syllables.max(1)
+        };
+        crd.syllable_times
+            .get(idx)
+            .copied()
+            .filter(|t| t.is_finite() && *t >= 0.0)
+    };
+
+    let mut paras: Vec<(Vec<char>, Vec<Option<f64>>)> = vec![(Vec::new(), Vec::new())];
+    let mut syl = 0usize;
+    for w in &crd.words {
+        let s = if traditional {
+            w.tc_hanzi
+                .as_deref()
+                .filter(|t| !t.is_empty())
+                .unwrap_or(&w.hanzi)
+        } else {
+            &w.hanzi
+        };
+        let k = w.pinyin.split_whitespace().count();
+        if s.contains('\n') {
+            for (part_idx, part) in s.split('\n').enumerate() {
+                if part_idx > 0 {
+                    paras.push((Vec::new(), Vec::new()));
+                }
+                let p = paras.last_mut().unwrap();
+                for c in part.chars() {
+                    p.0.push(c);
+                    p.1.push(None);
+                }
+            }
+            syl += k;
+            continue;
+        }
+        let chars: Vec<char> = s.chars().collect();
+        let m = chars.len();
+        let p = paras.last_mut().unwrap();
+        for (j, c) in chars.into_iter().enumerate() {
+            let t = if k == 0 {
+                None
+            } else {
+                let offset = if k <= m {
+                    j.min(k - 1)
+                } else {
+                    (j * k) / m.max(1)
+                };
+                time_at(syl + offset)
+            };
+            p.0.push(c);
+            p.1.push(t);
+        }
+        syl += k;
+    }
+
+    let blocks: Vec<(String, Vec<Option<f64>>)> = paras
+        .into_iter()
+        .filter_map(|(chars, times)| {
+            // Mirror `t.trim().trim_start_matches('\u{3000}').trim()` exactly.
+            let mut a = 0;
+            let mut b = chars.len();
+            while a < b && (chars[a].is_whitespace() || chars[a] == '\u{3000}') {
+                a += 1;
+            }
+            while b > a && chars[b - 1].is_whitespace() {
+                b -= 1;
+            }
+            if a == b {
+                return None;
+            }
+            let text: String = chars[a..b].iter().collect();
+            Some((text, times[a..b].to_vec()))
+        })
+        .collect();
+    if blocks.is_empty() {
+        return None;
+    }
+    let has_heading = blocks.len() > 1
+        && blocks[0].0.chars().count() <= MAX_HEADING
+        && !blocks[0]
+            .0
+            .contains(['。', '！', '？', '!', '?', '…', '；']);
+    let end_time = (n_times > total_syllables)
+        .then(|| crd.syllable_times.get(total_syllables).copied())
+        .flatten()
+        .filter(|t| t.is_finite() && *t >= 0.0);
+    Some(ChapterTiming {
+        has_heading,
+        blocks,
+        end_time,
+    })
+}
+
 fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
@@ -315,6 +474,17 @@ fn indices<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<usize>, D::Error> {
         .filter_map(|x| match x {
             serde_json::Value::Number(n) => n.as_u64().map(|n| n as usize),
             serde_json::Value::String(s) => s.trim().parse().ok(),
+            _ => None,
+        })
+        .collect())
+}
+
+fn times<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<f64>, D::Error> {
+    let v = Option::<Vec<serde_json::Value>>::deserialize(d)?.unwrap_or_default();
+    Ok(v.iter()
+        .filter_map(|x| match x {
+            serde_json::Value::Number(n) => n.as_f64().filter(|f| f.is_finite()),
+            serde_json::Value::String(s) => s.trim().parse::<f64>().ok().filter(|f| f.is_finite()),
             _ => None,
         })
         .collect())
@@ -407,6 +577,7 @@ mod tests {
             r#"[{"id":"2562","free":false,"locked":true,"course_position":1,"title":"T"},
                 {"id":2561,"free":true,"locked":false,"course_position":0,
                  "crd_url":"https://static.duchinese.net/documents/2561/abc123.crd?1",
+                 "audio_url":"https://static.duchinese.net/documents/2561/def456.mp3?9",
                  "course":{"id":124,"levels":null,"lesson_count":2,"placeholder_count":3,
                            "group":"short_stories","lessons_url":"/lessons/courses/124-x/lessons.json"}}]"#,
         )
@@ -415,6 +586,8 @@ mod tests {
         assert_eq!(l[0].id, "2561");
         assert!(l[0].readable() && !l[1].readable());
         assert_eq!(l[0].crd_hash(), "abc123");
+        assert!(l[0].has_audio() && !l[1].has_audio());
+        assert_eq!(l[0].audio_hash(), "def456");
         let c = l[0].course.as_ref().unwrap();
         assert_eq!(c.announced(), 5);
         assert!(c.is_story());
@@ -427,5 +600,56 @@ mod tests {
             Level::parse("upper_intermediate"),
             Some(Level::UpperIntermediate)
         );
+    }
+
+    #[test]
+    fn timing_maps_syllables_including_numbers_and_erhua() {
+        let raw = r#"{
+            "version": "2",
+            "words": [
+                {"hanzi": "刘备", "tc_hanzi": "劉備", "pinyin": "liú bèi"},
+                {"hanzi": "\n\n"},
+                {"hanzi": "这", "tc_hanzi": "這", "pinyin": "zhè"},
+                {"hanzi": "2000", "pinyin": "2"},
+                {"hanzi": "年", "pinyin": "nián"},
+                {"hanzi": "有点儿", "tc_hanzi": "有點兒", "pinyin": "yǒu diǎn'r"},
+                {"hanzi": "冷", "pinyin": "lěng"},
+                {"hanzi": "。"}
+            ],
+            "syllable_times": [0.5, 1.0, 2.0, 2.5, 3.0, 3.4, 3.8, 4.2, 5.0]
+        }"#;
+        let crd = Crd::parse(raw.as_bytes()).unwrap();
+        let t = timing(&crd, false).unwrap();
+        assert!(t.has_heading);
+        assert_eq!(t.end_time, Some(5.0));
+        assert_eq!(t.blocks.len(), 2);
+        assert_eq!(t.blocks[0].0, "刘备");
+        assert_eq!(t.blocks[0].1, vec![Some(0.5), Some(1.0)]);
+        assert_eq!(t.blocks[1].0, "这2000年有点儿冷。");
+        assert_eq!(
+            t.blocks[1].1,
+            vec![
+                Some(2.0), // 这
+                Some(2.5), // 2
+                Some(2.5), // 0
+                Some(2.5), // 0
+                Some(2.5), // 0
+                Some(3.0), // 年
+                Some(3.4), // 有
+                Some(3.8), // 点
+                Some(3.8), // 儿
+                Some(4.2), // 冷
+                None,      // 。
+            ]
+        );
+        // Traditional text has the same timestamps.
+        let tc = timing(&crd, true).unwrap();
+        assert_eq!(tc.blocks[0].0, "劉備");
+        assert_eq!(tc.blocks[1].0, "這2000年有點兒冷。");
+        assert_eq!(tc.blocks[1].1, t.blocks[1].1);
+
+        // Missing or wildly mismatched syllable_times returns None.
+        let bad = Crd::parse(CRD.as_bytes()).unwrap();
+        assert!(timing(&bad, false).is_none());
     }
 }

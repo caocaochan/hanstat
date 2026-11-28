@@ -16,6 +16,7 @@
 pub mod audio;
 pub(in crate::reader) mod audiobook;
 pub mod azure;
+pub mod duchinese;
 mod engine;
 pub mod key;
 pub mod local;
@@ -51,6 +52,9 @@ pub struct TtsSettings {
     pub playback: f32,
     /// The dictionary popup pauses reading while it is open.
     pub pause_for_popup: bool,
+    /// Play downloaded DuChinese native chapter audio instead of TTS when
+    /// available for a DuChinese book.
+    pub prefer_duchinese_audio: bool,
     /// Who reads: Azure or the local voice.
     pub source: Source,
     pub local: local::LocalSettings,
@@ -74,6 +78,7 @@ impl Default for TtsSettings {
             rate: 0,
             playback: 1.0,
             pause_for_popup: true,
+            prefer_duchinese_audio: true,
             source: Source::Azure,
             local: local::LocalSettings::default(),
         }
@@ -536,6 +541,11 @@ pub struct Tts {
     sent_speech: Option<Speech>,
     sent_client: Option<(String, String)>,
     sent_availability: Availability,
+    sent_prefer_du: Option<bool>,
+    /// Native DuChinese chapter audio resolver (for DuChinese EPUBs).
+    du: Option<Arc<duchinese::DuBook>>,
+    /// Cached `(chapters_with_audio, total_chapters)` for `du`.
+    du_coverage: Option<(usize, usize)>,
     batch: Option<Arc<Batch>>,
     /// This book's folder of saved audio.
     dir: PathBuf,
@@ -605,6 +615,9 @@ impl Tts {
             sent_speech: None,
             sent_client: None,
             sent_availability: Availability::Waiting,
+            sent_prefer_du: None,
+            du: None,
+            du_coverage: None,
             batch: None,
             cache_size: None,
             cache_job: None,
@@ -626,6 +639,17 @@ impl Tts {
             paused_by_popup: false,
             paused_until: None,
         }
+    }
+
+    /// Attach a DuChinese native-audio resolver for this book.
+    pub fn with_duchinese(mut self, du: Option<duchinese::DuBook>) -> Self {
+        self.du_coverage = du.as_ref().map(duchinese::DuBook::coverage);
+        self.du = du.map(Arc::new);
+        self
+    }
+
+    fn du_active_at(&self, spine: usize, s: &TtsSettings) -> bool {
+        s.prefer_duchinese_audio && self.du.as_ref().is_some_and(|d| d.chapter_has_audio(spine))
     }
 
     fn speech(&self, s: &TtsSettings) -> Speech {
@@ -693,11 +717,14 @@ impl Tts {
                 self.chapters.clone(),
                 self.dir.clone(),
                 self.speech(s),
+                self.du.clone(),
+                s.prefer_duchinese_audio,
                 self.repaint.clone(),
             ));
             self.sent_speech = Some(self.speech(s));
             self.sent_client = None;
             self.sent_availability = Availability::Waiting;
+            self.sent_prefer_du = Some(s.prefer_duchinese_audio);
             let e = self.engine.as_ref().unwrap();
             e.send(Cmd::Playback(playback_speed(s.playback)));
             self.sent_playback = Some(s.playback);
@@ -762,6 +789,10 @@ impl Tts {
         if self.sent_speech.as_ref() != Some(&speech) {
             engine.send(Cmd::Speech(speech.clone()));
             self.sent_speech = Some(speech);
+        }
+        if self.sent_prefer_du != Some(s.prefer_duchinese_audio) {
+            engine.send(Cmd::PreferDu(s.prefer_duchinese_audio));
+            self.sent_prefer_du = Some(s.prefer_duchinese_audio);
         }
         if !self.playback_dragging && self.sent_playback != Some(s.playback) {
             engine.send(Cmd::Playback(playback_speed(s.playback)));
@@ -837,9 +868,9 @@ impl Tts {
     pub fn play_from(&mut self, spine: usize, src: u32, s: &TtsSettings) {
         self.paused_by_popup = false;
         self.paused_until = None;
-        if s.source == Source::Azure {
+        if s.source == Source::Azure && !self.du_active_at(spine, s) {
             self.load_key();
-        } else {
+        } else if s.source != Source::Azure {
             self.stop_preview();
         }
         self.engine(s);
@@ -1261,6 +1292,9 @@ impl Tts {
                             self.transport(ui, 16.0);
                             ui.label(
                                 RichText::new(match st {
+                                    State::Loading if self.now.using_duchinese => {
+                                        "Loading DuChinese audio…"
+                                    }
                                     State::Loading if s.source == Source::Local => {
                                         if local::loaded(s.local.mode(), s.local.parallel) {
                                             "Making the audio…"
@@ -1270,6 +1304,7 @@ impl Tts {
                                     }
                                     State::Loading => "Waiting for Azure…",
                                     State::Paused => "Paused",
+                                    _ if self.now.using_duchinese => "DuChinese audio",
                                     _ => "Reading",
                                 })
                                 .weak(),
@@ -1284,6 +1319,31 @@ impl Tts {
                 );
                 if let Some(e) = &self.now.error {
                     ui.colored_label(crate::reader::theme::get(ui.ctx()).red, e);
+                }
+                if let Some((have, total)) = self.du_coverage
+                    && have > 0
+                {
+                    ui.separator();
+                    let label = if have >= total {
+                        "Use DuChinese audio".to_owned()
+                    } else {
+                        format!("Use DuChinese audio ({have} of {total} chapters)")
+                    };
+                    ui.checkbox(&mut s.prefer_duchinese_audio, label)
+                        .on_hover_text(
+                            "Play DuChinese's downloaded native narration synced to the text \
+                             instead of TTS. Chapters without downloaded audio fall back to TTS.",
+                        );
+                    if self.du_active_at(spine, s) {
+                        ui.label(
+                            RichText::new(
+                                "DuChinese's native narration is active for this chapter. \
+                                 Uncheck above to use Azure or local TTS instead.",
+                            )
+                            .size(12.0)
+                            .weak(),
+                        );
+                    }
                 }
                 ui.separator();
                 ui.horizontal(|ui| {

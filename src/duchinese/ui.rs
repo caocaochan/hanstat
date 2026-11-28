@@ -138,6 +138,8 @@ pub struct DuState {
     hovering: bool,
     /// Cached `is_file()` results for imported books missing from the Library.
     file_exists: HashMap<PathBuf, bool>,
+    /// Cached `(downloaded_chapters, total_chapters)` audio counts per imported course.
+    audio_counts: HashMap<u64, (usize, usize)>,
 }
 
 impl Default for DuState {
@@ -180,6 +182,7 @@ impl Default for DuState {
             frozen: None,
             hovering: false,
             file_exists: HashMap::new(),
+            audio_counts: HashMap::new(),
         }
     }
 }
@@ -459,6 +462,31 @@ impl App {
                 self.du_save();
             }
             Event::Built { record, id, before } => self.du_built(record, id, before, ctx),
+            Event::AudioDownloaded { course, chapters } => {
+                self.du.progress.remove(&course);
+                let title = if let Some(r) = self.du.records.get_mut(course) {
+                    r.audio = true;
+                    for (lesson, hash) in &chapters {
+                        if let Some(ch) = r.chapters.iter_mut().find(|c| c.lesson == *lesson) {
+                            ch.audio = hash.clone();
+                        }
+                    }
+                    Some(r.course.title.trim().to_owned())
+                } else {
+                    None
+                };
+                self.du.records_gen = self.du.records_gen.wrapping_add(1);
+                self.du.audio_counts.remove(&course);
+                self.du_save();
+                if let Some(title) = title {
+                    let n = chapters.len();
+                    let msg = format!(
+                        "{title}: audio downloaded for {n} chapter{}",
+                        if n == 1 { "" } else { "s" }
+                    );
+                    self.toast = Some((msg, ctx.input(|i| i.time) + 6.0));
+                }
+            }
             Event::Checked => self.du.checking = false,
             Event::Failed { course, error } => {
                 if let Some(c) = course {
@@ -579,6 +607,7 @@ impl App {
         self.du.records.put(record);
         self.du.records_gen = self.du.records_gen.wrapping_add(1);
         self.du.file_exists.clear();
+        self.du.audio_counts.remove(&course);
         self.du_save();
         let new = before.is_none() || old_id.is_none();
         self.du.library.push((path.clone(), new));
@@ -754,6 +783,7 @@ impl App {
     pub(crate) fn du_open(&mut self, ctx: &egui::Context) {
         self.du.open = true;
         self.du.file_exists.clear();
+        self.du.audio_counts.clear();
         if !self.du.catalogue_asked {
             self.du.catalogue_asked = true;
             self.du.push(ctx, Task::Catalogue { force: false });
@@ -791,11 +821,18 @@ impl App {
         let make = Make {
             traditional: s.traditional,
             translations: s.translations,
+            audio: s.audio,
             folder: s.folder(),
         };
         self.du.progress.insert(c.id, (0, 0));
         self.du.error = None;
         self.du.push(ctx, Task::Import(c.clone(), make));
+    }
+
+    fn du_download_audio(&mut self, r: Record, ctx: &egui::Context) {
+        self.du.progress.insert(r.course.id, (0, 0));
+        self.du.error = None;
+        self.du.push(ctx, Task::DownloadAudio(r));
     }
 
     fn du_check(&mut self, books: Vec<Record>, ctx: &egui::Context) {
@@ -1028,6 +1065,7 @@ impl App {
         let mut open = true;
         let mut import: Option<Course> = None;
         let mut check: Option<Vec<Record>> = None;
+        let mut get_audio: Option<Record> = None;
         let mut read: Option<Record> = None;
         let mut add_to_library: Option<PathBuf> = None;
         let mut sign_out = false;
@@ -1202,6 +1240,18 @@ impl App {
                             } else {
                                 false
                             };
+                            let audio_count = if let Some(r) = self.du.records.get(course_id) {
+                                if let Some(&cnt) = self.du.audio_counts.get(&course_id) {
+                                    Some(cnt)
+                                } else {
+                                    let root = store::cache_root();
+                                    let cnt = (r.audio_count(&root), r.chapters.len());
+                                    self.du.audio_counts.insert(course_id, cnt);
+                                    Some(cnt)
+                                }
+                            } else {
+                                None
+                            };
                             let c = &self.du.catalogue[cat_idx];
                             let rec = self.du.records.get(c.id);
                             let entry = rec.and_then(|r| self.du_entry(r));
@@ -1222,7 +1272,7 @@ impl App {
                                         ui.allocate_space(egui::vec2(w, h));
                                     }
                                 }
-                                let right_w = 250.0;
+                                let right_w = 290.0;
                                 ui.allocate_ui(egui::vec2((ui.available_width() - right_w).max(150.0), h), |ui| {
                                     ui.vertical(|ui| {
                                         ui.add(egui::Label::new(RichText::new(c.title.trim()).strong()).truncate())
@@ -1237,6 +1287,15 @@ impl App {
                                             let n = r.new_chapters(now);
                                             if n > 0 {
                                                 sub.push_str(&format!(" · {n} new"));
+                                            }
+                                            if let Some((have, total)) = audio_count
+                                                && have > 0
+                                            {
+                                                if have >= total {
+                                                    sub.push_str(" · audio");
+                                                } else {
+                                                    sub.push_str(&format!(" · audio ({have}/{total})"));
+                                                }
                                             }
                                         }
                                         ui.label(RichText::new(sub).small().color(palette::weak()));
@@ -1259,6 +1318,14 @@ impl App {
                                             }
                                             if ui.small_button("Update").on_hover_text("Ask DuChinese for new, opened-up or edited chapters now").clicked() {
                                                 check = Some(vec![r.clone()]);
+                                            }
+                                            if audio_count.is_some_and(|(have, total)| total > 0 && have < total)
+                                                && ui
+                                                    .small_button("Audio")
+                                                    .on_hover_text("Download DuChinese's native narration for each chapter; the reader plays it synced to the text instead of TTS")
+                                                    .clicked()
+                                            {
+                                                get_audio = Some(r.clone());
                                             }
                                         } else if unindexed_file_exists {
                                             if ui.button("Add to Library").on_hover_text("The book was imported but isn't in the Library").clicked() {
@@ -1330,6 +1397,10 @@ impl App {
                         .on_hover_text("Each paragraph followed by DuChinese's English, blurred until clicked. For new imports")
                         .changed();
                     settings_changed |= ui
+                        .checkbox(&mut s.audio, "Audio")
+                        .on_hover_text("Download DuChinese's native narration for each chapter; the reader plays it synced to the text instead of TTS. For new imports")
+                        .changed();
+                    settings_changed |= ui
                         .checkbox(&mut s.auto_update, "Add new chapters on their own")
                         .on_hover_text("Check imported stories for new chapters twice a day and add them")
                         .changed();
@@ -1368,6 +1439,9 @@ impl App {
         }
         if let Some(b) = check {
             self.du_check(b, ctx);
+        }
+        if let Some(r) = get_audio {
+            self.du_download_audio(r, ctx);
         }
         if let Some(r) = read {
             self.du_read(&r, ctx);
