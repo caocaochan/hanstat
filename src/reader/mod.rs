@@ -1567,7 +1567,7 @@ impl Reader {
                 self.dict.close();
                 let target = hit_text(p).and_then(|(src, _, _)| {
                     let ch = self.chapter(self.spine)?;
-                    let sentences = tts::sentences(&ch.chars);
+                    let sentences = tts::sentences_of(&ch);
                     let sentence = sentences.get(tts::sentence_at(&sentences, src))?;
                     sentence.contains(&src).then_some(popup::Spot {
                         spine: self.spine,

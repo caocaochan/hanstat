@@ -474,6 +474,21 @@ pub fn sentences(chars: &[char]) -> Vec<Range<u32>> {
     out
 }
 
+/// The spoken sentences of a chapter: [`sentences`] with DuChinese sentence
+/// translations ([`Chapter::spoiler_ranges`]) excluded, whether blurred or
+/// revealed.
+pub fn sentences_of(ch: &Chapter) -> Vec<Range<u32>> {
+    sentences_excluding(&ch.chars, &ch.spoiler_ranges)
+}
+
+pub(super) fn sentences_excluding(chars: &[char], skip: &[Range<u32>]) -> Vec<Range<u32>> {
+    let mut out = sentences(chars);
+    if !skip.is_empty() {
+        out.retain(|r| !skip.iter().any(|s| r.start < s.end && s.start < r.end));
+    }
+    out
+}
+
 /// The sentence holding character `src`, or the first after it (`len` past
 /// the last).
 pub fn sentence_at(s: &[Range<u32>], src: u32) -> usize {
@@ -1028,7 +1043,7 @@ impl Tts {
             .get(spine)
             .cloned()
             .flatten()?;
-        let s = sentences(&ch.chars);
+        let s = sentences_of(&ch);
         let mut buf = String::new();
         let mut billed = 0usize;
         for r in &s {
@@ -1073,7 +1088,7 @@ impl Tts {
                 let (mut sent, mut billed) = (0usize, 0usize);
                 let mut buf = String::new();
                 for ch in &chapters {
-                    let s = sentences(&ch.chars);
+                    let s = sentences_of(ch);
                     sent += s.len();
                     for r in &s {
                         buf.clear();
@@ -2066,5 +2081,45 @@ mod tests {
         assert_ne!(with(&|s| s.seed = 1), l.key("你好"));
         assert_ne!(with(&|s| s.chunk_chars = 120), l.key("你好"));
         assert_eq!(with(&|s| s.parallel = 1), l.key("你好"));
+    }
+
+    #[test]
+    fn duchinese_translations_are_excluded_from_tts() {
+        use super::super::css::RuleSet;
+        use super::super::tree::{Source as TreeSource, build_doc, ua_rules};
+
+        let html = r#"<html><body>
+            <h2>小猫</h2>
+            <p>这是一只猫。它很可爱。</p>
+            <p class="tr" lang="en">This is a cat. It is cute.</p>
+            <p>它喜欢吃鱼。</p>
+            <p class="tr" lang="en">It likes to eat fish.</p>
+        </body></html>"#;
+        let doc = scraper::Html::parse_document(html);
+        let ch = build_doc(
+            &doc,
+            &ua_rules(),
+            &RuleSet::default(),
+            TreeSource::Epub {
+                base: String::new(),
+                path: String::new(),
+                duchinese: true,
+            },
+        );
+        let spoken: Vec<String> = sentences_of(&ch)
+            .into_iter()
+            .map(|r| ch.chars[r.start as usize..r.end as usize].iter().collect())
+            .collect();
+        assert_eq!(
+            spoken,
+            ["小猫", "这是一只猫。", "它很可爱。", "它喜欢吃鱼。"]
+        );
+
+        let audio = engine::chapter_sentences(&ch.chars, &ch.spoiler_ranges);
+        let audio_texts: Vec<&str> = audio.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(
+            audio_texts,
+            ["小猫", "这是一只猫。", "它很可爱。", "它喜欢吃鱼。"]
+        );
     }
 }

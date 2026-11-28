@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.28.04] - 2026-11-28
+
+### Fixed
+- **Read aloud and audiobook export skip DuChinese English translations.** English translation paragraphs in DuChinese stories are now excluded from Read aloud playback, local voice previews and chapter counts, Azure cost estimates, **Play from here**, and audiobook export — regardless of whether they are currently blurred or revealed.
+
 ## [2026.11.28.03] - 2026-11-28
 
 ### Changed

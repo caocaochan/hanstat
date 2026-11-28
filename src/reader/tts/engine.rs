@@ -12,7 +12,7 @@
 
 use super::audio::{self, Output};
 use super::azure::{Azure, Fail};
-use super::{Speech, clip_path, local, opus, saved_clip, sentence_at, sentences};
+use super::{Speech, clip_path, local, opus, saved_clip, sentence_at};
 use crate::reader::tree::Chapter;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
@@ -30,8 +30,8 @@ pub(super) struct Sentence {
     para: usize,
 }
 
-pub(super) fn chapter_sentences(chars: &[char]) -> Vec<Sentence> {
-    let ranges = sentences(chars);
+pub(super) fn chapter_sentences(chars: &[char], skip: &[Range<u32>]) -> Vec<Sentence> {
+    let ranges = super::sentences_excluding(chars, skip);
     let paragraphs = local::paragraphs(chars, &ranges);
     ranges
         .into_iter()
@@ -753,7 +753,7 @@ impl Player {
             return Some(s.clone());
         }
         let ch = self.chapter(spine)?;
-        let s = Arc::new(sentences(&ch.chars));
+        let s = Arc::new(super::sentences_of(&ch));
         // Keep a few chapters.
         if self.sentences.len() > 8 {
             self.sentences.clear();
@@ -1059,7 +1059,12 @@ impl Player {
                         std::thread::sleep(Duration::from_millis(50));
                     };
                     let Some(ch) = ch else { break };
-                    pool.queue_chapter(&chapter_sentences(&ch.chars), &dir, &speech, &batch);
+                    pool.queue_chapter(
+                        &chapter_sentences(&ch.chars, &ch.spoiler_ranges),
+                        &dir,
+                        &speech,
+                        &batch,
+                    );
                     repaint();
                 }
                 batch.listed.store(true, Ordering::Relaxed);

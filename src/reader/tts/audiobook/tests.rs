@@ -22,7 +22,7 @@ fn chapter(spine: usize, title: &str, text: &str) -> Chapter {
     Chapter {
         spine,
         title: title.to_owned(),
-        sentences: chapter_sentences(&text.chars().collect::<Vec<_>>()),
+        sentences: chapter_sentences(&text.chars().collect::<Vec<_>>(), &[]),
     }
 }
 

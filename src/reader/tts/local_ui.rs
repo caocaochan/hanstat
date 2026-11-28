@@ -4,7 +4,7 @@
 
 use super::audio::{self, Output};
 use super::local::{self, LocalSettings, SPEAKERS};
-use super::{Source, Tts, TtsSettings, group, sentence_at, sentences};
+use super::{Source, Tts, TtsSettings, group, sentence_at, sentences_of};
 use eframe::egui::{self, Color32, RichText};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -267,7 +267,7 @@ impl Tts {
             .get(spine)
             .cloned()
             .flatten()?;
-        let sents = sentences(&ch.chars);
+        let sents = sentences_of(&ch);
         let paras = local::paragraphs(&ch.chars, &sents);
         let first = sentence_at(&sents, self.page_src).min(sents.len().saturating_sub(1));
         let mut text = String::new();
@@ -639,7 +639,7 @@ impl Tts {
                 .collect()
         };
         for (i, c) in pending {
-            let s = sentences(&c.chars);
+            let s = sentences_of(&c);
             let chars = s.iter().map(|r| r.len()).sum();
             self.local.sizes[i] = Some((s.len(), chars));
         }

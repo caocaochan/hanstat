@@ -4095,4 +4095,31 @@ fn reader_duchinese_blurred_translations() {
     d.click(&mut r, second_rect.center());
     assert!(r.selection.is_none());
     assert!(r.revealed_spoilers.contains(&(0, 1)));
+
+    // TTS skips English translations regardless of whether they are blurred or revealed.
+    let ch = r.chapter(0).unwrap();
+    let spoken: Vec<String> = tts::sentences_of(&ch)
+        .into_iter()
+        .map(|range| {
+            ch.chars[range.start as usize..range.end as usize]
+                .iter()
+                .collect()
+        })
+        .collect();
+    assert!(
+        spoken
+            .iter()
+            .all(|s| !s.contains("morning") && !s.contains("slowly") && !s.contains("kitten")),
+        "English translations must not be spoken: {spoken:?}"
+    );
+    assert!(spoken.iter().any(|s| s.contains("小白猫")));
+    assert!(spoken.iter().any(|s| s.contains("面包")));
+    assert!(spoken.iter().any(|s| s.contains("裤脚")));
+
+    // Right-clicking a revealed English translation leaves "Play from here" disabled.
+    d.text_menu(&mut r, second_rect.center());
+    assert!(
+        r.text_menu.unwrap().target.is_none(),
+        "Play from here must not target a revealed English translation"
+    );
 }

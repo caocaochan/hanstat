@@ -1,6 +1,6 @@
 [package]
 name = "hanstat"
-version = "2026.1128.3"
+version = "2026.1128.4"
 edition = "2024"
 description = "Accurate character/word statistics for Chinese EPUB and TXT files"
 license = "MIT OR Apache-2.0"

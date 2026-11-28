@@ -105,6 +105,9 @@ pub struct Chapter {
     /// The text in layout order, `'\0'` between blocks and at line breaks:
     /// what a dictionary lookup reads from the character under the pointer.
     pub chars: Vec<char>,
+    /// Character ranges in [`Chapter::chars`] belonging to DuChinese sentence
+    /// translations (excluded from read-aloud / TTS whether blurred or revealed).
+    pub spoiler_ranges: Vec<std::ops::Range<u32>>,
 }
 
 /// Style sheets parsed once per book, by the list of sheets a chapter links
@@ -283,7 +286,8 @@ pub fn build_doc(doc: &scraper::Html, ua: &RuleSet, author: &RuleSet, source: So
         root.children.push(Child::Block(block));
     }
     let mut chars = Vec::new();
-    index_text(&mut root, &mut chars);
+    let mut spoiler_ranges = Vec::new();
+    index_text(&mut root, &mut chars, false, &mut spoiler_ranges);
     let han_len = chars.iter().filter(|&&c| hanstat::chars::is_han(c)).count() as u32;
     Chapter {
         styles: b.styles,
@@ -293,15 +297,23 @@ pub fn build_doc(doc: &scraper::Html, ua: &RuleSet, author: &RuleSet, source: So
         han_len,
         anchors: b.anchors,
         chars,
+        spoiler_ranges,
     }
 }
 
 /// Number the text runs in layout order and collect their characters, with
 /// `'\0'` between blocks and inline groups and at forced breaks.
-fn index_text(block: &mut Block, chars: &mut Vec<char>) {
+fn index_text(
+    block: &mut Block,
+    chars: &mut Vec<char>,
+    in_spoiler: bool,
+    spoiler_ranges: &mut Vec<std::ops::Range<u32>>,
+) {
+    let is_spoiler = in_spoiler || block.spoiler.is_some();
+    let start = chars.len() as u32;
     for c in &mut block.children {
         match c {
-            Child::Block(b) => index_text(b, chars),
+            Child::Block(b) => index_text(b, chars, is_spoiler, spoiler_ranges),
             Child::Inline(items) => {
                 for it in items.iter_mut() {
                     match it {
@@ -317,6 +329,12 @@ fn index_text(block: &mut Block, chars: &mut Vec<char>) {
         }
         if chars.last().is_some_and(|c| *c != '\0') {
             chars.push('\0');
+        }
+    }
+    if !in_spoiler && block.spoiler.is_some() {
+        let end = chars.len() as u32;
+        if end > start {
+            spoiler_ranges.push(start..end);
         }
     }
 }

@@ -68,7 +68,7 @@ impl Book {
             .enumerate()
             .filter_map(|(i, path)| {
                 let chapter = tree::build(&epub, path, &mut sheets);
-                let sentences = chapter_sentences(&chapter.chars);
+                let sentences = chapter_sentences(&chapter.chars, &chapter.spoiler_ranges);
                 (!sentences.is_empty()).then(|| Chapter {
                     spine: i,
                     title: if labels[i].is_empty() {
