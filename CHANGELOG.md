@@ -1,5 +1,13 @@
 # Changelog
 
+## [2026.11.28.00] - 2026-11-28
+
+### Added
+- **Choose theme and fonts in the quote PNG exporter.** The **Export quote** dialog now lets you pick a **Theme** independently of the Reader's theme (defaulting to **Same as pages**) and choose separate **Quote** and **Title** fonts from your installed CJK fonts or the bundled LXGW WenKai (defaulting to **Same as reader** and **LXGW WenKai**, with a **Same as quote** option for the title). Your choices are remembered between exports and previewed with the same offscreen renderer used to save the PNG.
+
+### Fixed
+- **Opening Export as PNG… no longer corrupts Reader text.** Previously, opening the **Export quote** dialog replaced egui's font definitions on the live window context, wiping the font atlas and scrambling cached page glyphs behind the dialog. The live preview now renders offscreen without touching the Reader's font atlas.
+
 ## [2026.11.27.06] - 2026-11-27
 
 ### Added

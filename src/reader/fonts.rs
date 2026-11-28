@@ -54,7 +54,7 @@ impl FamilyInfo {
     }
 }
 
-const BUNDLED: &str = "LXGW WenKai";
+pub(super) const BUNDLED: &str = "LXGW WenKai";
 
 /// The fonts found, once the background scan is done.
 pub(super) fn families() -> Option<Arc<Vec<FamilyInfo>>> {
@@ -592,6 +592,18 @@ pub(super) fn default_choice(fams: &[FamilyInfo], serif: bool, traditional: bool
                 String::new()
             }
         })
+}
+
+/// Load the regular upright face of family `name` from `fams` as a font
+/// blob + collection face index, memory-mapped (with bitmap tables hidden).
+pub(super) fn load_family_face(
+    fams: &[FamilyInfo],
+    name: &str,
+) -> Option<(egui::epaint::text::Blob, u32)> {
+    let fam = fams.iter().find(|f| f.name.eq_ignore_ascii_case(name))?;
+    let face = fam.face(400)?;
+    let b = blob(face)?;
+    Some((b, face.index))
 }
 
 fn blob(face: &Face) -> Option<egui::epaint::text::Blob> {

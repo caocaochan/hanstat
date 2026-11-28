@@ -142,6 +142,13 @@ struct Settings {
     search_width: f32,
     /// Last layout chosen in the quote PNG exporter.
     quote_layout: quote::QuoteLayout,
+    /// Theme chosen in the quote PNG exporter; `None` follows the reader's theme.
+    quote_theme: Option<String>,
+    /// Quote text font chosen in the quote PNG exporter; `None` follows the reader's font.
+    quote_font: Option<String>,
+    /// Book title font chosen in the quote PNG exporter; `None` uses the bundled WenKai,
+    /// `Some("")` matches the quote font, otherwise a system font family name.
+    quote_title_font: Option<String>,
 }
 
 impl Default for Settings {
@@ -171,6 +178,9 @@ impl Default for Settings {
             tts: tts::TtsSettings::default(),
             search_width: 340.0,
             quote_layout: quote::QuoteLayout::default(),
+            quote_theme: None,
+            quote_font: None,
+            quote_title_font: None,
         }
     }
 }
@@ -1151,6 +1161,9 @@ impl Reader {
                 self.epub.title.clone(),
                 self.epub.author.clone(),
                 self.settings.quote_layout,
+                self.settings.quote_theme.clone(),
+                self.settings.quote_font.clone(),
+                self.settings.quote_title_font.clone(),
             ));
         }
     }
@@ -1904,10 +1917,25 @@ impl Reader {
         }
         if let Some(mut dlg) = self.quote_export.take() {
             let before_layout = dlg.card.layout;
+            let before_theme = dlg.theme_id.clone();
+            let before_quote_font = dlg.quote_font.clone();
+            let before_title_font = dlg.title_font.clone();
             let (mut keep_open, save) =
                 dlg.ui(&ctx, th, self.fonts.as_ref(), self.settings.sans_default);
             if dlg.card.layout != before_layout {
                 self.settings.quote_layout = dlg.card.layout;
+                self.dirty = true;
+            }
+            if dlg.theme_id != before_theme {
+                self.settings.quote_theme = dlg.theme_id.clone();
+                self.dirty = true;
+            }
+            if dlg.quote_font != before_quote_font {
+                self.settings.quote_font = dlg.quote_font.clone();
+                self.dirty = true;
+            }
+            if dlg.title_font != before_title_font {
+                self.settings.quote_title_font = dlg.title_font.clone();
                 self.dirty = true;
             }
             if save
@@ -1916,12 +1944,17 @@ impl Reader {
                     .add_filter("PNG", &["png"])
                     .save_file()
             {
+                let export_th = dlg.resolved_theme(th);
+                let fams = fonts::families();
                 match quote::export_png(
                     &ctx,
                     &dlg.card,
-                    th,
+                    export_th,
                     self.fonts.as_ref(),
                     self.settings.sans_default,
+                    dlg.quote_font.as_deref(),
+                    dlg.title_font.as_deref(),
+                    fams.as_deref().map(Vec::as_slice),
                     &path,
                 ) {
                     Ok(()) => keep_open = false,

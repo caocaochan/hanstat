@@ -345,6 +345,33 @@ impl Scene {
         Color32::from_rgb(row[3 * x], row[3 * x + 1], row[3 * x + 2])
     }
 
+    /// Rasterise the scene into an in-memory [`egui::ColorImage`] (parallelised
+    /// across strips, using the same pipeline as [`Self::write_png`]).
+    pub(crate) fn to_color_image(&self) -> egui::ColorImage {
+        let [w, h] = self.size;
+        let tris = self.triangles();
+        let strips = h.div_ceil(STRIP);
+        let mut buckets: Vec<Vec<&Tri>> = vec![Vec::new(); strips];
+        for t in &tris {
+            let [_, y0, _, y1] = t.bounds;
+            for b in &mut buckets[y0 / STRIP..=((y1 - 1) / STRIP).min(strips - 1)] {
+                b.push(t);
+            }
+        }
+        let rows: Vec<Vec<u8>> = (0..strips)
+            .into_par_iter()
+            .map(|s| {
+                let y0 = s * STRIP;
+                self.strip(&buckets[s], y0, STRIP.min(h - y0))
+            })
+            .collect();
+        let mut rgb = Vec::with_capacity(w * h * 3);
+        for chunk in rows {
+            rgb.extend_from_slice(&chunk);
+        }
+        egui::ColorImage::from_rgb([w, h], &rgb)
+    }
+
     /// Write the page to `path`.
     pub(crate) fn write_png(&self, path: &Path) -> Result<(), String> {
         let [w, h] = self.size;

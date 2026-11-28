@@ -84,15 +84,49 @@ pub(super) struct QuoteCard {
     pub(super) layout: QuoteLayout,
 }
 
+/// Sentinel value for [`QuoteDialog::title_font`] meaning "match the quote font".
+const TITLE_SAME_AS_QUOTE: &str = "";
+
+#[derive(Clone, PartialEq, Eq)]
+struct PreviewKey {
+    quote: String,
+    title: String,
+    author: String,
+    date: String,
+    layout: QuoteLayout,
+    theme_id: &'static str,
+    quote_font: Option<String>,
+    title_font: Option<String>,
+    reader_fonts_key: Option<(String, String)>,
+    sans_default: bool,
+    raster_scale_bits: u32,
+    fonts_scanned: bool,
+}
+
 /// State of the "Export quote" modal window.
 pub(super) struct QuoteDialog {
     pub(super) card: QuoteCard,
+    /// Chosen card theme id; `None` follows the reader's current theme.
+    pub(super) theme_id: Option<String>,
+    /// Chosen quote text font family name; `None` follows the reader's font.
+    pub(super) quote_font: Option<String>,
+    /// Chosen book title font family name; `None` uses bundled LXGW WenKai,
+    /// `Some("")` matches the quote font.
+    pub(super) title_font: Option<String>,
     pub(super) error: Option<String>,
-    fonts_installed: bool,
+    preview: Option<(PreviewKey, egui::TextureHandle)>,
 }
 
 impl QuoteDialog {
-    pub(super) fn new(quote: String, title: String, author: String, layout: QuoteLayout) -> Self {
+    pub(super) fn new(
+        quote: String,
+        title: String,
+        author: String,
+        layout: QuoteLayout,
+        theme_id: Option<String>,
+        quote_font: Option<String>,
+        title_font: Option<String>,
+    ) -> Self {
         QuoteDialog {
             card: QuoteCard {
                 quote: clean_quote(&quote),
@@ -101,23 +135,32 @@ impl QuoteDialog {
                 date: today_string(),
                 layout,
             },
+            theme_id,
+            quote_font,
+            title_font,
             error: None,
-            fonts_installed: false,
+            preview: None,
         }
+    }
+
+    /// The theme used to render and export the quote card: the user's chosen
+    /// theme if set (and known), otherwise the reader's current theme.
+    pub(super) fn resolved_theme<'a>(&self, reader_th: &'a Theme) -> &'a Theme {
+        self.theme_id
+            .as_deref()
+            .and_then(|id| theme::THEMES.iter().find(|t| t.id == id))
+            .unwrap_or(reader_th)
     }
 
     /// Draw the export dialog. Returns `(keep_open, save_clicked)`.
     pub(super) fn ui(
         &mut self,
         ctx: &egui::Context,
-        th: &Theme,
+        reader_th: &Theme,
         reader_fonts: Option<&fonts::Installed>,
         sans_default: bool,
     ) -> (bool, bool) {
-        if !self.fonts_installed {
-            install_in_ctx(ctx);
-            self.fonts_installed = true;
-        }
+        let fams = fonts::families();
         let mut open = true;
         let mut save = false;
         let mut close_clicked = false;
@@ -128,10 +171,10 @@ impl QuoteDialog {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
             .show(ctx, |ui| {
-                ui.set_min_width(420.0);
+                ui.set_min_width(440.0);
                 // Layout switcher.
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Layout").color(th.subtle));
+                    ui.label(RichText::new("Layout").color(reader_th.subtle));
                     ui.add_space(6.0);
                     for layout in QuoteLayout::ALL {
                         let [pw, ph] = layout.pixel_size();
@@ -143,37 +186,244 @@ impl QuoteDialog {
                         ui.label(
                             RichText::new(format!("{pw} × {ph} px"))
                                 .size(12.0)
-                                .color(th.muted),
+                                .color(reader_th.muted),
                         );
                     });
                 });
+                ui.add_space(6.0);
+
+                // Card theme switcher (independent from the reader's theme).
+                let current_override = self
+                    .theme_id
+                    .as_deref()
+                    .and_then(|id| theme::THEMES.iter().position(|t| t.id == id));
+                let shown_th = current_override.map_or(reader_th, |i| &theme::THEMES[i]);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Theme").color(reader_th.subtle));
+                    ui.add_space(6.0);
+                    let (swatch_rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                    let sp = ui.painter();
+                    sp.rect_filled(swatch_rect, 3.5, shown_th.page);
+                    sp.rect_stroke(
+                        swatch_rect,
+                        3.5,
+                        Stroke::new(1.0, theme::mix(shown_th.ink, shown_th.page, 0.25)),
+                        StrokeKind::Inside,
+                    );
+                    sp.circle_filled(swatch_rect.center(), 3.2, shown_th.accent);
+
+                    let btn_label =
+                        current_override.map_or("Same as pages", |i| theme::THEMES[i].name);
+                    let button = ui
+                        .add(
+                            egui::Button::new(btn_label)
+                                .right_text(crate::icons::glyph(
+                                    ui.ctx(),
+                                    crate::icons::CARET_DOWN,
+                                    false,
+                                ))
+                                .min_size(vec2(200.0, 0.0)),
+                        )
+                        .on_hover_text(
+                            "Theme used for the exported PNG (independent of the reader theme)",
+                        );
+                    egui::Popup::menu(&button)
+                        .id(egui::Id::unique("reader-quote-theme-list"))
+                        .show(|ui| {
+                            let col_w = super::THEME_COLUMN;
+                            let w = 2.0 * col_w + ui.spacing().item_spacing.x;
+                            let same = ui
+                                .allocate_ui(vec2(w, 30.0), |ui| {
+                                    theme::swatch_as(
+                                        ui,
+                                        reader_th,
+                                        "Same as pages",
+                                        current_override.is_none(),
+                                    )
+                                })
+                                .inner;
+                            if same.clicked() {
+                                self.theme_id = None;
+                                ui.close();
+                            }
+                            ui.horizontal_top(|ui| {
+                                for dark in [false, true] {
+                                    ui.vertical(|ui| {
+                                        ui.set_width(col_w);
+                                        ui.label(
+                                            RichText::new(if dark { "Dark" } else { "Light" })
+                                                .size(12.0)
+                                                .color(reader_th.muted),
+                                        );
+                                        for (i, t) in theme::THEMES
+                                            .iter()
+                                            .enumerate()
+                                            .filter(|(_, t)| t.dark == dark)
+                                        {
+                                            let r =
+                                                theme::swatch(ui, t, Some(i) == current_override);
+                                            if r.clicked() {
+                                                self.theme_id = Some(t.id.to_owned());
+                                                ui.close();
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                        });
+                });
+                ui.add_space(6.0);
+
+                // Independent quote & title font switchers.
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Quote").color(reader_th.subtle))
+                        .on_hover_text("Font used for the quote body text");
+                    let quote_label = self.quote_font.as_deref().unwrap_or("Same as reader");
+                    egui::ComboBox::from_id_salt("reader-quote-body-font")
+                        .selected_text(quote_label)
+                        .width(160.0)
+                        .height(360.0)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(self.quote_font.is_none(), "Same as reader")
+                                .clicked()
+                            {
+                                self.quote_font = None;
+                            }
+                            ui.separator();
+                            match &fams {
+                                None => {
+                                    ui.label("Looking for fonts…");
+                                }
+                                Some(list) => {
+                                    for fam in list.iter() {
+                                        let sel = self
+                                            .quote_font
+                                            .as_deref()
+                                            .is_some_and(|n| n.eq_ignore_ascii_case(&fam.name));
+                                        if ui.selectable_label(sel, fam.label()).clicked() {
+                                            self.quote_font = Some(fam.name.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        });
+
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Title").color(reader_th.subtle))
+                        .on_hover_text("Font used for the book title in the footer");
+                    let title_label = match self.title_font.as_deref() {
+                        None => fonts::BUNDLED,
+                        Some(TITLE_SAME_AS_QUOTE) => "Same as quote",
+                        Some(name) => name,
+                    };
+                    egui::ComboBox::from_id_salt("reader-quote-title-font")
+                        .selected_text(title_label)
+                        .width(160.0)
+                        .height(360.0)
+                        .show_ui(ui, |ui| {
+                            let same_sel = self.title_font.as_deref() == Some(TITLE_SAME_AS_QUOTE);
+                            if ui.selectable_label(same_sel, "Same as quote").clicked() {
+                                self.title_font = Some(TITLE_SAME_AS_QUOTE.to_owned());
+                            }
+                            ui.separator();
+                            match &fams {
+                                None => {
+                                    ui.label("Looking for fonts…");
+                                }
+                                Some(list) => {
+                                    for fam in list.iter() {
+                                        let sel = !same_sel
+                                            && self
+                                                .title_font
+                                                .as_deref()
+                                                .unwrap_or(fonts::BUNDLED)
+                                                .eq_ignore_ascii_case(&fam.name);
+                                        if ui.selectable_label(sel, fam.label()).clicked() {
+                                            if fam.name.eq_ignore_ascii_case(fonts::BUNDLED) {
+                                                self.title_font = None;
+                                            } else {
+                                                self.title_font = Some(fam.name.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                });
                 ui.add_space(10.0);
 
-                // Live WYSIWYG preview scaled to fit cleanly inside the modal.
+                // Resolve after switchers so changes update the preview on this frame.
+                let card_th = self.resolved_theme(reader_th);
+
+                // Live WYSIWYG preview rendered via the same offscreen rasterizer
+                // as `export_png` into a cached texture. This lets any system font
+                // be previewed without ever calling `ctx.set_fonts` on the live
+                // window (which would wipe egui's font atlas and corrupt cached
+                // reader pages).
                 let logical = self.card.layout.logical_size();
-                let max_box = vec2(400.0, 340.0);
+                let max_box = vec2(420.0, 320.0);
                 let preview_scale = (max_box.x / logical.x).min(max_box.y / logical.y);
                 let preview_size = logical * preview_scale;
                 let (slot, _) =
                     ui.allocate_exact_size(vec2(max_box.x, preview_size.y), Sense::hover());
                 let preview_rect = Rect::from_center_size(slot.center(), preview_size);
-                let quote_fam = quote_font_family(reader_fonts, sans_default);
-                let title_fam = title_font_family();
-                let meta_fam = FontFamily::Proportional;
-                let painter = ui.painter_at(preview_rect);
-                paint_quote_card(
-                    &painter,
-                    preview_rect,
-                    &self.card,
-                    th,
-                    &quote_fam,
-                    &title_fam,
-                    &meta_fam,
-                );
+                let raster_scale = (preview_scale * ctx.pixels_per_point()).clamp(0.5, SCALE);
+                let key = PreviewKey {
+                    quote: self.card.quote.clone(),
+                    title: self.card.title.clone(),
+                    author: self.card.author.clone(),
+                    date: self.card.date.clone(),
+                    layout: self.card.layout,
+                    theme_id: card_th.id,
+                    quote_font: self.quote_font.clone(),
+                    title_font: self.title_font.clone(),
+                    reader_fonts_key: reader_fonts.map(|f| f.key.clone()),
+                    sans_default,
+                    raster_scale_bits: raster_scale.to_bits(),
+                    fonts_scanned: fams.is_some(),
+                };
+                let needs_render = self.preview.as_ref().is_none_or(|(k, _)| *k != key);
+                if needs_render {
+                    let scene = render_scene_at_scale(
+                        ctx,
+                        &self.card,
+                        card_th,
+                        reader_fonts,
+                        sans_default,
+                        self.quote_font.as_deref(),
+                        self.title_font.as_deref(),
+                        fams.as_deref().map(Vec::as_slice),
+                        raster_scale,
+                    );
+                    let img = scene.to_color_image();
+                    match &mut self.preview {
+                        Some((k, tex)) => {
+                            tex.set(img, egui::TextureOptions::LINEAR);
+                            *k = key;
+                        }
+                        None => {
+                            let tex = ctx.load_texture(
+                                "reader-quote-preview",
+                                img,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            self.preview = Some((key, tex));
+                        }
+                    }
+                }
+                if let Some((_, tex)) = &self.preview {
+                    ui.painter().image(
+                        tex.id(),
+                        preview_rect,
+                        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                }
                 ui.painter().rect_stroke(
                     preview_rect,
                     CornerRadius::ZERO,
-                    Stroke::new(1.0, theme::mix(th.text, th.page, 0.16)),
+                    Stroke::new(1.0, theme::mix(reader_th.text, reader_th.page, 0.16)),
                     StrokeKind::Outside,
                 );
 
@@ -183,22 +433,22 @@ impl QuoteDialog {
                     .num_columns(2)
                     .spacing([10.0, 6.0])
                     .show(ui, |ui| {
-                        let field_w = 320.0;
-                        ui.label(RichText::new("Title").color(th.subtle));
+                        let field_w = 340.0;
+                        ui.label(RichText::new("Title").color(reader_th.subtle));
                         ui.add(
                             egui::TextEdit::singleline(&mut self.card.title)
                                 .desired_width(field_w)
                                 .hint_text("Book title"),
                         );
                         ui.end_row();
-                        ui.label(RichText::new("Author").color(th.subtle));
+                        ui.label(RichText::new("Author").color(reader_th.subtle));
                         ui.add(
                             egui::TextEdit::singleline(&mut self.card.author)
                                 .desired_width(field_w)
                                 .hint_text("Author (optional)"),
                         );
                         ui.end_row();
-                        ui.label(RichText::new("Date").color(th.subtle));
+                        ui.label(RichText::new("Date").color(reader_th.subtle));
                         ui.add(
                             egui::TextEdit::singleline(&mut self.card.date)
                                 .desired_width(field_w)
@@ -209,21 +459,25 @@ impl QuoteDialog {
 
                 if let Some(err) = &self.error {
                     ui.add_space(6.0);
-                    ui.label(RichText::new(err).color(th.red).size(13.0));
+                    ui.label(RichText::new(err).color(reader_th.red).size(13.0));
                 }
 
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(th.name).size(12.0).color(th.muted));
+                    ui.label(
+                        RichText::new(card_th.name)
+                            .size(12.0)
+                            .color(reader_th.muted),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        let primary = egui::Button::new(
-                            RichText::new("Save PNG…").strong().color(if th.dark {
-                                th.page
+                        let primary = egui::Button::new(RichText::new("Save PNG…").strong().color(
+                            if reader_th.dark {
+                                reader_th.page
                             } else {
                                 Color32::WHITE
-                            }),
-                        )
-                        .fill(th.accent);
+                            },
+                        ))
+                        .fill(reader_th.accent);
                         if ui.add(primary).clicked() {
                             save = true;
                         }
@@ -239,20 +493,57 @@ impl QuoteDialog {
 
 /// Render `card` into an offscreen [`crate::raster::Scene`] at exact 1024px
 /// longest edge (`SCALE = 2.0`).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_scene(
     ctx: &egui::Context,
     card: &QuoteCard,
     th: &Theme,
     reader_fonts: Option<&fonts::Installed>,
     sans_default: bool,
+    quote_font: Option<&str>,
+    title_font: Option<&str>,
+    fams: Option<&[fonts::FamilyInfo]>,
 ) -> crate::raster::Scene {
-    let defs = ctx.fonts(|f| f.definitions().clone());
+    render_scene_at_scale(
+        ctx,
+        card,
+        th,
+        reader_fonts,
+        sans_default,
+        quote_font,
+        title_font,
+        fams,
+        SCALE,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_scene_at_scale(
+    ctx: &egui::Context,
+    card: &QuoteCard,
+    th: &Theme,
+    reader_fonts: Option<&fonts::Installed>,
+    sans_default: bool,
+    quote_font: Option<&str>,
+    title_font: Option<&str>,
+    fams: Option<&[fonts::FamilyInfo]>,
+    scale: f32,
+) -> crate::raster::Scene {
+    let mut defs = ctx.fonts(|f| f.definitions().clone());
+    install_in_defs(&mut defs);
+    let quote_fam = quote_font
+        .and_then(|name| register_custom_family(&mut defs, "quote-body-custom", name, fams))
+        .unwrap_or_else(|| quote_font_family(reader_fonts, sans_default));
+    let title_fam = match title_font {
+        Some(TITLE_SAME_AS_QUOTE) => quote_fam.clone(),
+        Some(name) => register_custom_family(&mut defs, "quote-title-custom", name, fams)
+            .unwrap_or_else(title_font_family),
+        None => title_font_family(),
+    };
+    let meta_fam = FontFamily::Proportional;
     let egui_theme = ctx.theme();
     let base_style = (*ctx.global_style()).clone();
     let logical = card.layout.logical_size();
-    let quote_fam = quote_font_family(reader_fonts, sans_default);
-    let title_fam = title_font_family();
-    let meta_fam = FontFamily::Proportional;
     let card = card.clone();
 
     crate::raster::lay_out_from(
@@ -260,9 +551,9 @@ pub(super) fn render_scene(
         egui_theme,
         base_style,
         logical.x,
-        SCALE,
+        scale,
         th.desk,
-        install_in_defs,
+        |_| {},
         |_| {},
         |_| (),
         move |ui, _| {
@@ -274,15 +565,28 @@ pub(super) fn render_scene(
 }
 
 /// Write `card` to `path` as a PNG (1024px on its longest edge).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn export_png(
     ctx: &egui::Context,
     card: &QuoteCard,
     th: &Theme,
     reader_fonts: Option<&fonts::Installed>,
     sans_default: bool,
+    quote_font: Option<&str>,
+    title_font: Option<&str>,
+    fams: Option<&[fonts::FamilyInfo]>,
     path: &Path,
 ) -> Result<(), String> {
-    let scene = render_scene(ctx, card, th, reader_fonts, sans_default);
+    let scene = render_scene(
+        ctx,
+        card,
+        th,
+        reader_fonts,
+        sans_default,
+        quote_font,
+        title_font,
+        fams,
+    );
     scene.write_png(path)
 }
 
@@ -318,6 +622,33 @@ fn quote_font_family(reader_fonts: Option<&fonts::Installed>, sans_default: bool
     }
 }
 
+fn register_custom_family(
+    defs: &mut FontDefinitions,
+    slot_key: &str,
+    family_name: &str,
+    fams: Option<&[fonts::FamilyInfo]>,
+) -> Option<FontFamily> {
+    if family_name.eq_ignore_ascii_case(fonts::BUNDLED) {
+        return Some(title_font_family());
+    }
+    let (blob, index) = fonts::load_family_face(fams?, family_name)?;
+    defs.font_data.insert(
+        slot_key.to_owned(),
+        Arc::new(FontData::from_blob(blob, index)),
+    );
+    let mut chain = vec![slot_key.to_owned()];
+    if let Some(prop) = defs.families.get(&FontFamily::Proportional) {
+        for name in prop {
+            if !chain.contains(name) {
+                chain.push(name.clone());
+            }
+        }
+    }
+    let fam = FontFamily::Name(Arc::from(slot_key));
+    defs.families.insert(fam.clone(), chain);
+    Some(fam)
+}
+
 fn install_in_defs(defs: &mut FontDefinitions) {
     defs.font_data
         .entry(WENKAI_DATA_KEY.to_owned())
@@ -338,16 +669,6 @@ fn install_in_defs(defs: &mut FontDefinitions) {
     if !prop.iter().any(|n| n == WENKAI_DATA_KEY) {
         prop.push(WENKAI_DATA_KEY.to_owned());
     }
-}
-
-fn install_in_ctx(ctx: &egui::Context) {
-    let has = ctx.fonts(|f| f.definitions().families.contains_key(&title_font_family()));
-    if has {
-        return;
-    }
-    let mut defs = ctx.fonts(|f| f.definitions().clone());
-    install_in_defs(&mut defs);
-    ctx.set_fonts(defs);
 }
 
 /// Clean selected chapter text into tidy paragraphs for display on a card.
@@ -1587,7 +1908,7 @@ mod tests {
             (QuoteLayout::Vertical, [640, 1024]),
         ] {
             card.layout = layout;
-            let scene = render_scene(&ctx, &card, th, None, false);
+            let scene = render_scene(&ctx, &card, th, None, false, None, None, None);
             assert_eq!(scene.size(), expected, "{layout:?}");
             assert_eq!(scene.size()[0].max(scene.size()[1]), LONG_EDGE_PX);
             let out = dir
@@ -1600,6 +1921,124 @@ mod tests {
                 (expected[0], expected[1])
             );
         }
+    }
+
+    #[test]
+    fn independent_theme_and_font_selection_in_quote_dialog() {
+        let reader_th = &theme::THEMES[theme::index("ecru")];
+        let mocha_th = &theme::THEMES[theme::index("catppuccin-mocha")];
+
+        // Default follows the reader theme.
+        let mut dlg = QuoteDialog::new(
+            "世上本没有路。".to_owned(),
+            "呐喊".to_owned(),
+            "鲁迅".to_owned(),
+            QuoteLayout::Square,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(dlg.resolved_theme(reader_th).id, reader_th.id);
+
+        // Overriding theme renders in the chosen theme independently of the reader theme.
+        dlg.theme_id = Some(mocha_th.id.to_owned());
+        assert_eq!(dlg.resolved_theme(reader_th).id, mocha_th.id);
+
+        // Unknown theme id falls back safely to the reader theme.
+        dlg.theme_id = Some("nonexistent-theme".to_owned());
+        assert_eq!(dlg.resolved_theme(reader_th).id, reader_th.id);
+
+        // Rendering the same card in Ecru vs Catppuccin Mocha yields distinct pixels.
+        let ctx = test_ctx();
+        let ecru_scene = render_scene(&ctx, &dlg.card, reader_th, None, false, None, None, None);
+        let mocha_scene = render_scene(
+            &ctx,
+            &dlg.card,
+            mocha_th,
+            None,
+            false,
+            Some(fonts::BUNDLED),
+            Some(TITLE_SAME_AS_QUOTE),
+            None,
+        );
+        assert_ne!(
+            ecru_scene.pixel(pos2(10.0, 10.0)),
+            mocha_scene.pixel(pos2(10.0, 10.0)),
+            "choosing a different card theme must change the exported PNG colours"
+        );
+    }
+
+    #[test]
+    fn opening_quote_dialog_preserves_cached_page_glyph_uvs() {
+        let ctx = egui::Context::default();
+        let (defs, installed) = fonts::definitions(&[], "", "", 1);
+        ctx.set_fonts(defs);
+
+        // First frame activates the font atlas and lays out a cached reader galley.
+        let mut cached_latin: Option<Arc<egui::Galley>> = None;
+        let sample_latin = "The tunnel to summer, the exit of goodbyes.";
+        let sample_cjk = "怎么回事？追问得这么紧，跟她在学校时的个";
+        let serif_id = FontId::new(18.0, installed.serif.clone());
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            cached_latin = Some(ui.painter().layout_no_wrap(
+                sample_latin.to_owned(),
+                serif_id.clone(),
+                Color32::BLACK,
+            ));
+        });
+        out.textures_delta.clear();
+        let uvs = |g: &egui::Galley| {
+            g.rows
+                .iter()
+                .flat_map(|r| r.glyphs.iter().map(|gl| gl.uv_rect))
+                .collect::<Vec<_>>()
+        };
+        let before_latin = uvs(cached_latin.as_ref().expect("latin galley"));
+        assert!(before_latin.len() > 20);
+        assert!(before_latin.iter().any(|u| *u != before_latin[0]));
+
+        // Open the Export quote modal, switch themes and fonts across frames,
+        // and confirm the live context's font atlas is never wiped/invalidated.
+        let mut dlg = QuoteDialog::new(
+            sample_cjk.to_owned(),
+            "通往夏天的隧道，再见的出口".to_owned(),
+            "八目迷".to_owned(),
+            QuoteLayout::Square,
+            None,
+            None,
+            None,
+        );
+        let th = &theme::THEMES[0];
+        let mut fresh_latin: Option<Arc<egui::Galley>> = None;
+        let configs: [(Option<&str>, Option<&str>, Option<&str>); 3] = [
+            (None, None, None),
+            (
+                Some("catppuccin-mocha"),
+                Some(fonts::BUNDLED),
+                Some(TITLE_SAME_AS_QUOTE),
+            ),
+            (Some("gruvbox-dark"), None, Some(fonts::BUNDLED)),
+        ];
+        for (theme_id, quote_font, title_font) in configs {
+            dlg.theme_id = theme_id.map(str::to_owned);
+            dlg.quote_font = quote_font.map(str::to_owned);
+            dlg.title_font = title_font.map(str::to_owned);
+            let mut out = ctx.run_ui(Default::default(), |ui| {
+                dlg.ui(ui.ctx(), th, Some(&installed), false);
+                fresh_latin = Some(ui.painter().layout_no_wrap(
+                    sample_latin.to_owned(),
+                    serif_id.clone(),
+                    Color32::BLACK,
+                ));
+            });
+            out.textures_delta.clear();
+        }
+        assert!(dlg.preview.is_some(), "offscreen preview texture generated");
+        assert_eq!(
+            before_latin,
+            uvs(fresh_latin.as_ref().expect("fresh latin")),
+            "cached reader glyph UVs must remain valid after opening QuoteDialog and changing theme/fonts"
+        );
     }
 
     #[test]
@@ -1619,7 +2058,7 @@ mod tests {
                 "theme {} must distinguish mat from card",
                 th.id
             );
-            let scene = render_scene(&ctx, &card, th, None, false);
+            let scene = render_scene(&ctx, &card, th, None, false, None, None, None);
             assert_eq!(scene.size(), [1024, 1024], "theme {}", th.id);
         }
     }
@@ -1693,7 +2132,7 @@ mod tests {
                 date: "Nov 27, 2026".to_owned(),
                 layout,
             };
-            let scene = render_scene(&ctx, &card, th, None, false);
+            let scene = render_scene(&ctx, &card, th, None, false, None, None, None);
             scene.write_png(&dir.join(format!("{name}.png"))).unwrap();
         }
     }
