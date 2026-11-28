@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.28.07] - 2026-11-28
+
+### Fixed
+- **Robust reading position in the Reader.** Fixed a bug where advancing into a new chapter or jumping via **Contents** (or an internal link without a fragment) kept the previous chapter's character offset instead of resetting to the start, causing subsequent font/theme/layout changes to jump multiple pages forward and causing closing and reopening the book to snap back to the wrong page. Reading position now also stays accurate across one-page/two-page spread toggles, repeated font/size/window reflows, chapters with leading or trailing illustration pages, backward chapter turns, search peeks on exit, and `Home`/`End` jumps, and flushes mid-chapter page turns to disk shortly after turning.
+
 ## [2026.11.28.06] - 2026-11-28
 
 Thank you to **✨ nebula ✨** and **Lotus | 荷园** for reporting these bugs and layout issues!

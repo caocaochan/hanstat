@@ -274,7 +274,13 @@ pub struct Notice {
 #[derive(Clone, Debug)]
 enum Target {
     Offset(usize),
-    /// A character of [`Chapter::chars`] (the sentence read aloud).
+    /// Reflow keeping `offset` as the saved anchor while targeting `src` when
+    /// `offset` is shared with a preceding zero-text page (e.g. a cover image).
+    ReflowSrc {
+        offset: usize,
+        src: u32,
+    },
+    /// A character of [`Chapter::chars`] (the sentence read aloud or search hit).
     Src(u32),
     Anchor(String),
     Last,
@@ -325,6 +331,14 @@ pub struct Reader {
     /// Direction of the last move (skipping empty chapters).
     forward: bool,
     offset: usize,
+    /// Last known resolved, non-peek reading position, so saving while a
+    /// cross-chapter non-offset target is still loading never pairs a new
+    /// `spine` with an old chapter's `offset`.
+    last_valid_pos: Position,
+    /// Flush the reading position to the database once the pending target settles.
+    position_needs_save: bool,
+    /// When the reading position first changed in memory without a DB flush yet.
+    position_dirty_at: Option<f64>,
     prev_style: Option<(egui::Theme, Arc<egui::Style>)>,
     scroll: f32,
     resized_at: f64,
@@ -580,6 +594,12 @@ impl Reader {
             target: Some(Target::Offset(pos.offset)),
             forward: true,
             offset: pos.offset,
+            last_valid_pos: Position {
+                spine,
+                offset: pos.offset,
+            },
+            position_needs_save: false,
+            position_dirty_at: None,
             prev_style: Some((theme, prev)),
             scroll: 0.0,
             resized_at: 0.0,
@@ -658,6 +678,8 @@ impl Reader {
         if let Some(p) = self.peek.take() {
             self.spine = p.spine;
             self.offset = p.offset;
+            self.target = None;
+            self.last_valid_pos = p;
         }
         self.end_stats();
         self.save();
@@ -666,29 +688,69 @@ impl Reader {
         }
     }
 
-    pub fn save(&mut self) {
-        self.dirty = false;
-        if !self.should_persist() {
-            return;
+    /// The reading position that should be persisted right now.
+    /// Never returns a search-peek location or an unresolved cross-chapter
+    /// `(new_spine, old_offset)` pair.
+    fn persistent_position(&self) -> Position {
+        if let Some(p) = self.peek {
+            return p;
         }
-        // The place goes to the reading-stats database; to reader.json only
-        // while that can't be read (it is never written to then). Not while
-        // a search result is shown: reading is still where it was.
-        if self.peek.is_some() {
-        } else if crate::reading_stats::problem().is_none() {
-            crate::reading_stats::set_left_at(&self.book_id, self.spine, self.offset);
-            if let Err(e) = crate::reading_stats::save() {
-                self.error = Some(e);
+        let Some(t) = &self.target else {
+            return Position {
+                spine: self.spine,
+                offset: self.offset,
+            };
+        };
+        match t {
+            Target::Offset(o) | Target::ReflowSrc { offset: o, .. } => Position {
+                spine: self.spine,
+                offset: *o,
+            },
+            Target::Last | Target::Anchor(_) | Target::Src(_) => {
+                if let Some(l) = self.layouts.get(&self.spine)
+                    && !l.pages.is_empty()
+                {
+                    let step = self.drawn.or(self.last_geom).map_or(1, |g| self.step(&g));
+                    let mut p = match t {
+                        Target::Last => l.pages.len() - 1,
+                        Target::Anchor(a) => l.page_of_anchor(a).unwrap_or(0),
+                        Target::Src(s) => l.page_of_src(*s).unwrap_or(l.pages.len() - 1),
+                        Target::Offset(_) | Target::ReflowSrc { .. } => unreachable!(),
+                    };
+                    p -= p % step;
+                    return Position {
+                        spine: self.spine,
+                        offset: l.page_offset(p),
+                    };
+                }
+                if let Some(ch) = self.chapter(self.spine) {
+                    match t {
+                        Target::Last => {
+                            let end = ch.chars.iter().filter(|&&c| c != '\0' && c != ' ').count();
+                            return Position {
+                                spine: self.spine,
+                                offset: end,
+                            };
+                        }
+                        Target::Src(s) => {
+                            let off = ch.chars[..(*s as usize).min(ch.chars.len())]
+                                .iter()
+                                .filter(|&&c| c != '\0' && c != ' ')
+                                .count();
+                            return Position {
+                                spine: self.spine,
+                                offset: off,
+                            };
+                        }
+                        _ => {}
+                    }
+                }
+                self.last_valid_pos
             }
-        } else {
-            self.settings.positions.insert(
-                self.book_id.clone(),
-                Position {
-                    spine: self.spine,
-                    offset: self.offset,
-                },
-            );
         }
+    }
+
+    fn save_settings(&mut self) {
         let result = if let Some(default) = &self.session_tts_default {
             Settings {
                 tts: default.clone(),
@@ -703,8 +765,87 @@ impl Reader {
         }
     }
 
+    /// Record the reading position in memory and optionally flush it to disk.
+    fn sync_position(&mut self, flush_db: bool) {
+        if !flush_db && self.peek.is_some() {
+            return;
+        }
+        let pos = self.persistent_position();
+        if self.peek.is_none()
+            && !matches!(
+                self.target,
+                Some(Target::Last | Target::Anchor(_) | Target::Src(_))
+            )
+        {
+            self.last_valid_pos = pos;
+        }
+        if !self.should_persist() {
+            self.position_dirty_at = None;
+            return;
+        }
+        // The place goes to the reading-stats database; to reader.json only
+        // while that can't be read (it is never written to then).
+        if crate::reading_stats::problem().is_none() {
+            crate::reading_stats::set_left_at(&self.book_id, pos.spine, pos.offset);
+            if flush_db {
+                self.position_dirty_at = None;
+                if let Err(e) = crate::reading_stats::save() {
+                    self.error = Some(e);
+                }
+            } else {
+                self.position_dirty_at.get_or_insert(self.now);
+            }
+        } else {
+            self.position_dirty_at = None;
+            if self.settings.positions.get(&self.book_id) != Some(&pos) {
+                self.settings.positions.insert(self.book_id.clone(), pos);
+                if flush_db {
+                    self.save_settings();
+                } else {
+                    self.dirty = true;
+                }
+            }
+        }
+    }
+
+    pub fn save(&mut self) {
+        self.dirty = false;
+        if !self.should_persist() {
+            return;
+        }
+        self.sync_position(true);
+        self.save_settings();
+    }
+
     fn chapter(&self, i: usize) -> Option<Arc<Chapter>> {
         self.chapters.lock().unwrap().get(i).cloned().flatten()
+    }
+
+    /// Build a reflow target that preserves the current reading position
+    /// across layout changes (fonts, size, margins, window resize, spread).
+    fn reflow_target(&self) -> Target {
+        if self.page > 0
+            && let Some(l) = self.layouts.get(&self.spine)
+            && self.offset == l.page_offset(self.page)
+            && l.page_offset(self.page - 1) == self.offset
+            && let Some(src) = l.page_first_src(self.page)
+        {
+            return Target::ReflowSrc {
+                offset: self.offset,
+                src,
+            };
+        }
+        Target::Offset(self.offset)
+    }
+
+    /// Drop cached chapter layouts and ensure the current reading position is
+    /// restored once the open chapter lays out again.
+    fn invalidate_layouts(&mut self) {
+        if self.target.is_none() {
+            self.target = Some(self.reflow_target());
+        }
+        self.layouts.clear();
+        self.layout_work = None;
     }
 
     /// Fonts as chosen; reinstalled when the choice changes. `None` until the
@@ -730,8 +871,7 @@ impl Reader {
             .is_none_or(|f| f.key != (serif.clone(), sans.clone()))
         {
             self.fonts = Some(fonts::install(ctx, &fams, &serif, &sans));
-            self.layouts.clear();
-            self.layout_work = None;
+            self.invalidate_layouts();
         }
         let f = self.fonts.clone()?;
         let active = ctx.fonts(|v| v.definitions().families.contains_key(&f.serif));
@@ -794,6 +934,15 @@ impl Reader {
         }
         self.spine = spine;
         self.want.store(self.spine, Ordering::Relaxed);
+        match &target {
+            Target::Offset(o) | Target::ReflowSrc { offset: o, .. } => {
+                self.offset = *o;
+                if self.peek.is_none() {
+                    self.last_valid_pos = Position { spine, offset: *o };
+                }
+            }
+            Target::Src(_) | Target::Anchor(_) | Target::Last => {}
+        }
         self.target = Some(target);
     }
 
@@ -841,10 +990,7 @@ impl Reader {
     /// result's peek keeps the place for all that follow).
     fn search_go(&mut self, h: search::Hit) {
         if self.peek.is_none() {
-            self.peek = Some(Position {
-                spine: self.spine,
-                offset: self.offset,
-            });
+            self.peek = Some(self.persistent_position());
         }
         self.dict.close();
         self.selection = None;
@@ -863,10 +1009,6 @@ impl Reader {
         self.search_hit = None;
         self.dict.close();
         self.forward = false;
-        // An offset target keeps `offset` as it is (it is the place it
-        // names): set it, or the result's would stay and later re-layouts
-        // and saves would go there.
-        self.offset = p.offset;
         self.go_chapter(p.spine, Target::Offset(p.offset));
     }
 
@@ -878,7 +1020,14 @@ impl Reader {
             // (pages turned while the result was shown don't count).
             self.tracker.jumped();
             self.search_hit = None;
-            self.save();
+            if matches!(
+                self.target,
+                Some(Target::Last | Target::Anchor(_) | Target::Src(_))
+            ) {
+                self.position_needs_save = true;
+            } else {
+                self.sync_position(true);
+            }
         }
     }
 
@@ -983,11 +1132,14 @@ impl Reader {
         if self.page + step < l.pages.len() {
             self.page += step;
             self.offset = l.page_offset(self.page);
+            self.sync_position(false);
             return;
         }
         if self.spine + 1 < self.epub.spine.len() {
             self.go_chapter(self.spine + 1, Target::Offset(0));
-            self.save();
+            if self.peek.is_none() {
+                self.sync_position(true);
+            }
         } else if self.peek.is_none() {
             self.stats_finish();
         }
@@ -1004,18 +1156,30 @@ impl Reader {
         if self.page >= step {
             self.page -= step;
             self.offset = l.page_offset(self.page);
+            self.sync_position(false);
             return;
         }
         if self.spine > 0 {
             self.go_chapter(self.spine - 1, Target::Last);
+            if self.peek.is_none() {
+                self.position_needs_save = true;
+            }
         }
     }
 
     fn follow(&mut self, path: &str, fragment: Option<String>) {
         if let Some(i) = self.epub.spine.iter().position(|p| p == path) {
             self.forward = true;
-            self.go_chapter(i, fragment.map_or(Target::Offset(0), Target::Anchor));
-            self.save();
+            let target = fragment.map_or(Target::Offset(0), Target::Anchor);
+            let is_offset = matches!(target, Target::Offset(_));
+            self.go_chapter(i, target);
+            if self.peek.is_none() {
+                if is_offset {
+                    self.sync_position(true);
+                } else {
+                    self.position_needs_save = true;
+                }
+            }
         }
     }
 
@@ -1381,14 +1545,15 @@ impl Reader {
             if self.params.as_ref() != Some(&params) {
                 if settled {
                     self.params = Some(params);
-                    self.layouts.clear();
-                    self.layout_work = None;
+                    self.invalidate_layouts();
                     self.drawn = Some(g);
-                    self.target.get_or_insert(Target::Offset(self.offset));
                 } else {
                     ctx.request_repaint_after(std::time::Duration::from_millis(160));
                 }
             } else {
+                if self.drawn.is_some_and(|d| d.spread != g.spread) && self.target.is_none() {
+                    self.target = Some(self.reflow_target());
+                }
                 self.drawn = Some(g);
             }
             let g = self.drawn.unwrap_or(g);
@@ -1404,22 +1569,37 @@ impl Reader {
                     let n = self.epub.spine.len();
                     if self.forward && self.spine + 1 < n {
                         self.go_chapter(self.spine + 1, Target::Offset(0));
+                        if self.peek.is_none() {
+                            self.position_needs_save = true;
+                        }
                     } else if !self.forward && self.spine > 0 {
                         self.go_chapter(self.spine - 1, Target::Last);
+                        if self.peek.is_none() {
+                            self.position_needs_save = true;
+                        }
                     }
                     ctx.request_repaint();
                     return;
                 }
-                let by_offset = matches!(t, Target::Offset(_));
-                self.page = match t {
-                    Target::Offset(o) => l.page_of_offset(o),
-                    Target::Src(s) => l.page_of_src(s).unwrap_or(l.pages.len() - 1),
-                    Target::Anchor(a) => l.page_of_anchor(&a).unwrap_or(0),
+                self.page = match &t {
+                    Target::Offset(o) => l.page_of_offset(*o),
+                    Target::ReflowSrc { offset, src } => l
+                        .page_of_src(*src)
+                        .unwrap_or_else(|| l.page_of_offset(*offset)),
+                    Target::Src(s) => l.page_of_src(*s).unwrap_or(l.pages.len() - 1),
+                    Target::Anchor(a) => l.page_of_anchor(a).unwrap_or(0),
                     Target::Last => l.pages.len() - 1,
                 };
                 self.page -= self.page % step;
-                if !by_offset {
-                    self.offset = l.page_offset(self.page);
+                self.offset = match t {
+                    Target::Offset(o) | Target::ReflowSrc { offset: o, .. } => {
+                        o.min(l.text_total)
+                    }
+                    Target::Src(_) | Target::Anchor(_) | Target::Last => l.page_offset(self.page),
+                };
+                if self.peek.is_none() {
+                    let flush = std::mem::take(&mut self.position_needs_save);
+                    self.sync_position(flush);
                 }
             }
             self.page = self.page.min(l.pages.len().saturating_sub(1));
@@ -1814,7 +1994,9 @@ impl Reader {
                 self.forward = spine > self.spine;
                 self.tracker.turned();
                 self.go_chapter(spine, Target::Src(src));
-                self.save();
+                if self.peek.is_none() {
+                    self.position_needs_save = true;
+                }
                 ctx.request_repaint();
             }
         });
@@ -1918,12 +2100,25 @@ impl Reader {
                 self.prev(&g);
             }
             if home {
+                self.turned_at = self.now;
+                self.tracker.jumped();
+                self.target = None;
                 self.page = 0;
                 self.offset = 0;
+                self.sync_position(true);
             }
-            if end && let Some(l) = self.layouts.get(&self.spine) {
-                self.page = l.pages.len().saturating_sub(1);
+            if end
+                && let Some(l) = self.layouts.get(&self.spine)
+                && !l.pages.is_empty()
+            {
+                let step = self.step(&g);
+                self.turned_at = self.now;
+                self.tracker.jumped();
+                self.target = None;
+                let last = l.pages.len() - 1;
+                self.page = last - last % step;
                 self.offset = l.page_offset(self.page);
+                self.sync_position(true);
             }
             if esc && self.search.open {
                 // Esc with the sidebar shown closes it, not the book.
@@ -2032,6 +2227,13 @@ impl Reader {
         }
         if self.dirty && !ctx.input(|i| i.pointer.any_down()) {
             self.save();
+        } else if let Some(at) = self.position_dirty_at {
+            let elapsed = now - at;
+            if elapsed >= 2.0 && !ctx.input(|i| i.pointer.any_down()) {
+                self.sync_position(true);
+            } else {
+                ctx.request_repaint_after(Duration::from_secs_f64((2.0 - elapsed).max(0.05)));
+            }
         }
         if let Some(e) = self.error.take() {
             crate::palette::popup_window(&ctx, "Reader")
@@ -2244,6 +2446,7 @@ impl Reader {
             self.tracker.turned();
             self.page = p - p % step;
             self.offset = l.page_offset(self.page);
+            self.sync_position(false);
         }
         None
     }
@@ -2280,6 +2483,7 @@ impl Reader {
         self.tracker.turned();
         self.page = next;
         self.offset = l.page_offset(self.page);
+        self.sync_position(false);
     }
 
     fn contents_menu(&mut self, ui: &mut egui::Ui) {
@@ -2449,11 +2653,16 @@ impl Reader {
         if let Some(i) = go {
             let e = self.epub.toc[i].clone();
             self.forward = true;
-            self.go_chapter(
-                e.spine,
-                e.fragment.map_or(Target::Offset(0), Target::Anchor),
-            );
-            self.save();
+            let target = e.fragment.map_or(Target::Offset(0), Target::Anchor);
+            let is_offset = matches!(target, Target::Offset(_));
+            self.go_chapter(e.spine, target);
+            if self.peek.is_none() {
+                if is_offset {
+                    self.sync_position(true);
+                } else {
+                    self.position_needs_save = true;
+                }
+            }
         }
     }
 
@@ -3465,5 +3674,300 @@ mod geometry_tests {
         out.textures_delta.clear();
         assert_eq!(width, None);
         assert_eq!(height, Some(1500.0));
+    }
+}
+
+#[cfg(test)]
+mod position_tests {
+    use super::*;
+
+    fn write_test_epub(path: &Path) {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        let ch_body = |tag: &str| {
+            let mut body = String::from(r#"<html><meta charset="utf-8"><body>"#);
+            for i in 0..40 {
+                body.push_str(&format!(
+                    r#"<p id="p{i}">{tag}第{i}段：{}</p>"#,
+                    "春江潮水连海平海上明月共潮生滟滟随波千万里何处春江无月明。".repeat(3)
+                ));
+            }
+            body.push_str("</body></html>");
+            body
+        };
+        let ch0 = ch_body("甲");
+        let ch1 = ch_body("乙");
+        let ch2 = ch_body("丙");
+        let files: &[(&str, &str)] = &[
+            (
+                "META-INF/container.xml",
+                r#"<container><rootfiles><rootfile full-path="book.opf"/></rootfiles></container>"#,
+            ),
+            (
+                "book.opf",
+                r#"<package><metadata><title>Position robustness</title></metadata>
+                   <manifest>
+                     <item id="c0" href="c0.xhtml" media-type="application/xhtml+xml"/>
+                     <item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/>
+                     <item id="c2" href="c2.xhtml" media-type="application/xhtml+xml"/>
+                   </manifest>
+                   <spine>
+                     <itemref idref="c0"/>
+                     <itemref idref="c1"/>
+                     <itemref idref="c2"/>
+                   </spine></package>"#,
+            ),
+            ("c0.xhtml", &ch0),
+            ("c1.xhtml", &ch1),
+            ("c2.xhtml", &ch2),
+        ];
+        for &(name, body) in files {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    fn run_frames(ctx: &egui::Context, r: &mut Reader, size: Vec2, time: &mut f64, n: usize) {
+        for _ in 0..n {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                time: Some(*time),
+                predicted_dt: 1.0 / 60.0,
+                ..Default::default()
+            };
+            *time += 1.0 / 60.0;
+            let mut out = ctx.run_ui(raw, |ui| {
+                let _ = r.ui(ui);
+            });
+            out.textures_delta.clear();
+        }
+    }
+
+    fn wait_ready(ctx: &egui::Context, r: &mut Reader, size: Vec2, time: &mut f64) {
+        let start = std::time::Instant::now();
+        while fonts::families().is_none()
+            || !r.layouts.contains_key(&r.spine)
+            || r.target.is_some()
+            || r.progress().is_none()
+        {
+            run_frames(ctx, r, size, time, 1);
+            assert!(start.elapsed().as_secs() < 30, "reader never became ready");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        run_frames(ctx, r, size, time, 2);
+    }
+
+    fn open_test_reader(ctx: &egui::Context, path: &Path, book_id: &str) -> Reader {
+        let mut r = Reader::open(
+            path,
+            Some(book_id),
+            false,
+            ctx,
+            &mut DictionarySession::default(),
+        )
+        .unwrap();
+        r.persist = false;
+        r.settings = Settings {
+            spread: false,
+            size: 20.0,
+            ..Settings::default()
+        };
+        r
+    }
+
+    #[test]
+    fn chapter_transition_and_font_change_never_jump_or_lose_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("book.epub");
+        write_test_epub(&path);
+
+        let ctx = egui::Context::default();
+        crate::install_fonts(&ctx);
+        let size = vec2(1200.0, 800.0);
+        let mut time = 1.0;
+
+        let mut r = open_test_reader(&ctx, &path, "pos-test-1");
+        r.go_chapter(0, Target::Offset(0));
+        wait_ready(&ctx, &mut r, size, &mut time);
+        let g = r.drawn.unwrap();
+
+        // Walk to the last page of chapter 0 so `r.offset` is large.
+        let ch0_pages = r.layouts[&0].pages.len();
+        assert!(
+            ch0_pages >= 4,
+            "chapter 0 should span multiple pages: {ch0_pages}"
+        );
+        for _ in 0..ch0_pages - 1 {
+            r.next(&g);
+        }
+        assert_eq!(r.spine, 0);
+        assert_eq!(r.page, ch0_pages - 1);
+        let ch0_end_offset = r.offset;
+        assert!(
+            ch0_end_offset > 500,
+            "expected large end offset, got {ch0_end_offset}"
+        );
+
+        // Turn into chapter 1: offset and persistent_position must immediately become (1, 0).
+        r.next(&g);
+        assert_eq!(r.spine, 1);
+        assert_eq!(r.offset, 0);
+        assert_eq!(
+            r.persistent_position(),
+            Position {
+                spine: 1,
+                offset: 0
+            }
+        );
+        wait_ready(&ctx, &mut r, size, &mut time);
+        assert_eq!((r.spine, r.page, r.offset), (1, 0, 0));
+
+        // Change sans-serif font (and body text to sans): must stay at page 0, offset 0!
+        let fams = fonts::families().unwrap();
+        let alt_font = fams
+            .iter()
+            .find(|f| {
+                !f.name
+                    .eq_ignore_ascii_case(r.settings.sans.as_deref().unwrap_or(""))
+            })
+            .map(|f| f.name.clone())
+            .unwrap_or_else(|| fonts::BUNDLED.to_owned());
+        r.settings.sans = Some(alt_font);
+        r.settings.sans_default = true;
+        time += 0.5;
+        run_frames(&ctx, &mut r, size, &mut time, 4);
+        wait_ready(&ctx, &mut r, size, &mut time);
+        assert_eq!(
+            (r.spine, r.page, r.offset),
+            (1, 0, 0),
+            "changing sans-serif font on page 0 of a new chapter must not jump forward"
+        );
+        assert_eq!(
+            r.persistent_position(),
+            Position {
+                spine: 1,
+                offset: 0
+            }
+        );
+
+        // Advance deep into chapter 1, then jump back to chapter 1 start via Target::Offset(0)
+        // (same path as Contents menu): offset and persistent_position must immediately reset to 0.
+        let g = r.drawn.unwrap();
+        for _ in 0..3 {
+            r.next(&g);
+        }
+        assert!(r.page >= 3 && r.offset > 500);
+        r.go_chapter(1, Target::Offset(0));
+        assert_eq!(r.offset, 0);
+        assert_eq!(
+            r.persistent_position(),
+            Position {
+                spine: 1,
+                offset: 0
+            }
+        );
+        wait_ready(&ctx, &mut r, size, &mut time);
+        assert_eq!((r.spine, r.page, r.offset), (1, 0, 0));
+        assert_eq!(
+            r.persistent_position(),
+            Position {
+                spine: 1,
+                offset: 0
+            }
+        );
+    }
+
+    #[test]
+    fn prev_across_chapters_spread_toggle_and_reflows_stay_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("book.epub");
+        write_test_epub(&path);
+
+        let ctx = egui::Context::default();
+        crate::install_fonts(&ctx);
+        let size = vec2(1920.0, 1080.0);
+        let mut time = 1.0;
+
+        let mut r = open_test_reader(&ctx, &path, "pos-test-2");
+        r.go_chapter(1, Target::Offset(0));
+        wait_ready(&ctx, &mut r, size, &mut time);
+
+        // Prev from chapter 1 page 0 -> chapter 0 Target::Last.
+        // Even before layout finishes, persistent_position must not report (0, 0).
+        let g = r.drawn.unwrap();
+        r.prev(&g);
+        assert_eq!(r.spine, 0);
+        let pending_pos = r.persistent_position();
+        assert_eq!(pending_pos.spine, 0);
+        assert!(
+            pending_pos.offset > 500,
+            "prev to previous chapter must not report offset 0 before layout: {pending_pos:?}"
+        );
+        wait_ready(&ctx, &mut r, size, &mut time);
+        let last_page = r.layouts[&0].pages.len() - 1;
+        assert_eq!(r.page, last_page);
+        assert_eq!(r.offset, r.layouts[&0].page_offset(last_page));
+
+        // Move to an odd page (page 3) in one-page mode on a wide window where
+        // content width is identical in 1-page and 2-page spread modes.
+        r.go_chapter(1, Target::Offset(0));
+        wait_ready(&ctx, &mut r, size, &mut time);
+        let g = r.drawn.unwrap();
+        for _ in 0..3 {
+            r.next(&g);
+        }
+        assert_eq!(r.page, 3);
+        let anchor_offset = r.offset;
+        assert!(anchor_offset > 0);
+
+        // Toggle Two pages -> spread 2..3, anchor offset preserved.
+        r.settings.spread = true;
+        run_frames(&ctx, &mut r, size, &mut time, 3);
+        wait_ready(&ctx, &mut r, size, &mut time);
+        assert_eq!(r.page, 2);
+        assert_eq!(r.offset, anchor_offset);
+
+        // Toggle back to One page -> returns to exact page 3 (not stuck on page 2!).
+        r.settings.spread = false;
+        run_frames(&ctx, &mut r, size, &mut time, 3);
+        wait_ready(&ctx, &mut r, size, &mut time);
+        assert_eq!(r.page, 3);
+        assert_eq!(r.offset, anchor_offset);
+
+        // Repeated font size & vertical/horizontal reflows must not drift `r.offset`.
+        for (sz, vert) in [(26.0, false), (16.0, false), (20.0, true), (20.0, false)] {
+            r.settings.size = sz;
+            r.settings.vertical = vert;
+            time += 0.5;
+            run_frames(&ctx, &mut r, size, &mut time, 4);
+            wait_ready(&ctx, &mut r, size, &mut time);
+            assert_eq!(
+                r.offset, anchor_offset,
+                "reflow (size={sz}, vertical={vert}) must not drift offset"
+            );
+        }
+        assert_eq!(r.page, 3);
+
+        // Peek via search after advancing, and verify persistent_position keeps the pre-peek place.
+        let pre_peek = Position {
+            spine: r.spine,
+            offset: r.offset,
+        };
+        r.search_go(search::Hit {
+            spine: 2,
+            range: 0..4,
+            before: String::new(),
+            text: String::new(),
+            after: String::new(),
+        });
+        assert_eq!(r.persistent_position(), pre_peek);
+        wait_ready(&ctx, &mut r, size, &mut time);
+        assert_eq!(r.spine, 2);
+        assert_eq!(r.persistent_position(), pre_peek);
+        r.peek_back();
+        wait_ready(&ctx, &mut r, size, &mut time);
+        assert_eq!((r.spine, r.page, r.offset), (1, 3, anchor_offset));
     }
 }

@@ -161,6 +161,8 @@ pub(super) struct ChapterLayout {
     pub(super) links: Vec<Link>,
     pub(super) spoilers: Vec<Spoiler>,
     pub(super) hits: Hits,
+    /// Characters of text laid out in the chapter (the unit of [`Unit::text`]).
+    pub(super) text_total: usize,
     /// Chinese characters laid out in the chapter.
     pub(super) han_total: u32,
     /// Laid out in `vertical-rl` mode.
@@ -179,16 +181,37 @@ impl ChapterLayout {
             .map_or(self.han_total, |u| u.han)
     }
 
+    /// Characters of text laid out on `page`.
+    pub(super) fn page_text_len(&self, page: usize) -> usize {
+        let start = self.page_offset(page);
+        let end = self
+            .pages
+            .get(page + 1)
+            .and_then(|p| self.units.get(p.units.start))
+            .map_or(self.text_total, |u| u.text);
+        end.saturating_sub(start)
+    }
+
     /// The page holding the text at `offset` characters.
     pub(super) fn page_of_offset(&self, offset: usize) -> usize {
-        self.pages
-            .iter()
-            .rposition(|p| {
-                self.units
-                    .get(p.units.start)
-                    .is_some_and(|u| u.text <= offset)
-            })
-            .unwrap_or(0)
+        if offset == 0 {
+            return 0;
+        }
+        let Some(mut p) = self.pages.iter().rposition(|p| {
+            self.units
+                .get(p.units.start)
+                .is_some_and(|u| u.text <= offset)
+        }) else {
+            return 0;
+        };
+        // If `offset` lands on trailing zero-text pages (e.g. end-of-chapter
+        // illustrations), stay on the first of them rather than jumping to the last.
+        if self.page_offset(p) == offset && self.page_text_len(p) == 0 {
+            while p > 0 && self.page_offset(p - 1) == offset {
+                p -= 1;
+            }
+        }
+        p
     }
 
     pub(super) fn page_offset(&self, page: usize) -> usize {
@@ -639,6 +662,7 @@ fn finish(mut f: FlowState, page_block: f32, vertical: bool, content_w: f32) -> 
         links: f.links,
         spoilers: f.spoilers,
         hits: f.hits,
+        text_total: f.text,
         han_total: f.han,
         vertical,
         content_w,
@@ -3026,5 +3050,63 @@ mod tests {
                 dy: -0.45
             }
         );
+    }
+
+    #[test]
+    fn page_of_offset_handles_zero_text_and_image_pages() {
+        let unit = |text: usize, image_only: bool| Unit {
+            top: 0.0,
+            bottom: 10.0,
+            items: 0..0,
+            break_before: false,
+            image_only,
+            text,
+            han: 0,
+            spoiler: None,
+        };
+        let make = |pages: &[(usize, bool)], text_total: usize| ChapterLayout {
+            items: Vec::new(),
+            units: pages.iter().map(|&(t, img)| unit(t, img)).collect(),
+            decos: Vec::new(),
+            pages: (0..pages.len())
+                .map(|i| Page {
+                    y0: 0.0,
+                    units: i..i + 1,
+                    center: pages[i].1,
+                })
+                .collect(),
+            anchors: HashMap::new(),
+            links: Vec::new(),
+            spoilers: Vec::new(),
+            hits: Hits::default(),
+            text_total,
+            han_total: 0,
+            vertical: false,
+            content_w: 400.0,
+        };
+
+        // Leading illustrations before text: offset 0 stays on page 0; offset > 0 lands on text.
+        let leading = make(&[(0, true), (0, true), (0, false), (300, false)], 600);
+        assert_eq!(leading.page_of_offset(0), 0);
+        assert_eq!(leading.page_of_offset(1), 2);
+        assert_eq!(leading.page_of_offset(299), 2);
+        assert_eq!(leading.page_of_offset(300), 3);
+        assert_eq!(leading.page_of_offset(999), 3);
+
+        // All-image chapter: offset 0 stays on page 0 (never jumps to the last page).
+        let images_only = make(&[(0, true), (0, true), (0, true)], 0);
+        assert_eq!(images_only.page_of_offset(0), 0);
+
+        // Mid-chapter image: text page right after an image stays on the text page.
+        let mid = make(&[(0, false), (300, true), (300, false), (600, false)], 900);
+        assert_eq!(mid.page_of_offset(0), 0);
+        assert_eq!(mid.page_of_offset(300), 2);
+        assert_eq!(mid.page_of_offset(450), 2);
+        assert_eq!(mid.page_of_offset(600), 3);
+
+        // Trailing illustrations: landing at text_total hits the first trailing image, not the last.
+        let trailing = make(&[(0, false), (300, true), (300, true)], 300);
+        assert_eq!(trailing.page_of_offset(0), 0);
+        assert_eq!(trailing.page_of_offset(300), 1);
     }
 }
