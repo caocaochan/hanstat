@@ -146,8 +146,8 @@ fn render_pages() {
                             off.y += ((g.content.y - l.page_height(idx)) / 2.0).max(0.0);
                         }
                     }
-                    let (items, shift) = l.page_items(idx);
-                    let off = off + shift;
+                    let items = l.page_render_items(idx);
+                    let off = off + l.page_shift(idx);
                     let clip = Rect::from_min_size(origin, g.content).expand(4.0);
                     let clip_pad = if l.vertical {
                         vec2(0.0, g.inset.y * 0.4)
@@ -155,8 +155,8 @@ fn render_pages() {
                         vec2(g.inset.x * 0.5, 0.0)
                     };
                     let painter = ui.painter_at(clip.expand2(clip_pad));
-                    for i in &items {
-                        if let Item::Image { rect, path } = &l.items[*i] {
+                    for &(i, _) in &items {
+                        if let Item::Image { rect, path } = &l.items[i] {
                             let r = rect.translate(off);
                             images.load_now(
                                 &ctx,
@@ -165,8 +165,16 @@ fn render_pages() {
                             );
                         }
                     }
-                    for i in items {
-                        paint_item(&mut images, th, &painter, &l.items[i], off, 2.0);
+                    for (i, spoiler) in items {
+                        paint_item(
+                            &mut images,
+                            th,
+                            &painter,
+                            &l.items[i],
+                            off,
+                            2.0,
+                            spoiler.is_some(),
+                        );
                     }
                     let small = egui::FontId::proportional((settings.size * 0.62).max(11.0));
                     ui.painter().text(
@@ -3956,4 +3964,137 @@ fn reader_vertical_typography() {
         .filter(|it| matches!(it, Item::Text { angle, .. } if *angle == 0.0))
         .count();
     assert!(body_upright > 20, "expected upright stacked glyphs");
+}
+
+#[test]
+#[ignore = "opens the reader with the system fonts and dictionary settings"]
+fn reader_duchinese_blurred_translations() {
+    use crate::duchinese::data::{Paragraph, Text};
+    use crate::duchinese::epub::{self as du_epub, Book, Chapter as DuChapter};
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("duchinese_story.epub");
+    let text = Text {
+        heading: Some("第一章：遇见小猫".into()),
+        paragraphs: vec![
+            Paragraph {
+                text: "今天早上，我在公园里看见了一只非常可爱的小白猫。".into(),
+                translation: "This morning, I saw a very cute little white cat in the park.".into(),
+            },
+            Paragraph {
+                text: "它慢慢地走到我的脚边，抬起头看着我，好像在问我有没有带吃的。我笑了笑，从包里拿出一点面包分给它。".into(),
+                translation: "It slowly walked over to my feet and looked up at me, as if asking whether I had brought anything to eat. I smiled and took a bit of bread out of my bag to share with it.".into(),
+            },
+            Paragraph {
+                text: "小猫吃得很开心，吃完以后还轻轻地蹭了蹭我的裤脚。".into(),
+                translation: "The kitten ate happily, and after finishing it gently rubbed against my trouser leg.".into(),
+            },
+        ],
+    };
+    let bytes = du_epub::build(&Book {
+        course: 42,
+        title: "遇见小猫",
+        description: "A test story.",
+        source: "https://duchinese.net/lessons/courses/42-cat",
+        traditional: false,
+        translations: true,
+        modified: "2026-11-28T00:00:00Z",
+        cover: None,
+        chapters: vec![DuChapter {
+            lesson: "1001",
+            label: "1. 遇见小猫".into(),
+            text: &text,
+        }],
+    })
+    .unwrap();
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut d = Driver::new();
+    let mut r = d.open(path.to_str().unwrap());
+    r.settings.theme = "solarized-light".into();
+    apply_theme(&d.ctx, d.ctx.theme(), theme::index(&r.settings.theme));
+    d.ready(&mut r);
+    d.idle(&mut r, 4);
+
+    assert!(r.epub.duchinese);
+    assert!(
+        r.revealed_spoilers.is_empty(),
+        "all translations start blurred"
+    );
+
+    let (idx, off) = r.probe.sides[0];
+    let l = r.layouts.get(&r.spine).unwrap().clone();
+    let spoilers: Vec<(u32, Rect)> = l
+        .page_spoilers(idx)
+        .map(|s| (s.id, s.rect.translate(off)))
+        .collect();
+    assert!(
+        spoilers.iter().any(|(id, _)| *id == 0)
+            && spoilers.iter().any(|(id, _)| *id == 1)
+            && spoilers.iter().any(|(id, _)| *id == 2),
+        "expected 3 translation blocks, got {spoilers:?}"
+    );
+    d.snap("duchinese-blurred-light");
+
+    // Hovering a blurred translation shows PointingHand and does not reveal it.
+    let first_rect = spoilers.iter().find(|(id, _)| *id == 0).unwrap().1;
+    d.frame(&mut r, vec![egui::Event::PointerMoved(first_rect.center())]);
+    assert!(r.revealed_spoilers.is_empty());
+    assert_eq!(
+        d.last.as_ref().unwrap().platform_output.cursor_icon,
+        egui::CursorIcon::PointingHand
+    );
+    d.snap("duchinese-hover-light");
+
+    // Clicking the first translation reveals only it; the others remain blurred.
+    d.click(&mut r, first_rect.center());
+    assert!(r.revealed_spoilers.contains(&(0, 0)));
+    assert!(!r.revealed_spoilers.contains(&(0, 1)));
+    assert!(!r.revealed_spoilers.contains(&(0, 2)));
+    assert!(r.selection.is_none());
+    d.snap("duchinese-revealed-light");
+
+    // Dark theme preview with one revealed and two blurred.
+    r.settings.theme = "catppuccin-mocha".into();
+    apply_theme(&d.ctx, d.ctx.theme(), theme::index(&r.settings.theme));
+    d.ready(&mut r);
+    d.idle(&mut r, 4);
+    d.snap("duchinese-mixed-dark");
+
+    // Clicking the revealed translation again re-blurs it.
+    let (idx, off) = r.probe.sides[0];
+    let l = r.layouts.get(&r.spine).unwrap().clone();
+    let first_rect = l
+        .page_spoilers(idx)
+        .find(|s| s.id == 0)
+        .unwrap()
+        .rect
+        .translate(off);
+    d.click(&mut r, first_rect.center());
+    assert!(!r.revealed_spoilers.contains(&(0, 0)));
+
+    // Reveal the multi-line second translation, then drag-select inside it.
+    let second_rect = l
+        .page_spoilers(idx)
+        .find(|s| s.id == 1)
+        .unwrap()
+        .rect
+        .translate(off);
+    d.click(&mut r, second_rect.center());
+    assert!(r.revealed_spoilers.contains(&(0, 1)));
+    let drag_a = pos2(second_rect.left() + 8.0, second_rect.center().y);
+    let drag_b = pos2(second_rect.left() + 80.0, second_rect.center().y);
+    d.drag(&mut r, drag_a, drag_b);
+    assert!(
+        r.selection.is_some(),
+        "drag selects revealed translation text"
+    );
+    assert!(
+        r.revealed_spoilers.contains(&(0, 1)),
+        "dragging does not re-blur"
+    );
+    // Clicking while text is selected clears the selection without re-blurring.
+    d.click(&mut r, second_rect.center());
+    assert!(r.selection.is_none());
+    assert!(r.revealed_spoilers.contains(&(0, 1)));
 }

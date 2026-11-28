@@ -320,6 +320,7 @@ mod tests {
         );
 
         let epub = crate::reader::epub::Epub::open(&p).unwrap();
+        assert!(epub.duchinese, "DuChinese EPUB identified by urn");
         assert_eq!(epub.spine, ["OEBPS/l101.xhtml", "OEBPS/l102.xhtml"]);
         let labels: Vec<&str> = epub.toc.iter().map(|t| t.label.as_str()).collect();
         assert_eq!(labels, ["1. 小猫", "2. Chapter 2"]);

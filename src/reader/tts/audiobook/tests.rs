@@ -441,6 +441,7 @@ fn reader_plays_the_cached_sentence_before_requesting_setup() {
         tree::Source::Epub {
             base: String::new(),
             path: String::new(),
+            duchinese: false,
         },
     );
     let sentences = crate::reader::tts::sentences(&chapter.chars);

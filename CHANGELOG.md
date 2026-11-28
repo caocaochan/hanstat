@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.28.02] - 2026-11-28
+
+### Changed
+- **DuChinese sentence translations are blurred until clicked.** In books imported from DuChinese with **Sentence translations** ticked, each English translation paragraph now appears blurred by default in the Reader so it doesn't spoil the Chinese while you read. Click a blurred translation to reveal it (and click it again to re-blur it; dragging across revealed text still selects and copies normally). Works for both newly imported and previously imported DuChinese stories.
+
 ## [2026.11.28.01] - 2026-11-28
 
 ### Added

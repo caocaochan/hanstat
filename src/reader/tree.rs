@@ -71,6 +71,8 @@ pub struct Block {
     pub kind: BlockKind,
     pub children: Vec<Child>,
     pub id: Option<String>,
+    /// A DuChinese sentence translation block, blurred until clicked.
+    pub spoiler: Option<u32>,
 }
 
 /// Where a link goes.
@@ -206,6 +208,7 @@ pub fn build(epub: &Epub, path: &str, sheets: &mut SheetCache) -> Chapter {
         Source::Epub {
             base: base.to_owned(),
             path: path.to_owned(),
+            duchinese: epub.duchinese,
         },
     )
 }
@@ -213,7 +216,11 @@ pub fn build(epub: &Epub, path: &str, sheets: &mut SheetCache) -> Chapter {
 /// What a document is, for its links and images.
 pub enum Source {
     /// A file of the book: links and image paths resolve against it.
-    Epub { base: String, path: String },
+    Epub {
+        base: String,
+        path: String,
+        duchinese: bool,
+    },
     /// A dictionary popup's entry: `?query=` links look up, `<details>` not in
     /// `open` (numbered in document order) show only their summary, and image
     /// paths are the dictionary's media paths.
@@ -236,6 +243,7 @@ pub fn build_doc(doc: &scraper::Html, ua: &RuleSet, author: &RuleSet, source: So
         links: Vec::new(),
         source,
         details: 0,
+        spoilers: 0,
         summary: None,
         text_len: 0,
         anchors: Vec::new(),
@@ -258,6 +266,7 @@ pub fn build_doc(doc: &scraper::Html, ua: &RuleSet, author: &RuleSet, source: So
         kind: BlockKind::Flow,
         children: Vec::new(),
         id: None,
+        spoiler: None,
     };
     if let Some(body) = html
         .children()
@@ -320,6 +329,8 @@ struct Builder<'a> {
     source: Source,
     /// `<details>` elements seen so far (popup documents).
     details: u32,
+    /// Spoiler blocks seen so far (DuChinese sentence translations).
+    spoilers: u32,
     /// A `<summary>` about to be built: its marker and toggle link.
     summary: Option<(String, u32)>,
     text_len: usize,
@@ -530,7 +541,7 @@ impl Builder<'_> {
         }
         let href = el.value().attr("href")?;
         let target = match &self.source {
-            Source::Epub { base, path } => {
+            Source::Epub { base, path, .. } => {
                 if href.contains("://") || href.starts_with("mailto:") {
                     return None;
                 }
@@ -559,11 +570,27 @@ impl Builder<'_> {
         let list = style.display == Display::ListItem;
         let marker_style = style.list_style;
         let sid = self.push(style.clone());
+        let spoiler = if matches!(
+            self.source,
+            Source::Epub {
+                duchinese: true,
+                ..
+            }
+        ) && el.value().name() == "p"
+            && el.value().classes().any(|c| c == "tr")
+        {
+            let n = self.spoilers;
+            self.spoilers += 1;
+            Some(n)
+        } else {
+            None
+        };
         let mut block = Block {
             style: sid,
             kind: BlockKind::Flow,
             children: Vec::new(),
             id,
+            spoiler,
         };
         let mut run = Run::default();
         let mut link = None;
@@ -672,6 +699,7 @@ impl Builder<'_> {
                             kind: BlockKind::Image(img),
                             children: Vec::new(),
                             id: el.value().id().map(str::to_owned),
+                            spoiler: None,
                         }));
                     } else {
                         run.atomic(Inline::Image {
@@ -698,6 +726,7 @@ impl Builder<'_> {
                         kind: BlockKind::Image(img),
                         children: Vec::new(),
                         id: None,
+                        spoiler: None,
                     }));
                 }
                 return;
@@ -710,6 +739,7 @@ impl Builder<'_> {
                     kind: BlockKind::Rule,
                     children: Vec::new(),
                     id: None,
+                    spoiler: None,
                 }));
                 return;
             }
@@ -781,6 +811,7 @@ impl Builder<'_> {
                 kind: BlockKind::Flow,
                 children: Vec::new(),
                 id: None,
+                spoiler: None,
             };
             self.children(el, &style, sid, &mut scratch, &mut inner, link);
             // Content only; any blocks inside are flattened into the line.
@@ -841,6 +872,7 @@ impl Builder<'_> {
             kind: BlockKind::Flow,
             children: Vec::new(),
             id: None,
+            spoiler: None,
         };
         let mut inner = Run::default();
         let mut has_summary = false;
@@ -994,8 +1026,52 @@ mod tests {
             Source::Epub {
                 base: String::new(),
                 path: String::new(),
+                duchinese: false,
             },
         );
         assert_eq!(boxes(&book), 0);
+    }
+
+    #[test]
+    fn duchinese_translations_are_spoilers_only_in_duchinese_books() {
+        let html = r#"<html><body><p>中文</p><p class="tr" lang="en">English one.</p><p>第二段</p><p class="tr" lang="en">English two.</p></body></html>"#;
+        let doc = scraper::Html::parse_document(html);
+        let collect = |ch: &Chapter| -> Vec<Option<u32>> {
+            fn walk(b: &Block, out: &mut Vec<Option<u32>>) {
+                if b.spoiler.is_some() {
+                    out.push(b.spoiler);
+                }
+                for c in &b.children {
+                    if let Child::Block(child) = c {
+                        walk(child, out);
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            walk(&ch.root, &mut out);
+            out
+        };
+        let du = build_doc(
+            &doc,
+            &ua_rules(),
+            &RuleSet::default(),
+            Source::Epub {
+                base: String::new(),
+                path: String::new(),
+                duchinese: true,
+            },
+        );
+        assert_eq!(collect(&du), [Some(0), Some(1)]);
+        let other = build_doc(
+            &doc,
+            &ua_rules(),
+            &RuleSet::default(),
+            Source::Epub {
+                base: String::new(),
+                path: String::new(),
+                duchinese: false,
+            },
+        );
+        assert_eq!(collect(&other), []);
     }
 }

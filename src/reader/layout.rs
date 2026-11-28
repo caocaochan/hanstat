@@ -88,6 +88,8 @@ struct Unit {
     text: usize,
     /// Chinese characters of the chapter before it (reading stats).
     han: u32,
+    /// DuChinese translation block id, when this line is blurred until clicked.
+    spoiler: Option<u32>,
 }
 
 pub(super) struct Page {
@@ -100,6 +102,16 @@ pub(super) struct Page {
 pub(super) struct Link {
     pub(super) rect: Rect,
     pub(super) target: u32,
+    unit: usize,
+}
+
+/// One visual line of a blurred DuChinese translation paragraph.
+pub(super) struct Spoiler {
+    /// Click/hover target (flow coordinates).
+    pub(super) rect: Rect,
+    /// Tight text bounds (flow coordinates), for hover feedback.
+    pub(super) visual: Rect,
+    pub(super) id: u32,
     unit: usize,
 }
 
@@ -137,6 +149,7 @@ pub(super) struct ChapterLayout {
     pub(super) pages: Vec<Page>,
     pub(super) anchors: HashMap<String, usize>,
     pub(super) links: Vec<Link>,
+    pub(super) spoilers: Vec<Spoiler>,
     pub(super) hits: Hits,
     /// Chinese characters laid out in the chapter.
     pub(super) han_total: u32,
@@ -198,35 +211,46 @@ impl ChapterLayout {
         }
     }
 
-    /// Items of a page and the offset that places them (flow → page).
-    pub(super) fn page_items(&self, page: usize) -> (Vec<usize>, Vec2) {
-        let Some(p) = self.pages.get(page) else {
-            return (Vec::new(), Vec2::ZERO);
-        };
-        let first = &self.units[p.units.start];
-        let last = &self.units[p.units.end - 1];
-        let mut out: Vec<usize> = self
-            .decos
-            .iter()
-            .filter(|(t, b, _)| *b > first.top && *t < last.bottom)
-            .map(|d| d.2)
-            .collect();
-        for u in &self.units[p.units.clone()] {
-            out.extend(u.items.clone());
-        }
-        (out, self.page_shift(page))
-    }
-
-    /// The page's used height (for centring a lone image).
     /// The height of the whole flow (a popup entry: one long page).
     pub(super) fn flow_height(&self) -> f32 {
         self.units.last().map_or(0.0, |u| u.bottom)
     }
 
+    /// The page's used height (for centring a lone image).
     pub(super) fn page_height(&self, page: usize) -> f32 {
         self.pages.get(page).map_or(0.0, |p| {
             self.units[p.units.end - 1].bottom - self.units[p.units.start].top
         })
+    }
+
+    /// Items of a page with each item's spoiler id (if any).
+    pub(super) fn page_render_items(&self, page: usize) -> Vec<(usize, Option<u32>)> {
+        let Some(p) = self.pages.get(page) else {
+            return Vec::new();
+        };
+        let first = &self.units[p.units.start];
+        let last = &self.units[p.units.end - 1];
+        let mut out: Vec<(usize, Option<u32>)> = self
+            .decos
+            .iter()
+            .filter(|(t, b, _)| *b > first.top && *t < last.bottom)
+            .map(|d| (d.2, None))
+            .collect();
+        for u in &self.units[p.units.clone()] {
+            for idx in u.items.clone() {
+                out.push((idx, u.spoiler));
+            }
+        }
+        out
+    }
+
+    pub(super) fn page_spoilers(&self, page: usize) -> std::slice::Iter<'_, Spoiler> {
+        let Some(p) = self.pages.get(page) else {
+            return [].iter();
+        };
+        let a = self.spoilers.partition_point(|s| s.unit < p.units.start);
+        let z = self.spoilers.partition_point(|s| s.unit < p.units.end);
+        self.spoilers[a..z].iter()
     }
 
     pub(super) fn page_links(&self, page: usize) -> std::slice::Iter<'_, Link> {
@@ -450,6 +474,7 @@ struct FlowState {
     units: Vec<Unit>,
     decos: Vec<(f32, f32, usize)>,
     links: Vec<Link>,
+    spoilers: Vec<Spoiler>,
     y: f32,
     margin_pos: f32,
     margin_neg: f32,
@@ -480,6 +505,7 @@ struct BlockFrame {
     bottom_margin: f32,
     border: [f32; 4],
     deco_slot: Option<usize>,
+    spoiler: Option<u32>,
 }
 
 /// A chapter laid out across frames using the same fonts and geometry.
@@ -507,7 +533,8 @@ impl LayoutWork {
         };
         if self.stack.is_empty() {
             let inline_len = if p.vertical { p.page_h } else { p.content_w };
-            self.stack.push(flow.start_block(&ch.root, 0.0, inline_len));
+            self.stack
+                .push(flow.start_block(&ch.root, 0.0, inline_len, None));
         }
         while let Some((frame, parents)) = self.stack.split_last_mut() {
             let mut block = &ch.root;
@@ -522,14 +549,14 @@ impl LayoutWork {
             } else {
                 None
             };
-            let (x, width) = (frame.x, frame.width);
+            let (x, width, spoiler) = (frame.x, frame.width, frame.spoiler);
             match child {
                 Some(Child::Block(child)) => {
                     frame.next_child += 1;
-                    self.stack.push(flow.start_block(child, x, width));
+                    self.stack.push(flow.start_block(child, x, width, spoiler));
                 }
                 Some(Child::Inline(items)) => {
-                    flow.inline(items, block.style, x, width, frame.first_inline);
+                    flow.inline(items, block.style, x, width, frame.first_inline, spoiler);
                     frame.first_inline = false;
                     frame.next_child += 1;
                 }
@@ -600,6 +627,7 @@ fn finish(mut f: FlowState, page_block: f32, vertical: bool, content_w: f32) -> 
         pages,
         anchors: f.anchors,
         links: f.links,
+        spoilers: f.spoilers,
         hits: f.hits,
         han_total: f.han,
         vertical,
@@ -758,6 +786,7 @@ impl Flow<'_, '_> {
         self.state.margin_neg = 0.0;
     }
 
+    #[expect(clippy::too_many_arguments)]
     fn push_unit(
         &mut self,
         top: f32,
@@ -766,6 +795,7 @@ impl Flow<'_, '_> {
         image_only: bool,
         chars: usize,
         han: u32,
+        spoiler: Option<u32>,
     ) {
         let i = self.state.units.len();
         for a in std::mem::take(&mut self.state.pending_anchors) {
@@ -779,6 +809,7 @@ impl Flow<'_, '_> {
             image_only,
             text: self.state.text,
             han: self.state.han,
+            spoiler,
         });
         self.state.text += chars;
         self.state.han += han;
@@ -939,7 +970,13 @@ impl Flow<'_, '_> {
         v
     }
 
-    fn start_block(&mut self, b: &Block, x: f32, avail: f32) -> BlockFrame {
+    fn start_block(
+        &mut self,
+        b: &Block,
+        x: f32,
+        avail: f32,
+        parent_spoiler: Option<u32>,
+    ) -> BlockFrame {
         let s = self.style(b.style).clone();
         if let Some(id) = &b.id {
             self.state.pending_anchors.push(id.clone());
@@ -1017,6 +1054,7 @@ impl Flow<'_, '_> {
             bottom_margin: m[2].unwrap_or(0.0),
             border: bw,
             deco_slot,
+            spoiler: b.spoiler.or(parent_spoiler),
         }
     }
 
@@ -1205,7 +1243,7 @@ impl Flow<'_, '_> {
             path: img.path.clone(),
         });
         let n = self.state.items.len();
-        self.push_unit(top, self.state.y, n - 1..n, true, 0, 0);
+        self.push_unit(top, self.state.y, n - 1..n, true, 0, 0, None);
     }
 
     fn rule(&mut self, s: &Style, x0: f32, w: f32) {
@@ -1250,7 +1288,7 @@ impl Flow<'_, '_> {
         });
         let n = self.state.items.len();
         self.state.y += width;
-        self.push_unit(top, self.state.y, n - 1..n, false, 0, 0);
+        self.push_unit(top, self.state.y, n - 1..n, false, 0, 0, None);
     }
 
     /// Lay out an inline box's content on one line, within `avail`:
@@ -1453,7 +1491,15 @@ struct Ruby {
 }
 
 impl Flow<'_, '_> {
-    fn inline(&mut self, items: &[Inline], block_style: StyleId, x0: f32, w: f32, first: bool) {
+    fn inline(
+        &mut self,
+        items: &[Inline],
+        block_style: StyleId,
+        x0: f32,
+        w: f32,
+        first: bool,
+        spoiler: Option<u32>,
+    ) {
         let ch = self.ch;
         let bs = ch.styles[block_style as usize].clone();
         let vertical = self.p.vertical;
@@ -1732,6 +1778,7 @@ impl Flow<'_, '_> {
                     w,
                     line_indent,
                     justify_ok,
+                    spoiler,
                 );
             } else {
                 self.line(
@@ -1745,6 +1792,7 @@ impl Flow<'_, '_> {
                     w,
                     line_indent,
                     justify_ok,
+                    spoiler,
                 );
             }
             start = next;
@@ -1768,6 +1816,7 @@ impl Flow<'_, '_> {
         w: f32,
         indent: f32,
         justify_ok: bool,
+        spoiler: Option<u32>,
     ) {
         // Trailing spaces hang.
         let mut len = atoms.len();
@@ -2029,6 +2078,21 @@ impl Flow<'_, '_> {
                 i += 1;
             }
         }
+        // Spoilers (blurred DuChinese sentence translations).
+        if let Some(id) = spoiler
+            && !atoms.is_empty()
+        {
+            let x_min = xs[0];
+            let x_max = xs[atoms.len() - 1] + atoms[atoms.len() - 1].w;
+            let glyph_top = baseline_y - strut_base;
+            let glyph_bottom = glyph_top + strut_h;
+            self.state.spoilers.push(Spoiler {
+                rect: Rect::from_min_max(pos2(x_min, top), pos2(x_max, bottom)),
+                visual: Rect::from_min_max(pos2(x_min, glyph_top), pos2(x_max, glyph_bottom)),
+                id,
+                unit,
+            });
+        }
         // Characters, for the dictionary.
         let start = self.state.hits.x.len() as u32;
         for (i, a) in atoms.iter().enumerate() {
@@ -2060,7 +2124,7 @@ impl Flow<'_, '_> {
             .count() as u32;
         let n = self.state.items.len();
         self.state.y = bottom;
-        self.push_unit(top, bottom, first_item..n, false, chars, han);
+        self.push_unit(top, bottom, first_item..n, false, chars, han, spoiler);
     }
 
     /// Emit one vertical column (`vertical-rl`): characters flow top to bottom
@@ -2077,6 +2141,7 @@ impl Flow<'_, '_> {
         h: f32,
         indent: f32,
         justify_ok: bool,
+        spoiler: Option<u32>,
     ) {
         // Trailing spaces hang.
         let mut len = atoms.len();
@@ -2356,6 +2421,21 @@ impl Flow<'_, '_> {
 
         // Characters, for selection, dictionary lookup, search and read-aloud.
         let glyph_half = (max_fp * 0.58).min(left_half.min(right_half));
+        if let Some(id) = spoiler
+            && !atoms.is_empty()
+        {
+            let y_min = ys[0];
+            let y_max = ys[atoms.len() - 1] + atoms[atoms.len() - 1].w;
+            self.state.spoilers.push(Spoiler {
+                rect: Rect::from_min_max(pos2(-b_end, y_min), pos2(-b_start, y_max)),
+                visual: Rect::from_min_max(
+                    pos2(-(b_center + glyph_half), y_min),
+                    pos2(-(b_center - glyph_half), y_max),
+                ),
+                id,
+                unit,
+            });
+        }
         let start = self.state.hits.x.len() as u32;
         for (i, a) in atoms.iter().enumerate() {
             if a.kind == AKind::Char && a.src != NO_SRC {
@@ -2386,7 +2466,7 @@ impl Flow<'_, '_> {
             .count() as u32;
         let n = self.state.items.len();
         self.state.y = b_end;
-        self.push_unit(b_start, b_end, first_item..n, false, chars, han);
+        self.push_unit(b_start, b_end, first_item..n, false, chars, han, spoiler);
     }
 }
 
@@ -2444,6 +2524,7 @@ mod tests {
             Source::Epub {
                 base: String::new(),
                 path: String::new(),
+                duchinese: false,
             },
         );
         let p = Params {
@@ -2634,6 +2715,7 @@ mod tests {
             Source::Epub {
                 base: String::new(),
                 path: String::new(),
+                duchinese: false,
             },
         );
         let vert = super::super::fonts::VertForms::from_font(crate::png_report::WENKAI, 0);
@@ -2731,7 +2813,7 @@ mod tests {
             Some(last_src + 1)
         );
         // Page offset places the first column inside [0, content_w].
-        let (_, shift) = l.page_items(0);
+        let shift = l.page_shift(0);
         let placed = first_col.translate(shift);
         assert!(
             placed.left() >= 0.0 && placed.right() <= 800.5,

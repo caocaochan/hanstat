@@ -1327,7 +1327,7 @@ impl App {
                         .on_hover_text("DuChinese's own Traditional text: no conversion. Books imported before keep their script");
                     settings_changed |= ui
                         .checkbox(&mut s.translations, "Sentence translations")
-                        .on_hover_text("Each paragraph followed by DuChinese's English, in small print. For new imports")
+                        .on_hover_text("Each paragraph followed by DuChinese's English, blurred until clicked. For new imports")
                         .changed();
                     settings_changed |= ui
                         .checkbox(&mut s.auto_update, "Add new chapters on their own")

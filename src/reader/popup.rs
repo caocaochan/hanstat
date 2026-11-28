@@ -1214,6 +1214,7 @@ impl Popup {
                                             item,
                                             off,
                                             ppp,
+                                            false,
                                         );
                                     }
                                     // Links: toggles and cross-references.

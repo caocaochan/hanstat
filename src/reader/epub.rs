@@ -50,6 +50,8 @@ pub struct Epub {
     /// Content documents in reading order (ZIP paths), linear ones only.
     pub spine: Vec<String>,
     pub toc: Vec<TocEntry>,
+    /// Imported from DuChinese (`urn:hanstat:duchinese:…`).
+    pub duchinese: bool,
 }
 
 impl Epub {
@@ -82,6 +84,7 @@ impl Epub {
             author: String::new(),
             spine: Vec::new(),
             toc: Vec::new(),
+            duchinese: false,
         };
         epub.read_package()?;
         if epub.title.is_empty()
@@ -179,6 +182,7 @@ impl Epub {
             author: String::new(),
             spine,
             toc,
+            duchinese: false,
         }
     }
 
@@ -222,6 +226,12 @@ impl Epub {
             .trim()
             .to_owned();
         self.author = extract_author(&doc);
+        self.duchinese = doc.descendants().any(|n| {
+            n.tag_name().name() == "identifier"
+                && n.ancestors().any(|a| a.tag_name().name() == "metadata")
+                && n.text()
+                    .is_some_and(|t| t.trim().starts_with("urn:hanstat:duchinese:"))
+        });
         // id → (path, media type, properties)
         let mut manifest: HashMap<&str, (String, &str, &str)> = HashMap::new();
         for n in doc.descendants().filter(|n| n.tag_name().name() == "item") {
