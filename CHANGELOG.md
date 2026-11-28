@@ -1,5 +1,13 @@
 # Changelog
 
+## [2026.11.28.01] - 2026-11-28
+
+### Added
+- **Horizontal and vertical text direction in the quote PNG exporter.** The **Export quote** dialog now includes a **Text** direction switcher (**Horizontal** / **Vertical**), defaulting to the Reader's current reading direction until overridden and remembered between exports. Vertical mode sets quotes in traditional top-to-bottom, right-to-left columns using the chosen font's vertical punctuation forms (with upright characters and rotated fallback forms matching the Reader), pairing Square and Horizontal cards with a vertical left colophon and Vertical cards with a centered bookmark colophon.
+
+### Changed
+- **Balanced, orphan-free line and column wrapping on quote cards.** Both horizontal and vertical quote layouts now use an optimal line/column breaker that honours CJK kinsoku and Latin word boundaries, keeps lines non-increasing in length (no row or column longer than the one before it), and avoids single-character orphans and punctuation right at the start/top of a wrapped line.
+
 ## [2026.11.28.00] - 2026-11-28
 
 ### Added

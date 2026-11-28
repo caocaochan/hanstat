@@ -142,6 +142,8 @@ struct Settings {
     search_width: f32,
     /// Last layout chosen in the quote PNG exporter.
     quote_layout: quote::QuoteLayout,
+    /// Text direction chosen in the quote PNG exporter; `None` follows the reader's mode.
+    quote_direction: Option<quote::TextDirection>,
     /// Theme chosen in the quote PNG exporter; `None` follows the reader's theme.
     quote_theme: Option<String>,
     /// Quote text font chosen in the quote PNG exporter; `None` follows the reader's font.
@@ -178,6 +180,7 @@ impl Default for Settings {
             tts: tts::TtsSettings::default(),
             search_width: 340.0,
             quote_layout: quote::QuoteLayout::default(),
+            quote_direction: None,
             quote_theme: None,
             quote_font: None,
             quote_title_font: None,
@@ -1156,11 +1159,16 @@ impl Reader {
             self.tts.play_from(spot.spine, spot.src, &self.settings.tts);
         }
         if export_quote && let Some(text) = self.selected_text() {
+            let direction = self
+                .settings
+                .quote_direction
+                .unwrap_or_else(|| quote::TextDirection::from_vertical(self.settings.vertical));
             self.quote_export = Some(quote::QuoteDialog::new(
                 text,
                 self.epub.title.clone(),
                 self.epub.author.clone(),
                 self.settings.quote_layout,
+                direction,
                 self.settings.quote_theme.clone(),
                 self.settings.quote_font.clone(),
                 self.settings.quote_title_font.clone(),
@@ -1917,6 +1925,7 @@ impl Reader {
         }
         if let Some(mut dlg) = self.quote_export.take() {
             let before_layout = dlg.card.layout;
+            let before_direction = dlg.card.direction;
             let before_theme = dlg.theme_id.clone();
             let before_quote_font = dlg.quote_font.clone();
             let before_title_font = dlg.title_font.clone();
@@ -1924,6 +1933,10 @@ impl Reader {
                 dlg.ui(&ctx, th, self.fonts.as_ref(), self.settings.sans_default);
             if dlg.card.layout != before_layout {
                 self.settings.quote_layout = dlg.card.layout;
+                self.dirty = true;
+            }
+            if dlg.card.direction != before_direction {
+                self.settings.quote_direction = Some(dlg.card.direction);
                 self.dirty = true;
             }
             if dlg.theme_id != before_theme {

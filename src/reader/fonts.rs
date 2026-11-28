@@ -521,7 +521,7 @@ impl VertForms {
 }
 
 /// Cached vertical-form coverage for the bundled LXGW WenKai font.
-fn wenkai_vert() -> VertForms {
+pub(super) fn wenkai_vert() -> VertForms {
     static VERT: OnceLock<VertForms> = OnceLock::new();
     *VERT.get_or_init(|| VertForms::from_font(crate::png_report::WENKAI, 0))
 }

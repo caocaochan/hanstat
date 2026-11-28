@@ -408,7 +408,7 @@ struct InBox {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum VertGlyph {
+pub(super) enum VertGlyph {
     /// Upright character (`angle = 0.0`) with optical shift in ems.
     Upright { ch: char, dx: f32, dy: f32 },
     /// Rotated 90° clockwise (`angle = FRAC_PI_2`) in a sideways run.
@@ -608,9 +608,9 @@ fn finish(mut f: FlowState, page_block: f32, vertical: bool, content_w: f32) -> 
 }
 
 /// Characters that may not start a line.
-const NO_START: &str = "、。，．,.：:；;？?！!）)］]｝}〕〉》」』】〙〗〟’”｠»ヽヾーァィゥェォッャュョヮヵヶぁぃぅぇぉっゃゅょゎゕゖ々〻‐゠–〜～・…‥％%℃°′″";
+pub(super) const NO_START: &str = "、。，．,.：:；;？?！!）)］]｝}〕〉》」』】〙〗〟’”｠»ヽヾーァィゥェォッャュョヮヵヶぁぃぅぇぉっゃゅょゎゕゖ々〻‐゠–〜～・…‥％%℃°′″";
 /// Characters that may not end a line.
-const NO_END: &str = "（(［[｛{〔〈《「『【〘〖〝‘“｟«";
+pub(super) const NO_END: &str = "（(［[｛{〔〈《「『【〘〖〝‘“｟«";
 
 fn is_upright_vertical(c: char) -> bool {
     hanstat::chars::is_wide(c)
@@ -663,7 +663,7 @@ fn vert_form(c: char) -> Option<(char, bool)> {
     })
 }
 
-fn vert_glyph(c: char, has_vert: impl Fn(char) -> bool) -> VertGlyph {
+pub(super) fn vert_glyph(c: char, has_vert: impl Fn(char) -> bool) -> VertGlyph {
     if let Some((v, rotatable)) = vert_form(c) {
         if has_vert(v) {
             return VertGlyph::Upright {
@@ -700,7 +700,7 @@ fn vert_glyph(c: char, has_vert: impl Fn(char) -> bool) -> VertGlyph {
     }
 }
 
-fn cjk(c: char) -> bool {
+pub(super) fn cjk(c: char) -> bool {
     hanstat::chars::is_wide(c)
         || matches!(c, '\u{3000}'..='\u{303F}' | '\u{FF00}'..='\u{FFEF}' | '\u{2014}' | '\u{2026}' | '“' | '”' | '‘' | '’')
 }
@@ -2390,7 +2390,7 @@ impl Flow<'_, '_> {
     }
 }
 
-fn baseline(g: &Galley) -> f32 {
+pub(super) fn baseline(g: &Galley) -> f32 {
     g.rows
         .first()
         .and_then(|r| {
