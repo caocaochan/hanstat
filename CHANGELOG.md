@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.11.28.03] - 2026-11-28
+
+### Changed
+- **Smoother, faster blur for DuChinese sentence translations.** Replaced the multi-pass text blur with a cached Gaussian-feathered cloud texture drawn per word chunk, removing visual striping artifacts and cutting rendering cost while keeping the same click-to-reveal behaviour across all light and dark themes.
+
 ## [2026.11.28.02] - 2026-11-28
 
 ### Changed

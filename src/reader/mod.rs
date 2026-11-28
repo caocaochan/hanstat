@@ -1658,19 +1658,6 @@ impl Reader {
                 } else {
                     vec2(1.0, 0.0)
                 };
-                if let Some(hid) = hovered_blurred_spoiler {
-                    let hover_pad = if l.vertical {
-                        vec2(2.0, 4.0)
-                    } else {
-                        vec2(4.0, 1.0)
-                    };
-                    let fill = th.muted.gamma_multiply(if th.dark { 0.14 } else { 0.10 });
-                    for s in l.page_spoilers(idx) {
-                        if s.id == hid {
-                            painter.rect_filled(s.visual.translate(off).expand2(hover_pad), 4.0, fill);
-                        }
-                    }
-                }
                 if let Some(r) = &reading {
                     for r in l.char_rects(idx, r.clone()) {
                         painter.rect_filled(
@@ -1688,17 +1675,22 @@ impl Reader {
                     }
                 }
                 for (i, spoiler) in items {
-                    let blurred =
-                        spoiler.is_some_and(|id| !self.revealed_spoilers.contains(&(spine, id)));
-                    paint_item(
-                        &mut self.images,
-                        th,
-                        &painter,
-                        &l.items[i],
-                        off,
-                        ppp,
-                        blurred,
-                    );
+                    if spoiler.is_some_and(|id| !self.revealed_spoilers.contains(&(spine, id))) {
+                        continue;
+                    }
+                    paint_item(&mut self.images, th, &painter, &l.items[i], off, ppp);
+                }
+                for s in l.page_spoilers(idx) {
+                    if !self.revealed_spoilers.contains(&(spine, s.id)) {
+                        paint_spoiler_blur(
+                            &painter,
+                            th,
+                            s,
+                            off,
+                            l.vertical,
+                            hovered_blurred_spoiler == Some(s.id),
+                        );
+                    }
                 }
                 if let Some((sp, range)) = &self.search_hit
                     && *sp == self.spine
@@ -2959,52 +2951,92 @@ fn geometry(settings: &Settings, area: Rect) -> Geometry {
     }
 }
 
-fn paint_blurred_text(
-    painter: &egui::Painter,
-    th: &Theme,
-    pos: Pos2,
-    galley: &Arc<egui::Galley>,
-    angle: f32,
-) {
-    let fp = galley
-        .job
-        .sections
-        .first()
-        .map_or(16.0, |s| s.format.font_id.size);
-    // Wide 2D Gaussian-weighted multi-pass blur: horizontal spread (~0.52 em
-    // each way) blends neighbouring letters together so the line is genuinely
-    // illegible while keeping a soft, text-shaped cloud.
-    let step_x = fp * 0.13;
-    let step_y = fp * 0.12;
-    let (sx, sy) = (2.8f32, 1.8f32);
-    let mut samples: [(f32, f32, f32); 45] = [(0.0, 0.0, 0.0); 45];
-    let mut count = 0usize;
-    let mut weight_sum = 0.0f32;
-    for iy in -2i32..=2 {
-        for ix in -4i32..=4 {
-            let r2 = (ix as f32 / 4.0).powi(2) + (iy as f32 / 2.0).powi(2);
-            if r2 > 1.15 {
-                continue;
-            }
-            let w = (-0.5 * ((ix as f32 / sx).powi(2) + (iy as f32 / sy).powi(2))).exp();
-            samples[count] = (ix as f32 * step_x, iy as f32 * step_y, w);
-            weight_sum += w;
-            count += 1;
+/// Abramowitz & Stegun 7.1.26 approximation of `erf(x)` (max error 1.5e-7).
+fn erf_approx(x: f32) -> f32 {
+    let sign = x.signum();
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.327_591_1 * x);
+    let y = 1.0
+        - (((((1.061_405_4 * t - 1.453_152) * t) + 1.421_413_7) * t - 0.284_496_74) * t
+            + 0.254_829_6)
+            * t
+            * (-x * x).exp();
+    sign * y
+}
+
+/// 1D box `[a, 1 - a]` convolved with a Gaussian of std `sigma`, smoothly
+/// tapered to zero at `0` and `1` so texture edges never show a seam.
+fn gaussian_box(t: f32, a: f32, sigma: f32) -> f32 {
+    let s = sigma * std::f32::consts::SQRT_2;
+    let raw = 0.5 * (erf_approx((t - a) / s) - erf_approx((t - (1.0 - a)) / s));
+    let edge = (t.min(1.0 - t) / 0.08).clamp(0.0, 1.0);
+    let smooth_edge = edge * edge * (3.0 - 2.0 * edge);
+    (raw * smooth_edge).max(0.0)
+}
+
+/// Shared 64×32 white Gaussian-feathered cloud texture, uploaded once per
+/// egui context and tinted at draw time for any theme.
+fn spoiler_blur_texture(ctx: &egui::Context) -> egui::TextureId {
+    let key = egui::Id::unique("reader-spoiler-blur-tex");
+    if let Some(h) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(key)) {
+        return h.id();
+    }
+    const W: usize = 64;
+    const H: usize = 32;
+    let mut vals = vec![0.0f32; W * H];
+    let mut peak = 0.0f32;
+    for y in 0..H {
+        let v = (y as f32 + 0.5) / H as f32;
+        let gy = gaussian_box(v, 0.30, 0.145);
+        for x in 0..W {
+            let u = (x as f32 + 0.5) / W as f32;
+            let gx = gaussian_box(u, 0.24, 0.11);
+            let val = gx * gy;
+            vals[y * W + x] = val;
+            peak = peak.max(val);
         }
     }
-    let gain = 1.25 / weight_sum;
-    for &(dx, dy, w) in &samples[..count] {
-        let delta = if angle == 0.0 {
-            vec2(dx, dy)
-        } else {
-            vec2(dy, dx)
-        };
-        let mut shape = egui::epaint::TextShape::new(pos + delta, galley.clone(), th.ink)
-            .with_opacity_factor((w * gain).clamp(0.015, 0.15));
-        if angle != 0.0 {
-            shape = shape.with_angle(angle);
-        }
-        painter.add(shape);
+    let scale = if peak > 0.0 { 1.0 / peak } else { 1.0 };
+    let pixels: Vec<Color32> = vals
+        .into_iter()
+        .map(|val| {
+            let a = (val * scale * 255.0).round().clamp(0.0, 255.0) as u8;
+            Color32::from_rgba_unmultiplied(255, 255, 255, a)
+        })
+        .collect();
+    let img = egui::ColorImage {
+        size: [W, H],
+        source_size: vec2(W as f32, H as f32),
+        pixels,
+    };
+    let handle = ctx.load_texture("reader:spoiler-blur", img, egui::TextureOptions::LINEAR);
+    let id = handle.id();
+    ctx.data_mut(|d| d.insert_temp(key, handle));
+    id
+}
+
+fn paint_spoiler_blur(
+    painter: &egui::Painter,
+    th: &Theme,
+    spoiler: &layout::Spoiler,
+    off: Vec2,
+    vertical: bool,
+    hovered: bool,
+) {
+    let tex = spoiler_blur_texture(painter.ctx());
+    let uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
+    let fp = spoiler.font_px;
+    let pad = if vertical {
+        vec2(fp * 0.42, fp * 0.42)
+    } else {
+        vec2(fp * 0.45, fp * 0.42)
+    };
+    let base_alpha = if th.dark { 0.42 } else { 0.38 };
+    let boost = if hovered { 1.28 } else { 1.0 };
+    for blob in &spoiler.blobs {
+        let alpha = (base_alpha * blob.weight * boost).clamp(0.12, 0.72);
+        let color = th.muted.gamma_multiply(alpha);
+        painter.image(tex, blob.rect.translate(off).expand2(pad), uv, color);
     }
 }
 
@@ -3015,7 +3047,6 @@ fn paint_item(
     item: &Item,
     off: Vec2,
     ppp: f32,
-    blurred: bool,
 ) {
     match item {
         Item::Text {
@@ -3024,9 +3055,7 @@ fn paint_item(
             angle,
             faux,
         } => {
-            if blurred {
-                paint_blurred_text(painter, th, *pos + off, galley, *angle);
-            } else if *angle == 0.0 {
+            if *angle == 0.0 {
                 painter.galley(*pos + off, galley.clone(), th.ink);
                 if let Some((g, delta)) = faux {
                     painter.galley(*pos + off + *delta, g.clone(), th.ink);

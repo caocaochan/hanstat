@@ -166,15 +166,13 @@ fn render_pages() {
                         }
                     }
                     for (i, spoiler) in items {
-                        paint_item(
-                            &mut images,
-                            th,
-                            &painter,
-                            &l.items[i],
-                            off,
-                            2.0,
-                            spoiler.is_some(),
-                        );
+                        if spoiler.is_some() {
+                            continue;
+                        }
+                        paint_item(&mut images, th, &painter, &l.items[i], off, 2.0);
+                    }
+                    for s in l.page_spoilers(idx) {
+                        paint_spoiler_blur(&painter, th, s, off, l.vertical, false);
                     }
                     let small = egui::FontId::proportional((settings.size * 0.62).max(11.0));
                     ui.painter().text(

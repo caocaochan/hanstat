@@ -105,12 +105,22 @@ pub(super) struct Link {
     unit: usize,
 }
 
+/// One word-sized blur blob inside a [`Spoiler`] line.
+#[derive(Clone, Copy)]
+pub(super) struct SpoilerBlob {
+    pub(super) rect: Rect,
+    /// Relative opacity weight (`0.7..=1.0`) so consecutive words undulate like blurred text.
+    pub(super) weight: f32,
+}
+
 /// One visual line of a blurred DuChinese translation paragraph.
 pub(super) struct Spoiler {
     /// Click/hover target (flow coordinates).
     pub(super) rect: Rect,
-    /// Tight text bounds (flow coordinates), for hover feedback.
-    pub(super) visual: Rect,
+    /// Font size of this line, used to scale the Gaussian feather width.
+    pub(super) font_px: f32,
+    /// Per-word boxes painted as smooth Gaussian-feathered clouds while blurred.
+    pub(super) blobs: Vec<SpoilerBlob>,
     pub(super) id: u32,
     unit: usize,
 }
@@ -2084,11 +2094,12 @@ impl Flow<'_, '_> {
         {
             let x_min = xs[0];
             let x_max = xs[atoms.len() - 1] + atoms[atoms.len() - 1].w;
-            let glyph_top = baseline_y - strut_base;
-            let glyph_bottom = glyph_top + strut_h;
+            let fp = self.font_px(bs);
+            let blobs = spoiler_blobs_horizontal(atoms, &xs, baseline_y, fp);
             self.state.spoilers.push(Spoiler {
                 rect: Rect::from_min_max(pos2(x_min, top), pos2(x_max, bottom)),
-                visual: Rect::from_min_max(pos2(x_min, glyph_top), pos2(x_max, glyph_bottom)),
+                font_px: fp,
+                blobs,
                 id,
                 unit,
             });
@@ -2426,12 +2437,12 @@ impl Flow<'_, '_> {
         {
             let y_min = ys[0];
             let y_max = ys[atoms.len() - 1] + atoms[atoms.len() - 1].w;
+            let fp = self.font_px(bs);
+            let blobs = spoiler_blobs_vertical(atoms, &ys, -b_center, fp);
             self.state.spoilers.push(Spoiler {
                 rect: Rect::from_min_max(pos2(-b_end, y_min), pos2(-b_start, y_max)),
-                visual: Rect::from_min_max(
-                    pos2(-(b_center + glyph_half), y_min),
-                    pos2(-(b_center - glyph_half), y_max),
-                ),
+                font_px: fp,
+                blobs,
                 id,
                 unit,
             });
@@ -2480,6 +2491,110 @@ pub(super) fn baseline(g: &Galley) -> f32 {
                 .map(|gl| gl.pos.y + r.pos.y)
         })
         .unwrap_or(g.size().y * 0.8)
+}
+
+fn word_weight(slice: &[Atom]) -> f32 {
+    let mut h = 0u32;
+    let mut dense = 0usize;
+    for a in slice {
+        h = h.wrapping_mul(31).wrapping_add(a.ch as u32);
+        if a.ch.is_alphanumeric() {
+            dense += 1;
+        }
+    }
+    let len_bias = (dense.min(7) as f32 / 7.0) * 0.14;
+    let jitter = ((h % 11) as f32 / 10.0) * 0.18;
+    (0.68 + len_bias + jitter).min(1.0)
+}
+
+fn push_word_blobs_horizontal(
+    blobs: &mut Vec<SpoilerBlob>,
+    atoms: &[Atom],
+    xs: &[f32],
+    start: usize,
+    end: usize,
+    baseline_y: f32,
+    fp: f32,
+) {
+    // Split long words into ~2-em chunks so every blob has a consistent
+    // aspect ratio and gentle organic undulation along the line.
+    let mut s = start;
+    while s < end {
+        let mut e = s + 1;
+        while e < end && (xs[e] - xs[s]) < fp * 1.9 {
+            e += 1;
+        }
+        // Avoid leaving a tiny 1-char orphan chunk at the end of a word.
+        if end - e == 1 {
+            e = end;
+        }
+        let slice = &atoms[s..e];
+        let x0 = xs[s];
+        let x1 = xs[e - 1] + atoms[e - 1].w;
+        let has_tall = slice.iter().any(|a| {
+            a.ch.is_uppercase() || matches!(a.ch, 'b' | 'd' | 'f' | 'h' | 'k' | 'l' | 't')
+        });
+        let has_desc = slice
+            .iter()
+            .any(|a| matches!(a.ch, 'g' | 'j' | 'p' | 'q' | 'y'));
+        let y0 = baseline_y - fp * if has_tall { 0.68 } else { 0.54 };
+        let y1 = baseline_y + fp * if has_desc { 0.14 } else { 0.02 };
+        blobs.push(SpoilerBlob {
+            rect: Rect::from_min_max(pos2(x0, y0), pos2(x1, y1)),
+            weight: word_weight(slice),
+        });
+        s = e;
+    }
+}
+
+fn spoiler_blobs_horizontal(
+    atoms: &[Atom],
+    xs: &[f32],
+    baseline_y: f32,
+    fp: f32,
+) -> Vec<SpoilerBlob> {
+    let mut blobs = Vec::new();
+    let mut i = 0;
+    while i < atoms.len() {
+        while i < atoms.len() && (atoms[i].ch == ' ' || atoms[i].ch == '\u{3000}') {
+            i += 1;
+        }
+        if i >= atoms.len() {
+            break;
+        }
+        let start = i;
+        while i < atoms.len() && atoms[i].ch != ' ' && atoms[i].ch != '\u{3000}' {
+            i += 1;
+        }
+        push_word_blobs_horizontal(&mut blobs, atoms, xs, start, i, baseline_y, fp);
+    }
+    blobs
+}
+
+fn spoiler_blobs_vertical(atoms: &[Atom], ys: &[f32], cx: f32, fp: f32) -> Vec<SpoilerBlob> {
+    let mut blobs = Vec::new();
+    let half = fp * 0.30;
+    let mut i = 0;
+    while i < atoms.len() {
+        while i < atoms.len() && (atoms[i].ch == ' ' || atoms[i].ch == '\u{3000}') {
+            i += 1;
+        }
+        if i >= atoms.len() {
+            break;
+        }
+        let start = i;
+        while i < atoms.len() && atoms[i].ch != ' ' && atoms[i].ch != '\u{3000}' {
+            i += 1;
+        }
+        let slice = &atoms[start..i];
+        let y0 = ys[start];
+        let y1 = ys[i - 1] + atoms[i - 1].w;
+        blobs.push(SpoilerBlob {
+            rect: Rect::from_min_max(pos2(cx - half, y0), pos2(cx + half, y1)),
+            weight: word_weight(slice),
+        });
+    }
+    blobs
 }
 
 fn near_white(c: Color32) -> bool {
